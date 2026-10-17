@@ -1379,7 +1379,8 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
     mailSel = mailSel && doms.includes(mailSel) ? mailSel : (m.active || doms[0] || null);
     const hasUrl = !!(m.inbox_url || st.has_url);
     const deployed = hasUrl && st.wrangler_authed !== false;
-    const stepDone = [doms.length > 0, deployed, false];
+    // step 3 completes once the inbox has actually answered (persisted server-side)
+    const stepDone = [doms.length > 0, deployed, !!m.inbox_ok];
     const curStep = stepDone.findIndex(d => !d);
 
     const stepHead = (n, title, done, active) => `
@@ -1465,13 +1466,19 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
       {n:2, title:'Deploy the mail worker', body:s2body},
       {n:3, title:'Route mail to the worker in Cloudflare', body:s3body},
     ];
-    const startAt = curStep === -1 ? steps.length - 1 : curStep;
+    const allDone = curStep === -1;
+    const startAt = allDone ? -1 : curStep;
     box.innerHTML = steps.map((s, i) => {
       const done = stepDone[i];
       const active = i === startAt && !done;
       return stepHead(s.n, s.title, done, active) +
-        (active || (i === 2 && stepDone[0] && stepDone[1]) ? s.body : '');
-    }).join('');
+        (active ? s.body : (i === 2 && stepDone[0] && stepDone[1] && !allDone ? s.body : ''));
+    }).join('')
+    + (allDone
+        ? `<p style="color:var(--success,#3fb950);font-size:12.5px;margin-top:10px">
+             ✓ Email setup complete — signups will rotate across your domains and
+             read verification mail from your worker.</p>`
+        : '');
 
     // keep the manual url/secret inputs in sync (below the wizard)
     const u = $("#mail-inbox-url"); if (u && document.activeElement !== u) u.value = m.inbox_url || "";

@@ -589,8 +589,15 @@ class GeneratorManager:
         sec = m.get("inbox_secret") or ""
         m["inbox_secret_set"] = bool(sec)
         m["inbox_secret_masked"] = (sec[:4] + "…" + sec[-3:]) if len(sec) > 8 else ("•" * len(sec))
+        m["inbox_ok"] = bool(m.get("inbox_ok"))
         m.pop("inbox_secret", None)
         return m
+
+    def mark_inbox_verified(self, ok: bool) -> None:
+        """Persist the last inbox smoke-test result so the setup wizard can show
+        step 3 as complete (it survives reloads/restarts)."""
+        self.mail_cfg["inbox_ok"] = bool(ok)
+        self._save_mail_config()
 
     def export_worker(self, dest: str | Path = None) -> dict:
         """Copy the bundled mail-worker source to disk so the user can deploy it.
@@ -957,6 +964,8 @@ class GeneratorManager:
             except Exception as e:
                 test = {"ok": False, "error": str(e)}
                 _time.sleep(3)
+        # remember the result so the wizard can mark step 3 done (persisted)
+        self.mark_inbox_verified(bool(test.get("ok")))
         return {"ok": True, "inbox_url": self.mail_cfg["inbox_url"],
                 "worker_url": base_url, "kv_id": kv_id,
                 "secret_generated": True, "test": test}
@@ -980,9 +989,12 @@ class GeneratorManager:
             u = str(kw["inbox_url"] or "").strip()
             if u and not u.startswith(("http://", "https://")):
                 raise ValueError("inbox_url must start with http:// or https://")
+            if u != cfg.get("inbox_url"):
+                cfg["inbox_ok"] = False   # endpoint changed → re-verify
             cfg["inbox_url"] = u
         if "inbox_secret" in kw and str(kw["inbox_secret"] or "").strip():
             cfg["inbox_secret"] = str(kw["inbox_secret"]).strip()
+            cfg["inbox_ok"] = False       # new secret → re-verify
         self._save_mail_config()
         return self.mail_config()
 

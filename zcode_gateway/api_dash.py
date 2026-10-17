@@ -670,9 +670,14 @@ async def generator_mail_test(request: Request, key: str = Depends(admin_key)) -
         import httpx as _hx
         async with _hx.AsyncClient(timeout=15) as client:
             r = await client.get(url, params={"k": mgr.mail_cfg.get("inbox_secret", "")})
-        return {"ok": r.status_code == 200, "status": r.status_code,
-                "body": r.text[:200]}
+        ok = r.status_code == 200
+        mgr.mark_inbox_verified(ok)   # drives the wizard's step 3 checkmark
+        return {"ok": ok, "status": r.status_code, "body": r.text[:200]}
     except Exception as e:
+        try:
+            mgr.mark_inbox_verified(False)
+        except Exception:
+            pass
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 

@@ -84,3 +84,39 @@ def test_proxy_checker_parsing():
         assert checker.stats.get("best") == 1.25
         assert checker.stats.get("median") == 3.40
         assert checker.stats.get("ever_good") == 45
+
+def test_ansi_output_is_stripped():
+    from zcode_gateway.generator import _clean_output, _tail
+
+    esc = "\x1b"
+    raw = (esc + "[31mX " + esc + "[41;97mERROR" + esc + "[0m "
+           + esc + "[1mboom" + esc + "[0m")
+    clean = _clean_output(raw)
+    assert esc not in clean and "[31m" not in clean
+    assert clean == "X ERROR boom"
+
+    # when ESC was already consumed upstream, the parameter tail is removed too
+    assert "[31m" not in _tail("[31mX [0m[1mhello")
+
+    # genuine brackets survive
+    assert "[MAIL]" in _clean_output("created namespace [MAIL] ok")
+
+
+def test_inbox_verification_flag_persists():
+    import tempfile
+    from zcode_gateway.generator import GeneratorManager
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr = GeneratorManager(Path(tmpdir), data_dir=Path(tmpdir))
+        assert mgr.mail_config()["inbox_ok"] is False
+
+        mgr.mark_inbox_verified(True)
+        assert mgr.mail_config()["inbox_ok"] is True
+
+        # a fresh manager sees the persisted flag
+        again = GeneratorManager(Path(tmpdir), data_dir=Path(tmpdir))
+        assert again.mail_config()["inbox_ok"] is True
+
+        # changing the endpoint invalidates verification
+        again.set_mail_config(inbox_url="https://x.workers.dev/inbox")
+        assert again.mail_config()["inbox_ok"] is False
