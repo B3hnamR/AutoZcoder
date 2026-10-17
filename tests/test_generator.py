@@ -180,3 +180,49 @@ def test_manual_captcha_forces_visible_browser():
         # switching back to manual forces it off again
         mgr.set_options(captcha="manual")
         assert mgr.headless is False
+
+def test_pending_accounts_and_registration_ledger():
+    import tempfile
+    from zcode_gateway.generator import GeneratorManager
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        data = Path(tmpdir)
+        (data / "accountsg1.txt").write_text(
+            "a@x.me:pw:eyJabc.token\nbad-line\nb@x.me:pw:notajwt\n", encoding="utf-8")
+        (data / "starterg1.txt").write_text(
+            "a@x.me:pw:eyJabc.token\nc@x.me:pw:eyJdef.token\n", encoding="utf-8")
+
+        mgr = GeneratorManager(Path(tmpdir), data_dir=data)
+        # deduped across files, non-JWT tokens skipped, password with ':' kept
+        assert sorted(p["email"] for p in mgr.pending_accounts()) == ["a@x.me", "c@x.me"]
+        assert mgr.registered_emails() == set()
+
+        mgr.mark_registered("a@x.me")
+        assert mgr.registered_emails() == {"a@x.me"}
+        assert [p["email"] for p in mgr.pending_accounts()] == ["c@x.me"]
+
+        # ledger survives a restart (fresh manager, same data dir)
+        assert GeneratorManager(Path(tmpdir), data_dir=data).registered_emails() == {"a@x.me"}
+
+
+def test_zai_proxy_direct_sentinel_is_not_a_proxy():
+    import importlib, os, sys
+    gen = Path(__file__).resolve().parent.parent / "generator"
+    if not gen.is_dir():
+        return
+    sys.path.insert(0, str(gen))
+    try:
+        import plan_check
+        saved = os.environ.get("ZAI_PROXY")
+        for sentinel in ("0", "", "none", "direct", "off"):
+            os.environ["ZAI_PROXY"] = sentinel
+            assert plan_check._proxies() is None, sentinel
+        os.environ["ZAI_PROXY"] = "http://1.2.3.4:8080"
+        assert plan_check._proxies() == {"http": "http://1.2.3.4:8080",
+                                        "https": "http://1.2.3.4:8080"}
+        if saved is None:
+            os.environ.pop("ZAI_PROXY", None)
+        else:
+            os.environ["ZAI_PROXY"] = saved
+    except ImportError:
+        pass   # requests not installed in this env — skip

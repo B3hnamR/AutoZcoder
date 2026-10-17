@@ -583,6 +583,10 @@ def _generator(request: Request):
                     fut = asyncio.run_coroutine_threadsafe(
                         state.pool.upsert(account), main_loop)
                     fut.result(timeout=30)
+                    try:
+                        mgr.mark_registered(email)   # done → never re-register
+                    except Exception:
+                        pass
             except Exception:
                 log.exception("generator: pool registration failed for %s", email)
 
@@ -605,6 +609,19 @@ def _generator(request: Request):
         mgr.headless = bool(gc.headless) and mgr.captcha != "manual"
         mgr.set_options(ip_source="socks" if gc.socks_only else "pool")
         state.generator = mgr
+
+        # catch-up: signups that never reached the pool (gateway was closed, or
+        # a registration step errored) are registered now instead of being lost
+        try:
+            pending = mgr.pending_accounts()
+            if pending:
+                log.info("generator: registering %d account(s) found on disk",
+                         len(pending))
+                for info in pending:
+                    threading.Thread(target=register_account, args=(info,),
+                                     daemon=True).start()
+        except Exception:
+            log.exception("generator: catch-up scan failed")
     return mgr
 
 

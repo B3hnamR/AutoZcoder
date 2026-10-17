@@ -625,6 +625,58 @@ class GeneratorManager:
         self._save_mail_config()
         return self.mail_config()
 
+    # ---- registration ledger ------------------------------------------------ #
+
+    def _registered_path(self) -> Path:
+        return self.data_dir / "registered.json"
+
+    def registered_emails(self) -> set[str]:
+        try:
+            data = json.loads(self._registered_path().read_text(encoding="utf-8"))
+            return {str(e).strip().lower() for e in (data.get("emails") or []) if str(e).strip()}
+        except (OSError, ValueError):
+            return set()
+
+    def mark_registered(self, email: str) -> None:
+        """Remember that an account was written into the gateway pool."""
+        email = str(email or "").strip().lower()
+        if not email:
+            return
+        got = self.registered_emails() | {email}
+        p = self._registered_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps({"emails": sorted(got)}, indent=1), encoding="utf-8")
+        os.replace(tmp, p)
+
+    def pending_accounts(self) -> list[dict]:
+        """Accounts sitting in accounts*.txt / starter*.txt that never reached
+        the pool — e.g. created while the gateway was closed, or a registration
+        step failed. Lets the gateway catch up on start instead of silently
+        leaving successful signups out of rotation."""
+        done = self.registered_emails()
+        out, seen = [], set()
+        for pat in ("accounts*.txt", "starter*.txt"):
+            for f in sorted(self.data_dir.glob(pat)):
+                try:
+                    lines = f.read_text(encoding="utf-8", errors="ignore").splitlines()
+                except OSError:
+                    continue
+                for ln in lines:
+                    ln = ln.strip()
+                    if not ln or ln.count(":") < 2:
+                        continue
+                    email, password, token = ln.split(":", 2)
+                    email, token = email.strip().lower(), token.strip()
+                    if not email or email in seen or email in done:
+                        continue
+                    if not token.startswith("eyJ"):
+                        continue
+                    seen.add(email)
+                    out.append({"email": email, "password": password,
+                                "chat_token": token})
+        return out
+
     def export_worker(self, dest: str | Path = None) -> dict:
         """Copy the bundled mail-worker source to disk so the user can deploy it.
 

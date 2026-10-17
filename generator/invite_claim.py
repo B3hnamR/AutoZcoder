@@ -228,9 +228,18 @@ def send_one_message(zcode_jwt, log=print):
     return False
 
 
+_NO_PROXY = {"", "0", "none", "null", "direct", "off", "false", "no"}
+
+
 def _proxies():
-    raw = os.environ.get('ZAI_PROXY')
-    return {'http': raw, 'https': raw} if raw else None
+    # ZAI_PROXY may carry a sentinel meaning 'no proxy' - the gateway sets
+    # '0' for direct connections. Anything falsy or one of these tokens means
+    # go direct; otherwise the value would be used as a proxy host and every
+    # request dies with "Failed to resolve '0'".
+    raw = (os.environ.get('ZAI_PROXY') or '').strip()
+    if raw.lower() in _NO_PROXY:
+        return None
+    return {'http': raw, 'https': raw}
 
 
 APP_HEADERS = {  # exact cli/init header set captured from the desktop app
