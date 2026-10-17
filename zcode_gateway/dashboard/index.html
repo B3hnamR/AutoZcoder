@@ -1446,13 +1446,24 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
     const s3body = `
       <div style="margin:4px 0 10px 34px">
         <p style="color:var(--muted);font-size:12.5px;margin-bottom:8px">
-          Last manual step — tell Cloudflare to hand your domain's mail to the worker
-          (you already did this for your domain):</p>
-        <ol style="margin:0 0 10px 18px;color:var(--muted);font-size:12.5px">
-          <li>Open <a href="https://dash.cloudflare.com" target="_blank">dash.cloudflare.com</a> → your domain → <b>Email → Email Routing</b>.</li>
-          <li>Enable <b>Email Routing</b> if asked, then <b>Routing rules → Catch-all address → Edit</b>.</li>
-          <li>Action: <b>Send to a Worker</b> → pick <b>zai-mail</b> → Save.</li>
+          Last manual step — tell Cloudflare to hand this domain's mail to the
+          worker. Do it once per domain.</p>
+        <ol style="margin:0 0 10px 18px;color:var(--muted);font-size:12.5px;line-height:1.65">
+          <li><b>Onboard the domain</b> (skip if it already shows <b>Enabled</b>):
+            open <a href="https://dash.cloudflare.com" target="_blank">dash.cloudflare.com</a>
+            → your domain → <b>Email → Email Routing</b> → <b>Onboard Domain</b> →
+            pick the zone → <b>Continue</b> → on <b>Verify DNS records</b> review the
+            MX + TXT records → <b>Activate</b>.</li>
+          <li>Open the <b>Routing rules</b> tab. The <b>Catch-all</b> rule starts
+            <b>Disabled</b> with action <b>Drop</b>.</li>
+          <li>Click <b>⋯ → Edit</b> on that Catch-all → set <b>Action →
+            Send to a Worker</b> → <b>Destination → zai-mail</b> → <b>Save</b>.</li>
+          <li><b>Turn the toggle ON</b> so the Catch-all shows <b>Active</b> —
+            a disabled catch-all silently drops every message.</li>
         </ol>
+        <p class="help" style="margin:-4px 0 10px 18px">
+          The domain must show <b>Enabled</b> with DNS records <b>Configured</b> —
+          <b>Misconfigured</b> or <b>Syncing</b> means mail is still being dropped.</p>
         <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
           <button class="btn btn-pri btn-sm" onclick="App.mailTest()">Test inbox</button>
           <span id="mail-msg" style="color:var(--muted);font-size:12px"></span>
