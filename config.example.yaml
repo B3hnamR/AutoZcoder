@@ -49,6 +49,9 @@ update:
   repo: B3hnamR/ZcodeGate
 generator:
   enabled: false
-  zcodeauto_dir: ""     # '' = auto-detect; or set the ZCODEAUTO folder (has gen/)
-  invite_code: ""       # referral code claimed after signup ('' = off)
+  zcodeauto_dir: ""     # '' = auto-detect; or set the generator folder (has main.py)
+  captcha: "manual"     # manual = you solve it in a visible browser | auto = solver
+  headless: false       # only used with captcha: auto (manual always needs a window)
+  claim: true           # claim the invite Global Build after signup
+  invite_code: "MT9GNDQ8"      # referral code claimed after signup ('' = off)
   socks_only: true              # socks4/5 pool only (residential — passes Starter gate)

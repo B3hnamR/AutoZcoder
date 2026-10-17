@@ -596,11 +596,13 @@ def _generator(request: Request):
         mgr = GeneratorManager(gen_dir, on_account=register_account,
                                python_exe=getattr(gc, "python_exe", ""),
                                data_dir=data_dir)
-        # '' means off — the docs promise that, so honor it. Never fall back to
-        # a hardcoded referral code; a fresh install with invite_code unset
-        # must not claim anyone's referral.
-        mgr.claim = bool(gc.invite_code)
+        # defaults come from config.yaml; '' invite_code would mean "off", but
+        # the shipped default is the project's referral code (claim stays on)
+        mgr.claim = bool(gc.claim)
         mgr._invite_code = gc.invite_code
+        if gc.captcha in ("auto", "manual"):
+            mgr.captcha = gc.captcha
+        mgr.headless = bool(gc.headless) and mgr.captcha != "manual"
         mgr.set_options(ip_source="socks" if gc.socks_only else "pool")
         state.generator = mgr
     return mgr

@@ -155,3 +155,28 @@ def test_routing_confirmation_is_manual_and_per_domain():
         cfg = mgr.mail_config()
         assert cfg["routing_all_done"] is False
         assert cfg["routing_pending"] == ["a.com", "c.com"]
+
+def test_manual_captcha_forces_visible_browser():
+    import tempfile
+    from zcode_gateway.generator import GeneratorManager
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr = GeneratorManager(Path(tmpdir), data_dir=Path(tmpdir))
+        # defaults: you solve it, in a visible window, claiming the referral
+        opt = mgr.options()
+        assert opt["captcha"] == "manual"
+        assert opt["headless"] is False
+        assert opt["claim"] is True
+        assert opt["invite_code"] == "MT9GNDQ8"
+
+        # asking for headless while manual must not stick
+        mgr.set_options(headless=True)
+        assert mgr.headless is False
+
+        # auto captcha may run headless
+        mgr.set_options(captcha="auto", headless=True)
+        assert mgr.headless is True
+
+        # switching back to manual forces it off again
+        mgr.set_options(captcha="manual")
+        assert mgr.headless is False

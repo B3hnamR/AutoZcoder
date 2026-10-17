@@ -133,8 +133,13 @@ class GeneratorConfig(BaseModel):
     # locations). Never ship one machine's absolute path as the default.
     zcodeauto_dir: str = ""
     python_exe: str = ""               # python that can run ZCODEAUTO scripts ('' = auto-detect)
-    invite_code: str = ""               # referral code claimed after signup ('' = off)
-    socks_only: bool = True             # socks4/5 pool only (residential — passes Starter gate)
+    # 'manual' = you solve the captcha yourself in a visible browser.
+    # A visible browser is mandatory then (headless is forced off).
+    captcha: str = "manual"            # manual | auto
+    headless: bool = False             # only applies when captcha == 'auto'
+    claim: bool = True                 # claim the invite Global Build after signup
+    invite_code: str = "MT9GNDQ8"      # referral code to claim ('' = off)
+    socks_only: bool = True            # socks4/5 pool only (residential — passes Starter gate)
 
 
 class Config(BaseModel):

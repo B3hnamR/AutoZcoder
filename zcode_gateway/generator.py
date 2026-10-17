@@ -548,13 +548,13 @@ class GeneratorManager:
         self._seq = 0
         self._lock = threading.Lock()
         # options (dashboard-editable)
-        self.captcha = "auto"               # auto | manual
+        self.captcha = "manual"             # auto | manual — default: you solve it
         self.ip_source = "socks"            # socks | pool | direct | pin
         self.pin_proxy = ""
         self.retries = 5
         self.claim = True                   # invite Global Build claim on/off
-        self.headless = True
-        self._invite_code = ""              # claimed via the worker env (set by api layer)
+        self.headless = False               # default: visible window (manual captcha needs it)
+        self._invite_code = "MT9GNDQ8"      # referral code ('' = off; overridden by config)
         self.pool_file = self.data_dir / "proxies.txt"
         self.evergood_file = self.data_dir / "proxies_evergood.txt"
         self.bad_file = self.data_dir / "proxies_bad.txt"
@@ -1044,6 +1044,10 @@ class GeneratorManager:
         if "headless" in kw:
             v = kw["headless"]
             self.headless = v if isinstance(v, bool) else (str(v).lower() in ("true", "1", "yes", "on", "auto"))
+        # manual captcha means a human must see and solve it — a headless browser
+        # makes that impossible, so headless is forced off whenever captcha=manual
+        if self.captcha == "manual":
+            self.headless = False
         if "invite_code" in kw:
             self._invite_code = str(kw["invite_code"] or "").strip()
 

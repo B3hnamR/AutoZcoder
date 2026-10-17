@@ -1094,6 +1094,31 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
     clearTimeout(genSaveTimer);
     genSaveTimer = setTimeout(() => genSaveOptions(true), 350);
   }
+
+  /* manual captcha = a human must SEE and solve the challenge, so a headless
+     (background) browser is impossible. Force visible + explain instead of
+     letting the user pick a combination that can never work. */
+  function genCaptchaGuard(){
+    const cap = ($("#gen-captcha") || {}).value;
+    const hl = $("#gen-headless");
+    const hint = $("#gen-headless-hint");
+    if (!hl) return;
+    if (cap === "manual") {
+      hl.value = "false";
+      hl.disabled = true;
+      hl.title = "manual captcha requires a visible window";
+      if (hint) hint.textContent = "manual solving needs a visible window";
+    } else {
+      hl.disabled = false;
+      hl.title = "";
+      if (hint) hint.textContent = "";
+    }
+  }
+
+  function genCaptchaChanged(){
+    genCaptchaGuard();
+    genAutoSave();
+  }
   /* ------------ generator setup card (shared by Generator + Proxy tabs) ---- */
   function genSetupCard(msg){
     return `<div class="card">
@@ -1183,7 +1208,7 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
             <div><label class="lbl">browsers</label><br>
               <input type="number" id="gen-n" value="1" min="1" max="8" style="width:70px"></div>
             <div><label class="lbl">captcha</label><br>
-              <select id="gen-captcha" onchange="App.genAutoSave()">
+              <select id="gen-captcha" onchange="App.genCaptchaChanged()">
                 <option value="auto" ${o.captcha==='auto'?'selected':''}>auto — solver</option>
                 <option value="manual" ${o.captcha==='manual'?'selected':''}>manual — I solve</option>
               </select></div>
@@ -1200,7 +1225,8 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
               <select id="gen-headless" onchange="App.genAutoSave()">
                 <option value="true" ${o.headless!==false?'selected':''}>headless (background)</option>
                 <option value="false" ${o.headless===false?'selected':''}>visible window</option>
-              </select></div>
+              </select>
+              <div id="gen-headless-hint" class="help" style="margin-top:3px"></div></div>
             <div><label class="lbl">retries</label><br>
               <input type="number" id="gen-retries" value="${o.retries||5}" min="0" max="10" style="width:70px" oninput="App.genAutoSave()"></div>
             <div><label class="lbl">claim 100M</label><br>
@@ -1249,6 +1275,7 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
       genMounted = true;
       genLoadSources();
       mailRender();
+      genCaptchaGuard();   // reflect manual=>visible rule on first paint
       return;
     }
 
@@ -1399,24 +1426,37 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
       </div>`;
 
     // step 1 body: domains
+    // step 1 body — a permanent domain manager (always visible): add as many
+    // domains as you want, pick which one is active, remove any of them.
+    const domainRows = doms.map(d => `
+      <div style="display:flex;align-items:center;gap:10px;margin:3px 0">
+        <label style="display:inline-flex;align-items:center;gap:7px;cursor:pointer">
+          <input type="radio" name="mail-dom" value="${esc(d)}" ${d===mailSel?'checked':''}
+            onchange="App.mailSelDomain('${esc(d)}')">
+          <span class="mono">${esc(d)}</span>
+        </label>
+        ${d===m.active?'<b style="color:var(--success,#3fb950);font-size:11px">✓ active</b>':''}
+        <span style="font-size:11px;color:var(--faint)">
+          ${(m.routing_done||[]).includes(d)?'mail routed ✓':'mail not routed yet'}</span>
+        <button class="btn btn-quiet btn-sm" title="remove ${esc(d)}"
+          onclick="App.mailRemoveOne('${esc(d)}')">✕</button>
+      </div>`).join('');
+
     const s1body = `
       <div style="margin:4px 0 10px 34px">
-        ${doms.length ? `<div style="margin-bottom:8px">${doms.map(d => `
-          <label class="mono" style="display:inline-flex;align-items:center;gap:6px;margin:0 12px 6px 0;cursor:pointer">
-            <input type="radio" name="mail-dom" value="${esc(d)}" ${d===mailSel?'checked':''}
-              onchange="App.mailSelDomain('${esc(d)}')"> ${esc(d)} ${d===m.active?'<b style="color:var(--success,#3fb950)">✓ active</b>':''}
-          </label>`).join('')}</div>` : ''}
+        ${domainRows ? `<div style="margin-bottom:8px">${domainRows}</div>`
+                     : '<div style="color:var(--muted);font-size:12.5px;margin-bottom:8px">no domains yet — add your first below</div>'}
         <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
           <input type="text" id="mail-new-domain" placeholder="yourdomain.com" style="width:190px"
             onkeydown="if(event.key==='Enter')App.mailAddDomain()">
           <button class="btn btn-pri btn-sm" onclick="App.mailAddDomain()">＋ Add domain</button>
-          ${doms.length ? '<button class="btn btn-ghost btn-sm" onclick="App.mailRemoveDomain()">－ Remove selected</button>' : ''}
-          <span class="help" style="display:inline">every signup rotates across these domains</span>
+          <span class="help" style="display:inline">add several — every signup rotates across them</span>
         </div>
         <details style="margin-top:8px"><summary style="font-size:12px">First time? Get a domain into Cloudflare (2 min)</summary>
           <ol style="margin:6px 0 0 18px;color:var(--muted);font-size:12.5px">
             <li>Buy a domain anywhere (Namecheap, Porkbun, Cloudflare Registrar…).</li>
             <li>Add it to a free <a href="https://dash.cloudflare.com" target="_blank">Cloudflare</a> account (Cloudflare gives you 2 nameservers — set them at your registrar).</li>
+            <li>Then complete step 3 for that domain so its mail reaches the worker.</li>
           </ol></details>
       </div>`;
 
@@ -1448,19 +1488,23 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
     // step 3 body: the Cloudflare Email Routing rule (manual, unavoidable)
     // + final test
     // step 3 body: the Cloudflare Email Routing rule (manual, unavoidable)
-    // + per-domain confirmation + final worker test
-    const routingRows = (doms.length ? doms : []).map(d => {
+    // + per-domain confirmation. Once every domain is confirmed the whole
+    // instruction block disappears — nothing left to read or undo.
+    const routingRows = doms.map(d => {
       const done = (m.routing_done || []).includes(d);
       return `<div style="display:flex;align-items:center;gap:8px;margin:3px 0">
         <span class="mono" style="min-width:190px">${esc(d)}</span>
         ${done
-          ? `<span style="color:var(--success,#3fb950);font-size:12px">✓ routing set up</span>
-             <button class="btn btn-quiet btn-sm" onclick="App.mailRoutingDone('${esc(d)}',false)">undo</button>`
+          ? '<span style="color:var(--success,#3fb950);font-size:12px">✓ routing set up</span>'
           : `<button class="btn btn-pri btn-sm" onclick="App.mailRoutingDone('${esc(d)}',true)">Mark routing done</button>`}
       </div>`;
     }).join('');
 
-    const s3body = `
+    const s3body = routingDone
+      ? `<div style="margin:4px 0 10px 34px;color:var(--success,#3fb950);font-size:12.5px">
+           ✓ Routing set up for ${doms.map(esc).join(", ")} — mail reaches the worker.
+         </div>`
+      : `
       <div style="margin:4px 0 10px 34px">
         <p style="color:var(--muted);font-size:12.5px;margin-bottom:8px">
           Last step, and it is <b>manual</b> — Cloudflare must forward this domain's
@@ -1482,10 +1526,10 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
           The domain must show <b>Enabled</b> with DNS records <b>Configured</b> —
           <b>Misconfigured</b> or <b>Syncing</b> means mail is still being dropped.</p>
 
-        ${routingPending.length ? `<div style="margin:0 0 8px 18px;color:var(--warn);font-size:12.5px">
-          ⚠ Routing not confirmed for: <b>${routingPending.map(esc).join(", ")}</b></div>` : ''}
+        ${(m.routing_pending || []).length ? `<div style="margin:0 0 8px 18px;color:var(--warn);font-size:12.5px">
+          ⚠ Still to confirm: <b>${(m.routing_pending||[]).map(esc).join(", ")}</b></div>` : ''}
         ${routingRows ? `<div style="margin:0 0 10px 18px">
-          <div class="lbl" style="margin-bottom:4px">confirm per domain</div>${routingRows}</div>` : ''}
+          <div class="lbl" style="margin-bottom:4px">confirm once the catch-all is Active</div>${routingRows}</div>` : ''}
 
         <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
           <button class="btn btn-ghost btn-sm" onclick="App.mailTest()">Test worker inbox</button>
@@ -1493,10 +1537,7 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
         </div>
         <p class="help" style="margin-top:6px">
           This test only proves the <b>worker</b> answers — it cannot see whether
-          Cloudflare routes your mail, so it does not tick this step. Confirm with
-          the button above once the catch-all is active.</p>
-        <p class="help" style="margin-top:6px">All set → signups rotate across your
-        domains and read verification mail from your own worker. No Gmail app password.</p>
+          Cloudflare routes your mail, so it does not tick this step.</p>
       </div>`;
 
     const steps = [
@@ -1509,9 +1550,10 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
     box.innerHTML = steps.map((s, i) => {
       const done = stepDone[i];
       const active = i === startAt && !done;
-      // step 3 is manual — always keep its instructions on screen so the user
-      // can actually read and follow them (never auto-collapse it)
-      const showBody = active || i === 2;
+      // steps 1 (domains) and 3 (routing) stay on screen so they remain
+      // manageable after they turn green; step 2 (deploy) keeps its body
+      // hidden until it becomes the current step, then collapses again
+      const showBody = i === 0 || i === 2 || active;
       return stepHead(s.n, s.title, done, active) + (showBody ? s.body : '');
     }).join('')
     + (allDone
@@ -1574,17 +1616,27 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
     } catch (e) { toast(e.message); }
     mailRender();
   }
-  async function mailRemoveDomain(){
-    if (!mailSel) { toast("select a domain first"); return; }
+  async function mailRemoveOne(domain){
+    const d = String(domain || "").trim();
+    if (!d) return;
     try {
       const cur = await api("/admin/dash/generator/mail");
-      const doms = (cur.domains || []).filter(x => x !== mailSel);
+      const doms = (cur.domains || []).filter(x => x !== d);
+      const done = (cur.routing_done || []).filter(x => x !== d);
       await api("/admin/dash/generator/mail", {method:"POST",
-        body: JSON.stringify({domains: doms, active: doms[0] || ""})});
-      mailSel = doms[0] || null;
-      toast("domain removed");
-    } catch (e) { toast(e.message); }
-    mailRender();
+        body: JSON.stringify({domains: doms, active: (cur.active === d ? (doms[0] || "") : cur.active)})});
+      // keep the routing ledger in step with the domain list
+      await api("/admin/dash/generator/mail/routing", {method:"POST",
+        body: JSON.stringify({domain: d, done: false})});
+      if (mailSel === d) mailSel = doms[0] || null;
+      toast("removed " + d, "ok");
+      mailRender();
+    } catch (e) { toast(e.message, "err"); }
+  }
+
+  async function mailRemoveDomain(){
+    if (!mailSel) { toast("select a domain first"); return; }
+    await mailRemoveOne(mailSel);
   }
   let mailSaveTimer = null;
   function mailAutoSave(){
@@ -1849,8 +1901,8 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
   }
 
   return {start, login, tab, refresh, renderAccounts, renderGenerator, renderProxyTab, renderModels, renderLogs,
-          mailRender, mailAddDomain, mailRemoveDomain, mailSelDomain, mailSave, mailTest, mailAutoSave, mailDeploy, mailRoutingDone, pxClearLog,
-          genLocate,
+          mailRender, mailAddDomain, mailRemoveDomain, mailRemoveOne, mailSelDomain, mailSave, mailTest, mailAutoSave, mailDeploy, mailRoutingDone, pxClearLog,
+          genLocate, genCaptchaChanged, genCaptchaGuard,
           sortModels, filterModels, filterAccounts, syncModels, doImport, doReload, acct, acctRemove, saveSettings,
           regenKeys, clearLogs, toggleServer, copy,
           showUpdate, hideUpdate, skipUpdate, doUpdate,
