@@ -1152,13 +1152,18 @@ class GeneratorManager:
                 "data_dir": str(self.data_dir)}
 
     def _socks_count(self) -> int:
+        """Number of distinct SOCKS proxies available (pool + ever-good).
+        (It used to add scheme names to a set and return its size, so the UI
+        could never show more than 2.)"""
         seen = set()
         for f in (self.pool_file, self.evergood_file):
             try:
                 for ln in f.read_text(encoding="utf-8", errors="ignore").splitlines():
-                    s = ln.strip().split("://", 1)[0].lower()
-                    if s in ("socks4", "socks5"):
-                        seen.add(s)
+                    v = ln.strip()
+                    if "://" not in v:
+                        continue
+                    if v.split("://", 1)[0].lower() in ("socks4", "socks5"):
+                        seen.add(v)
             except OSError:
                 continue
         return len(seen)
