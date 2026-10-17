@@ -4,6 +4,9 @@ uvicorn[standard]>=0.32,<1.0
 httpx>=0.27,<1.0
 pydantic>=2.9,<3.0
 PyYAML>=6.0,<7.0
+# used at runtime by the generator bridge (generator/plan_check.py) when the
+# gateway registers a freshly created account into the pool
+requests>=2.31,<3.0
 
 # desktop shell (WebView2 window for the dashboard) — omit for headless servers
 pywebview>=6.0,<7.0

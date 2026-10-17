@@ -78,6 +78,12 @@ $buildArgs = @(
     "--collect-submodules", "uvicorn",
     "--hidden-import", "uvicorn.logging",
     "--hidden-import", "uvicorn.loops",
+    # the gateway registers new accounts through generator/plan_check.py, which
+    # imports requests at runtime (loaded from disk, so PyInstaller can't see it)
+    "--hidden-import", "requests",
+    "--hidden-import", "urllib3",
+    "--hidden-import", "urllib3.contrib.socks",
+    "--hidden-import", "certifi",
     "--hidden-import", "uvicorn.loops.auto",
     "--hidden-import", "uvicorn.protocols",
     "--hidden-import", "uvicorn.protocols.http",
