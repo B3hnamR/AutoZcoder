@@ -1499,11 +1499,13 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
         toast(r.test && r.test.ok ? "worker deployed + inbox reachable" : "worker deployed — run Test inbox", "ok");
         if (!r.test || !r.test.ok) mailSel = null;
       } else {
-        toast("deploy failed: " + (r.error || '?'), "err");
+        // full detail is in the log box above; keep the toast to one line
+        const first = String(r.error || '?').split('\n')[0].slice(0, 140);
+        toast("deploy failed: " + first, "err");
       }
     } catch (e) {
       if (logBox) logBox.textContent = '✗ ' + e.message;
-      toast("deploy failed: " + e.message, "err");
+      toast("deploy failed: " + String(e.message).split('\n')[0].slice(0, 140), "err");
     }
     mailDeploying = false;
     mailRender();

@@ -118,6 +118,31 @@ def resolve_zcodeauto_dir(configured: str = "") -> tuple[Path | None, list[Path]
 
 log = logging.getLogger("zcode_gateway.generator")
 
+# ANSI escapes: full sequences (\x1b[..m, erase-line, OSC hyperlinks) plus the
+# parameter tail that survives when something upstream already ate the ESC —
+# wrangler colourises with ESC[31m etc. and we never want them in the UI.
+_ANSI_ESC = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+_ANSI_TAIL = re.compile(r"\[[0-9;]*m")
+
+
+def _clean_output(s: str) -> str:
+    """Strip ANSI colour/erase codes and normalise \r progress noise."""
+    if not s:
+        return ""
+    s = _ANSI_ESC.sub("", s)
+    s = _ANSI_TAIL.sub("", s)
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    return "\n".join(ln.rstrip() for ln in s.split("\n"))
+
+
+def _tail(s: str, limit: int = 700) -> str:
+    """Cleaned output, trimmed to the last `limit` chars on a whole-line edge."""
+    s = _clean_output(s).strip()
+    if len(s) <= limit:
+        return s
+    return "…" + s[-limit:].split("\n", 1)[-1]
+
+
 # per-worker live state ------------------------------------------------------- #
 
 WORKER_LOG_LINES = 400   # ring buffer per worker
@@ -751,7 +776,7 @@ class GeneratorManager:
             capture_output=True, text=True, timeout=60,
             shell=False, encoding="utf-8", errors="replace",
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        out = (r.stdout or "") + (r.stderr or "")
+        out = _clean_output((r.stdout or "") + (r.stderr or ""))
         info["wrangler_authed"] = "You are logged in" in out
         if "@" in out and "logged in" in out:
             for tok in out.split():
@@ -791,54 +816,89 @@ class GeneratorManager:
                                   encoding="utf-8", errors="replace",
                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
+        def kv_id_for_title(title: str = "MAIL") -> str:
+            """Find an existing KV namespace by title. Idempotent deploys: the
+            namespace is reused instead of failing with 'already exists'."""
+            r = run([npx, "wrangler", "kv", "namespace", "list"], timeout=120)
+            out = _clean_output((r.stdout or "") + (r.stderr or ""))
+            # wrangler prints a JSON array; fall back to the table form
+            a, b = out.find("["), out.rfind("]")
+            if a != -1 and b > a:
+                try:
+                    for ns in json.loads(out[a:b + 1]):
+                        if str(ns.get("title", "")).strip().lower() == title.lower():
+                            return ns.get("id") or ""
+                except Exception:
+                    pass
+            for pat in (r"\b([0-9a-f]{32})\b[^\n]*?\b" + title + r"\b",
+                        r"\b" + title + r"\b[^\n]*?\b([0-9a-f]{32})\b"):
+                m = _re.search(pat, out, _re.I)
+                if m:
+                    return m.group(1)
+            return ""
+
         # 1) auth: whoami first — if logged in, skip the browser entirely
         r = run([npx, "wrangler", "whoami"], timeout=90)
-        out = (r.stdout or "") + (r.stderr or "")
+        out = _clean_output((r.stdout or "") + (r.stderr or ""))
         if "You are logged in" not in out:
             say("opening browser for Cloudflare login (one time)…")
             r = run([npx, "wrangler", "login"], timeout=600)
-            out = (r.stdout or "") + (r.stderr or "")
+            out = _clean_output((r.stdout or "") + (r.stderr or ""))
             if "You are logged in" not in out:
                 # login may have succeeded even on nonzero exit; recheck
                 r2 = run([npx, "wrangler", "whoami"], timeout=90)
-                out2 = (r2.stdout or "") + (r2.stderr or "")
+                out2 = _clean_output((r2.stdout or "") + (r2.stderr or ""))
                 if "You are logged in" not in out2:
                     return {"ok": False,
                             "error": "Cloudflare login did not complete — try again"}
 
-        # 2) KV namespace: reuse the id already in wrangler.toml if valid,
-        #    otherwise create one and patch the file
+        # 2) KV namespace: REUSE an existing one titled MAIL (idempotent),
+        #    else create it; always write the resolved id back into wrangler.toml
         toml_path = wdir / "wrangler.toml"
         toml_src = toml_path.read_text(encoding="utf-8")
-        m = _re.search(r'id\s*=\s*"([0-9a-f]{32})"', toml_src)
-        kv_id = m.group(1) if m else ""
-        kv_ok = False
+
+        kv_id = kv_id_for_title("MAIL")
         if kv_id:
-            chk = run([npx, "wrangler", "kv", "namespace", "info",
-                       "--namespace-id", kv_id], timeout=120)
-            kv_ok = chk.returncode == 0
-        if not kv_ok:
+            say("found existing KV namespace 'MAIL' — reusing it")
+
+        if not kv_id:
+            # maybe the id already in wrangler.toml is real (not the placeholder)
+            m = _re.search(r'id\s*=\s*"([0-9a-f]{32})"', toml_src)
+            cand = m.group(1) if m else ""
+            if cand and set(cand) != {"0"}:
+                chk = run([npx, "wrangler", "kv", "namespace", "info",
+                           "--namespace-id", cand], timeout=120)
+                if chk.returncode == 0:
+                    kv_id = cand
+                    say("reusing KV namespace from wrangler.toml")
+
+        if not kv_id:
             say("creating KV namespace…")
             r = run([npx, "wrangler", "kv", "namespace", "create", "MAIL"],
                     timeout=180)
-            out = (r.stdout or "") + (r.stderr or "")
-            m = _re.search(r'id\s*=\s*"([0-9a-f]{32})"', out)
-            if not m:
+            out = _clean_output((r.stdout or "") + (r.stderr or ""))
+            m = _re.search(r'id\s*=\s*"([0-9a-f]{32})"', out) \
+                or _re.search(r"\b([0-9a-f]{32})\b", out)
+            if m:
+                kv_id = m.group(1)
+            else:
+                # created concurrently / output unparsed — re-list and recover
+                kv_id = kv_id_for_title("MAIL")
+            if not kv_id:
                 return {"ok": False,
-                        "error": "KV namespace creation failed: " + out[-400:]}
-            kv_id = m.group(1)
-            toml_src = _re.sub(r'(id\s*=\s*)"[0-9a-f]{32}"', r'\1"%s"' % kv_id,
-                               toml_src, count=1)
-            toml_path.write_text(toml_src, encoding="utf-8")
-            say("KV namespace created and wired into wrangler.toml")
+                        "error": "KV namespace creation failed: " + _tail(out)}
+
+        toml_src = _re.sub(r'(id\s*=\s*)"[^"]*"', r'\1"%s"' % kv_id,
+                           toml_src, count=1)
+        toml_path.write_text(toml_src, encoding="utf-8")
 
         # 3) deploy
         say("deploying worker…")
         r = run([npx, "wrangler", "deploy"], timeout=600)
-        out = (r.stdout or "") + (r.stderr or "")
+        out = _clean_output((r.stdout or "") + (r.stderr or ""))
         m = _re.search(r"(https://[a-z0-9-]+\.workers\.dev)", out, _re.I)
         if r.returncode != 0 and not m:
-            return {"ok": False, "error": "deploy failed: " + out[-600:]}
+            return {"ok": False, "error": "deploy failed: " + _tail(out)}
         base_url = m.group(1) if m else None
         if not base_url:
             return {"ok": False,
@@ -858,14 +918,15 @@ class GeneratorManager:
             [npx, "wrangler", "secret", "put", "INBOX_SECRET"],
             cwd=str(wdir), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True, encoding="utf-8",
-            errors="replace", shell=False)
+            errors="replace", shell=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         out, _ = proc.communicate(input=secret + "\n", timeout=180)
-        if proc.returncode != 0 or "Successfully created secret" not in (out or "") \
-                and "secret" not in (out or "").lower():
+        clean = _clean_output(out or "")
+        if proc.returncode != 0 or "success" not in clean.lower():
             return {"ok": False, "inbox_url": base_url + "/inbox",
                     "secret_generated": True,
                     "error": "worker deployed but the secret upload failed: "
-                             + (out or "")[-400:]}
+                             + _tail(out)}
 
         # 5) persist the URL and smoke-test
         self.mail_cfg["inbox_url"] = base_url + "/inbox"
