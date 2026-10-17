@@ -896,14 +896,27 @@ class GeneratorManager:
         say("deploying worker…")
         r = run([npx, "wrangler", "deploy"], timeout=600)
         out = _clean_output((r.stdout or "") + (r.stderr or ""))
-        m = _re.search(r"(https://[a-z0-9-]+\.workers\.dev)", out, _re.I)
+        # the URL is https://<worker>.<account-subdomain>.workers.dev — the
+        # subdomain is its own label, so allow dotted labels before .workers.dev
+        m = _re.search(r"https://[a-z0-9][a-z0-9.\-]*\.workers\.dev", out, _re.I)
         if r.returncode != 0 and not m:
             return {"ok": False, "error": "deploy failed: " + _tail(out)}
-        base_url = m.group(1) if m else None
+        base_url = m.group(0).rstrip(".,)") if m else None
         if not base_url:
+            # deployed fine but the account has no workers.dev route enabled
+            low = out.lower()
+            if "workers.dev" in low and ("disabled" in low or "not enabled" in low
+                                         or "enable" in low):
+                return {"ok": False, "error":
+                        "worker deployed, but this account has workers.dev "
+                        "disabled — enable it in the Cloudflare dashboard "
+                        "(Workers → your worker → Settings → Domains & Routes) "
+                        "or paste the worker's /inbox URL below manually"}
             return {"ok": False,
-                    "error": "deployed but could not read the workers.dev URL — "
-                             "check the Cloudflare dashboard"}
+                    "error": "deployed but could not read the workers.dev URL "
+                             "from wrangler output — paste the worker's /inbox "
+                             "URL into the field below and press Save manually. "
+                             "Deploy said: " + _tail(out, 300)}
         say("deployed at " + base_url)
 
         # 4) INBOX_SECRET: use the configured one, or generate and store it
