@@ -1379,9 +1379,13 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
     mailSel = mailSel && doms.includes(mailSel) ? mailSel : (m.active || doms[0] || null);
     const hasUrl = !!(m.inbox_url || st.has_url);
     const deployed = hasUrl && st.wrangler_authed !== false;
-    // step 3 completes once the inbox has actually answered (persisted server-side)
-    const stepDone = [doms.length > 0, deployed, !!m.inbox_ok];
+    // step 3 = the MANUAL Cloudflare routing. There is no API to verify it, so
+    // it completes only on an explicit per-domain confirmation — never from the
+    // inbox test (which just proves the worker itself answers).
+    const routingDone = m.routing_all_done === true;
+    const stepDone = [doms.length > 0, deployed, routingDone];
     const curStep = stepDone.findIndex(d => !d);
+    const routingPending = m.routing_pending || doms;
 
     const stepHead = (n, title, done, active) => `
       <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
@@ -1443,11 +1447,24 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
 
     // step 3 body: the Cloudflare Email Routing rule (manual, unavoidable)
     // + final test
+    // step 3 body: the Cloudflare Email Routing rule (manual, unavoidable)
+    // + per-domain confirmation + final worker test
+    const routingRows = (doms.length ? doms : []).map(d => {
+      const done = (m.routing_done || []).includes(d);
+      return `<div style="display:flex;align-items:center;gap:8px;margin:3px 0">
+        <span class="mono" style="min-width:190px">${esc(d)}</span>
+        ${done
+          ? `<span style="color:var(--success,#3fb950);font-size:12px">✓ routing set up</span>
+             <button class="btn btn-quiet btn-sm" onclick="App.mailRoutingDone('${esc(d)}',false)">undo</button>`
+          : `<button class="btn btn-pri btn-sm" onclick="App.mailRoutingDone('${esc(d)}',true)">Mark routing done</button>`}
+      </div>`;
+    }).join('');
+
     const s3body = `
       <div style="margin:4px 0 10px 34px">
         <p style="color:var(--muted);font-size:12.5px;margin-bottom:8px">
-          Last manual step — tell Cloudflare to hand this domain's mail to the
-          worker. Do it once per domain.</p>
+          Last step, and it is <b>manual</b> — Cloudflare must forward this domain's
+          mail to the worker. Do it once per domain.</p>
         <ol style="margin:0 0 10px 18px;color:var(--muted);font-size:12.5px;line-height:1.65">
           <li><b>Onboard the domain</b> (skip if it already shows <b>Enabled</b>):
             open <a href="https://dash.cloudflare.com" target="_blank">dash.cloudflare.com</a>
@@ -1464,11 +1481,21 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
         <p class="help" style="margin:-4px 0 10px 18px">
           The domain must show <b>Enabled</b> with DNS records <b>Configured</b> —
           <b>Misconfigured</b> or <b>Syncing</b> means mail is still being dropped.</p>
+
+        ${routingPending.length ? `<div style="margin:0 0 8px 18px;color:var(--warn);font-size:12.5px">
+          ⚠ Routing not confirmed for: <b>${routingPending.map(esc).join(", ")}</b></div>` : ''}
+        ${routingRows ? `<div style="margin:0 0 10px 18px">
+          <div class="lbl" style="margin-bottom:4px">confirm per domain</div>${routingRows}</div>` : ''}
+
         <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-          <button class="btn btn-pri btn-sm" onclick="App.mailTest()">Test inbox</button>
+          <button class="btn btn-ghost btn-sm" onclick="App.mailTest()">Test worker inbox</button>
           <span id="mail-msg" style="color:var(--muted);font-size:12px"></span>
         </div>
-        <p class="help" style="margin-top:8px">Test passes → signups rotate across your
+        <p class="help" style="margin-top:6px">
+          This test only proves the <b>worker</b> answers — it cannot see whether
+          Cloudflare routes your mail, so it does not tick this step. Confirm with
+          the button above once the catch-all is active.</p>
+        <p class="help" style="margin-top:6px">All set → signups rotate across your
         domains and read verification mail from your own worker. No Gmail app password.</p>
       </div>`;
 
@@ -1482,8 +1509,10 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
     box.innerHTML = steps.map((s, i) => {
       const done = stepDone[i];
       const active = i === startAt && !done;
-      return stepHead(s.n, s.title, done, active) +
-        (active ? s.body : (i === 2 && stepDone[0] && stepDone[1] && !allDone ? s.body : ''));
+      // step 3 is manual — always keep its instructions on screen so the user
+      // can actually read and follow them (never auto-collapse it)
+      const showBody = active || i === 2;
+      return stepHead(s.n, s.title, done, active) + (showBody ? s.body : '');
     }).join('')
     + (allDone
         ? `<p style="color:var(--success,#3fb950);font-size:12.5px;margin-top:10px">
@@ -1573,14 +1602,24 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
       mailRender();
     } catch (e) { toast(e.message); if (!silent) { const m = $("#mail-msg"); if (m) m.textContent = "save failed: " + e.message; } }
   }
+  async function mailRoutingDone(domain, done){
+    try {
+      await api("/admin/dash/generator/mail/routing", {method:"POST",
+        body: JSON.stringify({domain, done: !!done})});
+      toast(done ? "routing confirmed for " + domain : "routing un-confirmed", done ? "ok" : undefined);
+      // the step-3 result depends on the persisted flag — refresh the view
+      mailRender();
+    } catch (e) { toast(e.message, "err"); }
+  }
+
   async function mailTest(){
     const msg = $("#mail-msg");
-    if (msg) msg.textContent = "testing…";
+    if (msg) msg.textContent = "testing worker…";
     try {
       const r = await api("/admin/dash/generator/mail/test");
-      const ok = r.ok ? `✓ inbox reachable (${r.status})` : `✗ ${r.error || ("HTTP " + r.status)}`;
+      const ok = r.ok ? `✓ worker reachable (${r.status})` : `✗ ${r.error || ("HTTP " + r.status)}`;
       if (msg) msg.textContent = ok;
-      toast(r.ok ? "inbox reachable" : "inbox test failed", r.ok ? "ok" : "err");
+      toast(r.ok ? "worker inbox reachable" : "worker inbox test failed", r.ok ? "ok" : "err");
     } catch (e) { if (msg) msg.textContent = "test failed: " + e.message; }
   }
   /* mailExportWorker removed — superseded by mailDeploy (one-click) */
@@ -1810,7 +1849,7 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
   }
 
   return {start, login, tab, refresh, renderAccounts, renderGenerator, renderProxyTab, renderModels, renderLogs,
-          mailRender, mailAddDomain, mailRemoveDomain, mailSelDomain, mailSave, mailTest, mailAutoSave, mailDeploy, pxClearLog,
+          mailRender, mailAddDomain, mailRemoveDomain, mailSelDomain, mailSave, mailTest, mailAutoSave, mailDeploy, mailRoutingDone, pxClearLog,
           genLocate,
           sortModels, filterModels, filterAccounts, syncModels, doImport, doReload, acct, acctRemove, saveSettings,
           regenKeys, clearLogs, toggleServer, copy,

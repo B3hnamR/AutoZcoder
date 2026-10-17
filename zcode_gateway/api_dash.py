@@ -628,6 +628,23 @@ async def generator_mail_export_worker(request: Request, key: str = Depends(admi
     return _generator(request).export_worker()
 
 
+@router.post("/admin/dash/generator/mail/routing")
+async def generator_mail_routing(request: Request, body: dict = Body(...),
+                                 key: str = Depends(admin_key)) -> dict:
+    """Confirm (or clear) that Cloudflare email routing is set up for a domain.
+
+    Email routing can't be verified through wrangler, so this is an explicit
+    user confirmation — the inbox test only proves the worker is reachable.
+    Body: {"domain": "example.com", "done": true} or {"all": true}."""
+    mgr = _generator(request)
+    if body.get("all"):
+        for d in (mgr.mail_cfg.get("domains") or []):
+            mgr.set_routing_done(d, bool(body.get("done", True)))
+    else:
+        mgr.set_routing_done(str(body.get("domain") or ""), bool(body.get("done", True)))
+    return mgr.mail_config()
+
+
 @router.get("/admin/dash/generator/mail/deploy-status")
 async def generator_mail_deploy_status(request: Request, key: str = Depends(admin_key)) -> dict:
     """Pre-deploy checklist state: files exported? wrangler authed? url set?"""

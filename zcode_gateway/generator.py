@@ -589,15 +589,41 @@ class GeneratorManager:
         sec = m.get("inbox_secret") or ""
         m["inbox_secret_set"] = bool(sec)
         m["inbox_secret_masked"] = (sec[:4] + "…" + sec[-3:]) if len(sec) > 8 else ("•" * len(sec))
+        # inbox_ok  = the worker endpoint answers (worker reachability only)
+        # routing_done = the user confirmed Cloudflare forwards mail to it —
+        #   this CANNOT be detected automatically (no API for catch-all rules),
+        #   so it is an explicit per-domain confirmation.
         m["inbox_ok"] = bool(m.get("inbox_ok"))
+        done = {str(d).strip().lower() for d in (m.get("routing_done") or [])}
+        doms = [str(d).strip().lower() for d in (m.get("domains") or [])]
+        m["routing_done"] = sorted(done)
+        m["routing_all_done"] = bool(doms) and all(d in done for d in doms)
+        m["routing_pending"] = [d for d in doms if d not in done]
         m.pop("inbox_secret", None)
         return m
 
     def mark_inbox_verified(self, ok: bool) -> None:
-        """Persist the last inbox smoke-test result so the setup wizard can show
-        step 3 as complete (it survives reloads/restarts)."""
+        """Persist the last inbox smoke-test result (worker reachability)."""
         self.mail_cfg["inbox_ok"] = bool(ok)
         self._save_mail_config()
+
+    def set_routing_done(self, domain: str, done: bool = True) -> dict:
+        """Record that the user finished Cloudflare email routing for a domain.
+
+        There is no API for Email Routing catch-all rules through wrangler, so
+        this is a deliberate manual confirmation — never inferred from the
+        inbox test (which only proves the worker itself answers)."""
+        d = str(domain or "").strip().lower()
+        if not d:
+            return self.mail_config()
+        doms = [str(x).strip().lower() for x in (self.mail_cfg.get("routing_done") or [])]
+        if done and d not in doms:
+            doms.append(d)
+        elif not done and d in doms:
+            doms.remove(d)
+        self.mail_cfg["routing_done"] = doms
+        self._save_mail_config()
+        return self.mail_config()
 
     def export_worker(self, dest: str | Path = None) -> dict:
         """Copy the bundled mail-worker source to disk so the user can deploy it.

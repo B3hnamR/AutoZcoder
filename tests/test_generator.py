@@ -120,3 +120,38 @@ def test_inbox_verification_flag_persists():
         # changing the endpoint invalidates verification
         again.set_mail_config(inbox_url="https://x.workers.dev/inbox")
         assert again.mail_config()["inbox_ok"] is False
+
+def test_routing_confirmation_is_manual_and_per_domain():
+    import tempfile
+    from zcode_gateway.generator import GeneratorManager
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr = GeneratorManager(Path(tmpdir), data_dir=Path(tmpdir))
+        mgr.set_mail_config(domains=["a.com", "b.com"])
+
+        # not confirmed by default, and the inbox test must NOT tick it
+        cfg = mgr.mail_config()
+        assert cfg["routing_all_done"] is False
+        assert set(cfg["routing_pending"]) == {"a.com", "b.com"}
+
+        mgr.mark_inbox_verified(True)
+        cfg = mgr.mail_config()
+        assert cfg["inbox_ok"] is True
+        assert cfg["routing_all_done"] is False      # worker reachable != routed
+
+        # per-domain explicit confirmation
+        mgr.set_routing_done("a.com", True)
+        cfg = mgr.mail_config()
+        assert cfg["routing_all_done"] is False
+        assert cfg["routing_pending"] == ["b.com"]
+
+        mgr.set_routing_done("b.com", True)
+        assert mgr.mail_config()["routing_all_done"] is True
+
+        # undo works, and adding a new domain reopens the step
+        mgr.set_routing_done("a.com", False)
+        assert mgr.mail_config()["routing_all_done"] is False
+        mgr.set_mail_config(domains=["a.com", "b.com", "c.com"])
+        cfg = mgr.mail_config()
+        assert cfg["routing_all_done"] is False
+        assert cfg["routing_pending"] == ["a.com", "c.com"]
