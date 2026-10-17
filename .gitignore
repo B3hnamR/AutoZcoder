@@ -1,0 +1,55 @@
+# ---- secrets & runtime data (never commit) ----
+config.yaml
+gateway.db
+gateway.db-*
+pool.json
+accounts/
+logs/
+output/
+generator-data/
+
+# generator runtime
+generator/mail.json
+generator/gmail.json
+generator/login.txt
+generator/output/
+generator/*.out
+generator/*.err
+generator/.pw-*
+
+# mail-worker runtime
+mail-worker/node_modules/
+mail-worker/.wrangler/
+mail-worker/package-lock.json
+
+# captures / diagnostics
+*.har
+captures/
+flows/
+run-*.txt
+run.pid
+
+# ---- python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---- build artifacts ----
+build/
+dist/
+dist-backup*/
+*.spec
+*.new.exe
+
+# ---- os / editors ----
+Thumbs.db
+Desktop.ini
+.DS_Store
+.idea/
+.vscode/

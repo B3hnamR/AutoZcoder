@@ -1,0 +1,54 @@
+server:
+  host: 127.0.0.1
+  port: 8788
+  require_client_key: true
+  admin_key: gw-admin-local
+  client_keys:
+    - key: gw-local-1
+      name: local
+upstream:
+  base_url: https://zcode.z.ai/api/v1
+  chat_path: /zcode-plan/anthropic/v1/messages
+  timeout_connect: 15
+  timeout_read: 600
+  max_attempts: 3
+  overload_max_attempts: 11
+  overload_base_delay_seconds: 2
+  overload_max_delay_seconds: 60
+pool:
+  strategy: least_in_flight
+  cooldown_seconds: 30
+  max_in_flight_per_account: 4
+  acquire_wait_seconds: 5
+  balance_poll_seconds: 60
+  blocked_model_cooldown_seconds: 900
+accounts:
+  source: accounts_dir
+  providers_json: "~/.zcode/v2/credentials.json"
+  dir: ./accounts
+  pool_file: ./pool.json
+models:
+  aliases:
+    glm-5.3: GLM-5.3
+    glm-5.3-flash: GLM-5.3-Flash
+  default: GLM-5.3-Flash
+  default_anthropic: GLM-5.3
+  default_max_tokens: 128000
+  probe_unknown: false
+  auto_free_fallback:
+    enabled: false
+    chain: [GLM-5.3, GLM-5.3-Flash]
+logging:
+  level: INFO
+  capture: false
+  capture_dir: ./logs
+store:
+  sqlite_path: ./gateway.db
+update:
+  enabled: false
+  repo: B3hnamR/ZcodeGate
+generator:
+  enabled: false
+  zcodeauto_dir: ""     # '' = auto-detect; or set the ZCODEAUTO folder (has gen/)
+  invite_code: ""       # referral code claimed after signup ('' = off)
+  socks_only: true              # socks4/5 pool only (residential — passes Starter gate)

@@ -1,0 +1,1805 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Zcode Gateway</title>
+<style>
+:root{
+  --bg:#0f1115; --panel:#151820; --card:#1a1e27; --elev:#222736;
+  --field:#10131a; --stripe:#161a22; --border:#262c3a;
+  --accent:#8b7cf7; --accent-deep:#8072eb; --accent-soft:#b3a7fb; --accent-dim:#2c2b45;
+  --fg:#e8eaf0; --muted:#9aa1b2; --faint:#929bad;
+  --ok:#3ddc84; --warn:#ffc857; --err:#ff6b7a;
+  --r:10px;
+}
+*{box-sizing:border-box; margin:0; padding:0}
+html,body{height:100%}
+body{
+  background:var(--bg); color:var(--fg);
+  font:14px/1.5 "Segoe UI", system-ui, sans-serif;
+  display:flex; overflow:hidden;
+}
+.mono{font-family:"Cascadia Mono","Consolas",monospace; font-size:12px}
+a{color:var(--accent-soft); text-decoration:none}
+a:hover{text-decoration:underline}
+
+/* ---------- layout ---------- */
+#side{width:212px; flex:none; background:var(--panel); border-right:1px solid var(--border);
+  display:flex; flex-direction:column; padding:18px 12px;}
+#main{flex:1; display:flex; flex-direction:column; min-width:0}
+#view{flex:1; overflow-y:auto; padding:22px 26px 40px}
+
+/* ---------- brand ---------- */
+#brand{display:flex; align-items:center; gap:10px; padding:2px 6px 18px; border-bottom:1px solid var(--border); margin-bottom:14px}
+#brand .mark{width:5px; height:34px; background:var(--accent); border-radius:2px; flex:none}
+#brand b{font:600 16px "Segoe UI Semibold", "Segoe UI", sans-serif; display:block}
+#brand small{color:var(--faint); font-size:11px}
+#brand small:hover{text-decoration:underline; color:var(--accent-soft)}
+
+/* ---------- nav ---------- */
+.nav-btn{display:flex; align-items:center; gap:11px; width:100%; text-align:left;
+  background:none; border:0; color:var(--muted); padding:10px 12px; border-radius:8px;
+  font:14px "Segoe UI", sans-serif; cursor:pointer; margin-bottom:2px}
+.nav-btn:hover{background:var(--elev); color:var(--fg)}
+.nav-btn.on{background:var(--accent-dim); color:var(--fg)}
+.nav-btn .ico{width:17px; text-align:center; font-size:15px; flex:none; opacity:.9}
+.nav-btn.on .ico{color:var(--accent-soft)}
+#side .spacer{flex:1}
+#side .foot{padding:10px 12px 2px; border-top:1px solid var(--border); color:var(--faint); font-size:11px}
+
+/* ---------- top bar ---------- */
+#top{display:flex; align-items:center; gap:10px; padding:14px 22px; border-bottom:1px solid var(--border); background:var(--panel)}
+#top h1{font:600 15px "Segoe UI Semibold","Segoe UI",sans-serif; margin-right:auto}
+.chip{display:inline-flex; align-items:center; gap:7px; background:var(--card);
+  border:1px solid var(--border); border-radius:999px; padding:5px 12px; font-size:12px; color:var(--muted)}
+.dot{width:7px; height:7px; border-radius:50%; background:var(--muted); flex:none}
+.dot.ok{background:var(--ok); box-shadow:0 0 0 3px rgba(61,220,132,.15)}
+.dot.warn{background:var(--warn); box-shadow:0 0 0 3px rgba(255,200,87,.14)}
+.dot.err{background:var(--err); box-shadow:0 0 0 3px rgba(255,107,122,.14)}
+.dot.off{background:var(--faint)}
+
+/* ---------- buttons ---------- */
+.btn{border:0; border-radius:8px; cursor:pointer; font:600 13px "Segoe UI",sans-serif;
+  padding:9px 16px; transition:background .12s, border-color .12s, color .12s}
+.btn-pri{background:var(--accent); color:#0e0b22}
+.btn-pri:hover{background:var(--accent-deep)}
+.btn-pri:disabled{background:var(--elev); color:var(--faint); cursor:default}
+.btn-ghost{background:var(--card); color:var(--fg); border:1px solid var(--border)}
+.btn-ghost:hover{background:var(--elev); border-color:var(--accent-dim)}
+.btn-quiet{background:transparent; color:var(--muted)}
+.btn-quiet:hover{background:var(--elev); color:var(--fg)}
+.btn-sm{padding:6px 11px; font-size:12px}
+.btn-danger:hover{border-color:var(--err); color:var(--err)}
+
+/* ---------- cards ---------- */
+.card{background:var(--card); border:1px solid var(--border); border-radius:var(--r);
+  padding:16px 18px; margin-bottom:16px}
+.card h2{font:600 13px "Segoe UI Semibold",sans-serif; margin-bottom:10px}
+.card h3{font:600 11px "Segoe UI Semibold",sans-serif; color:var(--faint);
+  text-transform:uppercase; letter-spacing:.07em; margin-bottom:8px}
+.grid2{display:grid; grid-template-columns:1fr 1fr; gap:16px}
+.kpis{display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; margin-bottom:16px}
+.kpi{background:var(--card); border:1px solid var(--border); border-radius:var(--r); padding:13px 15px}
+.kpi .v{font:600 22px "Segoe UI Semibold",sans-serif}
+.kpi .k{color:var(--muted); font-size:12px; margin-top:2px}
+
+/* ---------- tables ---------- */
+table{width:100%; border-collapse:collapse; font-size:13px}
+th{color:var(--faint); font:600 10px "Segoe UI Semibold",sans-serif; text-transform:uppercase;
+  letter-spacing:.06em; text-align:left; padding:8px 10px; border-bottom:1px solid var(--border);
+  cursor:default; position:sticky; top:0; background:var(--card); z-index:1}
+th.sortable{cursor:pointer} th.sortable:hover{color:var(--fg)}
+td{padding:9px 10px; border-bottom:1px solid var(--border); vertical-align:middle}
+tbody tr{transition:background .1s}
+tbody tr:hover{background:var(--elev)}
+tbody tr:nth-child(even){background:var(--stripe)}
+tbody tr:nth-child(even):hover{background:var(--elev)}
+tbody tr.sel{background:var(--accent-dim) !important}
+.tbl-wrap{border:1px solid var(--border); border-radius:var(--r); overflow:auto; background:var(--card)}
+
+/* ---------- states ---------- */
+.badge{display:inline-block; padding:2px 9px; border-radius:999px; font-size:11px; font-weight:600}
+.b-ready,.b-available{background:rgba(61,220,132,.13); color:var(--ok)}
+.b-cooling,.b-partial,.b-no_credit{background:rgba(255,200,87,.13); color:var(--warn)}
+.b-dead,.b-exhausted,.b-blocked,.b-capped,.b-no_entitlement{background:rgba(255,107,122,.13); color:var(--err)}
+.b-paid_exhausted,.b-unavailable{background:rgba(179,167,251,.13); color:var(--accent-soft)}
+.b-usage,.b-free,.b-plan{background:rgba(154,161,178,.12); color:var(--muted)}
+
+/* ---------- forms ---------- */
+input[type=text],input[type=search],input[type=number],input[type=password],select{
+  background:var(--field); color:var(--fg); border:1px solid var(--border);
+  border-radius:8px; padding:8px 11px; font:13px "Segoe UI",sans-serif; outline:none; width:100%}
+input:focus,select:focus{border-color:var(--accent)}
+input::placeholder{color:var(--faint)}
+.field{margin-bottom:13px}
+.field label{display:block; color:var(--muted); font-size:12px; margin-bottom:5px}
+.field .help{color:var(--faint); font-size:11px; margin-top:4px}
+fieldset{border:1px solid var(--border); border-radius:var(--r); padding:14px 16px; margin-bottom:16px; background:var(--card)}
+legend{padding:0 8px; color:var(--faint); font:600 11px "Segoe UI Semibold",sans-serif;
+  text-transform:uppercase; letter-spacing:.07em}
+.kv{display:grid; grid-template-columns:auto 1fr; gap:6px 18px; font-size:13px}
+.kv dt{color:var(--muted)} .kv dd{color:var(--fg)}
+.copyable{cursor:pointer} .copyable:hover{color:var(--accent-soft)}
+
+/* ---------- misc ---------- */
+.toolbar{display:flex; align-items:center; gap:10px; margin-bottom:14px}
+.toolbar .grow{flex:1}
+.empty{padding:44px 20px; text-align:center; color:var(--muted)}
+.empty h3{font:600 16px "Segoe UI Semibold",sans-serif; color:var(--fg);
+  text-transform:none; letter-spacing:0; margin-bottom:8px}
+.steps{display:flex; gap:26px; margin:14px 0 20px; flex-wrap:wrap}
+.steps div{display:flex; gap:9px; align-items:baseline}
+.steps b{color:var(--accent); font-size:19px}
+#toast{position:fixed; left:50%; bottom:22px; transform:translateX(-50%);
+  background:var(--card); border:1px solid var(--border); border-radius:999px;
+  padding:9px 18px; font-size:13px; display:none; z-index:50; max-width:80%;
+  box-shadow:0 8px 30px rgba(0,0,0,.45)}
+#toast.ok{border-color:var(--ok); color:var(--ok)}
+#toast.err{border-color:var(--err); color:var(--err)}
+#toast.warn{border-color:var(--warn); color:var(--warn)}
+#login{max-width:360px; margin:12vh auto; text-align:center}
+#login .card{text-align:left}
+.mono-list{font-family:"Cascadia Mono",monospace; font-size:12px; white-space:pre-wrap; word-break:break-all}
+canvas.chart{width:100%; height:190px}
+.scroll{max-height:340px; overflow-y:auto}
+details{margin-bottom:8px}
+summary{cursor:pointer; color:var(--muted); font-size:13px; padding:6px 0}
+summary:hover{color:var(--fg)}
+.model-acc{padding:8px 12px; border-left:2px solid var(--border); margin:2px 0 10px 8px; font-size:12px; color:var(--muted)}
+
+/* ---------- responsive ---------- */
+/* The WebView2 window can shrink to ~980x620; below that the fixed sidebar
+   and two-column grids overflow. Collapse gracefully instead. */
+@media (max-width: 960px){
+  body{flex-direction:column; overflow:auto}
+  #side{width:100%; flex:none; flex-direction:row; align-items:center;
+    flex-wrap:wrap; padding:10px 12px; border-right:0; border-bottom:1px solid var(--border)}
+  #brand{border-bottom:0; margin-bottom:0; padding:0 10px 0 6px}
+  .nav-btn{width:auto; margin-bottom:0; padding:8px 10px}
+  #side .spacer{display:none}
+  #side .foot{border-top:0; padding:0 10px; margin-left:auto}
+  #top{flex-wrap:wrap; padding:10px 14px}
+  #view{padding:14px 14px 40px; overflow:visible}
+  .grid2{grid-template-columns:1fr}
+  .dense-grid{grid-template-columns:1fr}
+  .dense .field{grid-template-columns:1fr}
+  .dense .field .help{grid-column:1}
+  .kv{grid-template-columns:1fr}
+  .steps{gap:14px}
+}
+@media (max-width: 640px){
+  .kpis{grid-template-columns:1fr 1fr}
+  .toolbar{flex-wrap:wrap}
+  #top h1{font-size:13px}
+}
+
+/* ---------- compact models table ---------- */
+.tbl-compact td{padding:5px 10px; font-size:12.5px}
+.tbl-compact details{margin:0}
+.tbl-compact summary{padding:0; list-style:none; display:flex; align-items:center; gap:8px}
+.tbl-compact summary::-webkit-details-marker{display:none}
+.tbl-compact summary .caret{color:var(--faint); font-size:10px; transition:transform .12s; flex:none}
+.tbl-compact details[open] summary .caret{transform:rotate(90deg)}
+.tbl-compact .model-acc{margin:6px 0 4px 4px; padding:4px 10px}
+th .arr{font-size:9px; margin-left:3px; color:var(--accent-soft)}
+
+/* ---------- dense settings ---------- */
+.dense-grid{display:grid; grid-template-columns:1fr 1fr; gap:14px}
+.dense fieldset{margin-bottom:0}
+.dense .field{display:grid; grid-template-columns:150px 1fr; gap:2px 12px;
+  align-items:center; margin-bottom:7px}
+.dense .field label{margin-bottom:0; font-size:12px}
+.dense .field .help{grid-column:2; margin-top:1px}
+.dense input[type=text],.dense input[type=search],.dense input[type=number],.dense select{padding:6px 9px; font-size:12.5px}
+
+/* ---------- guide ---------- */
+.guide h2{margin-top:0}
+.guide ol{margin:8px 0 10px 20px; color:var(--muted)}
+.guide ol li{margin-bottom:6px}
+.guide .note{color:var(--faint); font-size:12px; margin-top:8px}
+.guide kbd{background:var(--elev); border:1px solid var(--border); border-radius:5px;
+  padding:1px 7px; font:12px "Cascadia Mono",monospace}
+
+/* ---------- confirm modal ---------- */
+#confirm-modal, #login-modal{position:fixed; inset:0; background:rgba(5,7,10,.72);
+  display:none; align-items:center; justify-content:center; z-index:70}
+.confirm-card{background:var(--card); border:1px solid var(--border);
+  border-radius:12px; padding:18px 20px; width:380px; max-width:90vw;
+  box-shadow:0 16px 50px rgba(0,0,0,.55)}
+.confirm-card b{font:600 14px "Segoe UI Semibold",sans-serif}
+.confirm-card p{color:var(--muted); font-size:13px; margin-top:8px; white-space:pre-wrap}
+.confirm-actions{display:flex; justify-content:flex-end; gap:8px; margin-top:16px}
+.btn-danger-solid{background:var(--err); color:#26090e}
+.btn-danger-solid:hover{background:#ff8595}
+
+/* ---------- login-with-zcode modal ---------- */
+#login-modal .confirm-card{width:440px}
+#lg-code{font:700 34px "Cascadia Mono",monospace; letter-spacing:.08em; text-align:center;
+  color:var(--accent-soft); background:var(--field); border:1px solid var(--border);
+  border-radius:10px; padding:14px; margin:12px 0; user-select:all; cursor:pointer}
+#lg-status{color:var(--muted); font-size:13px; text-align:center; min-height:20px}
+::-webkit-scrollbar{width:10px; height:10px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--elev); border-radius:6px; border:2px solid var(--bg)}
+::-webkit-scrollbar-thumb:hover{background:var(--border)}
+.cap-cell{min-width:250px; font-size:12px}
+.cap-entry + .cap-entry{margin-top:12px; padding-top:10px; border-top:1px solid var(--border)}
+.cap-entry b{display:block; color:var(--fg); overflow-wrap:anywhere}
+.reset-time{color:var(--muted); font-size:12px; font-variant-numeric:tabular-nums; line-height:1.6}
+.reset-time time{white-space:nowrap}
+.reset-left{display:block; color:var(--fg)}
+.reset-note{color:var(--muted); font-size:12px; margin:0 0 12px}
+.cap-message{color:var(--muted); overflow-wrap:anywhere; max-width:65ch; margin:4px 0 10px}
+#accounts-no-match td{text-align:center; padding:24px; color:var(--muted)}
+</style>
+</head>
+<body>
+
+<!-- login (only when admin key is needed and not yet entered) -->
+<div id="login" style="display:none">
+  <div class="card">
+    <h2>Zcode Gateway</h2>
+    <p style="color:var(--muted); font-size:13px; margin-bottom:14px">
+      Enter the admin key to manage this gateway.</p>
+    <div class="field">
+      <label>Admin key</label>
+      <input type="password" id="login-key" autocomplete="off" spellcheck="false" aria-label="Admin key">
+    </div>
+    <button class="btn btn-pri" style="width:100%" onclick="App.login()">Continue</button>
+  </div>
+</div>
+
+<aside id="side" style="display:none">
+  <div id="brand">
+    <span class="mark"></span>
+    <div><b>Zcode Gateway</b>
+      <a href="https://t.me/B3hnamR" target="_blank" rel="noopener"><small>@B3hnamR · t.me/B3hnamR</small></a>
+    </div>
+  </div>
+  <button class="nav-btn" data-tab="accounts" onclick="App.tab('accounts')"><span class="ico">◉</span>Accounts</button>
+  <button class="nav-btn" data-tab="generator" onclick="App.tab('generator')"><span class="ico">⚡</span>Generator</button>
+  <button class="nav-btn" data-tab="proxy" onclick="App.tab('proxy')"><span class="ico">⇄</span>Proxy tools</button>
+  <button class="nav-btn" data-tab="models" onclick="App.tab('models')"><span class="ico">◇</span>Models</button>
+  <button class="nav-btn" data-tab="server" onclick="App.tab('server')"><span class="ico">▣</span>Server</button>
+  <button class="nav-btn" data-tab="settings" onclick="App.tab('settings')"><span class="ico">⚙</span>Settings</button>
+  <button class="nav-btn" data-tab="stats" onclick="App.tab('stats')"><span class="ico">∑</span>Stats</button>
+  <button class="nav-btn" data-tab="logs" onclick="App.tab('logs')"><span class="ico">≡</span>Logs</button>
+  <button class="nav-btn" data-tab="guide" onclick="App.tab('guide')"><span class="ico">?</span>Guide</button>
+  <div class="spacer"></div>
+  <div class="foot" id="foot-ver"></div>
+</aside>
+
+<div id="main" style="display:none">
+  <div id="top">
+    <h1 id="tab-title">Accounts</h1>
+    <span class="chip"><span class="dot off" id="dot-server"></span><span id="chip-server">gateway</span></span>
+    <span class="chip"><span class="dot off" id="dot-zcode"></span><span id="chip-zcode">Zcode: …</span></span>
+    <span class="chip" id="chip-ready"></span>
+    <button class="btn btn-quiet btn-sm" id="btn-update" title="updates"
+      style="display:none; position:relative" onclick="App.showUpdate()">🔔
+      <span id="update-dot" style="position:absolute; top:2px; right:2px; width:8px; height:8px;
+        border-radius:50%; background:var(--accent); box-shadow:0 0 6px var(--accent)"></span>
+    </button>
+    <button class="btn btn-quiet btn-sm" id="btn-toggle" onclick="App.toggleServer()">…</button>
+  </div>
+  <div id="view"></div>
+</div>
+
+<div id="toast"></div>
+
+<!-- in-app confirm dialog -->
+<div id="confirm-modal">
+  <div class="confirm-card">
+    <b id="cf-title"></b>
+    <p id="cf-body"></p>
+    <div class="confirm-actions">
+      <button class="btn btn-ghost btn-sm" id="cf-cancel">Cancel</button>
+      <button class="btn btn-pri btn-sm" id="cf-ok">OK</button>
+    </div>
+  </div>
+</div>
+
+<!-- login-with-zcode modal -->
+<div id="login-modal">
+  <div class="confirm-card" style="text-align:center">
+    <b>Login with Zcode</b>
+    <p style="color:var(--muted); font-size:13px; margin-top:8px">
+      Open the login page and approve access — no Zcode install needed.</p>
+    <p style="color:var(--warn); font-size:12.5px; margin-top:6px">
+      ⚠ Make sure you sign in with the account you want to add — if the browser
+      is already logged in as someone else, sign out first.</p>
+    <div id="lg-code">Browser approval</div>
+    <div style="display:flex; gap:8px; justify-content:center; margin-bottom:12px">
+      <a class="btn btn-pri btn-sm" id="lg-link" href="#" target="_blank" rel="noopener"
+         style="text-decoration:none; display:inline-flex; align-items:center">Open login page</a>
+      <button class="btn btn-quiet btn-sm" id="lg-cancel" onclick="App.loginCancel()">Cancel</button>
+    </div>
+    <div id="lg-status"></div>
+  </div>
+</div>
+
+<!-- update available card -->
+<div id="update-card" style="display:none; position:fixed; top:64px; right:22px; z-index:60;
+  width:360px; background:var(--card); border:1px solid var(--accent-dim); border-radius:12px;
+  padding:16px 18px; box-shadow:0 12px 40px rgba(0,0,0,.5)">
+  <div style="display:flex; align-items:center; gap:8px; margin-bottom:8px">
+    <b style="font-size:14px">Update available</b>
+    <span class="mono" id="upd-versions" style="color:var(--accent-soft)"></span>
+    <div class="grow" style="flex:1"></div>
+    <button class="btn btn-quiet btn-sm" onclick="App.hideUpdate()">✕</button>
+  </div>
+  <div id="upd-notes" class="mono-list" style="max-height:160px; overflow-y:auto;
+    color:var(--muted); margin-bottom:12px"></div>
+  <div style="display:flex; gap:8px; flex-wrap:wrap">
+    <button class="btn btn-pri btn-sm" id="upd-go" onclick="App.doUpdate()">Update now</button>
+    <a class="btn btn-ghost btn-sm" id="upd-link" href="#" target="_blank" rel="noopener"
+      style="text-decoration:none; display:inline-flex; align-items:center">Release notes</a>
+    <button class="btn btn-quiet btn-sm" onclick="App.skipUpdate()">Skip this version</button>
+  </div>
+  <div id="upd-progress" style="color:var(--faint); font-size:12px; margin-top:8px"></div>
+</div>
+
+<script>
+"use strict";
+const App = (() => {
+  /* ------------ state ------------ */
+  let key = sessionStorage.getItem("gw-admin-key") || "";
+  let curTab = "accounts";
+  let timer = null;
+  let serverUp = true;
+  const cache = {};
+
+  /* ------------ http ------------ */
+  async function api(path, opts = {}) {
+    opts.headers = Object.assign({"Authorization": "Bearer " + key,
+      "Content-Type": "application/json"}, opts.headers || {});
+    if (opts.body && typeof opts.body !== "string")
+      opts.body = JSON.stringify(opts.body);
+    let r;
+    try { r = await fetch(path, opts); }
+    catch (e) { serverUp = false; paintChips(); throw new Error("gateway unreachable"); }
+    serverUp = true;
+    if (r.status === 401 || r.status === 403) { showLogin(); throw new Error("bad admin key"); }
+    if (!r.ok) {
+      let detail = r.statusText;
+      try { detail = (await r.json()).detail || detail; } catch (_) {}
+      throw new Error(detail);
+    }
+    return r.json();
+  }
+
+  /* ------------ ui helpers ------------ */
+  function toast(msg, kind = "") {
+    const t = document.getElementById("toast");
+    t.textContent = msg; t.className = kind; t.style.display = "block";
+    clearTimeout(t._t); t._t = setTimeout(() => t.style.display = "none", 4500);
+  }
+  const $ = sel => document.querySelector(sel);
+  const esc = s => String(s ?? "").replace(/[&<>"']/g,
+    c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+  const fmtUsd = micro => (micro === null || micro === undefined) ? "—"
+    : "$" + (micro / 1e6).toFixed(2);
+  const fmtSecs = s => { if (s === null || s === undefined) return "—";
+    if (s < 60) return s + "s"; const h = Math.floor(s/3600), m = Math.round(s%3600/60);
+    return h ? `${h}h ${m}m` : `${m}m`; };
+  const fmtLeft = ms => { if (!ms) return "Long-lived"; const d = ms - Date.now(); if (d <= 0) return "expired";
+    const m = Math.floor(d/60000), h = Math.floor(m/60);
+    return h ? `${h}h ${m%60}m` : `${m} min`; };
+  const localZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  function capRelease(info, now = Date.now()) {
+    // A naive timestamp is ambiguous; use a relative fallback rather than guess.
+    let ms = typeof info.release_at === "string" && /(?:Z|[+-]\d{2}:\d{2})$/i.test(info.release_at)
+      ? Date.parse(info.release_at) : NaN;
+    if (!Number.isFinite(ms) && typeof info.release_in_s === "number" && Number.isFinite(info.release_in_s))
+      ms = now + Math.max(0, info.release_in_s) * 1000;
+    if (!Number.isFinite(ms)) return "Reset time unavailable";
+    const d = new Date(ms), seconds = Math.max(0, Math.ceil((ms - now) / 1000));
+    const minutes = Math.ceil(seconds / 60);
+    const left = seconds < 60 ? `${seconds}s` : minutes < 60 ? `${minutes}m`
+      : `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+    const local = d.toLocaleString(undefined, {year:"numeric", month:"short", day:"numeric",
+      hour:"2-digit", minute:"2-digit", second:"2-digit", hourCycle:"h23"});
+    return `<time datetime="${esc(d.toISOString())}">${esc(local)}</time>`
+      + `<span class="reset-left">${seconds ? "in " + left : "Reset due"}</span>`;
+  }
+  function capCell(account) {
+    const caps = account.model_caps || {};
+    const models = [...new Set([...Object.keys(caps), ...(account.capped_models || [])])].sort();
+    return models.map(model => {
+      const info = caps[model];
+      return `<div class="cap-entry" title="${esc(info?.message || model)}">
+        <b>${esc(model.split("/").pop())}</b>
+        ${info ? `<div class="reset-time">${capRelease(info)}</div>` : ""}</div>`;
+    }).join("") || "—";
+  }
+  function quotaCell(quotas) {
+    const entries = Object.entries(quotas || {});
+    return entries.map(([model, q]) => `<div class="cap-entry"><b>${esc(model)}</b>
+      <div>${Number(q.remaining).toLocaleString()} / ${Number(q.total).toLocaleString()} tokens</div>
+      ${q.resets_at ? `<div class="reset-time">${capRelease({release_at:new Date(q.resets_at*1000).toISOString()})}</div>` : ""}</div>`).join("") || "Not checked";
+  }
+  function planCell(a) {
+    if (!a.plans?.length) return a.has_plan === false ? badge("no_entitlement") : "Not checked";
+    return a.plans.map(p => `<b>${esc(p.name || p.plan_id)}</b><br><span style="color:var(--muted)">${esc(p.status)} · ${p.ends_at ? esc(new Date(p.ends_at*1000).toLocaleString()) : "No expiry"}</span>`).join("<br>");
+  }
+  function badge(state){ return `<span class="badge b-${esc(String(state).replace(/\s+/g,'_'))}">${esc(state)}</span>`; }
+  function copy(text){
+    const done = () => toast("copied", "ok");
+    const fail = () => toast("copy failed", "err");
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(text).then(done, () => legacyCopy(text) ? done() : fail());
+    } else {
+      legacyCopy(text) ? done() : fail();
+    }
+  }
+  function legacyCopy(text){
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+      document.body.appendChild(ta); ta.select();
+      const ok = document.execCommand("copy");
+      ta.remove(); return ok;
+    } catch (_) { return false; }
+  }
+
+  /* ------------ login ------------ */
+  function showLogin(){
+    $("#login").style.display = "block";
+    $("#side").style.display = "none";
+    $("#main").style.display = "none";
+  }
+  function hideLogin(){
+    $("#login").style.display = "none";
+    $("#side").style.display = "flex";
+    $("#main").style.display = "flex";
+  }
+  async function login(){
+    key = $("#login-key").value.trim();
+    try { await api("/admin/dash/server"); }
+    catch (e) { toast(e.message, "err"); return; }
+    sessionStorage.setItem("gw-admin-key", key);
+    hideLogin(); boot();
+  }
+
+  /* ------------ confirm dialog (replaces native confirm()) ------------ */
+  function confirmDlg(title, body, okLabel = "OK", danger = false){
+    return new Promise(resolve => {
+      const m = $("#confirm-modal");
+      $("#cf-title").textContent = title;
+      $("#cf-body").textContent = body;
+      const ok = $("#cf-ok");
+      ok.textContent = okLabel;
+      ok.className = "btn btn-sm " + (danger ? "btn-danger-solid" : "btn-pri");
+      m.style.display = "flex";
+      m.setAttribute("role", "dialog");
+      m.setAttribute("aria-modal", "true");
+      m.setAttribute("aria-labelledby", "cf-title");
+      const cancel = $("#cf-cancel");
+      const prevFocus = document.activeElement;
+      ok.focus();
+      const done = v => {
+        m.style.display = "none";
+        ok.onclick = null; cancel.onclick = null;
+        m.onclick = null; document.onkeydown = null;
+        if (prevFocus && prevFocus.focus) prevFocus.focus();
+        resolve(v);
+      };
+      ok.onclick = () => done(true);
+      cancel.onclick = () => done(false);
+      m.onclick = e => { if (e.target === m) done(false); };
+      document.onkeydown = e => {
+        if (e.key === "Escape") done(false);
+        // Enter confirms only when focus is inside the dialog — a stray
+        // global Enter must never trigger a destructive action
+        if (e.key === "Enter" && m.contains(document.activeElement)) done(true);
+        if (e.key === "Tab") {
+          const focusables = [ok, cancel];
+          const idx = focusables.indexOf(document.activeElement);
+          e.preventDefault();
+          const next = e.shiftKey
+            ? focusables[(idx <= 0 ? focusables.length : idx) - 1]
+            : focusables[(idx + 1) % focusables.length];
+          next.focus();
+        }
+      };
+    });
+  }
+
+  /* ------------ updates ------------ */
+  let updStatus = null;
+  async function pollUpdate(){
+    try {
+      updStatus = await api("/admin/dash/update/status");
+    } catch (e) { return; }
+    const skipped = localStorage.getItem("gw-skip-version") || "";
+    const show = updStatus && updStatus.update_available
+      && updStatus.latest !== skipped;
+    $("#btn-update").style.display = show ? "" : "none";
+  }
+  function showUpdate(){
+    if (!updStatus || !updStatus.update_available) return;
+    $("#upd-versions").textContent =
+      `${updStatus.current || "?"} → ${updStatus.latest || "?"}`;
+    $("#upd-notes").textContent = updStatus.notes || "";
+    $("#upd-link").href = updStatus.release_url || "#";
+    $("#upd-progress").textContent = "";
+    $("#upd-go").disabled = false;
+    $("#update-card").style.display = "block";
+  }
+  function hideUpdate(){ $("#update-card").style.display = "none"; }
+  function skipUpdate(){
+    if (updStatus && updStatus.latest)
+      localStorage.setItem("gw-skip-version", updStatus.latest);
+    hideUpdate(); pollUpdate();
+  }
+  async function doUpdate(){
+    const btn = $("#upd-go");
+    btn.disabled = true;
+    try {
+      $("#upd-progress").textContent = "downloading…";
+      await api("/admin/dash/update/download", {method:"POST"});
+      $("#upd-progress").textContent = "downloaded — restarting to apply…";
+      await api("/admin/dash/update/apply", {method:"POST"});
+      $("#upd-progress").textContent =
+        "updating — the tool relaunches itself in a few seconds.";
+    } catch (e) {
+      $("#upd-progress").textContent = "update failed: " + e.message;
+      btn.disabled = false;
+    }
+  }
+
+  /* ------------ chips / top bar ------------ */
+  async function paintChips(){
+    $("#dot-server").className = "dot " + (serverUp ? "ok" : "err");
+    $("#chip-server").textContent = serverUp ? "gateway: up" : "gateway: unreachable";
+    $("#btn-toggle").textContent = serverUp ? "Stop" : "…";
+    if (!serverUp) return;
+    try {
+      const cs = await api("/admin/dash/zcode-status");
+      const kinds = {running:"ok", logged_in:"ok", installed:"warn", off:"off"};
+      $("#dot-zcode").className = "dot " + (kinds[cs.chip_kind] || "off");
+      $("#chip-zcode").textContent = cs.detail;
+    } catch (e) { /* chip stays */ }
+    try {
+      const pool = await api("/admin/pool/state");
+      const total = Object.values(pool.by_state || {}).reduce((a, b) => a + b, 0);
+      $("#chip-ready").textContent = `${pool.ready}/${total} accounts ready`;
+    } catch (e) { $("#chip-ready").textContent = ""; }
+    pollUpdate();
+  }
+
+  async function toggleServer(){
+    if (!serverUp) { toast("gateway is not running", "warn"); return; }
+    if (!(await confirmDlg("Stop the gateway?",
+        "The process exits and frees the port.\nRelaunch ZcodeGateway.exe to start it again.",
+        "Stop", true))) return;
+    try { await api("/admin/dash/shutdown", {method: "POST"}); } catch (_) {}
+    serverUp = false; paintChips();
+    $("#btn-toggle").textContent = "Stopped";
+    toast("gateway stopped — you can close this window", "ok");
+  }
+
+  /* ------------ tab: accounts ------------ */
+  function filterAccounts(input) {
+    cache.acctQ = input.value;
+    const q = input.value.toLowerCase();
+    let count = 0;
+    document.querySelectorAll("#accounts-body tr[data-search]").forEach(row => {
+      const matches = row.dataset.search.includes(q);
+      row.hidden = !matches;
+      if (matches) count++;
+    });
+    const empty = $("#accounts-no-match");
+    if (empty) empty.hidden = count !== 0;
+  }
+  async function renderAccounts(v = $("#view")){
+    const [accs, pool] = await Promise.all([
+      api("/admin/accounts"), api("/admin/pool/state")]);
+    if (curTab !== "accounts") return;
+    const previous = $("#acct-q");
+    const focused = previous && document.activeElement === previous;
+    const selection = focused ? [previous.selectionStart, previous.selectionEnd] : null;
+    const query = previous?.value ?? cache.acctQ ?? "";
+    const rows = accs.accounts;
+    let html = `<div class="toolbar">
+      <button class="btn btn-pri" onclick="App.loginStart()">🔑 Login with Zcode</button>
+      <button class="btn btn-ghost" onclick="App.doImport()">⤓ Import from Zcode app</button>
+      <button class="btn btn-ghost" onclick="App.doReload()">Reload pool</button>
+      <button class="btn btn-quiet" onclick="App.refresh()">Refresh</button>
+      <div class="grow"></div>
+       <input type="search" id="acct-q" placeholder="Filter accounts…" aria-label="Filter accounts" style="max-width:230px"
+              oninput="App.filterAccounts(this)">
+    </div>`;
+    if (!rows.length) {
+      html += `<div class="card"><div class="empty">
+        <h3>No accounts yet</h3>
+        <p>Two ways in — no Zcode install needed for the first one.</p>
+        <div class="steps" style="justify-content:center">
+          <div><b>1</b><span>Click Login with Zcode</span></div>
+          <div><b>2</b><span>Approve access in your browser</span></div>
+          <div><b>3</b><span>Account joins the pool — done</span></div>
+        </div>
+        <button class="btn btn-pri" onclick="App.loginStart()">🔑 Login with Zcode</button>
+        <button class="btn btn-ghost" onclick="App.doImport()">Import from Zcode app</button>
+        <button class="btn btn-ghost" onclick="App.tab('guide')">Setup guide</button>
+      </div></div>`;
+    } else {
+      const shown = rows;
+      html += `<p class="reset-note">Cap resets in ${esc(localZone)} · Based on Zcode quota windows.</p>`;
+      html += `<div class="tbl-wrap"><table><thead><tr>
+        <th>Email</th><th>State</th><th>Plan / expiry</th><th>Token</th>
+        <th>Daily quota / reset</th><th>Runs</th><th>Capped models / local reset</th><th></th></tr></thead><tbody id="accounts-body">`;
+      for (const a of shown) {
+        const caps = capCell(a);
+        html += `<tr data-search="${esc([a.email, a.id, a.state, a.source, ...(a.capped_models || [])].join(" ").toLowerCase())}">
+          <td><b>${esc(a.email || a.id)}</b><br><span class="mono" style="color:var(--faint)">${esc(a.id)}</span></td>
+          <td>${badge(a.state)}</td>
+          <td>${planCell(a)}</td>
+          <td>${fmtLeft(a.expires_at || 0)}</td>
+          <td class="mono">${quotaCell(a.quotas)}</td>
+          <td>${a.in_flight}</td>
+          <td class="cap-cell">${caps}</td>
+          <td style="white-space:nowrap; text-align:right">
+            <button class="btn btn-quiet btn-sm" title="reload token from snapshot" aria-label="reload token"
+              data-act="acct-refresh" data-id="${esc(a.id)}">↻</button>
+            <button class="btn btn-quiet btn-sm" title="check model quotas" aria-label="check quotas"
+              data-act="acct-balance" data-id="${esc(a.id)}">Q</button>
+            <button class="btn btn-quiet btn-sm" title="enable" aria-label="enable account"
+              data-act="acct-enable" data-id="${esc(a.id)}">▶</button>
+            <button class="btn btn-quiet btn-sm btn-danger" title="remove" aria-label="remove account"
+              data-act="acct-remove" data-id="${esc(a.id)}">✕</button>
+          </td></tr>`;
+      }
+      html += `<tr id="accounts-no-match" hidden><td colspan="8">No accounts match this filter.</td></tr></tbody></table></div>
+        <p style="color:var(--faint); font-size:12px; margin-top:10px">
+          Daily quotas are independent for GLM-5.3 and GLM-5.3-Flash.
+          Reset times and plan expiry use your local timezone. A revoked token needs a new login.</p>`;
+    }
+    v.innerHTML = html;
+    // delegated listener: account ids come from snapshot files and must never
+    // be interpolated into inline JS strings (stored XSS via crafted id)
+    v.querySelectorAll("[data-act^='acct-']").forEach(btn => {
+      btn.addEventListener("click", () => {
+        const id = btn.dataset.id;
+        const act = btn.dataset.act;
+        if (act === "acct-refresh") acct("refresh", id);
+        else if (act === "acct-balance") acct("balance", id);
+        else if (act === "acct-enable") acct("enable", id);
+        else if (act === "acct-remove") acctRemove(id);
+      });
+    });
+    const q = document.getElementById("acct-q");
+    if (q) {
+      q.value = query;
+      filterAccounts(q);
+      if (focused) { q.focus(); q.setSelectionRange(...selection); }
+    }
+  }
+
+  async function doImport(){
+    try {
+      const r = await api("/admin/dash/import", {method:"POST"});
+      await api("/admin/pool/reload", {method:"POST"});
+      toast(`imported ${r.written ?? 0} account(s)`, "ok");
+      renderAccounts($("#view")); paintChips();
+    } catch (e) { toast("import: " + e.message, "err"); }
+  }
+  async function doReload(){
+    try {
+      const r = await api("/admin/pool/reload", {method:"POST"});
+      toast(`pool reloaded (${r.loaded} account(s), ${r.added} new)`, "ok");
+      renderAccounts($("#view")); paintChips();
+    } catch (e) { toast("reload: " + e.message, "err"); }
+  }
+  async function acct(action, id){
+    try {
+      if (action === "balance") {
+        const r = await api(`/admin/accounts/${encodeURIComponent(id)}/balance`, {method:"POST"});
+        toast("Model quotas checked", "ok");
+      } else {
+        await api(`/admin/accounts/${encodeURIComponent(id)}/${action}`, {method:"POST"});
+        toast(`${action}: ${id.split("-")[0]}…`, "ok");
+      }
+      renderAccounts($("#view"));
+    } catch (e) { toast(e.message, "err"); }
+  }
+  async function acctRemove(id){
+    if (!(await confirmDlg("Remove account?",
+        `${id} leaves the pool and stops serving requests.`,
+        "Remove", true))) return;
+    try { await api(`/admin/accounts/${encodeURIComponent(id)}`, {method:"DELETE"});
+      toast("removed", "ok"); renderAccounts($("#view")); paintChips(); }
+    catch (e) { toast(e.message, "err"); }
+  }
+
+  /* ------------ login with Zcode (device-code flow) ------------ */
+  let loginTimer = null;
+  async function loginStart(){
+    try {
+      const s = await api("/admin/dash/auth/login/start", {method:"POST"});
+      showLoginModal(s);
+    } catch (e) { toast("login: " + e.message, "err"); }
+  }
+  function showLoginModal(s){
+    $("#login-modal").style.display = "flex";
+    paintLogin(s);
+    if (loginTimer) clearInterval(loginTimer);
+    loginTimer = setInterval(pollLogin, 1500);
+  }
+  function paintLogin(s){
+    $("#lg-code").textContent = "Browser approval";
+    if (s.verification_url) $("#lg-link").href = s.verification_url;
+    const msg = {
+      awaiting_user: "Approve the login in your browser — this updates itself.",
+      registering:   "approved — registering the account…",
+      done:          "account added ✓",
+      expired:       "the code expired — close this and start again",
+      cancelled:     "cancelled",
+      error:         s.error || "something went wrong",
+    }[s.state] || s.state || "starting…";
+    $("#lg-status").textContent = msg;
+  }
+  async function pollLogin(){
+    let s;
+    try { s = await api("/admin/dash/auth/login/status"); }
+    catch (e) { return; }                          // keep polling
+    paintLogin(s);
+    if (["done","error","expired","cancelled"].includes(s.state)) {
+      clearInterval(loginTimer); loginTimer = null;
+      const msg = {
+        done:      "account added: " + (s.email || "unknown"),
+        cancelled: "login cancelled",
+        expired:   "login code expired — try again",
+        error:     "login failed: " + (s.error || "unknown error"),
+      }[s.state];
+      if (s.state === "done") {
+        toast(msg, "ok");
+        setTimeout(() => { hideLoginModal();
+          renderAccounts($("#view")); paintChips(); }, 1200);
+      } else if (s.state === "cancelled") {
+        hideLoginModal();
+      } else {
+        // denied / expired / error: say why, then close on its own
+        toast(msg, s.state === "expired" ? "warn" : "err");
+        setTimeout(hideLoginModal, 1600);
+      }
+    }
+  }
+  async function loginCancel(){
+    try { await api("/admin/dash/auth/login/cancel", {method:"POST"}); } catch (_) {}
+    hideLoginModal();
+  }
+  function hideLoginModal(){
+    if (loginTimer) { clearInterval(loginTimer); loginTimer = null; }
+    $("#login-modal").style.display = "none";
+  }
+  // copy the code on click
+  document.addEventListener("click", e => {
+    if (e.target && e.target.id === "lg-code" && e.target.textContent !== "…")
+      copy(e.target.textContent);
+  });
+
+  /* ------------ tab: models ------------ */
+  const STATUS_RANK = {available:0, cooling:1, partial:1, capped:2,
+                       no_entitlement:3, no_credit:4, unavailable:5};
+  function sortModels(key){
+    const cur = cache.mdlSort || {key:"rank", dir:1};
+    cache.mdlSort = {key, dir: (cur.key === key ? -cur.dir : 1)};
+    renderModels($("#view"));
+  }
+  function filterModels(input){
+    cache.mdlQ = input.value;
+    const q = input.value.toLowerCase();
+    document.querySelectorAll("#models-body tr").forEach(row => {
+      const name = row.querySelector("b.mono")?.textContent || "";
+      row.style.display = name.toLowerCase().includes(q) ? "" : "none";
+    });
+  }
+  async function syncModels(){
+    try {
+      const status = await api("/admin/models/catalog/refresh", {method:"POST"});
+      toast(status.error ? "Catalog sync failed; showing the last known list"
+                         : "Model catalog synced", status.error ? "warn" : "ok");
+      await renderModels($("#view"));
+    } catch (e) { toast(e.message, "err"); }
+  }
+  async function renderModels(v){
+    const data = await api("/admin/models/availability");
+    if (curTab !== "models") return;
+    const opened = new Set([...document.querySelectorAll("#models-body details[open]")]
+      .map(el => el.dataset.model));
+    const previousInput = document.getElementById("mdl-q");
+    const focused = document.activeElement === previousInput;
+    const selection = focused ? [previousInput.selectionStart, previousInput.selectionEnd] : null;
+    const q = previousInput?.value ?? cache.mdlQ ?? "";
+    const sort = cache.mdlSort || {key:"rank", dir:1};
+    cache.mdlSort = sort;
+    let models = data.models;
+    const keyFns = {
+      rank:  m => [STATUS_RANK[m.overall] ?? 9, m.model],
+      model: m => m.model,
+      lane:  m => [m.lane, m.model],
+      ratio: m => [(m.total_accounts ? m.available_on/m.total_accounts : 0), m.model],
+      next:  m => [m.next_release_in_s ?? 1e15, m.model],
+    };
+    const fn = keyFns[sort.key] || keyFns.rank;
+    models.sort((a, b) => {
+      const ka = fn(a), kb = fn(b);
+      const cmp = JSON.stringify(ka) < JSON.stringify(kb) ? -1
+                : JSON.stringify(ka) > JSON.stringify(kb) ? 1 : 0;
+      return cmp * sort.dir;
+    });
+    const th = (label, key) => {
+      const on = sort.key === key;
+      const arr = on ? (sort.dir === 1 ? "▲" : "▼") : "";
+      return `<th class="sortable" onclick="App.sortModels('${key}')">${label}<span class="arr">${arr}</span></th>`;
+    };
+    const catalog = data.catalog || {};
+    const source = catalog.source === "live" ? "Live Zcode catalog" : "Captured ZCode 3.14.4";
+    const synced = catalog.updated_at
+      ? " · synced " + new Date(catalog.updated_at * 1000).toLocaleTimeString() : "";
+    const syncError = catalog.error ? " · sync failed (" + catalog.error + ")" : "";
+    let html = `<div class="toolbar">
+      <h3 style="margin:0">${data.summary.fully_available}/${data.summary.total_models} fully available</h3>
+      <span style="color:var(--muted); font-size:12px">${esc(source + synced + syncError)}</span>
+      <div class="grow"></div>
+      <button class="btn btn-quiet btn-sm" onclick="App.syncModels()">Sync models</button>
+      <input type="text" id="mdl-q" placeholder="Filter models…" style="max-width:230px"
+             oninput="App.filterModels(this)"></div>`;
+    html += `<p class="reset-note">Reset times in ${esc(localZone)} · Based on Zcode quota windows.</p>`;
+    html += `<div class="tbl-wrap"><table class="tbl-compact"><thead><tr>
+      ${th("Model","model")}${th("Lane","lane")}${th("On accounts","ratio")}
+      ${th("Status","rank")}${th("Next reset · local","next")}</tr></thead><tbody id="models-body">`;
+    for (const m of models) {
+      html += `<tr>
+        <td><details data-model="${esc(m.model)}" ${opened.has(m.model) ? "open" : ""}><summary><span class="caret">▶</span>
+            <b class="mono" style="font-size:12px">${esc(m.model)}</b></summary>
+          <div class="model-acc">${
+            m.accounts.map(a => `<div>${esc(a.email || a.account_id)} —
+              ${badge(a.status)} <span style="color:var(--muted)">${esc(a.reason || "")}</span>
+              ${a.release_at || a.release_in_s != null ? `<div class="reset-time">${capRelease(a)}</div>` : ""}
+              ${a.message ? `<div class="cap-message">${esc(a.message)}</div>` : ""}</div>`
+            ).join("") || "<div>no accounts</div>"}</div></details></td>
+        <td><span class="badge b-plan">coding plan</span></td>
+        <td>${m.available_on}/${m.total_accounts}</td>
+        <td>${badge(m.overall)}</td>
+        <td class="reset-time">${m.next_release_in_s != null ? capRelease({release_in_s:m.next_release_in_s}) : "—"}</td>
+      </tr>`;
+    }
+    html += `</tbody></table></div>
+      <p style="color:var(--faint); font-size:12px; margin-top:10px">
+        Click a model for its per-account breakdown. Availability is inferred
+        from account state, plan expiry, quotas and known caps.
+        Sorted by availability — click a column to re-sort.</p>`;
+    v.innerHTML = html;
+    const input = document.getElementById("mdl-q");
+    input.value = q;
+    filterModels(input);
+    if (focused) {
+      input.focus();
+      input.setSelectionRange(selection[0], selection[1]);
+    }
+  }
+
+  /* ------------ tab: server ------------ */
+  async function renderServer(v){
+    const s = await api("/admin/dash/server");
+    const row = (k, val, copyable) => `<dt>${k}</dt>
+      <dd class="mono ${copyable ? "copyable" : ""}" ${copyable ? `data-copy="${esc(val)}" title="click to copy"` : ""}>${esc(val)}</dd>`;
+    v.innerHTML = `
+    <div class="grid2">
+      <fieldset><legend>Local endpoints</legend><dl class="kv">
+        ${row("OpenAI compatible", `http://${s.host}:${s.port}/v1/chat/completions`, true)}
+        ${row("Anthropic compatible", `http://${s.host}:${s.port}/v1/messages`, true)}
+        ${row("Models list", `http://${s.host}:${s.port}/v1/models`, true)}
+      </dl></fieldset>
+      <fieldset><legend>Keys</legend><dl class="kv">
+        ${row("Admin key", s.admin_key, true)}
+        ${(s.client_keys||[]).map(k => row(`Client key (${esc(k.name)})`, k.key, true)).join("")}
+      </dl>
+      <p style="color:var(--faint); font-size:11px; margin-top:8px">
+        Click a value to copy. Keys are required on /v1/* and /admin/*.</p></fieldset>
+      <fieldset><legend>Process</legend><dl class="kv">
+        ${row("Version", s.version)}
+        ${row("Config", s.config_path)}
+        ${row("Accounts dir", s.accounts_dir)}
+        ${row("Accounts source", s.accounts_source)}
+        ${row("Strategy", s.strategy)}
+      </dl></fieldset>
+      <fieldset><legend>Point a client at it</legend>
+        <p class="mono-list">base_url: http://${s.host}:${s.port}/v1
+api_key: ${esc(s.admin_key)}   # or any client key</p>
+        <p style="color:var(--faint); font-size:12px; margin-top:10px">
+          Works with the OpenAI SDK, Anthropic SDK, Kilo, Zcode (openai-compatible
+          provider), or plain curl.</p></fieldset>
+    </div>`;
+    v.querySelectorAll("[data-copy]").forEach(el =>
+      el.addEventListener("click", () => copy(el.dataset.copy)));
+  }
+
+  /* ------------ tab: settings ------------ */
+  async function renderSettings(v){
+    const s = await api("/admin/dash/settings");
+    const values = s.values;
+    const inp = (path, kind) => {
+      const val = values[path] ?? path.split('.').reduce((obj, part) => obj?.[part], s.effective);
+      if (kind === "bool") {
+        return `<select data-set="${path}"><option value="true" ${val ? "selected":""}>true</option>
+          <option value="false" ${!val ? "selected":""}>false</option></select>`;
+      }
+      const t = (kind === "int" || kind === "float") ? "number" : "text";
+      return `<input type="${t}" data-set="${path}" value="${esc(val ?? "")}"
+        ${kind==="float" ? 'step="any"' : ""}>`;
+    };
+    const grp = (title, rows) => `<fieldset><legend>${title}</legend>
+      ${rows.map(([path, kind, label, help]) => `
+        <div class="field"><label>${label}</label>${inp(path, kind)}
+        ${help ? `<div class="help">${help}</div>` : ""}</div>`).join("")}</fieldset>`;
+    v.innerHTML = `<form onsubmit="return false" class="dense">
+    <div class="dense-grid">
+    ${grp("Server", [
+      ["server.host","text","Host","loopback only is safest"],
+      ["server.port","int","Port","a restart is required"]])}
+    ${grp("Accounts", [
+      ["accounts.source","text","Source","accounts_dir · providers_json · pool_file"],
+      ["accounts.dir","text","Accounts folder","snapshot .txt files live here"],
+      ["accounts.pool_file","text","Pool file","for pool_file source"]])}
+    ${grp("Pool", [
+      ["pool.strategy","text","Strategy","least_in_flight · drain_first · round_robin · least_recently_used · quota_aware"],
+      ["pool.min_balance_micro","int","Legacy balance threshold","Zcode uses per-model token quotas"],
+      ["pool.refresh_lead_seconds","int","Refresh lead (s)","refresh tokens this long before expiry"],
+      ["pool.cooldown_seconds","int","Cooldown (s)","transport and server errors; model overload retries separately"],
+      ["pool.blocked_model_cooldown_seconds","int","Blocked-model cooldown (s)","405/3012 \"unusual activity\" parks just that model on that account"],
+      ["pool.max_in_flight_per_account","int","Max in-flight/acct","concurrent runs per account"],
+      ["pool.acquire_wait_seconds","float","Acquire wait (s)","how long to wait for a free slot"],
+      ["pool.balance_poll_seconds","int","Quota poll (s)","0 disables"]])}
+    ${grp("Upstream", [
+      ["upstream.timeout_connect","float","Connect timeout (s)",""],
+      ["upstream.timeout_read","float","Read timeout (s)","long streams"],
+      ["upstream.max_attempts","int","Account attempts","quota, authentication and other errors"],
+      ["upstream.overload_max_attempts","int","Overload attempts","native ZCode default: 11; includes first attempt"],
+      ["upstream.overload_base_delay_seconds","float","Overload initial delay (s)","exponential backoff with jitter"],
+      ["upstream.overload_max_delay_seconds","float","Overload maximum delay (s)","native ZCode default: 60"],
+      ["upstream.anthropic_cache_control","bool","Anthropic cache_control","captured as always-on; test at false"]])}
+    ${grp("Models", [
+      ["models.default","text","Default model",""],
+      ["models.default_anthropic","text","Default Anthropic",""],
+      ["models.probe_unknown","bool","Probe unknown","learn body variant on first 400"],
+      ["models.auto_free_fallback.enabled","bool","Fallback to another model","off by default; when on, a blocked/capped model is served by the next in models.auto_free_fallback.chain (set the chain in the desktop Settings or config.yaml)"]])}
+    ${grp("Logging", [
+      ["logging.level","text","Level","INFO · DEBUG · WARNING"],
+      ["logging.capture","bool","Capture exchanges","JSONL of every upstream call"]])}
+    ${grp("Updates", [
+      ["update.enabled","bool","Auto-check","check GitHub for new releases"],
+      ["update.interval_hours","float","Interval (h)","hours between checks"]])}
+    </div>
+    <div class="toolbar" style="margin-top:14px">
+      <button class="btn btn-pri" onclick="App.saveSettings()">Save</button>
+      <span style="color:var(--faint); font-size:12px">writes config.yaml — restart applies</span>
+      <div class="grow"></div>
+      <button class="btn btn-ghost btn-danger" onclick="App.regenKeys()">Regenerate keys</button>
+    </div></form>`;
+  }
+
+  async function saveSettings(){
+    const values = {};
+    document.querySelectorAll("[data-set]").forEach(el => { values[el.dataset.set] = el.value; });
+    try {
+      const r = await api("/admin/dash/settings", {method:"PUT", body:{values}});
+      toast(r.changed.length ? `saved ${r.changed.length} setting(s) — restart applies`
+                             : "no changes", "ok");
+    } catch (e) { toast("save: " + e.message, "err"); }
+  }
+  async function regenKeys(){
+    if (!(await confirmDlg("Regenerate keys?",
+        "The admin key and first client key change.\nClients using the old keys stop working. Restart required.",
+        "Regenerate", true))) return;
+    toast("key rotation stays in the desktop launcher for now (it also restarts the gateway).", "warn");
+  }
+
+  /* ------------ tab: stats ------------ */
+  async function renderStats(v){
+    const s = await api("/admin/stats?since=0");
+    const kpi = (k, val) => `<div class="kpi"><div class="v">${val}</div><div class="k">${k}</div></div>`;
+    v.innerHTML = `
+      <div class="kpis">
+        ${kpi("requests", s.requests)}
+        ${kpi("tokens", (s.total_tokens||0).toLocaleString())}
+        ${kpi("ok", s.ok)}
+        ${kpi("402", s.insufficient_credits)}
+        ${kpi("429", s.rate_limited)}
+        ${kpi("avg ms", Math.round(s.avg_duration_ms||0))}
+      </div>
+      <div class="grid2">
+        <div class="card"><h2>By model</h2><canvas class="chart" id="ch-model"></canvas></div>
+        <div class="card"><h2>By account</h2><canvas class="chart" id="ch-acct"></canvas></div>
+      </div>
+      <div class="card"><h2>All usage rows (model · account)</h2>
+        <div class="scroll"><table><thead><tr><th>Model / Account</th><th>Requests</th><th>Tokens</th></tr></thead>
+        <tbody>
+          ${(s.by_model||[]).map(r=>`<tr><td class="mono">${esc(r.model||"—")}</td><td>${r.requests}</td><td>${(r.tokens||0).toLocaleString()}</td></tr>`).join("")}
+          ${(s.by_account||[]).map(r=>`<tr><td class="mono">${esc(r.account_id||"—")}</td><td>${r.requests}</td><td>${(r.tokens||0).toLocaleString()}</td></tr>`).join("")}
+        </tbody></table></div></div>`;
+    barChart($("#ch-model"), (s.by_model||[]).slice(0,10), "tokens", "model");
+    barChart($("#ch-acct"), (s.by_account||[]).slice(0,10), "tokens", "account_id");
+  }
+
+  function barChart(canvas, rows, valKey, labelKey){
+    if (!canvas) return;
+    const dpr = window.devicePixelRatio || 1;
+    const w = canvas.clientWidth, h = canvas.clientHeight;
+    canvas.width = w*dpr; canvas.height = h*dpr;
+    const c = canvas.getContext("2d"); c.scale(dpr, dpr);
+    const max = Math.max(1, ...rows.map(r => r[valKey]||0));
+    const bw = rows.length ? Math.max(8, (w-60)/rows.length - 8) : 8;
+    c.strokeStyle = "#262c3a"; c.lineWidth = 1;
+    for (let i=1;i<4;i++){ const y = h-24 - (h-40)*i/4;
+      c.beginPath(); c.moveTo(46,y); c.lineTo(w-8,y); c.stroke(); }
+    rows.forEach((r,i)=>{
+      const x = 50 + i*((w-60)/Math.max(rows.length,1));
+      const bh = (h-44) * ((r[valKey]||0)/max);
+      c.fillStyle = "#8b7cf7";
+      c.fillRect(x, h-24-bh, bw, bh);
+      c.fillStyle = "#666e80"; c.font = "10px Segoe UI"; c.textAlign = "center";
+      const lbl = String(r[labelKey]||"—").split("/").pop().slice(0,10);
+      c.fillText(lbl, x+bw/2, h-10);
+    });
+  }
+
+  /* ------------ tab: logs ------------ */
+  let logsCleared = false;
+  async function renderLogs(v){
+    v = v || $("#view");
+    const level = document.getElementById("log-level")?.value || "";
+    const data = await api("/admin/dash/logs?limit=400" + (level ? "&level="+level : ""));
+    if (curTab !== "logs") return;
+    let html = `<div class="toolbar">
+      <select id="log-level" style="max-width:130px" onchange="App.renderLogs()"
+        aria-label="Filter by log level">
+        ${["","INFO","WARNING","ERROR"].map(l =>
+          `<option value="${l}" ${l===level?"selected":""}>${l||"all"}</option>`).join("")}
+      </select>
+      <div class="grow"></div>
+      <button class="btn btn-ghost btn-sm" onclick="App.clearLogs()">Clear</button>
+    </div>
+    <div class="card" style="padding:12px 16px"><div class="mono-list">${
+      logsCleared && !level ? '<span style="color:var(--faint)">—</span>' :
+      data.records.map(r => {
+        const col = r.level==="ERROR" ? "var(--err)" : r.level==="WARNING" ? "var(--warn)"
+                  : r.level==="DEBUG" ? "var(--faint)" : "var(--fg)";
+        return `<span style="color:var(--faint)">${esc(r.time)}</span> <span style="color:${col}">${esc(r.level)}</span> <span style="color:var(--muted)">${esc(r.logger)}:</span> ${esc(r.message)}`;
+      }).join("\n") || '<span style="color:var(--faint)">no log records yet</span>'
+    }</div></div>`;
+    v.innerHTML = html;
+  }
+  function clearLogs(){ /* ring buffer is process-side; just clear the view */
+    logsCleared = true;
+    const list = document.querySelector("#view .mono-list");
+    if (list) list.innerHTML = '<span style="color:var(--faint)">—</span>'; }
+
+  /* ------------ tab: generator ------------ */
+  let genMounted = false;
+  let pxMounted = false;
+  let genSaveTimer = null;
+  function genIpChanged(){
+    const ip = ($("#gen-ip")||{}).value;
+    const pin = $("#gen-pin");
+    if (ip === "pin" && pin) {
+      pin.focus();
+    }
+    genAutoSave();
+  }
+  function genAutoSave(){
+    clearTimeout(genSaveTimer);
+    genSaveTimer = setTimeout(() => genSaveOptions(true), 350);
+  }
+  /* ------------ generator setup card (shared by Generator + Proxy tabs) ---- */
+  function genSetupCard(msg){
+    return `<div class="card">
+      <h2>Connect ZCODEAUTO</h2>
+      <p style="color:var(--muted);font-size:13px;margin-bottom:6px">
+        The generator and proxy tools run the
+        <b>ZCODEAUTO</b> scripts (their <code>gen/</code> folder). Point the
+        gateway at your ZCODEAUTO folder once — no config editing, no restart.</p>
+      <p style="color:var(--err);font-size:12.5px;margin-bottom:12px">${esc(msg || "")}</p>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
+        <button class="btn btn-pri btn-sm" onclick="App.genLocate('auto')">🔍 Find ZCODEAUTO automatically</button>
+        <span class="help" style="display:inline">searches beside the app, your
+          home folder, Documents and common clone paths</span>
+      </div>
+      <label class="lbl">or enter the folder path (the one containing <code>gen/</code>)</label>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:4px">
+        <input type="text" id="zca-path" placeholder="C:\\path\\to\\ZCODEAUTO" style="max-width:460px"
+          onkeydown="if(event.key==='Enter')App.genLocate('path')">
+        <button class="btn btn-ghost btn-sm" onclick="App.genLocate('path')">Use this folder</button>
+      </div>
+      <p class="help" style="margin-top:10px">Don't have it yet? Clone ZCODEAUTO
+        (the account-generator project) and reopen this tab.</p>
+      <div id="zca-msg" style="font-size:12.5px;margin-top:6px"></div>
+    </div>`;
+  }
+
+  async function genLocate(mode){
+    const msg = $("#zca-msg");
+    const set = t => { if (msg) msg.textContent = t; };
+    try {
+      const body = mode === "path"
+        ? {path: ($("#zca-path") || {}).value || ""}
+        : {};
+      if (mode === "path" && !body.path.trim()) { set("enter a folder path first"); return; }
+      set("working…");
+      const r = await api("/admin/dash/generator/locate", {method:"POST", body: JSON.stringify(body)});
+      set("✓ connected: " + r.path);
+      toast("ZCODEAUTO connected", "ok");
+      genMounted = false; pxMounted = false;
+      refresh();
+    } catch (e) {
+      set("✗ " + e.message);
+    }
+  }
+
+  async function renderGenerator(v){
+    let st;
+    try {
+      st = await api("/admin/dash/generator/status");
+    }
+    catch (e) {
+      v.innerHTML = genSetupCard(e.message);
+      genMounted = false;
+      return;
+    }
+    const o = st.options || {};
+    const workerCard = w => {
+      const icon = {running:'●', starting:'◌', exited:'✓', failed:'✗', killed:'✗'}[w.state] || '◌';
+      const res = w.email ? ` · ${esc(w.email)}` : '';
+      const plan = w.global_build ? ' · ⚡ 100M GLOBAL BUILD' : (w.starter === true ? ' · ✅ STARTER' : (w.starter === false ? ' · no plan' : ''));
+      const lines = (w.lines || []).slice(-6).map(l =>
+        `<div class="mono" style="color:var(--faint);font-size:11px">${esc(l)}</div>`).join('');
+      return `<div class="card" style="padding:8px 12px; margin-bottom:8px">
+        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+          <b>${icon} ${esc(w.name)}</b>
+          <span class="mono" style="color:var(--muted)">proxy ${esc(w.proxy)}</span>
+          <span class="mono" style="color:var(--muted)">captcha ${esc(w.captcha)}</span>
+          <span>${esc(w.state)}</span>${res}${plan}
+          <div class="grow"></div>
+          ${w.state === 'running' || w.state === 'starting'
+            ? `<button class="btn btn-ghost btn-sm" onclick="App.genStop('${esc(w.name)}')">Kill</button>` : ''}
+        </div>${lines ? `<div style="margin-top:6px">${lines}</div>` : ''}
+      </div>`;
+    };
+    const workersHtml = (st.workers || []).map(workerCard).join('') ||
+      '<div class="empty" style="padding:16px;color:var(--muted)">no workers — press START</div>';
+    const isContainer = $("#gen-container");
+    if (!genMounted || !isContainer) {
+      const funnel = (id, label, val, color) =>
+        `<span class="kpi" style="padding:6px 10px"><span class="v" id="${id}" style="color:${color||'inherit'}">${val}</span>
+         <span class="k">${label}</span></span>`;
+      v.innerHTML = `
+      <div id="gen-container">
+        <div class="card" id="gen-options-card">
+          <h2>Options</h2>
+          <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:end">
+            <div><label class="lbl">browsers</label><br>
+              <input type="number" id="gen-n" value="1" min="1" max="8" style="width:70px"></div>
+            <div><label class="lbl">captcha</label><br>
+              <select id="gen-captcha" onchange="App.genAutoSave()">
+                <option value="auto" ${o.captcha==='auto'?'selected':''}>auto — solver</option>
+                <option value="manual" ${o.captcha==='manual'?'selected':''}>manual — I solve</option>
+              </select></div>
+            <div><label class="lbl">ip source</label><br>
+              <select id="gen-ip" onchange="App.genIpChanged()">
+                <option value="socks" id="opt-socks" ${o.ip_source==='socks'?'selected':''}>socks pool (${o.socks_available || 0})</option>
+                <option value="pool" ${o.ip_source==='pool'?'selected':''}>full pool</option>
+                <option value="direct" ${o.ip_source==='direct'?'selected':''}>my network (no proxy)</option>
+                <option value="pin" ${o.ip_source==='pin'?'selected':''}>pinned proxy</option>
+              </select></div>
+            <div><label class="lbl">pinned proxy</label><br>
+              <input type="text" id="gen-pin" value="${esc(o.pin_proxy||'')}" placeholder="http://ip:port or socks5://..." style="width:190px" oninput="App.genAutoSave()"></div>
+            <div><label class="lbl">browser UI</label><br>
+              <select id="gen-headless" onchange="App.genAutoSave()">
+                <option value="true" ${o.headless!==false?'selected':''}>headless (background)</option>
+                <option value="false" ${o.headless===false?'selected':''}>visible window</option>
+              </select></div>
+            <div><label class="lbl">retries</label><br>
+              <input type="number" id="gen-retries" value="${o.retries||5}" min="0" max="10" style="width:70px" oninput="App.genAutoSave()"></div>
+            <div><label class="lbl">claim 100M</label><br>
+              <select id="gen-claim" onchange="App.genAutoSave()">
+                <option value="on" ${o.claim!==false?'selected':''}>on</option>
+                <option value="off" ${o.claim===false?'selected':''}>off</option>
+              </select></div>
+            <div><label class="lbl">invite code</label><br>
+              <input type="text" id="gen-invite" value="${esc(o.invite_code||'')}" placeholder="your referral code (empty = off)" style="width:110px" oninput="App.genAutoSave()"></div>
+            <div style="display:flex;align-items:center;gap:6px">
+              <button class="btn btn-ghost btn-sm" onclick="App.genSaveOptions()">Save options</button>
+              <span id="gen-save-indicator" style="color:var(--success,#3fb950);font-size:12px;display:none">✓ Saved</span>
+            </div>
+          </div>
+        </div>
+        <div class="card" id="gen-mail-card">
+          <h2>Email setup <span style="font-weight:400;color:var(--muted);font-size:12px">— your own domains, 3 steps</span></h2>
+
+          <div id="mail-steps"></div>
+
+          <div style="display:grid;grid-template-columns:150px 1fr;gap:7px 12px;align-items:center;margin-top:14px">
+            <label class="lbl">worker inbox url</label>
+            <input type="text" id="mail-inbox-url" placeholder="filled automatically after deploy" oninput="App.mailAutoSave()">
+            <label class="lbl">inbox secret</label>
+            <input type="password" id="mail-inbox-secret" placeholder="filled automatically after deploy (or paste your own)" oninput="App.mailAutoSave()">
+          </div>
+          <div style="display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap">
+            <button class="btn btn-ghost btn-sm" onclick="App.mailSave()">Save manually</button>
+            <button class="btn btn-ghost btn-sm" onclick="App.mailTest()">Test inbox</button>
+            <span id="mail-msg" style="color:var(--muted);font-size:12px"></span>
+          </div>
+        </div>
+        </div>
+        <div style="margin:10px 0; display:flex; gap:8px; align-items:center">
+          <button class="btn btn-pri" onclick="App.genStart()">▶ START</button>
+          <button class="btn btn-ghost" onclick="App.genStopAll()">⏹ STOP ALL</button>
+          <div class="grow"></div>
+          <button class="btn btn-quiet btn-sm" onclick="App.genClearWorkers()" title="clear finished workers from the list">✕ clear finished</button>
+        </div>
+        <div id="gen-workers">${workersHtml}</div>
+        <div class="card" style="margin-top:10px"><h2>Pipeline</h2>
+          <p style="color:var(--muted);font-size:12px">
+          signup → Starter check → device login (+telemetry) → invite bind → client message
+          → successful accounts join the pool automatically.</p>
+        </div>`;
+      genMounted = true;
+      genLoadSources();
+      mailRender();
+      return;
+    }
+
+    // Dynamic partial update on existing DOM:
+    const optSocks = $("#opt-socks");
+    if (optSocks) optSocks.textContent = `socks pool (${o.socks_available || 0})`;
+
+    const wBox = $("#gen-workers");
+    if (wBox && wBox.innerHTML !== workersHtml) {
+      wBox.innerHTML = workersHtml;
+    }
+  }
+  async function genStart(){
+    const n = parseInt(($("#gen-n")||{}).value || "1", 10);
+    await api("/admin/dash/generator/start", {method:"POST", body: JSON.stringify({count: n})});
+    refresh();
+  }
+  async function genStop(name){
+    await api("/admin/dash/generator/stop", {method:"POST", body: JSON.stringify({name})});
+    refresh();
+  }
+  async function genStopAll(){
+    await api("/admin/dash/generator/stopall", {method:"POST", body: "{}"});
+    refresh();
+  }
+  async function genSaveOptions(silent = false){
+    const val = id => ($("#"+id)||{}).value;
+    const body = {
+      captcha: val("gen-captcha"),
+      ip_source: val("gen-ip"),
+      pin_proxy: val("gen-pin"),
+      retries: val("gen-retries"),
+      claim: val("gen-claim") === "on",
+      headless: val("gen-headless") === "true",
+      invite_code: val("gen-invite"),
+    };
+    try {
+      await api("/admin/dash/generator/options", {method:"POST", body: JSON.stringify(body)});
+      if (silent) {
+        const ind = $("#gen-save-indicator");
+        if (ind) {
+          ind.style.display = "inline";
+          clearTimeout(ind._timer);
+          ind._timer = setTimeout(() => { ind.style.display = "none"; }, 1500);
+        }
+      } else {
+        toast("options saved", "ok");
+      }
+    } catch (e) {
+      if (!silent) toast("save: " + e.message, "err");
+    }
+  }
+  async function proxyRun(action){
+    const val = id => ($("#"+id)||{}).value;
+    await api("/admin/dash/generator/proxies/run", {method:"POST", body: JSON.stringify({
+      action, max_latency: parseFloat(val("px-lat")||"6"),
+      concurrency: parseInt(val("px-conc")||"200", 10)})});
+    refresh();
+  }
+  async function proxyStop(){
+    await api("/admin/dash/generator/proxies/stop", {method:"POST", body:"{}"});
+    refresh();
+  }
+  async function genProxyImport(){
+    const ta = $("#px-import");
+    const text = ta ? ta.value : "";
+    if (!text.trim()) { toast("nothing to import"); return; }
+    const msg = $("#px-import-msg");
+    try {
+      const r = await api("/admin/dash/generator/proxies/import", {method:"POST",
+        body: JSON.stringify({text})});
+      if (msg) msg.textContent = `✓ imported ${r.imported}`;
+      if (ta) ta.value = "";
+      refresh();
+    } catch (e) { if (msg) msg.textContent = "import failed: " + e.message; }
+  }
+  function genProxyFile(){
+    const f = $("#px-file");
+    if (!f || !f.files || !f.files[0]) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const ta = $("#px-import");
+      if (ta) ta.value = String(reader.result || "").slice(0, 200000);
+      toast("file loaded — press Add to pool");
+    };
+    reader.readAsText(f.files[0]);
+  }
+  async function genLoadSources(){
+    try {
+      const r = await api("/admin/dash/generator/proxies/sources");
+      const ta = $("#px-sources"); if (ta) ta.value = r.text || "";
+      const msg = $("#px-sources-msg"); if (msg) msg.textContent = "";
+    } catch (e) {}
+  }
+  async function genSaveSources(){
+    const ta = $("#px-sources"); const text = ta ? ta.value : "";
+    const msg = $("#px-sources-msg");
+    try {
+      const r = await api("/admin/dash/generator/proxies/sources", {method:"POST",
+        body: JSON.stringify({text})});
+      if (msg) msg.textContent = `✓ saved (${r.sources} sources)`;
+    } catch (e) { if (msg) msg.textContent = "save failed: " + e.message; }
+  }
+  function autoscroll(el){ if (el) el.scrollTop = el.scrollHeight; }
+  function genClearWorkers(){
+    // remove non-alive worker cards from the list (workers dict untouched)
+    document.querySelectorAll('#gen-workers > div').forEach(card => {
+      if (!card.querySelector('.btn')) card.remove();
+      else if (!/running|starting/.test(card.textContent)) card.remove();
+    });
+  }
+
+  /* ------------ email system (domains + worker inbox) ------------ */
+  let mailSel = null;
+  let mailDeploying = false;
+
+  async function mailRenderWizard(){
+    // Step-by-step card. Each step shows its state; only the current step is
+    // actionable. Step 1 domains, Step 2 one-click worker deploy,
+    // Step 3 verify — done.
+    const box = $("#mail-steps");
+    if (!box) return;
+    let m = {}, st = {};
+    try { m = await api("/admin/dash/generator/mail"); } catch (e) { return; }
+    try { st = await api("/admin/dash/generator/mail/deploy-status"); } catch (e) { st = {}; }
+
+    const doms = m.domains || [];
+    mailSel = mailSel && doms.includes(mailSel) ? mailSel : (m.active || doms[0] || null);
+    const hasUrl = !!(m.inbox_url || st.has_url);
+    const deployed = hasUrl && st.wrangler_authed !== false;
+    const stepDone = [doms.length > 0, deployed, false];
+    const curStep = stepDone.findIndex(d => !d);
+
+    const stepHead = (n, title, done, active) => `
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
+        <span style="flex:none;width:24px;height:24px;border-radius:50%;display:inline-flex;
+          align-items:center;justify-content:center;font-size:12px;font-weight:700;
+          background:${done ? 'var(--success,#3fb950)' : active ? 'var(--accent)' : 'var(--elev)'};
+          color:${done || active ? '#0e0b22' : 'var(--muted)'}">${done ? '✓' : n}</span>
+        <b style="font-size:13px">${title}</b>
+        ${done ? '<span style="color:var(--success,#3fb950);font-size:12px">done</span>'
+               : active ? '<span style="color:var(--accent-soft);font-size:12px">← you are here</span>' : ''}
+      </div>`;
+
+    // step 1 body: domains
+    const s1body = `
+      <div style="margin:4px 0 10px 34px">
+        ${doms.length ? `<div style="margin-bottom:8px">${doms.map(d => `
+          <label class="mono" style="display:inline-flex;align-items:center;gap:6px;margin:0 12px 6px 0;cursor:pointer">
+            <input type="radio" name="mail-dom" value="${esc(d)}" ${d===mailSel?'checked':''}
+              onchange="App.mailSelDomain('${esc(d)}')"> ${esc(d)} ${d===m.active?'<b style="color:var(--success,#3fb950)">✓ active</b>':''}
+          </label>`).join('')}</div>` : ''}
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <input type="text" id="mail-new-domain" placeholder="yourdomain.com" style="width:190px"
+            onkeydown="if(event.key==='Enter')App.mailAddDomain()">
+          <button class="btn btn-pri btn-sm" onclick="App.mailAddDomain()">＋ Add domain</button>
+          ${doms.length ? '<button class="btn btn-ghost btn-sm" onclick="App.mailRemoveDomain()">－ Remove selected</button>' : ''}
+          <span class="help" style="display:inline">every signup rotates across these domains</span>
+        </div>
+        <details style="margin-top:8px"><summary style="font-size:12px">First time? Get a domain into Cloudflare (2 min)</summary>
+          <ol style="margin:6px 0 0 18px;color:var(--muted);font-size:12.5px">
+            <li>Buy a domain anywhere (Namecheap, Porkbun, Cloudflare Registrar…).</li>
+            <li>Add it to a free <a href="https://dash.cloudflare.com" target="_blank">Cloudflare</a> account (Cloudflare gives you 2 nameservers — set them at your registrar).</li>
+          </ol></details>
+      </div>`;
+
+    // step 2 body: one-click deploy
+    const authNote = st.wrangler_authed === true
+      ? '<span style="color:var(--success,#3fb950)">✓ Cloudflare account connected' +
+        (st.account ? ` (${esc(st.account)})` : '') + '</span>'
+      : st.wrangler_authed === false
+        ? '<span style="color:var(--warn)">not connected yet — the deploy opens a Cloudflare login in your browser, once</span>'
+        : '';
+    const s2body = `
+      <div style="margin:4px 0 10px 34px">
+        <p style="color:var(--muted);font-size:12.5px;margin-bottom:8px">
+          One click does everything: installs Node.js if this machine doesn't
+          have it, creates the Cloudflare Worker, KV storage and secret, deploys
+          it, and fills the URL + secret below.
+          ${st.wrangler_authed === false ? 'A browser window opens for the one-time Cloudflare login.' : ''}</p>
+        ${st.node_missing ? '<div style="margin-bottom:8px;font-size:12.5px;color:var(--warn)">⚠ Node.js is not installed — deploying will install it automatically (one time; Windows may ask for the admin prompt).</div>' : ''}
+        ${authNote ? `<div style="margin-bottom:8px;font-size:12.5px">${authNote}</div>` : ''}
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <button class="btn btn-pri" id="mail-deploy-btn" onclick="App.mailDeploy()"
+            ${mailDeploying ? 'disabled' : ''}>${mailDeploying ? 'Deploying…' : (hasUrl ? '↻ Redeploy worker' : '🚀 Deploy worker (one click)')}</button>
+          <span class="help" style="display:inline">installs Node.js automatically if missing; ~1–2 min</span>
+        </div>
+        <div id="mail-deploy-log" style="display:none;margin-top:8px" class="mono-list"></div>
+        ${st.exported === false && st.error ? `<div class="help" style="margin-top:6px;color:var(--err)">${esc(st.error)}</div>` : ''}
+      </div>`;
+
+    // step 3 body: the Cloudflare Email Routing rule (manual, unavoidable)
+    // + final test
+    const s3body = `
+      <div style="margin:4px 0 10px 34px">
+        <p style="color:var(--muted);font-size:12.5px;margin-bottom:8px">
+          Last manual step — tell Cloudflare to hand your domain's mail to the worker
+          (you already did this for your domain):</p>
+        <ol style="margin:0 0 10px 18px;color:var(--muted);font-size:12.5px">
+          <li>Open <a href="https://dash.cloudflare.com" target="_blank">dash.cloudflare.com</a> → your domain → <b>Email → Email Routing</b>.</li>
+          <li>Enable <b>Email Routing</b> if asked, then <b>Routing rules → Catch-all address → Edit</b>.</li>
+          <li>Action: <b>Send to a Worker</b> → pick <b>zai-mail</b> → Save.</li>
+        </ol>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <button class="btn btn-pri btn-sm" onclick="App.mailTest()">Test inbox</button>
+          <span id="mail-msg" style="color:var(--muted);font-size:12px"></span>
+        </div>
+        <p class="help" style="margin-top:8px">Test passes → signups rotate across your
+        domains and read verification mail from your own worker. No Gmail app password.</p>
+      </div>`;
+
+    const steps = [
+      {n:1, title:'Add your domain(s)', body:s1body},
+      {n:2, title:'Deploy the mail worker', body:s2body},
+      {n:3, title:'Route mail to the worker in Cloudflare', body:s3body},
+    ];
+    const startAt = curStep === -1 ? steps.length - 1 : curStep;
+    box.innerHTML = steps.map((s, i) => {
+      const done = stepDone[i];
+      const active = i === startAt && !done;
+      return stepHead(s.n, s.title, done, active) +
+        (active || (i === 2 && stepDone[0] && stepDone[1]) ? s.body : '');
+    }).join('');
+
+    // keep the manual url/secret inputs in sync (below the wizard)
+    const u = $("#mail-inbox-url"); if (u && document.activeElement !== u) u.value = m.inbox_url || "";
+    const sc = $("#mail-inbox-secret"); if (sc && document.activeElement !== sc) sc.placeholder =
+      m.inbox_secret_set ? `saved: ${m.inbox_secret_masked}` : "filled automatically after deploy (or paste your own)";
+  }
+
+  async function mailRender(){
+    await mailRenderWizard();
+  }
+
+  async function mailDeploy(){
+    const btn = $("#mail-deploy-btn");
+    const logBox = $("#mail-deploy-log");
+    mailDeploying = true;
+    if (btn) { btn.disabled = true; btn.textContent = 'Deploying…'; }
+    if (logBox) { logBox.style.display = 'block'; logBox.textContent = 'working…'; }
+    try {
+      const r = await api("/admin/dash/generator/mail/deploy", {method:"POST", body:"{}"});
+      if (logBox) {
+        logBox.textContent = (r.steps || []).map(s => '· ' + s).join('\n')
+          + (r.ok ? '\n✓ done' : '\n✗ ' + (r.error || 'failed'));
+      }
+      if (r.ok) {
+        toast(r.test && r.test.ok ? "worker deployed + inbox reachable" : "worker deployed — run Test inbox", "ok");
+        if (!r.test || !r.test.ok) mailSel = null;
+      } else {
+        toast("deploy failed: " + (r.error || '?'), "err");
+      }
+    } catch (e) {
+      if (logBox) logBox.textContent = '✗ ' + e.message;
+      toast("deploy failed: " + e.message, "err");
+    }
+    mailDeploying = false;
+    mailRender();
+  }
+
+  function mailSelDomain(d){ mailSel = d; mailRender(); }
+  async function mailAddDomain(){
+    const inp = $("#mail-new-domain");
+    const d = inp ? inp.value.trim() : "";
+    if (!d) { toast("type a domain first"); return; }
+    try {
+      const cur = await api("/admin/dash/generator/mail");
+      const doms = [...(cur.domains || []), d];
+      await api("/admin/dash/generator/mail", {method:"POST",
+        body: JSON.stringify({domains: doms, active: mailSel || doms[0]})});
+      if (inp) inp.value = "";
+      mailSel = d;
+      toast("domain added");
+    } catch (e) { toast(e.message); }
+    mailRender();
+  }
+  async function mailRemoveDomain(){
+    if (!mailSel) { toast("select a domain first"); return; }
+    try {
+      const cur = await api("/admin/dash/generator/mail");
+      const doms = (cur.domains || []).filter(x => x !== mailSel);
+      await api("/admin/dash/generator/mail", {method:"POST",
+        body: JSON.stringify({domains: doms, active: doms[0] || ""})});
+      mailSel = doms[0] || null;
+      toast("domain removed");
+    } catch (e) { toast(e.message); }
+    mailRender();
+  }
+  let mailSaveTimer = null;
+  function mailAutoSave(){
+    clearTimeout(mailSaveTimer);
+    mailSaveTimer = setTimeout(() => mailSave(true), 500);
+  }
+  async function mailSave(silent){
+    const val = id => ($("#"+id)||{}).value;
+    const body = {domains: null, inbox_url: val("mail-inbox-url")};
+    const sec = val("mail-inbox-secret");
+    if (sec && sec.trim()) body.inbox_secret = sec;
+    try {
+      await api("/admin/dash/generator/mail", {method:"POST", body: JSON.stringify(body)});
+      if (!silent) { toast("email setup saved", "ok"); const m = $("#mail-msg"); if (m) m.textContent = "✓ saved"; }
+      mailRender();
+    } catch (e) { toast(e.message); if (!silent) { const m = $("#mail-msg"); if (m) m.textContent = "save failed: " + e.message; } }
+  }
+  async function mailTest(){
+    const msg = $("#mail-msg");
+    if (msg) msg.textContent = "testing…";
+    try {
+      const r = await api("/admin/dash/generator/mail/test");
+      const ok = r.ok ? `✓ inbox reachable (${r.status})` : `✗ ${r.error || ("HTTP " + r.status)}`;
+      if (msg) msg.textContent = ok;
+      toast(r.ok ? "inbox reachable" : "inbox test failed", r.ok ? "ok" : "err");
+    } catch (e) { if (msg) msg.textContent = "test failed: " + e.message; }
+  }
+  /* mailExportWorker removed — superseded by mailDeploy (one-click) */
+
+
+  /* ------------ tab: proxy (proxy tools) ------------ */
+  let pxCache = {};
+  async function renderProxyTab(v){
+    let px;
+    try { px = await api("/admin/dash/generator/proxies"); }
+    catch (e) {
+      v.innerHTML = genSetupCard(e.message);
+      pxMounted = false;
+      return;
+    }
+    const ps = px.stats || {};
+    pxCache = ps;
+    const funnel = (id, label, val, color) =>
+      `<span class="kpi" style="padding:6px 10px"><span class="v" id="${id}" style="color:${color||'inherit'}">${val}</span>
+       <span class="k">${label}</span></span>`;
+    const pxLinesHtml = (px.lines || []).slice(-40).map(l =>
+      `<div class="mono" style="font-size:11px;color:var(--faint)">${esc(l)}</div>`).join("");
+    const shell = `
+      <div id="px-container">
+        <div class="card">
+          <h2>Proxy checker</h2>
+          <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:8px">
+            ${funnel("px-raw", "raw", ps.raw || 0)}
+            ${funnel("px-alive", "alive", ps.alive ?? ps.pool ?? 0, "var(--success,#3fb950)")}
+            ${funnel("px-pool", "pool", ps.pool_file || 0)}
+            ${funnel("px-evergood", "ever-good", ps.ever_good_file || 0)}
+            ${funnel("px-socks", "socks", ps.socks || 0)}
+            ${funnel("px-bad", "bad / MITM", ps.bad || 0, "var(--error,#f85149)")}
+            <span class="kpi" id="px-kpi-best" style="padding:6px 10px;display:${ps.best?'inline-flex':'none'}"><span class="v" id="px-best">${ps.best||''}s</span><span class="k">best</span></span>
+            <span class="kpi" id="px-kpi-median" style="padding:6px 10px;display:${ps.median?'inline-flex':'none'}"><span class="v" id="px-median">${ps.median||''}s</span><span class="k">median</span></span>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+            <label class="lbl">max latency s</label>
+            <input type="number" id="px-lat" value="6" step="0.5" min="1" style="width:70px">
+            <label class="lbl">concurrency</label>
+            <input type="number" id="px-conc" value="200" min="20" max="2000" style="width:80px">
+            <button class="btn btn-pri btn-sm" id="px-btn-all" onclick="App.proxyRun('all')"
+              ${px.running ? "disabled" : ""}>⤓ Scrape + Verify</button>
+            <button class="btn btn-ghost btn-sm" id="px-btn-verify" onclick="App.proxyRun('verify')"
+              ${px.running ? "disabled" : ""}>Verify raw</button>
+            <button class="btn btn-ghost btn-sm" id="px-btn-recheck" onclick="App.proxyRun('recheck')"
+              ${px.running ? "disabled" : ""}>↻ Recheck pool</button>
+            <button class="btn btn-ghost btn-sm" id="px-btn-stop" onclick="App.proxyStop()"
+              style="display:${px.running?'inline-block':'none'}">⏹ Stop</button>
+            <span id="px-status" style="color:var(--muted);font-size:12px">
+              ${px.running ? "checking… " + esc(px.action||"") + " (" + (px.elapsed||0) + "s)" : (px.state==='exited'?'finished':(px.state==='failed'?'failed':'idle'))}</span>
+          </div>
+          <div class="help" style="margin-top:6px;color:var(--muted);font-size:11px">
+            qualification: page loads + Aliyun captcha host reachable + valid TLS (anti-MITM) + latency cap.
+            Good ones land in pool + ever-good as they are found.</div>
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-top:8px">
+            <span class="help">live check log</span>
+            <button class="btn btn-quiet btn-sm" onclick="App.pxClearLog()" title="clear log">✕ clear</button>
+          </div>
+          <div id="px-lines" style="margin-top:4px;max-height:260px;overflow:auto;background:var(--field);border:1px solid var(--border);border-radius:8px;padding:8px">${pxLinesHtml}</div>
+        </div>
+        <div class="card">
+          <h2>Custom proxies</h2>
+          <textarea id="px-import" rows="4" placeholder="ip:port  or  proto://ip:port  — one per line"
+            style="width:100%;background:var(--field);color:var(--fg);border:1px solid var(--border);border-radius:8px;padding:8px 11px;font:12px ui-monospace,monospace;outline:none"></textarea>
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px">
+            <input type="file" id="px-file" accept=".txt,.csv" onchange="App.genProxyFile()" style="display:none">
+            <button class="btn btn-ghost btn-sm" onclick="document.getElementById('px-file').click()">⤒ Upload file</button>
+            <button class="btn btn-pri btn-sm" onclick="App.genProxyImport()">＋ Add to pool</button>
+            <span id="px-import-msg" style="color:var(--muted);font-size:12px"></span>
+          </div>
+          <div class="help">Added proxies join the pool immediately — usable before verification.</div>
+        </div>
+        <div class="card">
+          <h2>Proxy sources <span style="font-weight:400;color:var(--muted);font-size:12px">— scrape list</span></h2>
+          <textarea id="px-sources" rows="7" placeholder="proto url  — one per line,  # for comments"
+            style="width:100%;background:var(--field);color:var(--fg);border:1px solid var(--border);border-radius:8px;padding:8px 11px;font:12px ui-monospace,monospace;outline:none"></textarea>
+          <div style="display:flex;gap:8px;align-items:center;margin-top:8px">
+            <button class="btn btn-ghost btn-sm" onclick="App.genLoadSources()">↻ Load current</button>
+            <button class="btn btn-pri btn-sm" onclick="App.genSaveSources()">Save sources</button>
+            <span id="px-sources-msg" style="color:var(--muted);font-size:12px"></span>
+          </div>
+          <div class="help">Used by “Scrape + Verify”. Add or remove source lists here.</div>
+        </div>
+      </div>`;
+    if (!pxMounted || !$("#px-container")) {
+      v.innerHTML = shell;
+      pxMounted = true;
+      genLoadSources();
+      return;
+    }
+    // dynamic-only update: stats + buttons + log
+    const setT = (id, val) => { const el = $(id); if (el) el.textContent = val; };
+    setT("#px-raw", ps.raw || 0);
+    setT("#px-alive", ps.alive ?? ps.pool ?? 0);
+    setT("#px-pool", ps.pool_file || 0);
+    setT("#px-evergood", ps.ever_good_file || 0);
+    setT("#px-socks", ps.socks || 0);
+    setT("#px-bad", ps.bad || 0);
+    if (ps.best) { setT("#px-best", ps.best + "s"); const k = $("#px-kpi-best"); if (k) k.style.display = "inline-flex"; }
+    if (ps.median) { setT("#px-median", ps.median + "s"); const k = $("#px-kpi-median"); if (k) k.style.display = "inline-flex"; }
+    const all = $("#px-btn-all"); if (all) all.disabled = !!px.running;
+    const ver = $("#px-btn-verify"); if (ver) ver.disabled = !!px.running;
+    const rec = $("#px-btn-recheck"); if (rec) rec.disabled = !!px.running;
+    const stop = $("#px-btn-stop"); if (stop) stop.style.display = px.running ? "inline-block" : "none";
+    const stEl = $("#px-status");
+    if (stEl) stEl.textContent = px.running
+      ? ("checking… " + esc(px.action||"") + " (" + (px.elapsed||0) + "s)")
+      : (px.state === 'exited' ? 'finished' : (px.state === 'failed' ? 'failed' : 'idle'));
+    const pxBox = $("#px-lines");
+    if (pxBox && pxBox.innerHTML !== pxLinesHtml) {
+      const atBottom = pxBox.scrollHeight - pxBox.scrollTop <= pxBox.clientHeight + 20;
+      pxBox.innerHTML = pxLinesHtml;
+      if (atBottom) pxBox.scrollTop = pxBox.scrollHeight;
+    }
+  }
+  function pxClearLog(){
+    const box = $("#px-lines"); if (box) box.innerHTML = "";
+  }
+
+  /* ------------ tab: guide ------------ */
+  function renderGuide(v){
+    v.innerHTML = `<div class="guide">
+    <div class="card"><h2>Add your first account</h2>
+      <div class="steps">
+        <div><b>1</b><span>Click Login with Zcode</span></div>
+        <div><b>2</b><span>Approve access in your browser</span></div>
+        <div><b>3</b><span>Done — no Zcode install needed</span></div>
+      </div>
+      <ol>
+        <li>On the <a href="#" onclick="App.tab('accounts');return false">Accounts</a>
+            tab, click <kbd>🔑 Login with Zcode</kbd>. The browser approval link appears.</li>
+        <li>Click <kbd>Open login page</kbd>, sign in to your Zcode account and approve access.</li>
+        <li>The account is registered, snapshotted into
+            <span class="mono">accounts\\</span>, and joins the pool automatically.</li>
+      </ol>
+      <p class="note">Already have Zcode installed and signed in? <kbd>⤓ Import from
+        Zcode</kbd> snapshots the app’s current account instead — same result.</p>
+    </div>
+    <div class="grid2">
+      <div class="card"><h2>More accounts (load balancing)</h2>
+        <ol>
+          <li>In Zcode, sign out and sign in with the next account.</li>
+          <li>Click <kbd>⤓ Import from Zcode</kbd> again — each import adds one snapshot.</li>
+          <li><kbd>Reload pool</kbd>. Every account in the folder joins the rotation.</li>
+        </ol>
+        <p class="note">More accounts = more free-tier daily caps to spread across.
+          Zcode tokens are long-lived; revoked credentials need a new login or import.</p>
+      </div>
+      <div class="card"><h2>Accounts from another machine</h2>
+        <p style="color:var(--muted); font-size:13px">Copy any account snapshot
+          (<span class="mono">&lt;email&gt;.txt</span>) into the
+          <span class="mono">accounts\\</span> folder next to the exe, then
+          <kbd>Reload pool</kbd>. Snapshots are portable between machines.</p>
+      </div>
+      <div class="card"><h2>Point your tools at it</h2>
+        <p style="color:var(--muted); font-size:13px">Use the endpoints and keys on the
+          <a href="#" onclick="App.tab('server');return false">Server</a> tab with any
+          OpenAI- or Anthropic-compatible client (Kilo, Zcode's openai-compatible
+          provider, the SDKs, curl).</p>
+      </div>
+      <div class="card"><h2>Stopping</h2>
+        <p style="color:var(--muted); font-size:13px">The <kbd>Stop</kbd> button (top right)
+          or simply closing the window quits the tool and frees the port. Launch the exe
+          again to start it back up.</p>
+      </div>
+      <div class="card"><h2>Updates</h2>
+        <p style="color:var(--muted); font-size:13px">Update checks are disabled by default until ZcodeGate releases are published. You can enable the ZcodeGate release feed in Settings. When one exists, a <b>🔔</b> appears in the top bar — click it,
+          then <kbd>Update now</kbd>. The tool downloads the new exe, swaps it in, and
+          relaunches itself. Turn this off in Settings → Updates.</p>
+      </div>
+    </div></div>`;
+  }
+
+  /* ------------ tab switching + polling ------------ */
+  const RENDER = {accounts:renderAccounts, generator:renderGenerator, proxy:renderProxyTab, models:renderModels, server:renderServer,
+                  settings:renderSettings, stats:renderStats, logs:renderLogs,
+                  guide:renderGuide};
+
+  function tab(name){
+    if (curTab === "generator" || name !== "generator") {
+      genMounted = false;
+    }
+    if (curTab === "proxy" || name !== "proxy") {
+      pxMounted = false;
+    }
+    curTab = name;
+    document.querySelectorAll(".nav-btn").forEach(b =>
+      b.classList.toggle("on", b.dataset.tab === name));
+    $("#tab-title").textContent = name[0].toUpperCase() + name.slice(1);
+    refresh();
+    restartTimer();
+  }
+  function refresh(){
+    const v = $("#view");
+    if (curTab === "accounts") { const q = $("#acct-q"); if (q) cache.acctQ = q.value; }
+    if (curTab === "models")   { const q = $("#mdl-q");  if (q) cache.mdlQ  = q.value; }
+    RENDER[curTab](v).catch(e => { v.innerHTML =
+      `<div class="card"><div class="empty"><h3>Could not load</h3><p>${esc(e.message)}</p></div></div>`; });
+    paintChips();
+  }
+  function restartTimer(){
+    clearInterval(timer);
+    // live tabs poll; static tabs don't
+    const live = {accounts:4000, generator:3000, proxy:2000, models:6000, logs:3000, stats:8000}[curTab];
+    if (live) timer = setInterval(() => refresh(), live);
+  }
+
+  /* ------------ boot ------------ */
+  async function boot(){
+    paintChips();
+    tab("accounts");
+    try {
+      const s = await api("/admin/dash/server");
+      $("#foot-ver").textContent = "v" + s.version + " · " + s.host + ":" + s.port;
+    } catch (e) {}
+    setInterval(paintChips, 10000);   // chips poll independently of tab polling
+  }
+  async function start(){
+    if (!key) {
+      // maybe the key was never needed (single-user local default)? probe once
+      try { await api("/admin/dash/server"); }
+      catch (e) { showLogin(); return; }
+    }
+    try { await api("/admin/dash/server"); } catch (e) { showLogin(); return; }
+    hideLogin(); boot();
+  }
+
+  return {start, login, tab, refresh, renderAccounts, renderGenerator, renderProxyTab, renderModels, renderLogs,
+          mailRender, mailAddDomain, mailRemoveDomain, mailSelDomain, mailSave, mailTest, mailAutoSave, mailDeploy, pxClearLog,
+          genLocate,
+          sortModels, filterModels, filterAccounts, syncModels, doImport, doReload, acct, acctRemove, saveSettings,
+          regenKeys, clearLogs, toggleServer, copy,
+          showUpdate, hideUpdate, skipUpdate, doUpdate,
+          loginStart, loginCancel, genStart, genStop, genStopAll, genSaveOptions, genAutoSave, genIpChanged,
+          proxyRun, proxyStop, genProxyImport, genProxyFile, genLoadSources, genSaveSources,
+          genClearWorkers};
+})();
+window.addEventListener("DOMContentLoaded", App.start);
+</script>
+</body>
+</html>

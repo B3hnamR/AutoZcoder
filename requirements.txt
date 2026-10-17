@@ -1,0 +1,10 @@
+# AutoZCoder gateway runtime dependencies
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.32,<1.0
+httpx>=0.27,<1.0
+pydantic>=2.9,<3.0
+PyYAML>=6.0,<7.0
+
+# desktop shell (WebView2 window for the dashboard) — omit for headless servers
+pywebview>=6.0,<7.0
+pythonnet>=3.0,<4.0

@@ -1,0 +1,66 @@
+name: release
+
+# Build the single-file exe and attach it (+ SHA-256) to a GitHub Release.
+# Trigger: push a version tag, e.g.  git tag v0.4.0 && git push --tags
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag matches app version
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}".TrimStart("v")
+          $line = Select-String -Path zcode_gateway\__init__.py -Pattern '__version__ = "([^"]+)"'
+          if (-not $line) { throw "no __version__ found in zcode_gateway/__init__.py" }
+          $ver = $line.Matches[0].Groups[1].Value
+          if ($tag -ne $ver) {
+            throw "tag v$tag does not match __version__ $ver - bump zcode_gateway/__init__.py (and tools/exe_version.txt) before tagging"
+          }
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Create venv + install deps
+        run: |
+          python -m venv .venv
+          .\.venv\Scripts\python -m pip install --upgrade pip
+          .\.venv\Scripts\python -m pip install -r requirements.txt -r requirements-dev.txt
+      - name: Run tests
+        run: .\.venv\Scripts\python -m pytest tests -q
+
+  build:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Create venv + install build deps
+        run: |
+          python -m venv .venv
+          .\.venv\Scripts\python -m pip install --upgrade pip
+          .\.venv\Scripts\python -m pip install -r requirements.txt pyinstaller
+      - name: Build exe
+        run: .\build-exe.ps1
+      - name: Checksum
+        run: |
+          $h = (Get-FileHash .\dist\ZcodeGateway.exe -Algorithm SHA256).Hash.ToLower()
+          "$h  ZcodeGateway.exe" | Out-File -Encoding ascii .\dist\checksums.sha256
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/ZcodeGateway.exe
+            dist/checksums.sha256
+          generate_release_notes: true

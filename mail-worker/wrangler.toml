@@ -1,0 +1,13 @@
+name = "zai-mail"
+main = "src/index.js"
+compatibility_date = "2025-01-01"
+
+# The KV namespace id below is a placeholder. The one-click deploy resolves the
+# real id at deploy time: it looks for a namespace titled "MAIL" in your account
+# and reuses it, otherwise it creates one and writes the id back into this file.
+[[kv_namespaces]]
+binding = "MAIL"
+id = "00000000000000000000000000000000"
+
+# INBOX_SECRET is a Worker SECRET, not a var — set it via the one-click deploy
+# (or: wrangler secret put INBOX_SECRET). Do NOT add it under [vars].

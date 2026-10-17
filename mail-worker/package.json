@@ -1,0 +1,16 @@
+{
+  "name": "mail-worker",
+  "version": "1.0.0",
+  "description": "Catch-all mail for `behnamrjd.me` → this Worker → KV → the generator polls it over HTTP. No Gmail, no IMAP, no app password.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "devDependencies": {
+    "wrangler": "^4.151.0"
+  }
+}

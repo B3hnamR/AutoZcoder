@@ -1,0 +1,339 @@
+"""Upstream layer: fingerprint headers, body variants, HTTP client, error model.
+
+All shapes here come from the Phase-1 capture. Do not "improve" the header set
+or the body variants without re-capturing — the upstream fingerprints the client.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import time
+import uuid
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any, AsyncIterator
+
+import httpx
+
+from .config import UpstreamConfig
+
+log = logging.getLogger("zcode_gateway.upstream")
+
+# --------------------------------------------------------------------------- #
+# headers
+# --------------------------------------------------------------------------- #
+
+# The 16 static headers observed on every captured call. `authorization` and
+# `x-task-id` are filled per request; `host` and `content-length` are set by httpx.
+STATIC_HEADERS = {"accept": "*/*", "content-type": "application/json",
+                  "http-referer": "https://zcode.z.ai",
+                  "anthropic-version": "2023-06-01",
+                  "anthropic-beta": "mid-conversation-system-2026-04-07"}
+REQUIRED_HEADER_NAMES = set(STATIC_HEADERS) | {"authorization", "x-api-key", "x-device-mid",
+    "user-agent", "x-zcode-app-version", "x-zcode-agent"}
+VARIANTS = ("anthropic",)
+
+def new_task_id():
+    return str(uuid.uuid4())
+
+def build_headers(access_token, fp, task_id=None, *, device_mid=None, include_device_mid=True):
+    token = access_token.removeprefix("Bearer ").strip()
+    h = dict(STATIC_HEADERS)
+    h.update({"authorization": "Bearer " + token, "x-api-key": token,
+        "user-agent": fp.user_agent, "x-device-mid": device_mid or fp.device_mid,
+        "x-client-language": fp.language, "x-client-timezone": fp.timezone,
+        "x-os-category": fp.os_category, "x-os-version": fp.os_version,
+        "x-platform": fp.platform, "x-release-channel": "production",
+        "x-title": "Z Code@electron", "x-zcode-agent": "glm",
+        "x-zcode-app-version": fp.client_version, "x-zcode-session-type": "main",
+        "x-query-id": new_task_id(), "x-request-id": new_task_id(),
+        "x-zcode-trace-id": new_task_id(), "x-session-id": task_id or new_task_id()})
+    # The model captures carry the device in metadata, while billing/OAuth
+    # requests carry X-Device-Mid. Keep those two observed header sets distinct.
+    if not include_device_mid:
+        h.pop('x-device-mid')
+    return h
+
+def build_upstream_body(payload, variant="anthropic", default_max_tokens=128000,
+                        anthropic_cache_control=True):
+    from .zcode_protocol import build_body
+    return build_body(payload, default_max_tokens)
+
+
+# --------------------------------------------------------------------------- #
+# errors
+# --------------------------------------------------------------------------- #
+
+
+class ErrorKind(str, Enum):
+    OK = "ok"
+    INSUFFICIENT_CREDITS = "insufficient_credits"
+    UNAUTHORIZED = "unauthorized"
+    ENTITLEMENT = "entitlement"     # 403: no plan/subscription for THIS model
+    EDGE_BLOCK = "edge_block"       # 403 HTML from the CDN/edge, not the API
+    RATE_LIMITED = "rate_limited"
+    SERVER = "server"
+    CLIENT = "client"
+    TRANSPORT = "transport"
+
+
+# Codes that mean "this account cannot use this model", not "this account is bad".
+ENTITLEMENT_CODES = frozenset({
+    "ENTITLEMENT_ERROR",
+    "NOT_SUBSCRIBED",
+    "PLAN_REQUIRED",
+    "MODEL_NOT_IN_PLAN",
+})
+
+
+def is_entitlement_code(code: str) -> bool:
+    """Single source of truth for entitlement classification.
+
+    Three call sites used to classify independently (this frozenset plus two
+    substring checks), and they had already drifted: NOT_SUBSCRIBED matched
+    here but not the substring test. Accepts exact codes and any code
+    containing ENTITLEMENT/SUBSCRIB/PLAN (covers future plan-gate codes).
+    """
+    c = (code or "").upper()
+    if not c:
+        return False
+    if c in ENTITLEMENT_CODES:
+        return True
+    return ("ENTITLEMENT" in c) or ("SUBSCRIB" in c) or ("PLAN" in c)
+
+
+# Abuse-heuristic rejection: HTTP 405 + code 3012, message
+# "request has been blocked due to unusual activity." It is neither a quota nor
+# an account defect, and it is scoped to one account AND one model at a time —
+# the same account keeps serving other models (captured: GLM-5.3 blocked while
+# GLM-5.3-Flash still returns 200). Treated like a per-model park: the account
+# is skipped for that model and the request rotates to the next account.
+BLOCKED_CODES = frozenset({"3012"})
+
+
+def is_block_code(code: str) -> bool:
+    return str(code or "").upper() in BLOCKED_CODES
+
+
+def _error_code(body: str | bytes | None) -> str:
+    """Best-effort extraction of error.code from a JSON error body."""
+    text = body.decode("utf-8", "replace") if isinstance(body, bytes) else (body or "")
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        return ""
+    err = parsed.get("error", parsed)
+    if isinstance(err, dict):
+        return str(err.get("code") or "").upper()
+    return ""
+
+
+# Captured 2026-09-16: a global 403 served as HTML by Google's front end, for every
+# model regardless of entitlement:
+#   <html>...<title>403 Forbidden</title>...
+#   <h2>Your client does not have permission to get URL
+#       <code>/api/v1/chat/completions</code> from this server.</h2>
+# This is infrastructure, not the API, and not the account's fault.
+EDGE_BLOCK_MARKERS = (
+    "does not have permission to get url",
+    "403 forbidden",
+    "error: forbidden",
+)
+
+
+def _looks_like_edge_block(body: str | bytes | None) -> bool:
+    text = (body.decode("utf-8", "replace") if isinstance(body, bytes)
+            else (body or "")).lower()
+    if "<html" not in text:
+        return False
+    return any(marker in text for marker in EDGE_BLOCK_MARKERS)
+
+
+def classify(status: int, body: str | bytes | None = None) -> ErrorKind:
+    info = parse_upstream_error(status, body)
+    if info["code"] == "11113":
+        return ErrorKind.INSUFFICIENT_CREDITS
+    if status == 200:
+        return ErrorKind.OK
+    if status == 401:
+        return ErrorKind.UNAUTHORIZED
+    if status == 403:
+        if is_entitlement_code(_error_code(body)):
+            return ErrorKind.ENTITLEMENT
+        if _looks_like_edge_block(body):
+            return ErrorKind.EDGE_BLOCK
+        return ErrorKind.CLIENT
+    if status == 402:
+        return ErrorKind.INSUFFICIENT_CREDITS
+    if status == 429:
+        return ErrorKind.RATE_LIMITED
+    if 500 <= status < 600:
+        return ErrorKind.SERVER
+    return ErrorKind.CLIENT
+
+
+def edge_block_message(body: str | bytes | None) -> str:
+    """Short, human-readable summary of an edge block (bodies are HTML)."""
+    text = (body.decode("utf-8", "replace") if isinstance(body, bytes)
+            else (body or ""))
+    lowered = text.lower()
+    if "does not have permission to get url" in lowered:
+        return ("upstream edge rejected the request (403): the client has no "
+                "permission for this URL")
+    return "upstream edge rejected the request (403 Forbidden)"
+
+
+def parse_upstream_error(status: int, body: str | bytes | None) -> dict[str, Any]:
+    """Normalise an upstream error body (captured shape) into a dict."""
+    text = body.decode("utf-8", "replace") if isinstance(body, bytes) else (body or "")
+    try:
+        parsed = json.loads(text)
+        err = parsed.get("error", parsed)
+        if isinstance(err, dict):
+            return {
+                "code": str(err.get("code") or err.get("type") or f"http_{status}"),
+                "message": err.get("message") or err.get("msg") or text[:400],
+                "raw": parsed,
+            }
+    except Exception:
+        pass
+    return {"code": f"http_{status}", "message": text[:400], "raw": None}
+
+
+# Mapping for the OpenAI-compatible error envelope.
+ERROR_TYPE_BY_STATUS = {
+    400: "invalid_request_error",
+    401: "authentication_error",
+    402: "insufficient_quota",
+    403: "permission_error",
+    404: "not_found_error",
+    413: "invalid_request_error",
+    429: "rate_limit_error",
+    500: "server_error",
+    502: "server_error",
+    503: "server_error",
+    504: "server_error",
+}
+
+
+def openai_error(status: int, code: str, message: str,
+                 extra: dict[str, Any] | None = None) -> dict[str, Any]:
+    error = {
+        "message": message,
+        "type": ERROR_TYPE_BY_STATUS.get(status, "api_error"),
+        "param": None,
+        "code": code,
+    }
+    if extra:
+        error.update(extra)
+    return {"error": error}
+
+
+def anthropic_error(status: int, code: str, message: str,
+                    extra: dict[str, Any] | None = None) -> dict[str, Any]:
+    # Anthropic error types: invalid_request_error, authentication_error,
+    # permission_error, not_found_error, request_too_large, rate_limit_error,
+    # api_error, overloaded_error
+    mapping = {
+        400: "invalid_request_error",
+        401: "authentication_error",
+        403: "permission_error",
+        404: "not_found_error",
+        413: "request_too_large",
+        429: "rate_limit_error",
+    }
+    if status >= 500:
+        etype = "overloaded_error" if status == 529 else "api_error"
+    else:
+        etype = mapping.get(status, "api_error")
+    error: dict[str, Any] = {"type": etype, "message": message}
+    # Anthropic's envelope has no standard code field, but clients doing
+    # programmatic retry need the machine-readable code the OpenAI dialect
+    # already exposes — carry it as an additive field (ignored by strict clients)
+    if code:
+        error["code"] = code
+    if extra:
+        error.update(extra)
+    return {"type": "error", "error": error}
+
+
+# --------------------------------------------------------------------------- #
+# client
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class UpstreamResponse:
+    status_code: int
+    headers: dict[str, str]
+    _resp: httpx.Response
+
+    async def aread(self) -> bytes:
+        return await self._resp.aread()
+
+    def aiter_bytes(self) -> AsyncIterator[bytes]:
+        return self._resp.aiter_bytes()
+
+    async def aclose(self) -> None:
+        await self._resp.aclose()
+
+
+class UpstreamClient:
+    """Thin httpx wrapper. Adds nothing to the request the caller did not set."""
+
+    def __init__(self, cfg: UpstreamConfig) -> None:
+        self.cfg = cfg
+        self._client = httpx.AsyncClient(
+            timeout=httpx.Timeout(cfg.timeout_read, connect=cfg.timeout_connect),
+            limits=httpx.Limits(max_connections=200, max_keepalive_connections=50),
+            headers={},          # never inject a default User-Agent
+            follow_redirects=False,
+            http2=False,
+        )
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
+
+    async def send(self, headers: dict[str, str], body: dict[str, Any],
+                   stream: bool) -> UpstreamResponse:
+        req = self._client.build_request(
+            "POST", self.cfg.chat_url, headers=headers, json=body,
+        )
+        try:
+            resp = await self._client.send(req, stream=stream)
+        except httpx.HTTPError as exc:
+            raise TransportError(str(exc)) from exc
+        return UpstreamResponse(
+            status_code=resp.status_code,
+            headers={k.lower(): v for k, v in resp.headers.items()},
+            _resp=resp,
+        )
+
+
+class TransportError(Exception):
+    """Network-level failure — safe to retry on another account."""
+
+
+# --------------------------------------------------------------------------- #
+# SSE helpers
+# --------------------------------------------------------------------------- #
+
+
+def iter_sse_events(chunk_text):
+    events = []
+    for frame in __import__('re').split(r'\r\n\r\n|\n\n|\r\r', chunk_text):
+        lines = [line[5:].lstrip(' ') for line in frame.splitlines() if line.startswith('data:')]
+        if not lines: continue
+        data = '\n'.join(lines)
+        if data == '[DONE]':
+            events.append(data)
+            continue
+        try: events.append(json.loads(data))
+        except json.JSONDecodeError: pass
+    return events
+
+
+def sse_frame(obj: dict[str, Any]) -> bytes:
+    return ("data: " + json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+            + "\n\n").encode("utf-8")

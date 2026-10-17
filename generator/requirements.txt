@@ -1,0 +1,12 @@
+# AutoZCoder generator dependencies
+# Install into a normal Python (not the packaged exe) and then:
+#   python -m playwright install chromium
+playwright
+ddddocr
+opencv-python
+Pillow
+numpy
+requests
+urllib3
+certifi
+pysocks
