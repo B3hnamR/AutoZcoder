@@ -677,6 +677,45 @@ class GeneratorManager:
                                 "chat_token": token})
         return out
 
+    # ---- 100M referral finisher --------------------------------------------- #
+    # The invite chain needs: bind + login_device + ONE client message. The
+    # message sits behind Aliyun risk control, which answers 405/3012 until it
+    # relents (same behaviour the relay sees). So an account that got 2/3 is
+    # remembered here and retried in the background until the reward issues.
+
+    def _pending_ref_path(self) -> Path:
+        return self.data_dir / "pending_referral.json"
+
+    def pending_referrals(self) -> dict:
+        """{email: zcodeJWT} for accounts still waiting on the send_message task."""
+        try:
+            data = json.loads(self._pending_ref_path().read_text(encoding="utf-8"))
+            return {str(k): str(v) for k, v in (data.get("pending") or {}).items() if v}
+        except (OSError, ValueError):
+            return {}
+
+    def _save_pending_refs(self, pending: dict) -> None:
+        p = self._pending_ref_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps({"pending": pending}, indent=1), encoding="utf-8")
+        os.replace(tmp, p)
+
+    def add_pending_referral(self, email: str, zjwt: str) -> None:
+        email, zjwt = str(email or "").strip().lower(), str(zjwt or "").strip()
+        if not email or not zjwt:
+            return
+        pending = self.pending_referrals()
+        pending[email] = zjwt
+        self._save_pending_refs(pending)
+
+    def remove_pending_referral(self, email: str) -> None:
+        email = str(email or "").strip().lower()
+        pending = self.pending_referrals()
+        if email in pending:
+            pending.pop(email)
+            self._save_pending_refs(pending)
+
     def export_worker(self, dest: str | Path = None) -> dict:
         """Copy the bundled mail-worker source to disk so the user can deploy it.
 

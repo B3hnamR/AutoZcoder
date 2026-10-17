@@ -466,6 +466,62 @@ async def dash_server(request: Request, key: str = Depends(admin_key)) -> dict:
 
 # ---- account generator (ZCODEAUTO integration) ----------------------------- #
 
+def _referral_needs_finish(zjwt: str) -> bool:
+    """True when the invite chain is at 2/3 — bound + login done, message still
+    blocked by risk control (405/3012). Those accounts can be completed later."""
+    try:
+        from .generator import resolve_zcodeauto_dir
+        gen_dir, _checked = resolve_zcodeauto_dir("")
+        if gen_dir is None:
+            return False
+        sys.path.insert(0, str(gen_dir))
+        from invite_claim import referral_summary
+        s = referral_summary(zjwt, log=lambda *a: None) or {}
+        t = s.get("tasks") or {}
+        return bool(t.get("referral_bind_code")) and not t.get("send_message")
+    except Exception:
+        return False
+
+
+def _start_referral_finisher(mgr, interval_sec: int = 600) -> None:
+    """Background loop: retry the pending send_message task until the 100M
+    referral reward issues. Mirrors the relay's stance that 3012 is transient."""
+    if getattr(mgr, "_finisher_started", False):
+        return
+    mgr._finisher_started = True
+    stop = threading.Event()
+
+    def _loop():
+        while not stop.wait(interval_sec):
+            try:
+                pending = mgr.pending_referrals()
+                if not pending:
+                    continue
+                sys.path.insert(0, str(mgr.gen_dir))
+                from invite_claim import send_one_message, referral_summary
+                for email, zjwt in list(pending.items()):
+                    try:
+                        s = referral_summary(zjwt, log=lambda *a: None) or {}
+                        tasks = s.get("tasks") or {}
+                        if tasks.get("send_message") or s.get("issued"):
+                            mgr.remove_pending_referral(email)
+                            log.info("generator: 100M referral already complete for %s", email)
+                            continue
+                        if tasks.get("referral_bind_code"):
+                            if send_one_message(zjwt, log=lambda *a: None):
+                                mgr.remove_pending_referral(email)
+                                log.info("generator: 100M referral FINISHED for %s "
+                                         "(message sent, reward issued)", email)
+                            else:
+                                log.debug("generator: referral message still blocked for %s", email)
+                    except Exception:
+                        log.debug("generator: referral retry failed for %s", email, exc_info=True)
+            except Exception:
+                log.exception("generator: referral finisher loop error")
+
+    threading.Thread(target=_loop, name="referral-finisher", daemon=True).start()
+
+
 def _find_zcodeauto(state) -> tuple[Path | None, list[Path]]:
     """Resolve the generator folder (the one holding main.py)."""
     from .generator import resolve_zcodeauto_dir
@@ -587,6 +643,16 @@ def _generator(request: Request):
                         mgr.mark_registered(email)   # done → never re-register
                     except Exception:
                         pass
+                    # 2/3 referral (bind ok, message blocked by risk control):
+                    # remember it so the background finisher can complete it
+                    if chosen_plan != "zcode-v3-start-plan-referral":
+                        try:
+                            if _referral_needs_finish(zjwt):
+                                mgr.add_pending_referral(email, zjwt)
+                                log.info("generator: %s queued for 100M referral "
+                                         "finish (message task pending)", email)
+                        except Exception:
+                            log.exception("generator: referral queue check failed")
             except Exception:
                 log.exception("generator: pool registration failed for %s", email)
 
@@ -622,6 +688,8 @@ def _generator(request: Request):
                                      daemon=True).start()
         except Exception:
             log.exception("generator: catch-up scan failed")
+
+        _start_referral_finisher(mgr)
     return mgr
 
 

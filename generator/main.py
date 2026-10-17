@@ -1124,7 +1124,8 @@ def main():
                         zjwt, _ = device_login(token, log=logger.info)
                         if zjwt:
                             inv = claim_invite(token, invite_code, log=logger.info,
-                                               zjwt=zjwt, headless=IS_HEADLESS)
+                                               zjwt=zjwt, headless=IS_HEADLESS,
+                                               captcha_param=captcha_param)
                             s = inv.get('summary') or {}
                             global_build = bool(s.get('issued'))
                     except Exception as e:

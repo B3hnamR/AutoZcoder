@@ -226,3 +226,22 @@ def test_zai_proxy_direct_sentinel_is_not_a_proxy():
             os.environ["ZAI_PROXY"] = saved
     except ImportError:
         pass   # requests not installed in this env — skip
+
+def test_invite_captcha_param_is_header_safe():
+    import sys
+    gen = Path(__file__).resolve().parent.parent / "generator"
+    if not gen.is_dir():
+        return
+    sys.path.insert(0, str(gen))
+    try:
+        import invite_claim as ic
+    except ImportError:
+        return    # playwright not installed in this env — generator-side only
+    # the old _captcha_param returned (param, region) and that tuple was used
+    # directly as an HTTP header value -> InvalidHeader crash
+    assert ic._norm_captcha_param(None) is None
+    assert ic._norm_captcha_param("") is None
+    assert ic._norm_captcha_param(("p", "region")) == "p"
+    assert ic._norm_captcha_param(["q"]) == "q"
+    assert ic._norm_captcha_param("abc") == "abc"
+    assert isinstance(ic.CAPTCHA_HOOK, str) and "11xygtvd" in ic.CAPTCHA_HOOK
