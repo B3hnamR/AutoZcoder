@@ -205,6 +205,73 @@ def resolve_python(explicit: str = "") -> str:
     return found or sys.executable
 
 
+class PlaywrightSetup:
+    """On-demand installer for the generator's browser dependency.
+
+    The exe cannot bundle Playwright + Chromium (~200 MB); instead, the first
+    time a signup worker or 100M claim needs a browser, missing pieces are
+    installed into the system Python right then: `pip install playwright`
+    and `playwright install chromium`. Progress streams into the dashboard
+    log so the user sees what is happening."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._done = False           # verified once per process
+        self._installing = False
+
+    def status(self) -> dict:
+        return {"installing": self._installing, "ready": self._done}
+
+    def _run(self, argv: list[str], emit) -> bool:
+        try:
+            proc = subprocess.Popen(
+                argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="replace",
+                cwd=str(Path(argv[0]).parent) if os.path.isfile(argv[0]) else None,
+                **_no_window())
+        except Exception as e:
+            emit(f"  playwright setup failed to start: {type(e).__name__}: {e}")
+            return False
+        for line in proc.stdout or []:
+            line = line.rstrip()
+            if line:
+                emit(f"  {line[:160]}")
+        proc.wait()
+        return proc.returncode == 0
+
+    def ensure(self, python_exe: str, emit=print) -> bool:
+        """Make sure `python_exe` can run Playwright + Chromium. Fast no-op
+        when everything is already installed."""
+        with self._lock:
+            if self._done:
+                return True
+            self._installing = True
+        try:
+            py = python_exe
+            # 1) package present?
+            chk = subprocess.run([py, "-c", "import playwright"],
+                                 capture_output=True, **_no_window())
+            if chk.returncode != 0:
+                emit("playwright not found — installing into your Python "
+                     "(one-time, ~40 MB)…")
+                if not self._run([py, "-m", "pip", "install", "--upgrade",
+                                  "playwright"], emit):
+                    emit("  playwright install FAILED — see lines above")
+                    return False
+            # 2) chromium browser present? `playwright install` is idempotent:
+            # it verifies the cache and exits fast when up to date.
+            emit("checking chromium browser (one-time setup)…")
+            if not self._run([py, "-m", "playwright", "install", "chromium"],
+                             emit):
+                emit("  chromium install FAILED — see lines above")
+                return False
+            self._done = True
+            emit("playwright ready ✓")
+            return True
+        finally:
+            self._installing = False
+
+
 class GenWorker:
     def __init__(self, name: str, argv: list[str], env: dict[str, str],
                  gen_dir: Path, on_exit=None):
@@ -893,6 +960,8 @@ class GeneratorManager:
         self._lock = threading.Lock()
         # per-run internal auth token for gateway admin calls from children
         self.internal_token = ""
+        # on-demand playwright installer (signup workers + 100M claims)
+        self.playwright = PlaywrightSetup()
         # options (dashboard-editable)
         self.captcha = "manual"             # auto | manual — default: you solve it
         self.ip_source = "direct"           # socks | pool | direct | pin — default: my network (no proxy)
@@ -1707,6 +1776,14 @@ class GeneratorManager:
 
     # ---- workers ------------------------------------------------------------
 
+    def _ensure_playwright(self, emit=None) -> bool:
+        """Signup workers and claims drive a real Chromium via Playwright.
+        The dependency is installed on first use, into the system Python —
+        never bundled in the exe."""
+        if emit is None:
+            emit = lambda line: log.info("playwright-setup: %s", line)
+        return self.playwright.ensure(self.python_exe, emit)
+
     def start_workers(self, count: int = 1) -> dict:
         with self._lock:
             started = []
@@ -1720,6 +1797,13 @@ class GeneratorManager:
                 w.start()
                 started.append(name)
         return {"started": started}
+
+    def start_workers_checked(self, count: int = 1, emit=print) -> dict:
+        """start_workers, but with a guaranteed Playwright setup first
+        (streams one-time install progress to the caller via `emit`)."""
+        if not self._ensure_playwright(emit):
+            return {"error": "playwright setup failed — check the log"}
+        return self.start_workers(count)
 
     def _worker_env(self, name: str) -> dict[str, str]:
         env = {
@@ -1833,6 +1917,8 @@ class GeneratorManager:
                 mode = "direct"
         else:
             proxy = ""
+        if not self._ensure_playwright():
+            return {"error": "playwright setup failed — check the log"}
         name = f"claim-{int(time.time())}"
         job = ClaimJob(name, email, mode, proxy, self.gen_dir,
                        self.python_exe, self._invite_code,

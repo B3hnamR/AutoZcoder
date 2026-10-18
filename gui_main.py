@@ -144,6 +144,77 @@ def _run_server() -> None:
             time.sleep(min(2 ** attempts, 15))
 
 
+def _webview2_available() -> bool:
+    """True when the WebView2 runtime this exe needs is installed.
+
+    Checks the registry keys the WebView2 Evergreen runtime writes, plus
+    the folder-based install. pywebview's edgechromium GUI hard-crashes on
+    machines without it (clean Windows, Server, LTSC) — we detect it up
+    front and offer the browser dashboard instead of a crash.
+    """
+    try:
+        import winreg
+    except ImportError:
+        return True          # not Windows: let webview decide
+    probes = (
+        (winreg.HKEY_LOCAL_MACHINE,
+         r"Software\WOW6432Node\Microsoft\EdgeUpdate\Clients\"
+         r"{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"),
+        (winreg.HKEY_LOCAL_MACHINE,
+         r"Software\Microsoft\EdgeUpdate\Clients\"
+         r"{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"),
+        (winreg.HKEY_CURRENT_USER,
+         r"Software\Microsoft\EdgeUpdate\Clients\"
+         r"{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"),
+    )
+    for hive, path in probes:
+        try:
+            with winreg.OpenKey(hive, path) as k:
+                winreg.QueryValueEx(k, "pv")
+                return True
+        except OSError:
+            continue
+    # folder-based per-app install next to the exe
+    try:
+        if any((Path(os.environ.get("PROGRAMFILES(X86)", "")) / "Microsoft" / "EdgeWebView" / "Application").glob("*")):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _offer_webview2_or_browser(url: str) -> bool:
+    """WebView2 missing: offer to install it; otherwise use the browser.
+
+    Returns True when the caller should keep going (browser mode)."""
+    rc = ctypes.windll.user32.MessageBoxW(
+        0,
+        "This window needs the Microsoft WebView2 runtime, which is not installed.\n\n"
+        "Yes — download & install WebView2 now (recommended, ~2 MB, one time).\n"
+        "No  — open the dashboard in your web browser instead.",
+        "Zcode Gateway — WebView2 missing", 0x24)      # MB_ICONWARNING|YESNO
+    if rc == 6:                                        # IDYES
+        import subprocess
+        try:
+            # winget is present on Win11 / updated Win10; falls back to
+            # direct download when missing
+            subprocess.Popen(
+                ["winget", "install", "--id", "Microsoft.EdgeWebView2Runtime",
+                 "--silent", "--accept-package-agreements",
+                 "--accept-source-agreements"],
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            _notify("WebView2 install started.\n\n"
+                    "Once it finishes, run Zcode Gateway again for the "
+                    "native window.\nFalling back to your browser now.")
+        except FileNotFoundError:
+            webbrowser.open("https://developer.microsoft.com/microsoft-edge/webview2/")
+            _notify("Download 'Evergreen Bootstrapper' from the page that just "
+                    "opened, run it, then start Zcode Gateway again.\n"
+                    "Falling back to your browser now.")
+    webbrowser.open(url)
+    return True
+
+
 def main() -> None:
     _fix_streams()
     import argparse
@@ -189,6 +260,11 @@ def main() -> None:
     threading.Thread(target=_run_server, daemon=True, name="gateway").start()
     if not _wait_for(url):
         webbrowser.open(url)   # fall back to the browser rather than a dead window
+        return
+
+    if not _webview2_available():
+        # native window impossible on this machine: install prompt + browser
+        _offer_webview2_or_browser(url)
         return
 
     webview.create_window(

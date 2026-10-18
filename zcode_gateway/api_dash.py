@@ -825,7 +825,13 @@ async def generator_options(request: Request, body: dict = Body(...),
 async def generator_start(request: Request, body: dict = Body(default={}),
                           key: str = Depends(admin_key)) -> dict:
     count = int(body.get("count", 1)) if isinstance(body, dict) else 1
-    return _generator(request).start_workers(count)
+    mgr = _generator(request)
+
+    def _emit(line: str) -> None:
+        # install progress lands in the dashboard's log view
+        log.info("playwright-setup: %s", line)
+
+    return await asyncio.to_thread(mgr.start_workers_checked, count, _emit)
 
 
 @router.post("/admin/dash/generator/stop")
