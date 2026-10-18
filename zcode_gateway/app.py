@@ -72,6 +72,14 @@ async def lifespan(app: FastAPI):
         log.warning("relay health loop failed to start", exc_info=True)
 
     pool = PoolManager(cfg.pool, accounts)
+    # persist per-model parks (UNUSUAL_ACTIVITY / GEO_BLOCKED / caps) next to
+    # the sqlite store so a restart doesn't forget and re-burn every account
+    try:
+        caps_file = Path(cfg.store.sqlite_path).resolve().parent / "model-caps.json"
+        pool.set_caps_path(caps_file)
+        pool.load_caps()
+    except Exception:
+        log.warning("model-cap persistence unavailable", exc_info=True)
     tokens = TokenManager(cfg, pool)
     client = UpstreamClient(cfg.upstream, relay_manager=relay_manager)
     service = ChatService(cfg, pool, tokens, client, registry, store, capture)

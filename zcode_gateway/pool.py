@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -340,6 +341,68 @@ class PoolManager:
         # incremented on every release()/reacquire(); acquire() waiters sleep on
         # a generation mismatch instead of polling on a fixed timer
         self._slot_gen = 0
+        # persisted per-model parks (UNUSUAL_ACTIVITY / GEO_BLOCKED / caps):
+        # a gateway restart must not forget them and re-burn every account
+        self.caps_path: Path | None = None
+
+    def set_caps_path(self, path: Path | str) -> None:
+        """Enable park persistence to <sqlite-dir>/model-caps.json."""
+        self.caps_path = Path(path)
+
+    def load_caps(self) -> None:
+        """Re-apply unexpired saved parks onto loaded accounts."""
+        if not self.caps_path or not self.caps_path.is_file():
+            return
+        try:
+            data = json.loads(self.caps_path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        now = time.time()
+        changed = False
+        for acc_id, models in (data or {}).items():
+            acc = self._accounts.get(acc_id)
+            if not acc:
+                changed = True          # account gone: prune next save
+                continue
+            for model, cap in (models or {}).items():
+                release_at = float(cap.get("release_at_epoch", 0))
+                if release_at > now:
+                    acc.model_caps[model] = release_at
+                    acc.model_cap_info[model] = {
+                        "code": cap.get("code", "MODEL_PARKED"),
+                        "message": cap.get("message", ""),
+                        "release_at": cap.get("release_at"),
+                    }
+                else:
+                    changed = True
+        if changed:
+            self._save_caps()
+
+    def _save_caps(self) -> None:
+        """Atomic write of all unexpired parks. Called under the pool lock."""
+        if not self.caps_path:
+            return
+        now = time.time()
+        out: dict[str, dict[str, dict]] = {}
+        for acc in self._accounts.values():
+            caps: dict[str, dict] = {}
+            for model, until in (acc.model_caps or {}).items():
+                if float(until) > now:
+                    info = acc.model_cap_info.get(model, {})
+                    caps[model] = {
+                        "code": info.get("code", "MODEL_PARKED"),
+                        "message": info.get("message", ""),
+                        "release_at": info.get("release_at"),
+                        "release_at_epoch": float(until),
+                    }
+            if caps:
+                out[acc.id] = caps
+        try:
+            tmp = self.caps_path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(out, indent=1), encoding="utf-8")
+            os.replace(tmp, self.caps_path)
+        except OSError:
+            log.debug("could not persist model caps", exc_info=True)
 
     # -- access ---------------------------------------------------------- #
 
@@ -431,6 +494,8 @@ class PoolManager:
                 "release_in_s": int(max(seconds, 1.0)),
             }
             account.last_error = f"{reason}:{model}"
+            # persist so a restart doesn't forget the park and re-burn accounts
+            self._save_caps()
 
     async def unavailable_reason(self, model: str) -> dict | None:
         """Why can this model not be served right now?
