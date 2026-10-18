@@ -1,4 +1,5 @@
 import logging, os
+import shutil
 # silence PIL/pngjs chunk-stream debug spam
 logging.getLogger('PIL').setLevel(logging.WARNING)
 os.environ.setdefault('PYTHONWARNINGS', 'ignore')
@@ -15,7 +16,8 @@ import html
 from pathlib import Path
 from playwright.sync_api import sync_playwright
 
-from utils import ANTI_DETECTION_SCRIPT, BROWSER_ARGS, SELECTORS, take_screenshot, timing
+from utils import BROWSER_ARGS, SELECTORS, take_screenshot, timing
+import fingerprint
 from captcha_solver import CaptchaSolver
 from config import CONFIG
 
@@ -139,8 +141,8 @@ STARTER_FILE = os.path.join(OUTPUT_DIR, f'starter{OUT_SUFFIX}.txt')
 
 # Dedicated chromium profile per process: lets us identify (and kill) browsers left
 # behind by a killed run without ever touching the user's own Chrome.
-PROFILE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                           '.pw-profile' + OUT_SUFFIX)
+PROFILE_DIR = os.path.join(OUTPUT_DIR, '.pw-profile' + OUT_SUFFIX)
+LAST_CAPTCHA_PARAM = None
 
 
 def env_on(name):
@@ -167,13 +169,29 @@ def set_proxy(url):
         os.environ.pop('ZAI_PROXY', None)
 
 
+def _redact_proxy(url):
+    """Never log a proxy's login (user:pass@) — logs are shared and end up in captures."""
+    return re.sub(r'//[^/@]*@', '//', url) if url else url
+
+
 def pick_verified_proxy():
     """Verify-on-pick: grab a pool entry and re-test it before use.
     ZAI_SOCKS_ONLY=1: socks4/5 entries only (residential-style — they pass the
-    Starter gate; HTTP datacenter ranges fail it)."""
+    Starter gate; HTTP datacenter ranges fail it).
+    ZAI_PROXY_TYPES: comma-separated scheme filter (http,https,socks4,socks5)
+    — overrides/refines ZAI_SOCKS_ONLY ('all' or empty = every type).
+    ZAI_PROXY_COUNTRY: filter by 2-letter country code (e.g. US)."""
     try:
         import proxy_pool
-        return proxy_pool.pick_verified(socks=env_on('ZAI_SOCKS_ONLY'))
+        types = [t.strip().lower() for t in
+                 os.environ.get('ZAI_PROXY_TYPES', '').split(',') if t.strip()]
+        if types == ['all']:
+            types = []
+        return proxy_pool.pick_verified(
+            socks=env_on('ZAI_SOCKS_ONLY') and not types,
+            country=os.environ.get('ZAI_PROXY_COUNTRY'),
+            types=types or None,
+        )
     except Exception as e:
         logger.warning(f"proxy pick failed: {e}")
         return None
@@ -205,13 +223,11 @@ def req_proxies():
 def kill_stale_browsers():
     """Kill chromium processes left over from a previous killed run.
 
-    Only touches processes whose command line contains the EXACT argument
-    `--user-data-dir=<our profile dir>` as a whole token — a substring/wildcard
-    match would let .pw-profilew1 also match .pw-profilew10/w11 and kill other
-    workers' browsers. CommandLineToArgvW-style parsing via a regex that
-    requires the argument to END right after the path (quote or whitespace).
+    Profiles are now PER-ACCOUNT (.pw-profile-<email-token> under OUTPUT_DIR),
+    so match on the shared prefix instead of one worker's exact dir — scoped
+    to OUTPUT_DIR so the user's own Chrome and other apps are never touched.
     """
-    pat = re.escape(PROFILE_DIR) + r'("|\s|$)'
+    pat = re.escape(os.path.join(OUTPUT_DIR, '.pw-profile')) + r'[^"]*("|\s|$)'
     try:
         ps = ("Get-CimInstance Win32_Process | "
               "Where-Object { $_.Name -match 'chrome|chromium|msedge' -and "
@@ -444,6 +460,17 @@ def env_flag(name):
     return v.strip().lower() in ('1', 'true', 'yes', 'on')
 
 
+def _rm_profile(profile_dir):
+    """Wipe a per-account browser profile. Keeps the generator-data dir from
+    accumulating one chromium profile per signup; virgin storage per account
+    is the point of per-account profiles in the first place."""
+    if profile_dir:
+        try:
+            shutil.rmtree(profile_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+
 def signup(email, password, mail=None):
     logger.info(f"Starting: {email}")
     timing.start('total_signup')
@@ -451,7 +478,9 @@ def signup(email, password, mail=None):
     try:
         with sync_playwright() as p:
             # Persistent context (playwright refuses --user-data-dir via launch()).
-            # Using our own profile dir lets kill_stale_browsers() reap orphans.
+            # Profile dir is PER-ACCOUNT (virgin storage for every signup) and
+            # removed on exit; kill_stale_browsers() still reaps orphans via
+            # the exact-arg command-line match below.
             is_manual = env_flag('ZAI_MANUAL')
             if is_manual:
                 is_headless = False
@@ -460,20 +489,33 @@ def signup(email, password, mail=None):
             else:
                 is_headless = CONFIG.get('headless', False)
 
+            ident = fingerprint.make_identity(
+                proxy_url=(CURRENT_PROXY if CURRENT_PROXY and CURRENT_PROXY != '0' else None))
+            logger.info(f"    [fp] {ident['chrome_major']} · {ident['viewport']['width']}x{ident['viewport']['height']} · "
+                        f"{ident['hardware_concurrency']}c/{ident['device_memory']}G · "
+                        f"cc={ident['country']} · tz={ident['timezone_id']} · locale={ident['locale']}")
+
+            account_profile = os.path.join(OUTPUT_DIR, '.pw-profile-' + re.sub(r'[^a-zA-Z0-9]', '_', email.split('@')[0])[:24])
+            try:
+                shutil.rmtree(account_profile, ignore_errors=True)
+            except Exception:
+                pass
+
             context = p.chromium.launch_persistent_context(
-                PROFILE_DIR,
+                account_profile,
                 headless=is_headless,
                 args=BROWSER_ARGS,
                 proxy=pw_proxy(),
-                viewport={'width': CONFIG['viewport_width'], 'height': CONFIG['viewport_height']},
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                locale='en-US',
-                timezone_id='America/New_York',
+                viewport=ident['viewport'],
+                user_agent=ident['user_agent'],
+                locale=ident['locale'],
+                timezone_id=ident['timezone_id'],
             )
             browser = context   # `browser.close()` below closes the persistent context
 
             page = context.new_page()
-            page.add_init_script(ANTI_DETECTION_SCRIPT)
+            page.add_init_script(fingerprint.base_script(ident))
+            page.add_init_script(fingerprint.noise_script(ident))
             page.add_init_script(CAPTCHA_VERIFY_HOOK)
 
             # Capture the REAL auth token from the signup response's set-cookie.
@@ -625,6 +667,7 @@ def signup(email, password, mail=None):
                     logger.warning("Captcha widget did not load (IP-blocked?) — skipping run")
                     take_screenshot(page, "captcha_not_loaded")
                     browser.close()
+                    _rm_profile(account_profile)
                     return 'CAPTCHA_NOT_LOADED'
 
                 solver = CaptchaSolver(logger, CONFIG)
@@ -639,6 +682,7 @@ def signup(email, password, mail=None):
                     logger.warning("Captcha stopped serving challenges (IP-blocked) — skipping run")
                     take_screenshot(page, "captcha_not_loaded")
                     browser.close()
+                    _rm_profile(account_profile)
                     return 'CAPTCHA_NOT_LOADED'
 
                 if not result:
@@ -654,6 +698,7 @@ def signup(email, password, mail=None):
                         logger.error("Captcha failed")
                         take_screenshot(page, "captcha_failed")
                         browser.close()
+                        _rm_profile(account_profile)
                         return None
 
                 if isinstance(result, str) and len(result) > 20:
@@ -681,6 +726,8 @@ def signup(email, password, mail=None):
                     pass
                 if not captcha_param and isinstance(result, str) and len(result) > 40:
                     captcha_param = result
+                global LAST_CAPTCHA_PARAM
+                LAST_CAPTCHA_PARAM = captcha_param
                 logger.info(f"captcha_verify_param: {'captured' if captcha_param else 'MISSING'}")
 
                 def _page_post(path, payload):
@@ -782,11 +829,13 @@ def signup(email, password, mail=None):
                 if token:
                     logger.info(f"Account token email={token_email(token)}")
                     browser.close()
+                    _rm_profile(account_profile)
                     return token
 
                 logger.warning("No non-guest token obtained — account not confirmed")
                 logger.info(f"    auth calls seen: {captured['calls']}")
                 browser.close()
+                _rm_profile(account_profile)
                 return None
 
             except Exception as e:
@@ -796,6 +845,7 @@ def signup(email, password, mail=None):
                     browser.close()
                 except:
                     pass
+                _rm_profile(account_profile)
                 return None
 
     except Exception as e:
@@ -906,8 +956,10 @@ class CatchAllMail:
         url = self.inbox_url + ('&' if '?' in self.inbox_url else '?') + 'to=' + self.email
         if self.inbox_secret:
             url += '&k=' + self.inbox_secret
+        ua = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+              '(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36')
         try:
-            r = requests.get(url, timeout=15, verify=_verify)
+            r = requests.get(url, timeout=15, verify=_verify, headers={'User-Agent': ua})
             j = r.json()
         except Exception as e:
             self.logger.debug(f"inbox poll error: {e}")
@@ -964,7 +1016,7 @@ def main():
         picked = pick_verified_proxy()
         if picked:
             set_proxy(picked)
-            logger.info(f"Using pool proxy: {picked}")
+            logger.info(f"Using pool proxy: {_redact_proxy(picked)}")
         else:
             # Never silently substitute the user's chosen route: a pool run that
             # falls back to direct burns the home IP AND hides the reason.
@@ -1018,7 +1070,7 @@ def main():
             newp = pick_verified_proxy()
             if newp:
                 set_proxy(newp)
-                logger.info(f"Account {i+1} proxy: {newp}")
+                logger.info(f"Account {i+1} proxy: {_redact_proxy(newp)}")
             else:
                 logger.error(f"Account {i+1}: POOL MODE — no live proxy, aborting "
                              f"(run proxy_pool.py verify)")
@@ -1056,7 +1108,8 @@ def main():
             if not mail.create_account():
                 break
             email, password = mail.email, mail.password
-            route = f"proxy={newp}" if rotate else f"same route ({CURRENT_PROXY or 'direct'})"
+            route = (f"proxy={_redact_proxy(newp)}" if rotate
+                     else f"same route ({_redact_proxy(CURRENT_PROXY) or 'direct'})")
             logger.info(f"  retry {pr + 1}/{max_proxy_retries} — "
                         f"{route} email={email}")
 
@@ -1121,13 +1174,20 @@ def main():
                 if invite_code and starter and isinstance(result, str):
                     try:
                         from invite_claim import device_login, claim_invite
-                        zjwt, _ = device_login(token, log=logger.info)
+                        zjwt, _ = device_login(token, log=logger.info,
+                                               force_direct=False)
                         if zjwt:
+                            # claim from the SAME exit IP as signup — the whole
+                            # 100M flow is risk-scored, and a direct-IP claim
+                            # after a proxy signup reads as unusual activity.
                             inv = claim_invite(token, invite_code, log=logger.info,
                                                zjwt=zjwt, headless=IS_HEADLESS,
-                                               captcha_param=captcha_param)
+                                               force_direct=False,
+                                               captcha_param=LAST_CAPTCHA_PARAM)
                             s = inv.get('summary') or {}
-                            global_build = bool(s.get('issued'))
+                            global_build = bool(s.get('issued')) or bool(
+                                s.get('current') and s.get('target') and s['current'] >= s['target']
+                            )
                     except Exception as e:
                         logger.warning(f"invite claim failed: {e}")
 

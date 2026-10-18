@@ -10,7 +10,7 @@
   --field:#10131a; --stripe:#161a22; --border:#262c3a;
   --accent:#8b7cf7; --accent-deep:#8072eb; --accent-soft:#b3a7fb; --accent-dim:#2c2b45;
   --fg:#e8eaf0; --muted:#9aa1b2; --faint:#929bad;
-  --ok:#3ddc84; --warn:#ffc857; --err:#ff6b7a;
+  --ok:#3ddc84; --warn:#ffc857; --err:#ff6b7a; --success:#3fb950;
   --r:10px;
 }
 *{box-sizing:border-box; margin:0; padding:0}
@@ -202,7 +202,7 @@ th .arr{font-size:9px; margin-left:3px; color:var(--accent-soft)}
   padding:1px 7px; font:12px "Cascadia Mono",monospace}
 
 /* ---------- confirm modal ---------- */
-#confirm-modal, #login-modal{position:fixed; inset:0; background:rgba(5,7,10,.72);
+#confirm-modal, #login-modal, #relay-modal{position:fixed; inset:0; background:rgba(5,7,10,.72);
   display:none; align-items:center; justify-content:center; z-index:70}
 .confirm-card{background:var(--card); border:1px solid var(--border);
   border-radius:12px; padding:18px 20px; width:380px; max-width:90vw;
@@ -232,6 +232,44 @@ th .arr{font-size:9px; margin-left:3px; color:var(--accent-soft)}
 .reset-note{color:var(--muted); font-size:12px; margin:0 0 12px}
 .cap-message{color:var(--muted); overflow-wrap:anywhere; max-width:65ch; margin:4px 0 10px}
 #accounts-no-match td{text-align:center; padding:24px; color:var(--muted)}
+
+/* ---------- selects (custom dropdown) ---------- */
+select.sel{appearance:none; -webkit-appearance:none; cursor:pointer; padding-right:30px;
+  background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%239aa1b2' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat:no-repeat; background-position:right 10px center}
+select.sel:hover{border-color:var(--accent-dim)}
+select.sel:disabled{opacity:.55; cursor:not-allowed}
+select.sel option{background:var(--card); color:var(--fg)}
+
+/* ---------- dropdown menu (actions / Kebab) ---------- */
+.dd{position:relative; display:inline-block}
+.dd-btn{display:inline-flex; align-items:center; justify-content:center; gap:6px;
+  background:transparent; color:var(--muted); border:0; border-radius:7px;
+  width:30px; height:28px; cursor:pointer; font-size:15px; line-height:1}
+.dd-btn:hover, .dd.open .dd-btn{background:var(--elev); color:var(--fg)}
+.dd-menu{position:absolute; right:0; top:calc(100% + 5px); z-index:40; min-width:190px;
+  background:var(--card); border:1px solid var(--border); border-radius:10px;
+  padding:5px; box-shadow:0 12px 34px rgba(0,0,0,.5); display:none; text-align:left}
+.dd.open .dd-menu{display:block}
+.dd-item{display:flex; align-items:center; gap:9px; width:100%; background:none; border:0;
+  color:var(--fg); font:13px "Segoe UI",sans-serif; padding:8px 10px; border-radius:7px;
+  cursor:pointer; white-space:nowrap}
+.dd-item:hover{background:var(--elev)}
+.dd-item .ic{width:16px; text-align:center; flex:none; opacity:.85}
+.dd-item.danger{color:var(--err)}
+.dd-item.danger:hover{background:rgba(255,107,122,.1)}
+.dd-sep{height:1px; background:var(--border); margin:5px 4px}
+
+/* ---------- misc polish ---------- */
+.lbl{color:var(--muted); font-size:12px; display:inline-block; margin-bottom:4px}
+select option{background:var(--card); color:var(--fg)}
+input[type=number]{min-width:0}
+.px-kpi{background:var(--card); border:1px solid var(--border); border-radius:var(--r);
+  padding:6px 12px; display:inline-flex; flex-direction:column; min-width:74px}
+.px-kpi .v{font:600 17px "Segoe UI Semibold",sans-serif}
+.px-kpi .k{color:var(--muted); font-size:11px}
+.progress{height:4px; background:var(--elev); border-radius:99px; overflow:hidden; flex:1; min-width:120px}
+.progress > div{height:100%; background:var(--accent); border-radius:99px; transition:width .4s ease}
 </style>
 </head>
 <body>
@@ -244,7 +282,8 @@ th .arr{font-size:9px; margin-left:3px; color:var(--accent-soft)}
       Enter the admin key to manage this gateway.</p>
     <div class="field">
       <label>Admin key</label>
-      <input type="password" id="login-key" autocomplete="off" spellcheck="false" aria-label="Admin key">
+      <input type="password" id="login-key" autocomplete="off" spellcheck="false" aria-label="Admin key"
+        onkeydown="if(event.key==='Enter')App.login()">
     </div>
     <button class="btn btn-pri" style="width:100%" onclick="App.login()">Continue</button>
   </div>
@@ -264,6 +303,7 @@ th .arr{font-size:9px; margin-left:3px; color:var(--accent-soft)}
   <button class="nav-btn" data-tab="server" onclick="App.tab('server')"><span class="ico">▣</span>Server</button>
   <button class="nav-btn" data-tab="settings" onclick="App.tab('settings')"><span class="ico">⚙</span>Settings</button>
   <button class="nav-btn" data-tab="stats" onclick="App.tab('stats')"><span class="ico">∑</span>Stats</button>
+  <button class="nav-btn" data-tab="usage" onclick="App.tab('usage')"><span class="ico">▤</span>Usage</button>
   <button class="nav-btn" data-tab="logs" onclick="App.tab('logs')"><span class="ico">≡</span>Logs</button>
   <button class="nav-btn" data-tab="guide" onclick="App.tab('guide')"><span class="ico">?</span>Guide</button>
   <div class="spacer"></div>
@@ -317,6 +357,11 @@ th .arr{font-size:9px; margin-left:3px; color:var(--accent-soft)}
     </div>
     <div id="lg-status"></div>
   </div>
+</div>
+
+<!-- deploy relay modal -->
+<div id="relay-modal">
+  <div class="confirm-card" id="relay-modal-card" style="width:520px;max-width:92vw;max-height:90vh;overflow-y:auto"></div>
 </div>
 
 <!-- update available card -->
@@ -606,6 +651,8 @@ const App = (() => {
       <button class="btn btn-pri" onclick="App.loginStart()">🔑 Login with Zcode</button>
       <button class="btn btn-ghost" onclick="App.doImport()">⤓ Import from Zcode app</button>
       <button class="btn btn-ghost" onclick="App.doReload()">Reload pool</button>
+      <button class="btn btn-ghost" id="claim-all-btn" onclick="App.claimAllPending()">⚡ Claim all pending</button>
+      <span id="socks-badge" class="badge" style="background:var(--elev);color:var(--muted)">… socks</span>
       <button class="btn btn-quiet" onclick="App.refresh()">Refresh</button>
       <div class="grow"></div>
        <input type="search" id="acct-q" placeholder="Filter accounts…" aria-label="Filter accounts" style="max-width:230px"
@@ -629,9 +676,16 @@ const App = (() => {
       html += `<p class="reset-note">Cap resets in ${esc(localZone)} · Based on Zcode quota windows.</p>`;
       html += `<div class="tbl-wrap"><table><thead><tr>
         <th>Email</th><th>State</th><th>Plan / expiry</th><th>Token</th>
-        <th>Daily quota / reset</th><th>Runs</th><th>Capped models / local reset</th><th></th></tr></thead><tbody id="accounts-body">`;
+        <th>Daily quota / reset</th><th>Runs</th><th>Capped models / local reset</th><th>Err</th><th></th></tr></thead><tbody id="accounts-body">`;
       for (const a of shown) {
         const caps = capCell(a);
+        const hasGlobal = (a.plans || []).some(p => /global|referral/i.test(p.name || p.plan_id || ''));
+        const claimItems = !hasGlobal ? `
+                <button class="dd-item" data-act="acct-claim-proxy" data-id="${esc(a.id)}"><span class="ic">⚡</span>Claim 100M · proxy</button>
+                <button class="dd-item" data-act="acct-claim-direct" data-id="${esc(a.id)}"><span class="ic">⚡</span>Claim 100M · direct</button>` : '';
+        // autopsy: last errors as a sparkline + hover detail for dead/cooling accounts
+        const errs = (a.error_history || []).slice(-12);
+        const errCell = errs.length ? `<span class="mono" title="${esc(errs.map(e => `${e.ago_s||'?'}s ago ${e.status||''} ${e.code||''}`).join('\n'))}" style="cursor:help;color:${a.state==='dead'?'var(--err)':'var(--warn)'}">${errs.length}err</span>` : '<span style="color:var(--faint)">—</span>';
         html += `<tr data-search="${esc([a.email, a.id, a.state, a.source, ...(a.capped_models || [])].join(" ").toLowerCase())}">
           <td><b>${esc(a.email || a.id)}</b><br><span class="mono" style="color:var(--faint)">${esc(a.id)}</span></td>
           <td>${badge(a.state)}</td>
@@ -640,18 +694,23 @@ const App = (() => {
           <td class="mono">${quotaCell(a.quotas)}</td>
           <td>${a.in_flight}</td>
           <td class="cap-cell">${caps}</td>
+          <td>${errCell}</td>
           <td style="white-space:nowrap; text-align:right">
-            <button class="btn btn-quiet btn-sm" title="reload token from snapshot" aria-label="reload token"
-              data-act="acct-refresh" data-id="${esc(a.id)}">↻</button>
-            <button class="btn btn-quiet btn-sm" title="check model quotas" aria-label="check quotas"
-              data-act="acct-balance" data-id="${esc(a.id)}">Q</button>
-            <button class="btn btn-quiet btn-sm" title="enable" aria-label="enable account"
-              data-act="acct-enable" data-id="${esc(a.id)}">▶</button>
-            <button class="btn btn-quiet btn-sm btn-danger" title="remove" aria-label="remove account"
-              data-act="acct-remove" data-id="${esc(a.id)}">✕</button>
+            <div class="dd" data-dd>
+              <button class="dd-btn" aria-label="account actions" title="actions"
+                data-act="acct-menu" data-id="${esc(a.id)}">⋯</button>
+              <div class="dd-menu">
+                <button class="dd-item" data-act="acct-refresh" data-id="${esc(a.id)}"><span class="ic">↻</span>Reload token</button>
+                <button class="dd-item" data-act="acct-balance" data-id="${esc(a.id)}"><span class="ic">Q</span>Check quotas</button>
+                <button class="dd-item" data-act="acct-enable" data-id="${esc(a.id)}"><span class="ic">▶</span>Enable</button>
+                ${claimItems}
+                <div class="dd-sep"></div>
+                <button class="dd-item danger" data-act="acct-remove" data-id="${esc(a.id)}"><span class="ic">✕</span>Remove</button>
+              </div>
+            </div>
           </td></tr>`;
       }
-      html += `<tr id="accounts-no-match" hidden><td colspan="8">No accounts match this filter.</td></tr></tbody></table></div>
+      html += `<tr id="accounts-no-match" hidden><td colspan="9">No accounts match this filter.</td></tr></tbody></table></div>
         <p style="color:var(--faint); font-size:12px; margin-top:10px">
           Daily quotas are independent for GLM-5.3 and GLM-5.3-Flash.
           Reset times and plan expiry use your local timezone. A revoked token needs a new login.</p>`;
@@ -660,13 +719,17 @@ const App = (() => {
     // delegated listener: account ids come from snapshot files and must never
     // be interpolated into inline JS strings (stored XSS via crafted id)
     v.querySelectorAll("[data-act^='acct-']").forEach(btn => {
-      btn.addEventListener("click", () => {
+      btn.addEventListener("click", e => {
         const id = btn.dataset.id;
         const act = btn.dataset.act;
+        if (act === "acct-menu") return;      // toggled by the global dd handler
+        closeDropdowns();
         if (act === "acct-refresh") acct("refresh", id);
         else if (act === "acct-balance") acct("balance", id);
         else if (act === "acct-enable") acct("enable", id);
         else if (act === "acct-remove") acctRemove(id);
+        else if (act === "acct-claim-proxy") acctClaim(id, "proxy");
+        else if (act === "acct-claim-direct") acctClaim(id, "direct");
       });
     });
     const q = document.getElementById("acct-q");
@@ -675,6 +738,7 @@ const App = (() => {
       filterAccounts(q);
       if (focused) { q.focus(); q.setSelectionRange(...selection); }
     }
+    paintSocksBadge();
   }
 
   async function doImport(){
@@ -711,6 +775,46 @@ const App = (() => {
     try { await api(`/admin/accounts/${encodeURIComponent(id)}`, {method:"DELETE"});
       toast("removed", "ok"); renderAccounts($("#view")); paintChips(); }
     catch (e) { toast(e.message, "err"); }
+  }
+  async function acctClaim(id, mode){
+    toast(`starting 100M claim (${mode})…`, "info");
+    try {
+      const r = await api(`/admin/accounts/${encodeURIComponent(id)}/claim100m`, {
+        method: "POST",
+        body: JSON.stringify({mode: mode})
+      });
+      if (r.error) toast(r.error, "err");
+      else toast(`claim started (${r.started || mode}${r.mode && r.mode !== mode ? " → " + r.mode : ""})`, "ok");
+    } catch(e) {
+      toast("claim failed: " + e.message, "err");
+    }
+  }
+
+  async function claimAllPending(){
+    if (!(await confirmDlg("Claim 100M for all pending accounts?",
+        "Runs a visible browser per account, one at a time (proxy mode, direct fallback). " +
+        "You will click Accept in each window.", "Start", true))) return;
+    try {
+      const r = await api("/claims/claim_all_pending", {
+        method: "POST", body: JSON.stringify({mode: "proxy"})
+      });
+      if (r.error) { toast(r.error, "err"); return; }
+      toast("claim-all queue started — watch generator ▸ claims", "ok");
+    } catch(e) { toast("claim-all: " + e.message, "err"); }
+  }
+
+  async function paintSocksBadge(){
+    const el = $("#socks-badge");
+    if (!el) return;
+    try {
+      const r = await api("/admin/dash/proxy/socks_ready");      const n = r.socks_ready;
+      if (n < 0) { el.textContent = "pool ?"; el.style.color = "var(--muted)"; }
+      else if (n === 0) { el.textContent = "0 socks ⚠"; el.style.color = "var(--err)"; }
+      else { el.textContent = `${n} socks ✓`; el.style.color = "var(--ok)"; }
+      el.title = r.last_verified_at
+        ? `last verified ${Math.round((Date.now()/1000 - r.last_verified_at)/60)} min ago`
+        : "never verified";
+    } catch(e) { /* badge is decorative */ }
   }
 
   /* ------------ login with Zcode (device-code flow) ------------ */
@@ -778,6 +882,28 @@ const App = (() => {
   document.addEventListener("click", e => {
     if (e.target && e.target.id === "lg-code" && e.target.textContent !== "…")
       copy(e.target.textContent);
+  });
+
+  /* ---------- dropdown menus ---------- */
+  function closeDropdowns(except){
+    document.querySelectorAll(".dd.open").forEach(dd => {
+      if (dd !== except) dd.classList.remove("open");
+    });
+  }
+  document.addEventListener("click", e => {
+    const btn = e.target.closest("[data-act='acct-menu']");
+    if (btn) {
+      const dd = btn.closest(".dd");
+      const wasOpen = dd.classList.contains("open");
+      closeDropdowns(dd);
+      dd.classList.toggle("open", !wasOpen);
+      e.stopPropagation();
+      return;
+    }
+    if (!e.target.closest(".dd-menu")) closeDropdowns();
+  });
+  document.addEventListener("keydown", e => {
+    if (e.key === "Escape") closeDropdowns();
   });
 
   /* ------------ tab: models ------------ */
@@ -925,7 +1051,7 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
     const inp = (path, kind) => {
       const val = values[path] ?? path.split('.').reduce((obj, part) => obj?.[part], s.effective);
       if (kind === "bool") {
-        return `<select data-set="${path}"><option value="true" ${val ? "selected":""}>true</option>
+        return `<select class="sel" data-set="${path}"><option value="true" ${val ? "selected":""}>true</option>
           <option value="false" ${!val ? "selected":""}>false</option></select>`;
       }
       const t = (kind === "int" || kind === "float") ? "number" : "text";
@@ -1055,10 +1181,10 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
     const data = await api("/admin/dash/logs?limit=400" + (level ? "&level="+level : ""));
     if (curTab !== "logs") return;
     let html = `<div class="toolbar">
-      <select id="log-level" style="max-width:130px" onchange="App.renderLogs()"
+      <select id="log-level" class="sel" style="max-width:130px" onchange="App.renderLogs()"
         aria-label="Filter by log level">
         ${["","INFO","WARNING","ERROR"].map(l =>
-          `<option value="${l}" ${l===level?"selected":""}>${l||"all"}</option>`).join("")}
+          `<option value="${l}" ${l===level?"selected":""}>${l||"all levels"}</option>`).join("")}
       </select>
       <div class="grow"></div>
       <button class="btn btn-ghost btn-sm" onclick="App.clearLogs()">Clear</button>
@@ -1081,10 +1207,16 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
   /* ------------ tab: generator ------------ */
   let genMounted = false;
   let pxMounted = false;
+  const claimStates = {};   // claim name -> last seen state (for finish toasts)
   let genSaveTimer = null;
   function genIpChanged(){
     const ip = ($("#gen-ip")||{}).value;
     const pin = $("#gen-pin");
+    const pt = $("#gen-ptypes");
+    if (pt) {
+      pt.disabled = ip !== "pool";
+      pt.title = pt.disabled ? "applies to the proxy pool source" : "";
+    }
     if (ip === "pin" && pin) {
       pin.focus();
     }
@@ -1177,23 +1309,64 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
     const o = st.options || {};
     const workerCard = w => {
       const icon = {running:'●', starting:'◌', exited:'✓', failed:'✗', killed:'✗'}[w.state] || '◌';
+      const stateCol = {running:'var(--ok)', starting:'var(--accent-soft)', exited:'var(--ok)',
+                        failed:'var(--err)', killed:'var(--err)'}[w.state] || 'var(--muted)';
       const res = w.email ? ` · ${esc(w.email)}` : '';
-      const plan = w.global_build ? ' · ⚡ 100M GLOBAL BUILD' : (w.starter === true ? ' · ✅ STARTER' : (w.starter === false ? ' · no plan' : ''));
+      const plan = w.global_build ? ' · <b style="color:var(--warn)">⚡ 100M GLOBAL BUILD</b>'
+        : (w.starter === true ? ' · <b style="color:var(--ok)">✅ STARTER</b>' : (w.starter === false ? ' · <span style="color:var(--muted)">no plan</span>' : ''));
       const lines = (w.lines || []).slice(-6).map(l =>
         `<div class="mono" style="color:var(--faint);font-size:11px">${esc(l)}</div>`).join('');
       return `<div class="card" style="padding:8px 12px; margin-bottom:8px">
         <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-          <b>${icon} ${esc(w.name)}</b>
-          <span class="mono" style="color:var(--muted)">proxy ${esc(w.proxy)}</span>
-          <span class="mono" style="color:var(--muted)">captcha ${esc(w.captcha)}</span>
-          <span>${esc(w.state)}</span>${res}${plan}
+          <b><span style="color:${stateCol}">${icon}</span> ${esc(w.name)}</b>
+          <span class="badge" style="background:var(--elev); color:${stateCol}">${esc(w.state)}</span>
+          ${w.proxy ? `<span class="mono" title="${esc(w.proxy)}" style="color:var(--muted)">⇄ ${esc(String(w.proxy).length > 34 ? String(w.proxy).slice(0,34)+'…' : w.proxy)}</span>` : ''}
+          <span class="mono" style="color:var(--faint)">captcha ${esc(w.captcha)}</span>
+          ${res}${plan}
           <div class="grow"></div>
           ${w.state === 'running' || w.state === 'starting'
-            ? `<button class="btn btn-ghost btn-sm" onclick="App.genStop('${esc(w.name)}')">Kill</button>` : ''}
+            ? `<button class="btn btn-ghost btn-sm btn-danger" data-act="genStop" data-id="${esc(w.name)}">Kill</button>`
+            : `<button class="btn btn-quiet btn-sm" title="remove from list" data-act="genRemove" data-id="${esc(w.name)}">✕</button>`}
         </div>${lines ? `<div style="margin-top:6px">${lines}</div>` : ''}
       </div>`;
     };
-    const workersHtml = (st.workers || []).map(workerCard).join('') ||
+    const claimCard = c => {
+      const icon = {running:'⚡', starting:'◌', exited:'✓', failed:'✗', killed:'✗'}[c.state] || '◌';
+      const stateCol = {running:'var(--warn)', starting:'var(--accent-soft)', exited:'var(--ok)',
+                        failed:'var(--err)', killed:'var(--err)'}[c.state] || 'var(--muted)';
+      const lines = (c.lines || []).slice(-10).map(l =>
+        `<div class="mono" style="color:var(--faint);font-size:11px">${esc(l)}</div>`).join('');
+      const issued = c.result && c.result.summary && c.result.summary.issued
+        ? ' · <b style="color:var(--warn)">⚡ 100M GLOBAL BUILD ISSUED</b>'
+        : (c.state === 'exited' ? ' · <span style="color:var(--ok)">finished</span>' : '');
+      return `<div class="card" style="padding:8px 12px; margin-bottom:8px; border-left:3px solid var(--warn)">
+        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+          <b><span style="color:${stateCol}">${icon}</span> 100M Claim: ${esc(c.email || c.name)}</b>
+          <span class="badge" style="background:var(--elev); color:${stateCol}">${esc(c.state)}</span>
+          <span class="mono" style="color:var(--muted)">${esc(c.mode || 'proxy')}</span>
+          ${c.proxy ? `<span class="mono" title="${esc(c.proxy)}" style="color:var(--muted)">⇄ ${esc(String(c.proxy).length > 34 ? String(c.proxy).slice(0,34)+'…' : c.proxy)}</span>` : ''}
+          <span class="mono" style="color:var(--faint)">${c.elapsed || 0}s</span>
+          ${issued}
+          <div class="grow"></div>
+          ${c.state === 'running' || c.state === 'starting'
+            ? `<button class="btn btn-ghost btn-sm btn-danger" data-act="claimStop" data-id="${esc(c.name)}">Kill</button>`
+            : `<button class="btn btn-quiet btn-sm" title="remove from list" data-act="claimRemove" data-id="${esc(c.name)}">✕</button>`}
+        </div>${lines ? `<div style="margin-top:6px;max-height:180px;overflow:auto;background:var(--field);border-radius:6px;padding:6px">${lines}</div>` : ''}
+      </div>`;
+    };
+    const claimsHtml = (st.claims || []).map(claimCard).join('');
+    // claim-finished toasts: transition running -> terminal state
+    (st.claims || []).forEach(c => {
+      const prev = claimStates[c.name];
+      const terminal = c.state === 'exited' || c.state === 'failed' || c.state === 'killed';
+      if (prev && prev === 'running' && terminal) {
+        const issued = c.result && c.result.summary && c.result.summary.issued;
+        if (issued) toast(`⚡ 100M issued: ${c.email}`, "ok");
+        else toast(`claim finished (not issued): ${c.email}`, "err");
+      }
+      claimStates[c.name] = c.state;
+    });
+    const workersHtml = claimsHtml + (st.workers || []).map(workerCard).join('') ||
       '<div class="empty" style="padding:16px;color:var(--muted)">no workers — press START</div>';
     const isContainer = $("#gen-container");
     if (!genMounted || !isContainer) {
@@ -1204,38 +1377,51 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
       <div id="gen-container">
         <div class="card" id="gen-options-card">
           <h2>Options</h2>
-          <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:end">
-            <div><label class="lbl">browsers</label><br>
-              <input type="number" id="gen-n" value="1" min="1" max="8" style="width:70px"></div>
-            <div><label class="lbl">captcha</label><br>
-              <select id="gen-captcha" onchange="App.genCaptchaChanged()">
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px 14px;align-items:end">
+            <div><label class="lbl">browsers</label>
+              <input type="number" id="gen-n" value="1" min="1" max="8" style="width:100%"></div>
+            <div><label class="lbl">captcha</label>
+              <select id="gen-captcha" class="sel" style="width:100%" onchange="App.genCaptchaChanged()">
                 <option value="auto" ${o.captcha==='auto'?'selected':''}>auto — solver</option>
                 <option value="manual" ${o.captcha==='manual'?'selected':''}>manual — I solve</option>
               </select></div>
-            <div><label class="lbl">ip source</label><br>
-              <select id="gen-ip" onchange="App.genIpChanged()">
-                <option value="socks" id="opt-socks" ${o.ip_source==='socks'?'selected':''}>socks pool (${o.socks_available || 0})</option>
-                <option value="pool" ${o.ip_source==='pool'?'selected':''}>full pool</option>
+            <div><label class="lbl">ip source</label>
+              <select id="gen-ip" class="sel" style="width:100%" onchange="App.genIpChanged()">
+                <option value="pool" id="opt-pool" ${['pool','socks'].includes(o.ip_source)?'selected':''}>proxy pool (${o.pool_available || 0})</option>
                 <option value="direct" ${o.ip_source==='direct'?'selected':''}>my network (no proxy)</option>
                 <option value="pin" ${o.ip_source==='pin'?'selected':''}>pinned proxy</option>
               </select></div>
-            <div><label class="lbl">pinned proxy</label><br>
-              <input type="text" id="gen-pin" value="${esc(o.pin_proxy||'')}" placeholder="http://ip:port or socks5://..." style="width:190px" oninput="App.genAutoSave()"></div>
-            <div><label class="lbl">browser UI</label><br>
-              <select id="gen-headless" onchange="App.genAutoSave()">
+            <div><label class="lbl">proxy types</label>
+              <select id="gen-ptypes" class="sel" style="width:100%" onchange="App.genAutoSave()" title="which schemes the generator may pick from the pool">
+                <option value="all" id="opt-pt-all" ${(o.proxy_types||'socks')==='all'?'selected':''}>all types (${(o.types_counts||{}).all || 0})</option>
+                <option value="socks" id="opt-pt-socks" ${(o.proxy_types||'socks')==='socks'?'selected':''}>socks4 + socks5 (${(o.types_counts||{}).socks || 0})</option>
+                <option value="socks5" id="opt-pt-socks5" ${o.proxy_types==='socks5'?'selected':''}>socks5 only (${(o.types_counts||{}).socks5 || 0})</option>
+                <option value="socks4" id="opt-pt-socks4" ${o.proxy_types==='socks4'?'selected':''}>socks4 only (${(o.types_counts||{}).socks4 || 0})</option>
+                <option value="http" id="opt-pt-http" ${o.proxy_types==='http'?'selected':''}>http(s) only (${(o.types_counts||{}).http || 0})</option>
+              </select></div>
+            <div><label class="lbl">country</label>
+              <select id="gen-country" class="sel" style="width:100%" onchange="App.genAutoSave()">
+                <option value="ALL" ${(!o.country||o.country==='ALL')?'selected':''}>any country</option>
+                <option value="US" ${o.country==='US'?'selected':''}>US — United States (${(o.countries_available||{})['US'] || 0})</option>
+                ${Object.entries(o.countries_available||{}).filter(([c])=>c.toUpperCase()!=='US').map(([c, n])=>`<option value="${c}" ${o.country===c?'selected':''}>${c} (${n})</option>`).join('')}
+              </select></div>
+            <div style="grid-column:span 2"><label class="lbl">pinned proxy</label>
+              <input type="text" id="gen-pin" value="${esc(o.pin_proxy||'')}" placeholder="http://ip:port or socks5://..." style="width:100%" oninput="App.genAutoSave()"></div>
+            <div><label class="lbl">browser UI</label>
+              <select id="gen-headless" class="sel" style="width:100%" onchange="App.genAutoSave()">
                 <option value="true" ${o.headless!==false?'selected':''}>headless (background)</option>
                 <option value="false" ${o.headless===false?'selected':''}>visible window</option>
               </select>
               <div id="gen-headless-hint" class="help" style="margin-top:3px"></div></div>
-            <div><label class="lbl">retries</label><br>
-              <input type="number" id="gen-retries" value="${o.retries||5}" min="0" max="10" style="width:70px" oninput="App.genAutoSave()"></div>
-            <div><label class="lbl">claim 100M</label><br>
-              <select id="gen-claim" onchange="App.genAutoSave()">
+            <div><label class="lbl">retries</label>
+              <input type="number" id="gen-retries" value="${o.retries||5}" min="0" max="10" style="width:100%" oninput="App.genAutoSave()"></div>
+            <div><label class="lbl">claim 100M</label>
+              <select id="gen-claim" class="sel" style="width:100%" onchange="App.genAutoSave()">
                 <option value="on" ${o.claim!==false?'selected':''}>on</option>
                 <option value="off" ${o.claim===false?'selected':''}>off</option>
               </select></div>
-            <div><label class="lbl">invite code</label><br>
-              <input type="text" id="gen-invite" value="${esc(o.invite_code||'')}" placeholder="your referral code (empty = off)" style="width:110px" oninput="App.genAutoSave()"></div>
+            <div><label class="lbl">invite code</label>
+              <input type="text" id="gen-invite" value="${esc(o.invite_code||'')}" placeholder="referral code (empty = off)" style="width:100%" oninput="App.genAutoSave()"></div>
             <div style="display:flex;align-items:center;gap:6px">
               <button class="btn btn-ghost btn-sm" onclick="App.genSaveOptions()">Save options</button>
               <span id="gen-save-indicator" style="color:var(--success,#3fb950);font-size:12px;display:none">✓ Saved</span>
@@ -1280,8 +1466,19 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
     }
 
     // Dynamic partial update on existing DOM:
-    const optSocks = $("#opt-socks");
-    if (optSocks) optSocks.textContent = `socks pool (${o.socks_available || 0})`;
+    const tc = o.types_counts || {};
+    const setOpt = (id, text) => { const el = $(id); if (el) el.textContent = text; };
+    setOpt("#opt-pool", `proxy pool (${o.pool_available || 0})`);
+    setOpt("#opt-pt-all", `all types (${tc.all || 0})`);
+    setOpt("#opt-pt-socks", `socks4 + socks5 (${tc.socks || 0})`);
+    setOpt("#opt-pt-socks5", `socks5 only (${tc.socks5 || 0})`);
+    setOpt("#opt-pt-socks4", `socks4 only (${tc.socks4 || 0})`);
+    setOpt("#opt-pt-http", `http(s) only (${tc.http || 0})`);
+    const ptSel = $("#gen-ptypes");
+    if (ptSel) {
+      ptSel.disabled = !["pool", "socks"].includes(o.ip_source);
+      ptSel.title = ptSel.disabled ? "applies to the proxy pool source" : "";
+    }
 
     const wBox = $("#gen-workers");
     if (wBox && wBox.innerHTML !== workersHtml) {
@@ -1306,6 +1503,8 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
     const body = {
       captcha: val("gen-captcha"),
       ip_source: val("gen-ip"),
+      proxy_types: val("gen-ptypes"),
+      country: val("gen-country") || "ALL",
       pin_proxy: val("gen-pin"),
       retries: val("gen-retries"),
       claim: val("gen-claim") === "on",
@@ -1330,10 +1529,67 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
   }
   async function proxyRun(action){
     const val = id => ($("#"+id)||{}).value;
+    const chk = id => { const el = $("#"+id); return el ? !!el.checked : undefined; };
     await api("/admin/dash/generator/proxies/run", {method:"POST", body: JSON.stringify({
-      action, max_latency: parseFloat(val("px-lat")||"6"),
-      concurrency: parseInt(val("px-conc")||"200", 10)})});
+      action,
+      preset: val("px-preset") || undefined,
+      max_latency: parseFloat(val("px-lat")||"6"),
+      timeout: parseInt(val("px-timeout")||"10", 10),
+      concurrency: parseInt(val("px-conc")||"400", 10),
+      probe_timeout: parseFloat(val("px-ptimeout")||"3"),
+      probe_concurrency: parseInt(val("px-pconc")||"300", 10),
+      dead_cache_hours: parseFloat(val("px-dead")||"0"),
+      prefilter: chk("px-prefilter"),
+      retry_failed: chk("px-retry")})});
     refresh();
+  }
+  async function proxyMaintain(action){
+    const msg = $("#px-maint-msg");
+    if (msg) msg.textContent = "working…";
+    try {
+      await api("/admin/dash/generator/proxies/maintain", {method:"POST",
+        body: JSON.stringify({action})});
+      if (msg) msg.textContent = "✓ " + action + " started";
+      refresh();
+    } catch (e) { if (msg) msg.textContent = action + " failed: " + e.message; }
+  }
+  async function proxyGeo(){
+    const msg = $("#px-geo-msg");
+    if (msg) msg.textContent = "downloading…";
+    try {
+      const r = await api("/admin/dash/generator/proxies/geo", {method:"POST", body:"{}"});
+      if (r && r.error) throw new Error(r.error);
+      if (msg) msg.textContent = "✓ download started — watch the log";
+      refresh();
+    } catch (e) { if (msg) msg.textContent = "download failed: " + e.message; }
+  }
+  async function proxyYield(){
+    const box = $("#px-yield");
+    if (!box) return;
+    try {
+      const r = await api("/admin/dash/generator/proxies/yield");
+      const rows = (r && r.sources) || [];
+      if (!rows.length) {
+        box.innerHTML = `<div class="help">no scans yet — run one to see which sources produce working proxies.</div>`;
+        return;
+      }
+      box.innerHTML = `<table style="width:100%;border-collapse:collapse;font-size:12px">
+        <thead><tr style="color:var(--muted);text-align:left">
+          <th style="padding:4px 6px">source</th><th style="padding:4px 6px">found</th>
+          <th style="padding:4px 6px">avg/run</th><th style="padding:4px 6px">runs</th>
+          <th style="padding:4px 6px">errors</th></tr></thead><tbody>
+        ${rows.map(s => `<tr style="border-top:1px solid var(--border)">
+          <td class="mono" style="padding:4px 6px;max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+            title="${esc(s.url||'')}">${esc(String(s.url||'').replace(/^https?:\/\//,'').slice(0,90))}</td>
+          <td style="padding:4px 6px;color:${(s.found||0)>0?'var(--ok)':'var(--faint)'}">${s.found||0}</td>
+          <td style="padding:4px 6px">${s.avg ?? 0}</td>
+          <td style="padding:4px 6px;color:var(--muted)">${s.runs||0}</td>
+          <td style="padding:4px 6px;color:${(s.errors||0)>0?'var(--err)':'var(--faint)'}">${s.errors||0}</td>
+        </tr>`).join("")}
+      </tbody></table>`;
+    } catch (e) {
+      box.innerHTML = `<div class="help">yield unavailable: ${esc(e.message)}</div>`;
+    }
   }
   async function proxyStop(){
     await api("/admin/dash/generator/proxies/stop", {method:"POST", body:"{}"});
@@ -1344,9 +1600,10 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
     const text = ta ? ta.value : "";
     if (!text.trim()) { toast("nothing to import"); return; }
     const msg = $("#px-import-msg");
+    const proto = (($("#px-import-proto")||{}).value) || "http";
     try {
       const r = await api("/admin/dash/generator/proxies/import", {method:"POST",
-        body: JSON.stringify({text})});
+        body: JSON.stringify({text, default_proto: proto})});
       if (msg) msg.textContent = `✓ imported ${r.imported}`;
       if (ta) ta.value = "";
       refresh();
@@ -1380,12 +1637,69 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
     } catch (e) { if (msg) msg.textContent = "save failed: " + e.message; }
   }
   function autoscroll(el){ if (el) el.scrollTop = el.scrollHeight; }
-  function genClearWorkers(){
-    // remove non-alive worker cards from the list (workers dict untouched)
+  async function genClearWorkers(){
+    // server-side removal: a DOM-only clear comes straight back on the next poll
+    try {
+      await api("/admin/dash/generator/workers/clear", {method:"POST", body:"{}"});
+      await api("/admin/claims/clear", {method:"POST", body:"{}"});
+    } catch (e) { /* fall through to the DOM sweep */ }
     document.querySelectorAll('#gen-workers > div').forEach(card => {
       if (!card.querySelector('.btn')) card.remove();
       else if (!/running|starting/.test(card.textContent)) card.remove();
     });
+    refresh();
+  }
+  async function genRemove(name){
+    try {
+      await api("/admin/dash/generator/workers/remove", {method:"POST",
+        body: JSON.stringify({name})});
+    } catch (e) { /* ignore */ }
+    refresh();
+  }
+  async function claimStop(name){
+    try {
+      await api("/admin/claims/stop", {method:"POST", body: JSON.stringify({name})});
+    } catch (e) { /* ignore */ }
+    refresh();
+  }
+  async function claimRemove(name){
+    try {
+      await api("/admin/claims/remove", {method:"POST", body: JSON.stringify({name})});
+    } catch (e) { /* ignore */ }
+    refresh();
+  }
+
+  async function pxAutoVerify(enabled){
+    const sel = $("#px-auto-interval");
+    const interval = sel ? parseInt(sel.value, 10) : 45;
+    try {
+      const r = await api("/admin/dash/proxy/auto_verify", {
+        method: "POST",
+        body: JSON.stringify({enabled, interval_min: interval})
+      });
+      toast(r.auto_verify ? `auto re-verify on (every ${r.interval_min} min)` : "auto re-verify off", "ok");
+      pxAutoPaint();
+    } catch(e) { toast("auto-verify: " + e.message, "err"); }
+  }
+
+  function pxAutoPaint(){
+    const cb = $("#px-auto-verify");
+    if (cb) cb.checked = pxAutoState.auto_verify;
+    const lbl = $("#px-auto-state");
+    if (lbl) lbl.textContent = pxAutoState.auto_verify
+      ? (pxAutoState.last_verified_at
+          ? `· verified ${Math.max(0, Math.round((Date.now()/1000 - pxAutoState.last_verified_at)/60))} min ago`
+          : "· first check pending")
+      : "";
+  }
+  const pxAutoState = {auto_verify: false, last_verified_at: null};
+  async function pxAutoRefresh(){
+    try {
+      const r = await api("/admin/dash/proxy/socks_ready");
+      pxAutoState.auto_verify = !!r.auto_verify;
+      pxAutoState.last_verified_at = r.last_verified_at || null;
+      pxAutoPaint();
+    } catch(e) { /* decorative */ }
   }
 
   /* ------------ email system (domains + worker inbox) ------------ */
@@ -1432,14 +1746,14 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
       <div style="display:flex;align-items:center;gap:10px;margin:3px 0">
         <label style="display:inline-flex;align-items:center;gap:7px;cursor:pointer">
           <input type="radio" name="mail-dom" value="${esc(d)}" ${d===mailSel?'checked':''}
-            onchange="App.mailSelDomain('${esc(d)}')">
+            data-act="mailSelDomain" data-id="${esc(d)}">
           <span class="mono">${esc(d)}</span>
         </label>
         ${d===m.active?'<b style="color:var(--success,#3fb950);font-size:11px">✓ active</b>':''}
         <span style="font-size:11px;color:var(--faint)">
           ${(m.routing_done||[]).includes(d)?'mail routed ✓':'mail not routed yet'}</span>
         <button class="btn btn-quiet btn-sm" title="remove ${esc(d)}"
-          onclick="App.mailRemoveOne('${esc(d)}')">✕</button>
+          data-act="mailRemoveOne" data-id="${esc(d)}">✕</button>
       </div>`).join('');
 
     const s1body = `
@@ -1496,7 +1810,7 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
         <span class="mono" style="min-width:190px">${esc(d)}</span>
         ${done
           ? '<span style="color:var(--success,#3fb950);font-size:12px">✓ routing set up</span>'
-          : `<button class="btn btn-pri btn-sm" onclick="App.mailRoutingDone('${esc(d)}',true)">Mark routing done</button>`}
+          : `<button class="btn btn-pri btn-sm" data-act="mailRoutingDone" data-id="${esc(d)}">Mark routing done</button>`}
       </div>`;
     }).join('');
 
@@ -1679,6 +1993,448 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
 
   /* ------------ tab: proxy (proxy tools) ------------ */
   let pxCache = {};
+  let pxWasRunning = false;
+  const PX_PRESETS = {
+    thorough: {t: 12, c: 300,  pt: 4, pc: 300},
+    balanced: {t: 10, c: 400,  pt: 3, pc: 300},
+    fast:     {t: 6,  c: 800,  pt: 2, pc: 500},
+  };
+  function pxPresetChanged(){
+    const p = PX_PRESETS[(($("#px-preset")||{}).value) || "balanced"] || PX_PRESETS.balanced;
+    const set = (id, v) => { const el = $("#"+id); if (el) el.value = v; };
+    set("px-timeout", p.t); set("px-conc", p.c); set("px-ptimeout", p.pt); set("px-pconc", p.pc);
+  }
+  function pxReasonsHtml(ps){
+    const r = ps.reasons || {};
+    const labels = ps.labels || {};
+    const keys = Object.keys(r).filter(k => r[k] > 0).sort((a,b) => r[b] - r[a]).slice(0, 8);
+    if (!keys.length) return "";
+    const tone = k => (k === "local_limit" ? "var(--warn)" :
+                       (k === "tls" || k === "bad_response") ? "var(--err)" : "var(--muted)");
+    return keys.map(k => `<span class="px-kpi" title="${esc(labels[k] || k)}">
+      <span class="v" style="font-size:14px;color:${tone(k)}">${r[k]}</span>
+      <span class="k">${esc(labels[k] || k)}</span></span>`).join("");
+  }
+  /* ------------ tab: proxy (edge relays) ------------ */
+  let relayData = { enabled: true, active_url: "", active_id: "", models: ["GLM-5.3"], relays: [] };
+  let relayLoading = false;
+
+  async function loadRelays(){
+    if (relayLoading) return;
+    relayLoading = true;
+    try {
+      const res = await api("/admin/dash/relays");
+      if (res) relayData = res;
+    } catch(e) {
+      console.warn("Failed to load relays:", e);
+    } finally {
+      relayLoading = false;
+    }
+    renderRelaysUI();
+  }
+
+  function renderRelaysUI(){
+    const chkEn = $("#relay-enabled");
+    if (chkEn) chkEn.checked = !!relayData.enabled;
+    const chk53 = $("#relay-mod-53");
+    if (chk53) chk53.checked = (relayData.models || []).some(m => m.toLowerCase().includes("5.3") && !m.toLowerCase().includes("flash"));
+    const chkFlash = $("#relay-mod-flash");
+    if (chkFlash) chkFlash.checked = (relayData.models || []).some(m => m.toLowerCase().includes("flash"));
+    const selStrategy = $("#relay-strategy");
+    if (selStrategy) selStrategy.value = relayData.strategy || "single";
+
+    const list = $("#relay-list");
+    if (!list) return;
+    const relays = relayData.relays || [];
+    if (!relays.length) {
+      list.innerHTML = `<div class="empty" style="padding:16px;text-align:center;color:var(--muted);font-size:12.5px;background:var(--field);border:1px dashed var(--border);border-radius:8px">
+        No edge relays configured. Deploy a serverless relay above (Cloudflare, Vercel, Deno, or Netlify) to route GLM-5.3.
+      </div>`;
+      return;
+    }
+
+    const typeIcons = {
+      cloudflare: `<span style="color:#f38020;font-weight:700">⚡ CF</span>`,
+      vercel: `<span style="font-weight:700">▲ Vercel</span>`,
+      deno: `<span style="font-weight:700">🦕 Deno</span>`,
+      netlify: `<span style="color:#00ad9f;font-weight:700">◆ Netlify</span>`,
+      custom: `<span style="color:var(--muted)">🔗 Custom</span>`,
+    };
+
+    list.innerHTML = `<table style="width:100%;border-collapse:collapse;font-size:12.5px">
+      <thead>
+        <tr style="color:var(--muted);text-align:left;border-bottom:1px solid var(--border)">
+          <th style="padding:6px 8px;width:50px">Active</th>
+          <th style="padding:6px 8px">Name</th>
+          <th style="padding:6px 8px">Provider</th>
+          <th style="padding:6px 8px">Relay URL</th>
+          <th style="padding:6px 8px">Status</th>
+          <th style="padding:6px 8px;text-align:right">Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${relays.map(r => {
+          const isActive = r.id === relayData.active_id || r.url === relayData.active_url;
+          const ageMin = r.last_tested_at ? Math.round((Date.now()/1000 - r.last_tested_at)/60) : null;
+          const statusBadge = r.last_status === 200
+            ? `<span class="badge" style="background:rgba(34,197,94,0.12);color:var(--ok)">✓ 200 OK (${r.last_latency_ms || 0}ms)</span>`
+            : (r.last_status ? `<span class="badge" style="background:rgba(239,68,68,0.12);color:var(--err)">✗ ${r.last_status}</span>` : `<span style="color:var(--faint)">untested</span>`)
+              + (ageMin !== null ? `<div style="font-size:10px;color:var(--faint);margin-top:2px">checked ${ageMin}m ago${r.last_error ? ' · ' + esc(String(r.last_error).slice(0,40)) : ''}</div>` : '');
+          return `<tr style="border-top:1px solid var(--border); ${isActive ? 'background:rgba(255,255,255,0.02)' : ''}">
+            <td style="padding:8px">
+              <input type="radio" name="active-relay" ${isActive ? 'checked' : ''} data-act="relaySetActive" data-id="${esc(r.id)}">
+            </td>
+            <td style="padding:8px"><b>${esc(r.name || r.id)}</b></td>
+            <td style="padding:8px">${typeIcons[r.type] || r.type}</td>
+            <td style="padding:8px" class="mono" title="${esc(r.url)}">${esc(r.url.length > 42 ? r.url.slice(0, 39) + '…' : r.url)}</td>
+            <td style="padding:8px" id="relay-status-${esc(r.id)}">${statusBadge}</td>
+            <td style="padding:8px;text-align:right;white-space:nowrap">
+              <button class="btn btn-quiet btn-sm" data-act="relayTest" data-id="${esc(r.id)}" title="Ping test">↻ Test</button>
+              <button class="btn btn-quiet btn-sm" data-act="relayDelete" data-id="${esc(r.id)}" title="Delete" style="color:var(--err)">✕</button>
+            </td>
+          </tr>`;
+        }).join('')}
+      </tbody>
+    </table>`;
+  }
+
+  async function saveRelayOptions(){
+    const chkEn = $("#relay-enabled");
+    const chk53 = $("#relay-mod-53");
+    const chkFlash = $("#relay-mod-flash");
+    const selStrategy = $("#relay-strategy");
+    const models = [];
+    if (chk53 && chk53.checked) models.push("GLM-5.3");
+    if (chkFlash && chkFlash.checked) models.push("GLM-5.3-Flash");
+    const enabled = chkEn ? chkEn.checked : true;
+    const strategy = selStrategy ? selStrategy.value : "single";
+    try {
+      const res = await api("/admin/dash/relays/settings", {
+        method: "POST",
+        body: JSON.stringify({ enabled, models, strategy, active_id: relayData.active_id })
+      });
+      if (res && res.settings) relayData = res.settings;
+      toast("Relay options saved", "ok");
+    } catch(e) {
+      toast("Failed to save relay options: " + e.message, "err");
+    }
+  }
+
+  async function setActiveRelay(id){
+    try {
+      const res = await api("/admin/dash/relays/settings", {
+        method: "POST",
+        body: JSON.stringify({ active_id: id })
+      });
+      if (res && res.settings) relayData = res.settings;
+      renderRelaysUI();
+      toast("Active relay updated", "ok");
+    } catch(e) {
+      toast("Failed to set active relay: " + e.message, "err");
+    }
+  }
+
+  async function testRelay(id){
+    const el = $("#relay-status-" + id);
+    if (el) el.innerHTML = `<span style="color:var(--muted)">testing…</span>`;
+    try {
+      const res = await api("/admin/dash/relays/test", {
+        method: "POST",
+        body: JSON.stringify({ id })
+      });
+      if (res && res.ok) {
+        toast(`Relay test passed: 200 OK (${res.elapsed_ms || 0}ms)`, "ok");
+      } else {
+        toast(`Relay test failed: ${(res && res.error) || (res && res.status) || 'error'}`, "err");
+      }
+      loadRelays();
+    } catch(e) {
+      toast("Test error: " + e.message, "err");
+      loadRelays();
+    }
+  }
+
+  async function deleteRelay(id){
+    const r = (relayData.relays || []).find(x => x.id === id);
+    const name = (r && (r.name || r.id)) || id;
+    const url = (r && r.url) || "";
+    const isActive = relayData.active_id === id;
+    if (!(await confirmDlg("Delete relay?",
+        `${name}${url ? ` — ${url}` : ""} will be removed from the relay list.` +
+        (isActive ? " It is the ACTIVE relay — another one (or none) becomes active." : ""),
+        "Delete", true))) return;
+    try {
+      await api(`/admin/dash/relays/${encodeURIComponent(id)}`, { method: "DELETE" });
+      toast("Relay deleted", "ok");
+      loadRelays();
+    } catch(e) {
+      toast("Failed to delete relay: " + e.message, "err");
+    }
+  }
+
+  function closeRelayModal(){
+    const m = $("#relay-modal");
+    if (m) m.style.display = "none";
+  }
+
+  function openRelayModal(type){
+    const card = $("#relay-modal-card");
+    if (!card) return;
+    let html = "";
+    if (type === "cloudflare") {
+      html = `
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
+          <b style="font-size:16px">Deploy Cloudflare Relay</b>
+          <button class="btn btn-quiet btn-sm" onclick="App.closeRelayModal()">✕</button>
+        </div>
+        <div style="border-radius:8px;background:rgba(249,115,22,0.06);border:1px solid rgba(249,115,22,0.2);padding:12px 14px;margin-bottom:14px;display:flex;flex-direction:column;gap:6px">
+          <p style="font-size:13.5px;font-weight:600;margin:0;color:var(--fg)">What is Cloudflare Relay?</p>
+          <p style="font-size:12px;color:var(--muted);margin:0">Deploys a Cloudflare Worker as a proxy relay. All AI provider requests will be forwarded through Cloudflare's global edge network.</p>
+          <ul style="font-size:12px;color:var(--muted);margin:4px 0 0 16px;padding:0;line-height:1.6">
+            <li>High performance global routing and IP masking via Cloudflare Workers</li>
+            <li>Free tier: 100,000 requests per day</li>
+            <li>Requires Cloudflare Account ID and a Workers API Token (Edit Workers permission)</li>
+          </ul>
+          <div style="margin-top:6px;padding-top:6px;border-top:1px solid rgba(249,115,22,0.15);font-size:11.5px;color:var(--muted)">
+            <p style="font-weight:600;margin:0 0 4px 0;color:var(--fg)">How to generate your API Token:</p>
+            <ol style="margin:0 0 0 16px;padding:0;line-height:1.6">
+              <li>Go to <b>My Profile</b> → <b>API Tokens</b> → <b>Create Token</b></li>
+              <li>Scroll down to <b>Custom Token</b> and click <b>Get started</b></li>
+              <li>Under <b>Permissions</b>: Account | Workers Scripts | Edit</li>
+              <li>Under <b>Account Resources</b>: Include | Account | <i>Your Account Name</i></li>
+              <li>Click <b>Continue to summary</b> → <b>Create Token</b></li>
+            </ol>
+          </div>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:12px">
+          <div>
+            <label class="lbl">Account ID</label>
+            <input type="text" id="rf-cf-account" placeholder="your-cloudflare-account-id" style="width:100%;background:var(--field);color:var(--fg);border:1px solid var(--border);border-radius:8px;padding:8px 10px;font:13px sans-serif;outline:none">
+            <div class="note" style="color:var(--faint);font-size:11px;margin-top:3px">Found on the right side of the Cloudflare dashboard overview page.</div>
+          </div>
+          <div>
+            <label class="lbl">API Token</label>
+            <input type="password" id="rf-cf-token" placeholder="your-cloudflare-api-token" style="width:100%;background:var(--field);color:var(--fg);border:1px solid var(--border);border-radius:8px;padding:8px 10px;font:13px sans-serif;outline:none">
+            <div class="note" style="color:var(--faint);font-size:11px;margin-top:3px">Requires "Workers Scripts: Edit" permission. <a href="https://dash.cloudflare.com/profile/api-tokens" target="_blank" rel="noopener" style="color:var(--accent-soft)">Get token →</a></div>
+          </div>
+          <div>
+            <label class="lbl">Worker Name</label>
+            <input type="text" id="rf-cf-name" placeholder="cloudflare-relay" style="width:100%;background:var(--field);color:var(--fg);border:1px solid var(--border);border-radius:8px;padding:8px 10px;font:13px sans-serif;outline:none">
+            <div class="note" style="color:var(--faint);font-size:11px;margin-top:3px">Unique name for your Cloudflare Worker. Leave empty for auto-generated name.</div>
+          </div>
+          <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px">
+            <button class="btn btn-ghost" onclick="App.closeRelayModal()">Cancel</button>
+            <button class="btn btn-pri" id="btn-deploy-relay" onclick="App.relayDeploy('cloudflare')">Deploy Worker</button>
+          </div>
+        </div>
+      `;
+    } else if (type === "vercel") {
+      html = `
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
+          <b style="font-size:16px">Deploy Vercel Relay</b>
+          <button class="btn btn-quiet btn-sm" onclick="App.closeRelayModal()">✕</button>
+        </div>
+        <div style="border-radius:8px;background:rgba(59,130,246,0.06);border:1px solid rgba(59,130,246,0.2);padding:12px 14px;margin-bottom:14px;display:flex;flex-direction:column;gap:6px">
+          <p style="font-size:13.5px;font-weight:600;margin:0;color:var(--fg)">What is Vercel Relay?</p>
+          <p style="font-size:12px;color:var(--muted);margin:0">Deploys an edge relay function to Vercel. All AI provider requests will be forwarded through Vercel's edge network, masking your real IP from providers.</p>
+          <ul style="font-size:12px;color:var(--muted);margin:4px 0 0 16px;padding:0;line-height:1.6">
+            <li>Your IP is replaced by Vercel's dynamic edge IPs (hundreds of IPs across 20+ global regions)</li>
+            <li>Vercel serves millions of apps — providers can't block Vercel IPs without affecting legitimate traffic</li>
+            <li>Free tier: 100GB bandwidth/month, 500K edge invocations</li>
+            <li>Deploy multiple relays on different accounts for more IP diversity</li>
+          </ul>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:12px">
+          <div>
+            <label class="lbl">Vercel API Token</label>
+            <input type="password" id="rf-vc-token" placeholder="your-vercel-api-token" style="width:100%;background:var(--field);color:var(--fg);border:1px solid var(--border);border-radius:8px;padding:8px 10px;font:13px sans-serif;outline:none">
+            <div class="note" style="color:var(--faint);font-size:11px;margin-top:3px">Token is used once for deployment and not stored. <a href="https://vercel.com/account/tokens" target="_blank" rel="noopener" style="color:var(--accent-soft)">Get token →</a></div>
+          </div>
+          <div>
+            <label class="lbl">Project Name</label>
+            <input type="text" id="rf-vc-name" placeholder="vercel-relay" style="width:100%;background:var(--field);color:var(--fg);border:1px solid var(--border);border-radius:8px;padding:8px 10px;font:13px sans-serif;outline:none">
+            <div class="note" style="color:var(--faint);font-size:11px;margin-top:3px">Unique name for your Vercel project. Leave empty for auto-generated name.</div>
+          </div>
+          <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px">
+            <button class="btn btn-ghost" onclick="App.closeRelayModal()">Cancel</button>
+            <button class="btn btn-pri" id="btn-deploy-relay" onclick="App.relayDeploy('vercel')">Deploy</button>
+          </div>
+        </div>
+      `;
+    } else if (type === "deno") {
+      html = `
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
+          <b style="font-size:16px">Deploy Deno Relay</b>
+          <button class="btn btn-quiet btn-sm" onclick="App.closeRelayModal()">✕</button>
+        </div>
+        <div style="border-radius:8px;background:var(--elev);border:1px solid var(--border);padding:12px 14px;margin-bottom:14px;display:flex;flex-direction:column;gap:6px">
+          <p style="font-size:13.5px;font-weight:600;margin:0;color:var(--fg)">What is Deno Relay?</p>
+          <p style="font-size:12px;color:var(--muted);margin:0">Deploys a relay worker to Deno Deploy's global edge network. All AI provider requests are forwarded through Deno's edge, masking your real IP.</p>
+          <ul style="font-size:12px;color:var(--muted);margin:4px 0 0 16px;padding:0;line-height:1.6">
+            <li>Deno Deploy v2 runs on a high-performance global edge network</li>
+            <li>Free tier: 1M requests & 100GiB outbound traffic per month</li>
+            <li>No per-request CPU time limits (unlike Vercel/Cloudflare)</li>
+            <li>Support up to 20 active apps & 50 custom domains</li>
+            <li>Deploy multiple relays for maximum IP diversity</li>
+          </ul>
+          <div style="margin-top:6px;padding-top:6px;border-top:1px solid var(--border);font-size:11.5px;color:var(--muted)">
+            <p style="font-weight:600;margin:0 0 4px 0;color:var(--fg)">How to generate API token:</p>
+            <ol style="margin:0 0 0 16px;padding:0;line-height:1.6">
+              <li>Go to <b>console.deno.com</b></li>
+              <li>Select your <b>Organization</b> → <b>Settings</b> → <b>Organization Tokens</b></li>
+              <li>Create a <b>Organization Token</b> (prefix <b>ddo_</b>)</li>
+            </ol>
+          </div>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:12px">
+          <div>
+            <label class="lbl">Deno Deploy API Token</label>
+            <input type="password" id="rf-dn-token" placeholder="ddo_xxxxxxxxxxxxxxxxxxxx" style="width:100%;background:var(--field);color:var(--fg);border:1px solid var(--border);border-radius:8px;padding:8px 10px;font:13px sans-serif;outline:none">
+            <div class="note" style="color:var(--faint);font-size:11px;margin-top:3px">Token is used once for deployment, not stored. Found in Organization Settings.</div>
+          </div>
+          <div>
+            <label class="lbl">Organization Domain</label>
+            <input type="text" id="rf-dn-org" placeholder="your-org.deno.net" style="width:100%;background:var(--field);color:var(--fg);border:1px solid var(--border);border-radius:8px;padding:8px 10px;font:13px sans-serif;outline:none">
+            <div class="note" style="color:var(--faint);font-size:11px;margin-top:3px">Organization's default domain. Your relay URL will be in the format: https://my-relay.your-org.deno.net</div>
+          </div>
+          <div>
+            <label class="lbl">App Name</label>
+            <input type="text" id="rf-dn-name" placeholder="deno-relay" style="width:100%;background:var(--field);color:var(--fg);border:1px solid var(--border);border-radius:8px;padding:8px 10px;font:13px sans-serif;outline:none">
+            <div class="note" style="color:var(--faint);font-size:11px;margin-top:3px">Unique app name. Leave empty for auto-generated name.</div>
+          </div>
+          <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px">
+            <button class="btn btn-ghost" onclick="App.closeRelayModal()">Cancel</button>
+            <button class="btn btn-pri" id="btn-deploy-relay" onclick="App.relayDeploy('deno')">Deploy Relay</button>
+          </div>
+        </div>
+      `;
+    } else if (type === "netlify") {
+      html = `
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
+          <b style="font-size:16px">Deploy Netlify Relay</b>
+          <button class="btn btn-quiet btn-sm" onclick="App.closeRelayModal()">✕</button>
+        </div>
+        <div style="border-radius:8px;background:rgba(20,184,166,0.06);border:1px solid rgba(20,184,166,0.2);padding:12px 14px;margin-bottom:14px;display:flex;flex-direction:column;gap:6px">
+          <p style="font-size:13.5px;font-weight:600;margin:0;color:var(--fg)">What is Netlify Relay?</p>
+          <p style="font-size:12px;color:var(--muted);margin:0">Deploys a serverless relay function to Netlify's global edge network. All AI provider requests are forwarded through Netlify's edge, masking your real IP.</p>
+          <ul style="font-size:12px;color:var(--muted);margin:4px 0 0 16px;padding:0;line-height:1.6">
+            <li>Runs on Netlify Functions with a 60-second execution limit and streaming support</li>
+            <li>Free tier: 125,000 function invocations and 100GB bandwidth per month</li>
+            <li>Relay URL format: https://your-site.netlify.app/.netlify/functions/relay</li>
+            <li>Deploy multiple relays on different accounts for more IP diversity</li>
+          </ul>
+          <div style="margin-top:6px;padding-top:6px;border-top:1px solid rgba(20,184,166,0.15);font-size:11.5px;color:var(--muted)">
+            <p style="font-weight:600;margin:0 0 4px 0;color:var(--fg)">How to generate API token:</p>
+            <ol style="margin:0 0 0 16px;padding:0;line-height:1.6">
+              <li>Go to <b>User Settings</b> → <b>Applications</b> → <b>Personal access tokens</b></li>
+              <li>Select <b>New access token</b> and generate a token</li>
+              <li>Copy the token — you won't see it again after leaving the page</li>
+            </ol>
+          </div>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:12px">
+          <div>
+            <label class="lbl">Netlify API Token</label>
+            <input type="password" id="rf-nl-token" placeholder="nfp_xxxxxxxxxxxxxxxxxxxx" style="width:100%;background:var(--field);color:var(--fg);border:1px solid var(--border);border-radius:8px;padding:8px 10px;font:13px sans-serif;outline:none">
+            <div class="note" style="color:var(--faint);font-size:11px;margin-top:3px">Token is used once for deployment and not stored. <a href="https://app.netlify.com/user/applications#personal-access-tokens" target="_blank" rel="noopener" style="color:var(--accent-soft)">Get token →</a></div>
+          </div>
+          <div>
+            <label class="lbl">Site Name</label>
+            <input type="text" id="rf-nl-name" placeholder="netlify-relay" style="width:100%;background:var(--field);color:var(--fg);border:1px solid var(--border);border-radius:8px;padding:8px 10px;font:13px sans-serif;outline:none">
+            <div class="note" style="color:var(--faint);font-size:11px;margin-top:3px">Unique site name (lowercase letters, numbers, hyphens). Your relay URL will be https://site-name.netlify.app/.netlify/functions/relay</div>
+          </div>
+          <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px">
+            <button class="btn btn-ghost" onclick="App.closeRelayModal()">Cancel</button>
+            <button class="btn btn-pri" id="btn-deploy-relay" onclick="App.relayDeploy('netlify')">Deploy</button>
+          </div>
+        </div>
+      `;
+    } else {
+      html = `
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
+          <b style="font-size:16px">Add Existing Relay URL</b>
+          <button class="btn btn-quiet btn-sm" onclick="App.closeRelayModal()">✕</button>
+        </div>
+        <div style="font-size:12.5px;color:var(--muted);margin-bottom:14px">
+          Add any deployed 9Router-compatible edge relay endpoint (Cloudflare Worker, Vercel Edge, Deno Deploy, or Netlify Function).
+        </div>
+        <div style="display:flex;flex-direction:column;gap:12px">
+          <div>
+            <label class="lbl">Relay Name</label>
+            <input type="text" id="rf-cs-name" placeholder="my-edge-relay" style="width:100%;background:var(--field);color:var(--fg);border:1px solid var(--border);border-radius:8px;padding:8px 10px;font:13px sans-serif;outline:none">
+          </div>
+          <div>
+            <label class="lbl">Relay URL</label>
+            <input type="url" id="rf-cs-url" placeholder="https://my-relay.workers.dev" style="width:100%;background:var(--field);color:var(--fg);border:1px solid var(--border);border-radius:8px;padding:8px 10px;font:13px sans-serif;outline:none">
+            <div class="note" style="color:var(--faint);font-size:11px;margin-top:3px">Must be an HTTPS endpoint implementing <code>x-relay-target</code> and <code>x-relay-path</code>.</div>
+          </div>
+          <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px">
+            <button class="btn btn-ghost" onclick="App.closeRelayModal()">Cancel</button>
+            <button class="btn btn-pri" onclick="App.relayAddCustom()">Add Relay</button>
+          </div>
+        </div>
+      `;
+    }
+    card.innerHTML = html;
+    $("#relay-modal").style.display = "flex";
+  }
+
+  async function relayDeploy(type){
+    const btn = $("#btn-deploy-relay");
+    if (btn) { btn.disabled = true; btn.textContent = "Deploying… (may take ~1 min)"; }
+    const params = { type };
+    if (type === "cloudflare") {
+      params.accountId = ($("#rf-cf-account")||{}).value;
+      params.apiToken = ($("#rf-cf-token")||{}).value;
+      params.projectName = ($("#rf-cf-name")||{}).value;
+    } else if (type === "vercel") {
+      params.vercelToken = ($("#rf-vc-token")||{}).value;
+      params.projectName = ($("#rf-vc-name")||{}).value;
+    } else if (type === "deno") {
+      params.denoToken = ($("#rf-dn-token")||{}).value;
+      params.orgDomain = ($("#rf-dn-org")||{}).value;
+      params.projectName = ($("#rf-dn-name")||{}).value;
+    } else if (type === "netlify") {
+      params.netlifyToken = ($("#rf-nl-token")||{}).value;
+      params.projectName = ($("#rf-nl-name")||{}).value;
+    }
+    try {
+      const res = await api("/admin/dash/relays/deploy", {
+        method: "POST",
+        body: JSON.stringify(params)
+      });
+      if (res && res.relay) {
+        toast(`Relay deployed successfully: ${res.relay.name}`, "ok");
+        closeRelayModal();
+        loadRelays();
+      } else {
+        toast("Deploy finished", "ok");
+        closeRelayModal();
+        loadRelays();
+      }
+    } catch(e) {
+      toast(`Deploy failed: ${e.message}`, "err");
+      if (btn) { btn.disabled = false; btn.textContent = "Deploy"; }
+    }
+  }
+
+  async function relayAddCustom(){
+    const name = ($("#rf-cs-name")||{}).value;
+    const url = ($("#rf-cs-url")||{}).value;
+    if (!url) { toast("Relay URL is required", "err"); return; }
+    try {
+      await api("/admin/dash/relays/add", {
+        method: "POST",
+        body: JSON.stringify({ name, url, type: "custom" })
+      });
+      toast("Relay added", "ok");
+      closeRelayModal();
+      loadRelays();
+    } catch(e) {
+      toast(`Failed to add relay: ${e.message}`, "err");
+    }
+  }
+
   async function renderProxyTab(v){
     let px;
     try { px = await api("/admin/dash/generator/proxies"); }
@@ -1687,106 +2443,275 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
       pxMounted = false;
       return;
     }
+    pxAutoRefresh();
     const ps = px.stats || {};
     pxCache = ps;
-    const funnel = (id, label, val, color) =>
-      `<span class="kpi" style="padding:6px 10px"><span class="v" id="${id}" style="color:${color||'inherit'}">${val}</span>
+    const kpi = (id, label, val, color) =>
+      `<span class="px-kpi" title="${esc(label)}"><span class="v" id="${id}" style="color:${color||'var(--fg)'}">${val}</span>
        <span class="k">${label}</span></span>`;
+    const probed = ps.probed ?? 0, total = ps.total ?? 0;
+    const pct = total > 0 ? Math.round(probed / total * 100) : 0;
     const pxLinesHtml = (px.lines || []).slice(-40).map(l =>
       `<div class="mono" style="font-size:11px;color:var(--faint)">${esc(l)}</div>`).join("");
     const shell = `
       <div id="px-container">
         <div class="card">
           <h2>Proxy checker</h2>
-          <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:8px">
-            ${funnel("px-raw", "raw", ps.raw || 0)}
-            ${funnel("px-alive", "alive", ps.alive ?? ps.pool ?? 0, "var(--success,#3fb950)")}
-            ${funnel("px-pool", "pool", ps.pool_file || 0)}
-            ${funnel("px-evergood", "ever-good", ps.ever_good_file || 0)}
-            ${funnel("px-socks", "socks", ps.socks || 0)}
-            ${funnel("px-bad", "bad / MITM", ps.bad || 0, "var(--error,#f85149)")}
-            <span class="kpi" id="px-kpi-best" style="padding:6px 10px;display:${ps.best?'inline-flex':'none'}"><span class="v" id="px-best">${ps.best||''}s</span><span class="k">best</span></span>
-            <span class="kpi" id="px-kpi-median" style="padding:6px 10px;display:${ps.median?'inline-flex':'none'}"><span class="v" id="px-median">${ps.median||''}s</span><span class="k">median</span></span>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px">
+            ${kpi("px-raw", "raw", ps.raw || 0)}
+            ${kpi("px-alive", "alive this scan", ps.alive ?? 0, "var(--ok)")}
+            ${kpi("px-pool", "usable pool", ps.pool_file || 0, "var(--ok)")}
+            ${kpi("px-known", "known", ps.pool_json || ps.pool_file || 0)}
+            ${kpi("px-healthy", "healthy", ps.healthy || 0, "var(--ok)")}
+            ${kpi("px-unverified", "unverified", ps.unverified || 0, "var(--warn)")}
+            ${kpi("px-evergood", "ever-good", ps.ever_good_file || 0)}
+            ${kpi("px-socks", "socks", ps.socks || 0, "var(--accent-soft)")}
+            ${kpi("px-used", "used", ps.used || 0, "var(--warn)")}
+            ${kpi("px-bad", "bad / MITM", ps.bad || 0, "var(--err)")}
+            ${ps.best ? `<span class="px-kpi"><span class="v">${ps.best}s</span><span class="k">best</span></span>` : ""}
+            ${ps.median ? `<span class="px-kpi"><span class="v">${ps.median}s</span><span class="k">median</span></span>` : ""}
           </div>
-          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-            <label class="lbl">max latency s</label>
-            <input type="number" id="px-lat" value="6" step="0.5" min="1" style="width:70px">
-            <label class="lbl">concurrency</label>
-            <input type="number" id="px-conc" value="200" min="20" max="2000" style="width:80px">
-            <button class="btn btn-pri btn-sm" id="px-btn-all" onclick="App.proxyRun('all')"
-              ${px.running ? "disabled" : ""}>⤓ Scrape + Verify</button>
-            <button class="btn btn-ghost btn-sm" id="px-btn-verify" onclick="App.proxyRun('verify')"
-              ${px.running ? "disabled" : ""}>Verify raw</button>
-            <button class="btn btn-ghost btn-sm" id="px-btn-recheck" onclick="App.proxyRun('recheck')"
-              ${px.running ? "disabled" : ""}>↻ Recheck pool</button>
-            <button class="btn btn-ghost btn-sm" id="px-btn-stop" onclick="App.proxyStop()"
-              style="display:${px.running?'inline-block':'none'}">⏹ Stop</button>
-            <span id="px-status" style="color:var(--muted);font-size:12px">
-              ${px.running ? "checking… " + esc(px.action||"") + " (" + (px.elapsed||0) + "s)" : (px.state==='exited'?'finished':(px.state==='failed'?'failed':'idle'))}</span>
+          <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end">
+            <div><label class="lbl">scan preset</label><br>
+              <select id="px-preset" style="width:120px" onchange="App.pxPresetChanged()"
+                title="measured defaults: balanced is best on a home connection">
+                <option value="balanced" selected>balanced</option>
+                <option value="thorough">thorough</option>
+                <option value="fast">fast</option>
+              </select></div>
+            <div><label class="lbl">max latency s</label><br>
+              <input type="number" id="px-lat" value="${ps.max_latency || 6}" step="0.5" min="1" style="width:80px"></div>
+            <div><label class="lbl">timeout s</label><br>
+              <input type="number" id="px-timeout" value="10" min="2" max="60" style="width:74px"></div>
+            <div><label class="lbl">checks</label><br>
+              <input type="number" id="px-conc" value="400" min="20" max="5000" style="width:84px"></div>
+            <div><label class="lbl">tcp probes</label><br>
+              <input type="number" id="px-pconc" value="300" min="10" max="5000" style="width:84px"></div>
+            <div><label class="lbl">probe timeout</label><br>
+              <input type="number" id="px-ptimeout" value="3" min="1" max="30" step="0.5" style="width:84px"></div>
+            <div><label class="lbl">dead cache h</label><br>
+              <input type="number" id="px-dead" value="0" min="0" max="720" style="width:84px"
+                title="skip hosts that failed recently; 0 = off"></div>
+            <label class="help" style="display:flex;gap:6px;align-items:center;cursor:pointer">
+              <input type="checkbox" id="px-prefilter" checked> TCP prefilter</label>
+            <label class="help" style="display:flex;gap:6px;align-items:center;cursor:pointer"
+              title="re-try timeouts/resets once: recovers roughly 30% more proxies">
+              <input type="checkbox" id="px-retry" checked> second chance</label>
+            <div style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap">
+              <button class="btn btn-pri btn-sm" id="px-btn-all" onclick="App.proxyRun('all')"
+                ${px.running ? "disabled" : ""}>⤓ Scrape + Verify</button>
+              <button class="btn btn-ghost btn-sm" id="px-btn-verify" onclick="App.proxyRun('verify')"
+                ${px.running ? "disabled" : ""}>Verify raw</button>
+              <button class="btn btn-ghost btn-sm" id="px-btn-recheck" onclick="App.proxyRun('recheck')"
+                ${px.running ? "disabled" : ""}>↻ Recheck pool</button>
+              <button class="btn btn-ghost btn-sm" id="px-btn-stop" onclick="App.proxyStop()"
+                style="display:${px.running?'inline-block':'none'}">⏹ Stop</button>
+            </div>
+            <div style="display:flex;gap:8px;align-items:center;margin-top:10px;flex-wrap:wrap">
+              <label class="help" style="display:flex;gap:6px;align-items:center;cursor:pointer;font-weight:600;color:var(--fg)">
+                <input type="checkbox" id="px-auto-verify" onchange="App.pxAutoVerify(this.checked)"> Auto re-verify
+              </label>
+              <select id="px-auto-interval" style="background:var(--field);color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:3px 6px;font-size:12px">
+                <option value="30">every 30 min</option>
+                <option value="45" selected>every 45 min</option>
+                <option value="90">every 90 min</option>
+                <option value="180">every 3 h</option>
+              </select>
+              <span style="font-size:11px;color:var(--faint)">keeps the pool fresh so claims never hit a stale set</span>
+              <span id="px-auto-state" style="font-size:11px;color:var(--muted)"></span>
+            </div>
           </div>
-          <div class="help" style="margin-top:6px;color:var(--muted);font-size:11px">
-            qualification: page loads + Aliyun captcha host reachable + valid TLS (anti-MITM) + latency cap.
-            Good ones land in pool + ever-good as they are found.</div>
+          <div id="px-progress-row" style="display:${px.running && total ? 'flex' : 'none'};gap:10px;align-items:center;margin-top:12px">
+            <div class="progress"><div id="px-progress" style="width:${pct}%"></div></div>
+            <span class="mono" id="px-progress-text" style="color:var(--muted);font-size:12px">${probed}/${total}</span>
+          </div>
+          <div style="margin-top:10px;color:var(--muted);font-size:12px" id="px-status-line">
+            ${px.running ? "checking… " + esc(px.action||"") + " (" + (px.elapsed||0) + "s)" : (px.state==='exited'?'✓ finished':(px.state==='failed'?'✗ failed':'idle'))}</div>
+          <div id="px-reasons" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">${pxReasonsHtml(ps)}</div>
+          <div class="help" style="margin-top:6px;color:var(--faint);font-size:11px">
+            qualification: page loads with the z.ai app shell + Aliyun captcha host reachable + valid TLS (anti-MITM)
+            + latency cap. Only verified proxies count as usable; a failed recheck drops one until it passes again.</div>
           <div style="display:flex;align-items:center;justify-content:space-between;margin-top:8px">
             <span class="help">live check log</span>
             <button class="btn btn-quiet btn-sm" onclick="App.pxClearLog()" title="clear log">✕ clear</button>
           </div>
-          <div id="px-lines" style="margin-top:4px;max-height:260px;overflow:auto;background:var(--field);border:1px solid var(--border);border-radius:8px;padding:8px">${pxLinesHtml}</div>
+          <div id="px-lines" style="margin-top:4px;max-height:240px;overflow:auto;background:var(--field);border:1px solid var(--border);border-radius:8px;padding:8px">${pxLinesHtml}</div>
+        </div>
+        <div class="card">
+          <h2>Pool maintenance</h2>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+            <button class="btn btn-ghost btn-sm" onclick="App.proxyMaintain('prune')"
+              title="drop proxies that stayed unhealthy for two weeks">✂ Prune unhealthy</button>
+            <button class="btn btn-ghost btn-sm" onclick="App.proxyMaintain('clear-bad')"
+              title="forget the MITM / TLS blacklist">Clear bad list</button>
+            <button class="btn btn-ghost btn-sm" onclick="App.proxyMaintain('clear-used')"
+              title="allow previously used proxies to be picked again">Clear used list</button>
+            <button class="btn btn-ghost btn-sm" onclick="App.proxyMaintain('clear-dead')"
+              title="re-check hosts that recently failed">Clear dead cache</button>
+            <span id="px-maint-msg" style="color:var(--muted);font-size:12px"></span>
+          </div>
+          <div class="help" style="margin-top:6px">The pool scores every proxy: a failed check adds one, a pass removes one.
+            A proxy counts as usable only when its latest check passed and its score stays at or below 3 —
+            imports sit as pending until a real check proves them.</div>
+          <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:12px;padding-top:12px;border-top:1px solid var(--border)">
+            <div>
+              <div class="lbl">location data</div>
+              <div class="help" id="px-geo-line" style="margin:0">
+                ${(ps.geo||{}).available ? `offline country/ASN ready (${esc(String((ps.geo||{}).updated||''))})` : "not downloaded — country filters use the local cache only"}
+              </div>
+            </div>
+            <button class="btn btn-ghost btn-sm" onclick="App.proxyGeo()" ${px.running ? "disabled" : ""}
+              title="download DB-IP Lite (~7 MB, no account): offline country + ASN, no API calls">⤓ Download databases</button>
+            <span class="help" style="margin:0;font-size:11px">by
+              <a href="https://db-ip.com" target="_blank" rel="noopener">DB-IP</a> (CC BY 4.0)</span>
+            <span id="px-geo-msg" style="color:var(--muted);font-size:12px"></span>
+          </div>
+        </div>
+        <div class="card" id="relay-card">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+            <h2>Edge Relays <span style="font-weight:400;color:var(--muted);font-size:12px">— Cloudflare, Vercel, Deno, Netlify</span></h2>
+            <div style="display:flex;align-items:center;gap:8px">
+              <span id="relay-status-msg" style="font-size:12px;color:var(--muted)"></span>
+            </div>
+          </div>
+
+          <div style="background:rgba(234, 179, 8, 0.08);border:1px solid rgba(234, 179, 8, 0.3);border-radius:8px;padding:12px 14px;margin-bottom:14px;color:var(--fg);font-size:13px;line-height:1.5">
+            <div style="display:flex;align-items:flex-start;gap:10px">
+              <span style="font-size:20px;line-height:1">⚠️</span>
+              <div>
+                <b style="color:var(--warn)">Important Notice:</b> ZCode blocks standard <b>GLM-5.3</b> from direct residential/datacenter IPs with <code>HTTP 405 (unusual activity)</code>.
+                You <b>must</b> deploy and route through an edge relay (Cloudflare, Vercel, Deno, or Netlify) to use GLM-5.3 without errors.
+              </div>
+            </div>
+          </div>
+
+          <div style="display:flex;align-items:center;gap:18px;flex-wrap:wrap;padding:12px 14px;background:var(--field);border:1px solid var(--border);border-radius:8px;margin-bottom:14px">
+            <label class="help" style="display:flex;gap:6px;align-items:center;cursor:pointer;font-weight:600;color:var(--fg);margin:0">
+              <input type="checkbox" id="relay-enabled" onchange="App.saveRelayOptions()"> Enable Edge Relay
+            </label>
+            <div style="height:20px;width:1px;background:var(--border)"></div>
+            <span style="font-size:12px;color:var(--muted)">Route models through relay:</span>
+            <label class="help" style="display:flex;gap:6px;align-items:center;cursor:pointer;margin:0">
+              <input type="checkbox" id="relay-mod-53" onchange="App.saveRelayOptions()"> <b>GLM-5.3</b> <span class="badge" style="background:var(--elev);color:var(--ok)">Recommended</span>
+            </label>
+            <label class="help" style="display:flex;gap:6px;align-items:center;cursor:pointer;margin:0">
+              <input type="checkbox" id="relay-mod-flash" onchange="App.saveRelayOptions()"> GLM-5.3-Flash
+            </label>
+            <div style="height:20px;width:1px;background:var(--border)"></div>
+            <span style="font-size:12px;color:var(--muted)">Rotation:</span>
+            <select id="relay-strategy" onchange="App.saveRelayOptions()" style="background:var(--field);color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:4px 8px;font-size:12.5px">
+              <option value="single">Single (active relay only)</option>
+              <option value="round_robin">Round Robin</option>
+              <option value="random">Random</option>
+            </select>
+            <span style="font-size:11px;color:var(--faint)">a failed relay is skipped for 60s</span>
+          </div>
+
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:14px">
+            <button class="btn btn-ghost btn-sm" onclick="App.openRelayModal('cloudflare')"><span style="color:#f38020">⚡</span> Deploy Cloudflare Relay</button>
+            <button class="btn btn-ghost btn-sm" onclick="App.openRelayModal('vercel')">▲ Deploy Vercel Relay</button>
+            <button class="btn btn-ghost btn-sm" onclick="App.openRelayModal('deno')">🦕 Deploy Deno Relay</button>
+            <button class="btn btn-ghost btn-sm" onclick="App.openRelayModal('netlify')"><span style="color:#00ad9f">◆</span> Deploy Netlify Relay</button>
+            <button class="btn btn-quiet btn-sm" onclick="App.openRelayModal('custom')">＋ Add Existing URL</button>
+            <div class="grow"></div>
+            <button class="btn btn-quiet btn-sm" onclick="App.loadRelays()">↻ Refresh</button>
+          </div>
+
+          <div id="relay-list" style="overflow-x:auto"></div>
         </div>
         <div class="card">
           <h2>Custom proxies</h2>
-          <textarea id="px-import" rows="4" placeholder="ip:port  or  proto://ip:port  — one per line"
+          <textarea id="px-import" rows="4" placeholder="ip:port, proto://ip:port, user:pass@ip:port, host:port:user:pass, CIDR, JSON or an HTML list"
             style="width:100%;background:var(--field);color:var(--fg);border:1px solid var(--border);border-radius:8px;padding:8px 11px;font:12px ui-monospace,monospace;outline:none"></textarea>
           <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px">
-            <input type="file" id="px-file" accept=".txt,.csv" onchange="App.genProxyFile()" style="display:none">
+            <input type="file" id="px-file" accept=".txt,.csv,.json,.html,.htm" onchange="App.genProxyFile()" style="display:none">
             <button class="btn btn-ghost btn-sm" onclick="document.getElementById('px-file').click()">⤒ Upload file</button>
+            <div style="display:flex;gap:6px;align-items:center">
+              <span class="help" style="margin:0">bare ip:port means</span>
+              <select id="px-import-proto" style="width:104px">
+                <option value="http" selected>http</option>
+                <option value="socks5">socks5</option>
+                <option value="socks4">socks4</option>
+                <option value="all">every type</option>
+              </select>
+            </div>
             <button class="btn btn-pri btn-sm" onclick="App.genProxyImport()">＋ Add to pool</button>
             <span id="px-import-msg" style="color:var(--muted);font-size:12px"></span>
           </div>
-          <div class="help">Added proxies join the pool immediately — usable before verification.</div>
+          <div class="help">Added proxies are queued as <b>pending</b> — they join the pool only after
+            Verify raw / Recheck pool proves them, so the generator never counts untested imports.
+            Logins (<span class="mono">user:pass@</span>) are kept for use but hidden in logs and this list.</div>
         </div>
         <div class="card">
           <h2>Proxy sources <span style="font-weight:400;color:var(--muted);font-size:12px">— scrape list</span></h2>
-          <textarea id="px-sources" rows="7" placeholder="proto url  — one per line,  # for comments"
+          <textarea id="px-sources" rows="6" placeholder="proto url  — one per line,  # for comments"
             style="width:100%;background:var(--field);color:var(--fg);border:1px solid var(--border);border-radius:8px;padding:8px 11px;font:12px ui-monospace,monospace;outline:none"></textarea>
           <div style="display:flex;gap:8px;align-items:center;margin-top:8px">
             <button class="btn btn-ghost btn-sm" onclick="App.genLoadSources()">↻ Load current</button>
             <button class="btn btn-pri btn-sm" onclick="App.genSaveSources()">Save sources</button>
             <span id="px-sources-msg" style="color:var(--muted);font-size:12px"></span>
           </div>
-          <div class="help">Used by “Scrape + Verify”. Add or remove source lists here.</div>
+          <div class="help">Used by “Scrape + Verify”. A source that produces nothing is visible in the yield
+            table below — delete it instead of guessing.</div>
+        </div>
+        <div class="card">
+          <h2>Source yield</h2>
+          <div id="px-yield" style="max-height:220px;overflow:auto">
+            <div class="help">no scans yet — run one to see which sources produce working proxies.</div>
+          </div>
+          <div style="display:flex;gap:8px;align-items:center;margin-top:8px">
+            <button class="btn btn-ghost btn-sm" onclick="App.proxyYield()">↻ Refresh yield</button>
+          </div>
         </div>
       </div>`;
     if (!pxMounted || !$("#px-container")) {
       v.innerHTML = shell;
       pxMounted = true;
       genLoadSources();
+      proxyYield();
+      loadRelays();
       return;
     }
     // dynamic-only update: stats + buttons + log
     const setT = (id, val) => { const el = $(id); if (el) el.textContent = val; };
     setT("#px-raw", ps.raw || 0);
-    setT("#px-alive", ps.alive ?? ps.pool ?? 0);
+    setT("#px-alive", ps.alive ?? 0);
     setT("#px-pool", ps.pool_file || 0);
+    setT("#px-known", ps.pool_json || ps.pool_file || 0);
+    setT("#px-healthy", ps.healthy || 0);
+    setT("#px-unverified", ps.unverified || 0);
     setT("#px-evergood", ps.ever_good_file || 0);
     setT("#px-socks", ps.socks || 0);
+    setT("#px-used", ps.used || 0);
     setT("#px-bad", ps.bad || 0);
-    if (ps.best) { setT("#px-best", ps.best + "s"); const k = $("#px-kpi-best"); if (k) k.style.display = "inline-flex"; }
-    if (ps.median) { setT("#px-median", ps.median + "s"); const k = $("#px-kpi-median"); if (k) k.style.display = "inline-flex"; }
+    const rx = $("#px-reasons");
+    if (rx) rx.innerHTML = pxReasonsHtml(ps);
+    const gl = $("#px-geo-line");
+    if (gl) gl.textContent = (ps.geo||{}).available
+      ? `offline country/ASN ready (${(ps.geo||{}).updated || ''})`
+      : "not downloaded — country filters use the local cache only";
+    const row = $("#px-progress-row");
+    if (row) {
+      row.style.display = px.running && total ? "flex" : "none";
+      const bar = $("#px-progress"); if (bar) bar.style.width = pct + "%";
+      setT("#px-progress-text", probed + "/" + total);
+    }
     const all = $("#px-btn-all"); if (all) all.disabled = !!px.running;
     const ver = $("#px-btn-verify"); if (ver) ver.disabled = !!px.running;
     const rec = $("#px-btn-recheck"); if (rec) rec.disabled = !!px.running;
     const stop = $("#px-btn-stop"); if (stop) stop.style.display = px.running ? "inline-block" : "none";
-    const stEl = $("#px-status");
-    if (stEl) stEl.textContent = px.running
-      ? ("checking… " + esc(px.action||"") + " (" + (px.elapsed||0) + "s)")
-      : (px.state === 'exited' ? 'finished' : (px.state === 'failed' ? 'failed' : 'idle'));
+    const stEl = $("#px-status-line");
+    if (stEl) stEl.innerHTML = px.running
+      ? "checking… " + esc(px.action||"") + " (" + (px.elapsed||0) + "s)"
+      : (px.state === 'exited' ? '✓ finished' : (px.state === 'failed' ? '✗ failed' : 'idle'));
     const pxBox = $("#px-lines");
     if (pxBox && pxBox.innerHTML !== pxLinesHtml) {
       const atBottom = pxBox.scrollHeight - pxBox.scrollTop <= pxBox.clientHeight + 20;
       pxBox.innerHTML = pxLinesHtml;
       if (atBottom) pxBox.scrollTop = pxBox.scrollHeight;
     }
+    if (pxWasRunning && !px.running) proxyYield();   // scan just finished: refresh yield
+    pxWasRunning = !!px.running;
   }
   function pxClearLog(){
     const box = $("#px-lines"); if (box) box.innerHTML = "";
@@ -1846,10 +2771,54 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
     </div></div>`;
   }
 
+  /* ------------ tab: usage ------------ */
+  async function renderUsage(v){
+    const res = await api("/admin/dash/usage");
+    const d = res.last_30d || {}, all = res.all_time || {}, daily = res.daily || [];
+    const maxReq = Math.max(1, ...daily.map(x => x.requests));
+    const bars = daily.map(x => `
+      <div style="display:flex;align-items:flex-end;gap:4px;flex:1;flex-direction:column;min-width:0">
+        <div title="${x.day}: ${x.requests} requests, ${fmtTok(x.tokens)} tokens (${x.ok} ok)"
+          style="width:100%;height:${Math.round(28 + (x.requests/maxReq)*120)}px;border-radius:3px 3px 0 0;
+          background:linear-gradient(180deg,var(--accent-soft,#4f8cff),rgba(79,140,255,0.25));min-height:${x.requests?4:1}px"></div>
+        <span style="font-size:9.5px;color:var(--faint);white-space:nowrap">${x.day}</span>
+      </div>`).join('');
+    const modelRows = (d.by_model||[]).slice(0,8).map(m => `
+      <tr style="border-top:1px solid var(--border)">
+        <td style="padding:5px 8px">${esc(m.model||'—')}</td>
+        <td style="padding:5px 8px;text-align:right">${m.requests}</td>
+        <td style="padding:5px 8px;text-align:right">${fmtTok(m.tokens)}</td>
+      </tr>`).join('');
+    v.innerHTML = `
+      <div class="card"><h2>Traffic — last 14 days</h2>
+        <div style="display:flex;align-items:flex-end;gap:4px;height:180px;padding:8px 2px">${bars}</div>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin:12px 0">
+        <div class="card" style="padding:12px"><div style="font-size:11px;color:var(--muted)">REQUESTS (30D)</div>
+          <div style="font-size:24px;font-weight:700">${d.requests||0}</div></div>
+        <div class="card" style="padding:12px"><div style="font-size:11px;color:var(--muted)">TOKENS (30D)</div>
+          <div style="font-size:24px;font-weight:700">${fmtTok(d.total_tokens)}</div></div>
+        <div class="card" style="padding:12px"><div style="font-size:11px;color:var(--muted)">SUCCESS RATE (30D)</div>
+          <div style="font-size:24px;font-weight:700">${d.requests?Math.round((d.ok/d.requests)*100):100}%</div></div>
+        <div class="card" style="padding:12px"><div style="font-size:11px;color:var(--muted)">AVG LATENCY (30D)</div>
+          <div style="font-size:24px;font-weight:700">${((d.avg_duration_ms||0)/1000).toFixed(1)}s</div></div>
+      </div>
+      <div class="card"><h2>By model (30 days)</h2>
+        <table style="width:100%;border-collapse:collapse;font-size:12.5px">
+          <thead><tr style="color:var(--muted);text-align:left">
+            <th style="padding:5px 8px">Model</th><th style="padding:5px 8px;text-align:right">Requests</th>
+            <th style="padding:5px 8px;text-align:right">Tokens</th></tr></thead>
+          <tbody>${modelRows || '<tr><td colspan="3" style="padding:12px;color:var(--faint)">no traffic recorded yet</td></tr>'}</tbody>
+        </table>
+        <p style="color:var(--faint);font-size:11.5px;margin:10px 0 0">All-time: ${all.requests||0} requests, ${fmtTok(all.total_tokens)} tokens. Rate-limited (30d): ${d.rate_limited||0} · credit-exhausted: ${d.insufficient_credits||0}.</p>
+      </div>`;
+  }
+  function fmtTok(n){ n = n||0; if (n >= 1e9) return (n/1e9).toFixed(1)+'B'; if (n >= 1e6) return (n/1e6).toFixed(1)+'M'; if (n >= 1e3) return (n/1e3).toFixed(1)+'k'; return String(n); }
+
   /* ------------ tab switching + polling ------------ */
   const RENDER = {accounts:renderAccounts, generator:renderGenerator, proxy:renderProxyTab, models:renderModels, server:renderServer,
                   settings:renderSettings, stats:renderStats, logs:renderLogs,
-                  guide:renderGuide};
+                  usage:renderUsage, guide:renderGuide};
 
   function tab(name){
     if (curTab === "generator" || name !== "generator") {
@@ -1869,14 +2838,20 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
     const v = $("#view");
     if (curTab === "accounts") { const q = $("#acct-q"); if (q) cache.acctQ = q.value; }
     if (curTab === "models")   { const q = $("#mdl-q");  if (q) cache.mdlQ  = q.value; }
-    RENDER[curTab](v).catch(e => { v.innerHTML =
-      `<div class="card"><div class="empty"><h3>Could not load</h3><p>${esc(e.message)}</p></div></div>`; });
+    // renderGuide is synchronous (returns undefined) — calling .catch on it
+    // threw every tick and skipped restartTimer(), leaving the previous
+    // tab's interval running forever.
+    const out = RENDER[curTab](v);
+    if (out && typeof out.catch === "function") {
+      out.catch(e => { v.innerHTML =
+        `<div class="card"><div class="empty"><h3>Could not load</h3><p>${esc(e.message)}</p></div></div>`; });
+    }
     paintChips();
   }
   function restartTimer(){
     clearInterval(timer);
     // live tabs poll; static tabs don't
-    const live = {accounts:4000, generator:3000, proxy:2000, models:6000, logs:3000, stats:8000}[curTab];
+    const live = {accounts:4000, generator:3000, proxy:2000, models:6000, logs:3000, stats:8000, usage:15000}[curTab];
     if (live) timer = setInterval(() => refresh(), live);
   }
 
@@ -1908,8 +2883,33 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
           showUpdate, hideUpdate, skipUpdate, doUpdate,
           loginStart, loginCancel, genStart, genStop, genStopAll, genSaveOptions, genAutoSave, genIpChanged,
           proxyRun, proxyStop, genProxyImport, genProxyFile, genLoadSources, genSaveSources,
-          genClearWorkers};
+          proxyMaintain, proxyGeo, proxyYield, pxPresetChanged, pxAutoVerify,
+          genClearWorkers, genRemove, claimStop, claimRemove, acctClaim, claimAllPending,
+          openRelayModal, closeRelayModal, relayDeploy, relayAddCustom, loadRelays,
+          saveRelayOptions, setActiveRelay, testRelay, deleteRelay};
 })();
+
+// Global delegated listener: names/ids/domains must never be interpolated into
+// inline JS strings (HTML-entity decoding happens before JS parsing, so
+// esc() cannot protect onclick='...' contexts). Buttons carry data-act/data-id.
+window.addEventListener("click", e => {
+  const el = e.target.closest("[data-act]");
+  if (!el) return;
+  const act = el.dataset.act, id = el.dataset.id;
+  if (act === "genStop") App.genStop(id);
+  else if (act === "genRemove") App.genRemove(id);
+  else if (act === "claimStop") App.claimStop(id);
+  else if (act === "claimRemove") App.claimRemove(id);
+  else if (act === "mailRemoveOne") App.mailRemoveOne(id);
+  else if (act === "mailRoutingDone") App.mailRoutingDone(id, true);
+  else if (act === "relaySetActive") App.setActiveRelay(id);
+  else if (act === "relayTest") App.testRelay(id);
+  else if (act === "relayDelete") App.deleteRelay(id);
+});
+window.addEventListener("change", e => {
+  const el = e.target;
+  if (el && el.dataset && el.dataset.act === "mailSelDomain") App.mailSelDomain(el.dataset.id);
+});
 window.addEventListener("DOMContentLoaded", App.start);
 </script>
 </body>

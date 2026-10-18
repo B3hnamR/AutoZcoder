@@ -28,6 +28,7 @@ captures/
 flows/
 run-*.txt
 run.pid
+docs/BUG-AUDIT-*.md
 
 # ---- python ----
 __pycache__/

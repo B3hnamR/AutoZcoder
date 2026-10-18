@@ -7,6 +7,10 @@ PyYAML>=6.0,<7.0
 # used at runtime by the generator bridge (generator/plan_check.py) when the
 # gateway registers a freshly created account into the pool
 requests>=2.31,<3.0
+# relay deploys use the Windows system cert store (frozen exe has no certifi
+# bundle; AV/proxy TLS interception broke api.netlify.com etc.)
+truststore>=0.9
+certifi
 
 # desktop shell (WebView2 window for the dashboard) — omit for headless servers
 pywebview>=6.0,<7.0

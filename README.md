@@ -124,6 +124,36 @@ Live checks (explicit, separate from tests):
 - Authenticated client/admin routes, per-install keys, redacted captures (off by default).
 - One-click Cloudflare worker deploy with automatic Node.js install.
 
+### Proxy pool (generator)
+
+The generator's proxy tooling verifies every candidate against `chat.z.ai`
+itself: the auth page must load with a valid certificate **and** the Aliyun
+captcha host must be reachable. Around that gate:
+
+- **One parser** for every list shape: `ip:port`, `scheme://`, `user:pass@`,
+  provider style `host:port:user:pass`, CIDR ranges (up to /16), HTML tables
+  and JSON records (`generator/proxy_parse.py`).
+- **TCP prefilter** before any HTTPS request (measured: ~3 s/port instead of two
+  full HTTP timeouts per dead host).
+- **Health scoring** in `pool.json` — a failed check adds one, a pass removes
+  one; a proxy stays usable while its score is ≤ 3. `proxies.txt` is the
+  best-first export, so `main.py` is unchanged. Pasted proxies are `vouched`
+  and stay pending until a real check passes; only verified proxies are exported
+  or counted by the generator.
+- **Second chance** pass over timeouts/resets (recovers roughly 30% more on
+  free lists).
+- **Typed failure reasons** (timeout, refused, TLS/MITM, hijacked page,
+  wrong protocol, *your PC ran out of connections*, …) shown live in the
+  dashboard instead of a bare "0 found".
+- **Dead cache** (opt-in) so repeat scans skip hosts that just failed.
+- **Cross-process claims**: eight workers are eight processes; the claim lock
+  is a file lock, so two workers can never get the same exit IP.
+- **Per-source yield** and scan presets (`balanced` / `thorough` / `fast`).
+- **Offline geo** — optional DB-IP Lite download for country/ASN, replacing
+  rate-limited API lookups. Data by [DB-IP](https://db-ip.com) (CC BY 4.0).
+
+CLI: `python generator/proxy_pool.py{ fetch | verify | recheck | pick | geo | stats | prune | clear-bad | clear-used | clear-dead }`.
+
 ## Security notes
 
 - Runtime secrets (`config.yaml`, `gateway.db`, `accounts/`, `generator/mail.json`,

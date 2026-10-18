@@ -16,7 +16,7 @@ upstream:
   overload_base_delay_seconds: 2
   overload_max_delay_seconds: 60
 pool:
-  strategy: least_in_flight
+  strategy: drain_first
   cooldown_seconds: 30
   max_in_flight_per_account: 4
   acquire_wait_seconds: 5
@@ -46,7 +46,7 @@ store:
   sqlite_path: ./gateway.db
 update:
   enabled: false
-  repo: B3hnamR/ZcodeGate
+  repo: B3hnamR/AutoZcoder
 generator:
   enabled: false
   zcodeauto_dir: ""     # '' = auto-detect; or set the generator folder (has main.py)
@@ -54,4 +54,5 @@ generator:
   headless: false       # only used with captcha: auto (manual always needs a window)
   claim: true           # claim the invite Global Build after signup
   invite_code: "MT9GNDQ8"      # referral code claimed after signup ('' = off)
-  socks_only: true              # socks4/5 pool only (residential — passes Starter gate)
+  socks_only: true              # legacy bool (proxy_types below overrides it)
+  proxy_types: "socks"          # all | socks | socks5 | socks4 | http — pool scheme filter

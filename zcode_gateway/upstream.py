@@ -109,11 +109,14 @@ def is_entitlement_code(code: str) -> bool:
 # the same account keeps serving other models (captured: GLM-5.3 blocked while
 # GLM-5.3-Flash still returns 200). Treated like a per-model park: the account
 # is skipped for that model and the request rotates to the next account.
-BLOCKED_CODES = frozenset({"3012"})
+BLOCKED_CODES = frozenset({"3012", "405", "HTTP_405"})
 
 
-def is_block_code(code: str) -> bool:
-    return str(code or "").upper() in BLOCKED_CODES
+def is_block_code(code: str, status: int = 0) -> bool:
+    if status == 405:
+        return True
+    c = str(code or "").upper()
+    return c in BLOCKED_CODES or "3012" in c or "405" in c
 
 
 def _error_code(body: str | bytes | None) -> str:
@@ -125,7 +128,7 @@ def _error_code(body: str | bytes | None) -> str:
         return ""
     err = parsed.get("error", parsed)
     if isinstance(err, dict):
-        return str(err.get("code") or "").upper()
+        return str(err.get("code") or err.get("statusCode") or "").upper()
     return ""
 
 
@@ -192,7 +195,7 @@ def parse_upstream_error(status: int, body: str | bytes | None) -> dict[str, Any
         err = parsed.get("error", parsed)
         if isinstance(err, dict):
             return {
-                "code": str(err.get("code") or err.get("type") or f"http_{status}"),
+                "code": str(err.get("code") or err.get("statusCode") or err.get("type") or f"http_{status}"),
                 "message": err.get("message") or err.get("msg") or text[:400],
                 "raw": parsed,
             }
@@ -282,8 +285,9 @@ class UpstreamResponse:
 class UpstreamClient:
     """Thin httpx wrapper. Adds nothing to the request the caller did not set."""
 
-    def __init__(self, cfg: UpstreamConfig) -> None:
+    def __init__(self, cfg: UpstreamConfig, relay_manager: Any = None) -> None:
         self.cfg = cfg
+        self.relay_manager = relay_manager
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(cfg.timeout_read, connect=cfg.timeout_connect),
             limits=httpx.Limits(max_connections=200, max_keepalive_connections=50),
@@ -297,18 +301,73 @@ class UpstreamClient:
 
     async def send(self, headers: dict[str, str], body: dict[str, Any],
                    stream: bool) -> UpstreamResponse:
-        req = self._client.build_request(
-            "POST", self.cfg.chat_url, headers=headers, json=body,
-        )
-        try:
-            resp = await self._client.send(req, stream=stream)
-        except httpx.HTTPError as exc:
-            raise TransportError(str(exc)) from exc
-        return UpstreamResponse(
-            status_code=resp.status_code,
-            headers={k.lower(): v for k, v in resp.headers.items()},
-            _resp=resp,
-        )
+        # Rotation: get_relay_for_model applies the strategy (single /
+        # round_robin / random) and skips cooled-down relays.
+        tried_relay_urls: list[str] = []
+        max_relay_tries = 1
+        if self.relay_manager and self.relay_manager.get_relay_count() > 1:
+            max_relay_tries = min(3, self.relay_manager.get_relay_count())
+
+        last_exc: Exception | None = None
+        for attempt in range(max_relay_tries):
+            relay_url = None
+            if self.relay_manager:
+                req_model = str(body.get("model") or "")
+                relay_url = self.relay_manager.get_relay_for_model(req_model)
+                if relay_url and relay_url in tried_relay_urls:
+                    # already tried this one this call — stop rotating
+                    relay_url = None if len(tried_relay_urls) >= self.relay_manager.get_relay_count() else relay_url
+                    if relay_url is None:
+                        break
+
+            try:
+                if relay_url:
+                    import urllib.parse
+                    parsed = urllib.parse.urlparse(self.cfg.chat_url)
+                    target = f"{parsed.scheme}://{parsed.netloc}"
+                    relay_path = parsed.path + (f"?{parsed.query}" if parsed.query else "")
+
+                    fwd_headers = dict(headers)
+                    fwd_headers["x-relay-target"] = target
+                    fwd_headers["x-relay-path"] = relay_path
+                    req = self._client.build_request(
+                        "POST", relay_url, headers=fwd_headers, json=body,
+                    )
+                else:
+                    if attempt > 0:
+                        break  # no relay path left — re-raise the last error
+                    req = self._client.build_request(
+                        "POST", self.cfg.chat_url, headers=headers, json=body,
+                    )
+                resp = await self._client.send(req, stream=stream)
+            except httpx.HTTPError as exc:
+                # relay (or direct) transport failure: mark + rotate
+                if relay_url and self.relay_manager:
+                    self.relay_manager.mark_relay_failed(relay_url)
+                    tried_relay_urls.append(relay_url)
+                    last_exc = TransportError(str(exc))
+                    continue
+                raise TransportError(str(exc)) from exc
+
+            if relay_url and resp.status_code >= 500 and self.relay_manager:
+                # the relay itself is unhappy — cool it and try the next one
+                await resp.aclose()
+                self.relay_manager.mark_relay_failed(relay_url)
+                tried_relay_urls.append(relay_url)
+                last_exc = TransportError(f"relay {relay_url} returned {resp.status_code}")
+                continue
+
+            if relay_url and self.relay_manager:
+                self.relay_manager.mark_relay_ok(relay_url)
+            return UpstreamResponse(
+                status_code=resp.status_code,
+                headers={k.lower(): v for k, v in resp.headers.items()},
+                _resp=resp,
+            )
+
+        if last_exc is not None:
+            raise last_exc
+        raise TransportError("no relay attempt succeeded")
 
 
 class TransportError(Exception):

@@ -307,3 +307,127 @@ async def refresh_model_catalog(request: Request,
     if state.catalog is None:
         raise HTTPException(status_code=503, detail="model catalogue unavailable")
     return await state.catalog.refresh_if_due(force=True)
+
+# ---- per-account 100M claim (Accounts tab) --------------------------------- #
+# Runs the standalone claim (generator/claim100.py) for one account, either
+# through a pool proxy (default; pinned proxy first) or on the direct IP.
+
+
+@router.post("/accounts/{account_id}/claim100m")
+async def claim_100m(request: Request, account_id: str, body: dict = Body(default={}),
+                     key: str = Depends(admin_key)) -> dict:
+    state = get_state(request)
+    account = await state.pool.find(account_id)
+    if account is None:
+        raise HTTPException(status_code=404, detail="account not found")
+    email = (account.email or "").strip().lower()
+    if not email:
+        raise HTTPException(status_code=400, detail="account has no email on file")
+    mode = "direct" if str(body.get("mode") or "").lower() == "direct" else "proxy"
+    from .api_dash import _generator
+    mgr = _generator(request)
+    if mgr is None:
+        raise HTTPException(status_code=400, detail="generator manager unavailable")
+    # claims touch disk and browsers; keep the loop free
+    return await asyncio.to_thread(mgr.start_claim, email, mode)
+
+
+@router.post("/claims/stop")
+async def claim_stop(request: Request, body: dict = Body(...),
+                     key: str = Depends(admin_key)) -> dict:
+    name = str(body.get("name") or "")
+    from .api_dash import _generator
+    ok = _generator(request).stop_claim(name)
+    if not ok:
+        raise HTTPException(status_code=404, detail="no such claim")
+    return {"stopped": name}
+
+
+@router.post("/claims/remove")
+async def claim_remove(request: Request, body: dict = Body(...),
+                       key: str = Depends(admin_key)) -> dict:
+    name = str(body.get("name") or "")
+    from .api_dash import _generator
+    ok = _generator(request).remove_claim(name)
+    if not ok:
+        raise HTTPException(status_code=404, detail="no such claim")
+    return {"removed": name}
+
+
+@router.post("/claims/clear")
+async def claim_clear(request: Request, key: str = Depends(admin_key)) -> dict:
+    from .api_dash import _generator
+    n = _generator(request).clear_finished_claims()
+    return {"cleared": n}
+
+
+@router.post("/claims/claim_all_pending")
+async def claim_all_pending(request: Request, body: dict = Body(default={}),
+                            key: str = Depends(admin_key)) -> dict:
+    """Sequentially claim 100M for every starter account that hasn't yet.
+    Runs in the background: returns immediately with a queue id."""
+    mode = "direct" if str(body.get("mode") or "").lower() == "direct" else "proxy"
+    from .api_dash import _generator
+    mgr = _generator(request)
+    if getattr(mgr, "_claim_all_running", False):
+        return {"error": "claim-all already running"}
+    mgr._claim_all_running = True
+
+    def _run():
+        try:
+            mgr.claim_all_pending(mode=mode)
+        finally:
+            mgr._claim_all_running = False
+
+    import threading
+    threading.Thread(target=_run, daemon=True).start()
+    return {"started": True, "mode": mode}
+
+
+@router.get("/claims/claim_all_status")
+async def claim_all_status(request: Request, key: str = Depends(admin_key)) -> dict:
+    from .api_dash import _generator
+    mgr = _generator(request)
+    return {"running": bool(getattr(mgr, "_claim_all_running", False)),
+            "claims": mgr.claims_public()}
+
+
+@router.get("/dash/proxy/socks_ready")
+async def proxy_socks_ready(request: Request, key: str = Depends(admin_key)) -> dict:
+    """Live socks count + last verified time for the claim health badge."""
+    from .api_dash import _generator
+    mgr = _generator(request)
+
+    def _read():
+        return {"socks_ready": mgr.socks_ready_count(),
+                "last_verified_at": mgr.checker.last_verified_at,
+                "auto_verify": mgr.checker.auto_verify,
+                "auto_interval_min": mgr.checker.auto_interval_min}
+
+    return await asyncio.to_thread(_read)
+
+
+@router.post("/dash/proxy/auto_verify")
+async def proxy_auto_verify(request: Request, body: dict = Body(...),
+                            key: str = Depends(admin_key)) -> dict:
+    """Toggle the background pool re-verify loop."""
+    from .api_dash import _generator
+    mgr = _generator(request)
+    enabled = bool(body.get("enabled"))
+    interval = body.get("interval_min")
+    return mgr.checker.set_auto_verify(enabled, interval)
+
+
+@router.get("/dash/usage")
+async def usage_dashboard(request: Request, key: str = Depends(admin_key)) -> dict:
+    """Usage stats for the dashboard: totals + daily buckets."""
+    state = get_state(request)
+    summary = await asyncio.to_thread(state.store.summary, 86400 * 30)
+    summary_all = await asyncio.to_thread(state.store.summary)
+    daily = await asyncio.to_thread(state.store.daily_buckets, 14)
+    return {"last_30d": summary, "all_time": summary_all, "daily": daily}
+
+
+def raise404(name):
+    from fastapi import HTTPException as _H
+    raise _H(status_code=404, detail="no such claim")

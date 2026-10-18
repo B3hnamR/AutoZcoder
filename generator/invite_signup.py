@@ -28,11 +28,11 @@ from utils import ANTI_DETECTION_SCRIPT, BROWSER_ARGS
 from config import CONFIG
 
 OUT_SUFFIX = os.environ.get('ZAI_OUT_SUFFIX', 'inv')
-PROFILE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                           '.pw-profile' + OUT_SUFFIX)
-ACC_FILE = f'output/accounts{OUT_SUFFIX}.txt'
-PLANS_FILE = f'output/plans{OUT_SUFFIX}.jsonl'
-STARTER_FILE = f'output/starter{OUT_SUFFIX}.txt'
+OUTPUT_DIR = os.environ.get('ZAI_OUTPUT_DIR', 'output')
+PROFILE_DIR = os.path.join(OUTPUT_DIR, '.pw-profile' + OUT_SUFFIX)
+ACC_FILE = os.path.join(OUTPUT_DIR, f'accounts{OUT_SUFFIX}.txt')
+PLANS_FILE = os.path.join(OUTPUT_DIR, f'plans{OUT_SUFFIX}.jsonl')
+STARTER_FILE = os.path.join(OUTPUT_DIR, f'starter{OUT_SUFFIX}.txt')
 
 DEFAULT_URL = 'https://zcode.z.ai/invite/MT9GNDQ8'
 
@@ -76,17 +76,22 @@ def main():
         return True
 
     with sync_playwright() as p:
+        import fingerprint as _fp
+        ident = _fp.make_identity()
+        print(f'[fp] chrome/{ident["chrome_major"]} · {ident["viewport"]["width"]}x{ident["viewport"]["height"]} · '
+              f'cc={ident["country"]} · tz={ident["timezone_id"]}')
         ctx = p.chromium.launch_persistent_context(
             PROFILE_DIR,
             headless=False,
             args=BROWSER_ARGS,
-            viewport={'width': 1280, 'height': 800},
-            user_agent=UA,
-            locale='en-US',
-            timezone_id='America/New_York',
+            viewport=ident['viewport'],
+            user_agent=ident['user_agent'],
+            locale=ident['locale'],
+            timezone_id=ident['timezone_id'],
         )
         page = ctx.new_page()
-        page.add_init_script(ANTI_DETECTION_SCRIPT)
+        page.add_init_script(_fp.base_script(ident))
+        page.add_init_script(_fp.noise_script(ident))
 
         def on_response(resp):
             try:
@@ -143,7 +148,7 @@ def main():
             tok = captured['token']
             email = captured['email'] or 'unknown'
             print('\n[+] saving…')
-            Path('output').mkdir(exist_ok=True)
+            Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
             with open(ACC_FILE, 'a', encoding='utf-8') as f:
                 f.write(f'{email}:manual-invite:{tok}\n')
 

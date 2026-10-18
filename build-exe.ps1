@@ -57,6 +57,18 @@ if ($needRuntime) {
 
 $mode = if ($Console) { "--console" } else { "--windowed" }
 
+# Stage only the generator sources. The live folder accumulates Playwright
+# profiles (browser cookies), proxy ledgers and token caches; none of that
+# belongs inside a shipped exe.
+$genStage = Join-Path ([System.IO.Path]::GetTempPath()) ("zcoder-generator-" + [guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Force -Path $genStage | Out-Null
+Copy-Item -Path (Join-Path $Here "generator\*.py") -Destination $genStage
+foreach ($f in @("README.md", "requirements.txt")) {
+    $src = Join-Path $Here "generator\$f"
+    if (Test-Path $src) { Copy-Item -LiteralPath $src -Destination $genStage }
+}
+Write-Host "  generator sources staged: $((Get-ChildItem $genStage -File).Count) files"
+
 # icon: official Zcode logo, extracted to assets/ by tools/make_icon.py
 $icon = Join-Path $Here "assets\zcode.ico"
 $iconArg = @()
@@ -106,12 +118,13 @@ $buildArgs = @(
     # so PyInstaller cannot see them
     "--hidden-import", "zcode_gateway.generator",
     "--hidden-import", "zcode_gateway.accounts_dir_bridge",
-    # ship the example config, the app icon assets, the dashboard page, and the
-    # Cloudflare mail-worker template used by the one-click deploy
+    # ship the example config, the app icon assets, the dashboard page, the
+    # Cloudflare mail-worker template, and the bundled generator scripts
     "--add-data", "config.example.yaml;.",
     "--add-data", "assets;assets",
     "--add-data", "zcode_gateway/dashboard;zcode_gateway/dashboard",
     "--add-data", "mail-worker;mail-worker",
+    "--add-data", "$genStage;generator",
     "--paths", $Here,
     "--specpath", $Here
 ) + $iconArg + $versionArg + @("gui_main.py")
@@ -119,6 +132,7 @@ $buildArgs = @(
 Write-Host "`n  building (this takes a minute)...`n" -ForegroundColor Cyan
 & $py @buildArgs
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed with exit code $LASTEXITCODE" }
+Remove-Item -LiteralPath $genStage -Recurse -Force -ErrorAction SilentlyContinue
 
 $exe = Join-Path $Here "dist\ZcodeGateway.exe"
 if (-not (Test-Path $exe)) { throw "expected output missing: $exe" }

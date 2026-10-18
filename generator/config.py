@@ -1,4 +1,7 @@
+import os
 from pathlib import Path
+
+_out = os.environ.get('ZAI_OUTPUT_DIR', 'output')
 
 CONFIG = {
     'url': 'https://chat.z.ai/auth',
@@ -47,13 +50,13 @@ CONFIG = {
     'log_level': 'INFO',
     'log_to_file': True,
     'log_to_console': True,
-    'log_file': 'output/output.txt',
+    'log_file': os.path.join(_out, 'output.txt'),
     'save_screenshots': True,
     'save_captcha_images': True,
     'track_timing': True,
-    'log_dir': 'output',
-    'screenshot_dir': 'output',
-    'data_dir': 'output',
-    'output_dir': 'output',
-    'debug_dir': 'output',
+    'log_dir': _out,
+    'screenshot_dir': _out,
+    'data_dir': _out,
+    'output_dir': _out,
+    'debug_dir': _out,
 }

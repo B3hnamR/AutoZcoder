@@ -16,18 +16,15 @@ Usage from the generator (after finish_signup):
 Standalone:
     python invite_claim.py <chat_token> [invite_code]
 """
-import io
 import json
 import os
-import re
 import sys
 import time
 
 sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
-from utils import ANTI_DETECTION_SCRIPT, BROWSER_ARGS
-from config import CONFIG
+from utils import BROWSER_ARGS
 
 # NOTE: playwright is imported lazily inside claim_invite(). The referral
 # helpers below (referral_summary / send_one_message) are imported by the
@@ -125,10 +122,16 @@ def _oauth_bridge(page, chat_token, log=print):
         time.sleep(1)
     time.sleep(2)
 
-    # consent screen: tick the required Terms checkbox, THEN Continue enables
+    # consent screen: tick the required Terms checkbox, THEN Continue — keep
+    # driving until the URL actually leaves login/authorize. A single click
+    # can hit a lookalike button (e.g. an empty-email "Continue" on a login
+    # page) and the exchange then silently bounces back to /login.
+    deadline = time.time() + 45
     consent_clicked = False
-    for _ in range(15):
-        # required agreement checkbox (Continue is disabled until checked)
+    while time.time() < deadline:
+        url = page.url
+        if 'zcode.z.ai' in url and '/login' not in url and 'authorize' not in url:
+            break
         try:
             cb = page.locator('input[type="checkbox"]').first
             if cb.count() and not cb.is_checked():
@@ -137,43 +140,57 @@ def _oauth_bridge(page, chat_token, log=print):
                 time.sleep(0.5)
         except Exception:
             pass
-        # role-based click is the one proven to advance this page — try it first
+        clicked = False
         try:
             btn = page.get_by_role('button', name='Continue')
             if btn.count() and btn.first.is_enabled():
                 btn.first.click(timeout=5000)
-                consent_clicked = True
+                clicked = True
                 log('  invite: bridge -> consent approved (role)')
         except Exception:
             pass
-        if not consent_clicked:
-            for sel in ('button:has-text("Continue")',
-                        'button:has-text("Authorize")',
-                        'button:has-text("Allow")'):
+        if not clicked:
+            for sel in ('button:has-text("Authorize")',
+                        'button:has-text("Allow")',
+                        'button:has-text("Continue")'):
                 try:
                     loc = page.locator(sel).last
                     if loc.is_visible() and loc.is_enabled():
                         loc.click()
-                        consent_clicked = True
+                        clicked = True
                         log(f'  invite: bridge -> consent approved ({sel})')
                         break
                 except Exception:
                     continue
-        if consent_clicked:
-            break
+        consent_clicked = consent_clicked or clicked
         time.sleep(1)
     if not consent_clicked:
         log('  invite: bridge -> consent not completed')
 
-    # wait for the token exchange + redirect back to zcode
-    for _ in range(25):
-        url = page.url
-        if 'zcode.z.ai' in url and '/login' not in url and 'authorize' not in url:
-            break
-        time.sleep(1)
     time.sleep(2)
-    ok = 'zcode.z.ai' in page.url and 'authorize' not in page.url
-    log(f'  invite: bridge settled at {page.url[:80]}')
+    # settled = really logged in. The URL alone is a lie: the invite page is
+    # public and renders while logged out. The web app stores its session JWT in
+    # localStorage as `zcodejwttoken` after /api/v1/oauth/token; without it the
+    # Accept click can never fire bind-code (headless Chromium silently fails
+    # this exchange).
+    token = False
+    deadline = time.time() + 12
+    while time.time() < deadline:
+        try:
+            token = bool(page.evaluate(
+                "() => { try { return !!localStorage.getItem('zcodejwttoken'); }"
+                " catch (e) { return false; } }"))
+        except Exception:
+            token = False
+        if token:
+            break
+        time.sleep(0.5)
+    url_ok = ('zcode.z.ai' in page.url and '/login' not in page.url
+              and 'authorize' not in page.url)
+    ok = url_ok and token
+    log(f'  invite: bridge settled at {page.url[:80]}'
+        + (' (ok)' if ok else
+           (' (NO SESSION — token missing)' if not token else ' (no session)')))
     return ok
 
 
@@ -195,14 +212,19 @@ def referral_summary(zcode_jwt, log=print):
             'target': reward.get('target') if reward else None}
 
 
+_LAST_CAPTCHA_REGION = None
+
+
 def _captcha_param(log=print):
     """Pull a traceless-captcha param from the local Go captcha service
     (POST /api/captcha/solve {return:'param'}, auth: admin/admin). Optional —
     the in-page send is the primary path; this is a fallback for headless runs.
 
-    Returns the param STRING, or None. (It used to return a (param, region)
-    tuple, which was then set as an HTTP header and blew up with
-    'Header part ((None, '')) must be of type str or bytes'.)"""
+    Returns the param STRING, or None. The matching region is kept in
+    ``_LAST_CAPTCHA_REGION`` and must be sent as X-Aliyun-Captcha-Verify-Region;
+    without it the API answers 405/3012 even with a fresh param.
+    """
+    global _LAST_CAPTCHA_REGION
     import requests
     base = os.environ.get('ZAI_CAPTCHA_URL') or 'http://127.0.0.1:8687'
     try:
@@ -215,6 +237,7 @@ def _captcha_param(log=print):
                    headers=h, timeout=180)
         j = r.json()
         if j.get('success') and j.get('param'):
+            _LAST_CAPTCHA_REGION = j.get('region') or _LAST_CAPTCHA_REGION
             return str(j['param'])
         log(f'  invite: captcha solve failed: {str(j)[:120]}')
     except Exception as e:
@@ -241,7 +264,8 @@ def _norm_captcha_param(v):
     return s.strip() or None
 
 
-def send_message_in_page(page, zcode_jwt, log=print, captcha_param=None) -> bool:
+def send_message_in_page(page, zcode_jwt, log=print, captcha_param=None,
+                         captcha_region=None) -> bool:
     """Send the one client message from INSIDE the logged-in browser page.
 
     The client chat endpoint is guarded by the Aliyun traceless captcha: a plain
@@ -273,8 +297,20 @@ def send_message_in_page(page, zcode_jwt, log=print, captcha_param=None) -> bool
         const h = {'content-type': 'application/json',
                    'accept': 'text/event-stream',
                    'anthropic-version': '2023-06-01',
-                   'authorization': 'Bearer ' + a.jwt};
-        if (a.cap) h['x-aliyun-captcha-verify-param'] = a.cap;        const r = await fetch(a.url, {
+                   'authorization': 'Bearer ' + a.jwt,
+                   'x-api-key': a.jwt,
+                   'x-zcode-agent': 'glm',
+                   'x-zcode-app-version': '3.15.3',
+                   'x-zcode-session-type': 'main',
+                   'x-client-language': 'en-US',
+                   'x-os-category': 'windows',
+                   'x-platform': 'win32-x64',
+                   'http-referer': 'https://zcode.z.ai',
+                   'x-device-mid': a.dev,
+                   'x-session-id': a.sid};
+        if (a.cap) h['x-aliyun-captcha-verify-param'] = a.cap;
+        if (a.reg) h['x-aliyun-captcha-verify-region'] = a.reg;
+        const r = await fetch(a.url, {
           method: 'POST', credentials: 'include', headers: h,
           body: JSON.stringify(a.body),
         });
@@ -284,7 +320,9 @@ def send_message_in_page(page, zcode_jwt, log=print, captcha_param=None) -> bool
     }"""
     try:
         res = page.evaluate(js, {'url': CLI_MESSAGES, 'jwt': zcode_jwt,
-                                 'body': body, 'cap': captcha_param or ''})
+                                 'body': body, 'cap': captcha_param or '',
+                                 'reg': captcha_region or '',
+                                 'dev': device_mid or '', 'sid': session_id or ''})
     except Exception as e:
         log(f'  invite: in-page send failed to run ({type(e).__name__})')
         return False
@@ -293,48 +331,75 @@ def send_message_in_page(page, zcode_jwt, log=print, captcha_param=None) -> bool
     return st == 200
 
 
-def send_one_message(zcode_jwt, log=print, captcha_param=None, retries=4):
+def _send_confirmed(zcode_jwt, log=print, last=None):
+    """The endpoint may answer 405/3012 on the wire while still crediting the
+    task server-side — the referral summary is the only truth."""
+    try:
+        s = referral_summary(zcode_jwt, log=lambda *a, **k: None)
+        if s and s['tasks'].get('send_message'):
+            log('  invite: send_message confirmed by summary')
+            return True
+    except Exception:
+        pass
+    if last:
+        log(f'  invite: message not sent: {last}')
+    return False
+
+
+def send_one_message(zcode_jwt, log=print, retries=2):
     """Complete the send_message task via the ZCode client chat API.
-    Body mirrors the native ZCode client exactly (bootstrap system blocks,
-    thinking enabled, metadata.user_id).
 
-    The client call is guarded by Aliyun traceless captcha: without a fresh
-    `x-aliyun-captcha-verify-param` the API answers 405 / code 3012 "unusual
-    activity". The bind-code request the browser just made carries a valid
-    param, so we replay that one; if it is missing we fall back to asking the
-    local captcha service (ZAI_CAPTCHA_URL), and finally to retries."""
+    Uses the exact wire contract from the gateway (GLM-5.3-Flash, anthropic-beta,
+    electron headers, stream=True) which passes upstream risk control with 200."""
     import requests
-    from plan_check import build_headers
-
-    if captcha_param is None:
-        captcha_param = _captcha_param(log=log)
-    captcha_param = _norm_captcha_param(captcha_param)
+    gateway_url = os.environ.get("ZAI_GATEWAY_URL") or "http://127.0.0.1:8788"
+    # Per-run token when spawned by the gateway; legacy static value only
+    # authenticates from loopback (manual CLI runs of this repo's tools).
+    internal = os.environ.get("ZAI_GATEWAY_INTERNAL_TOKEN") or "gateway-internal"
+    try:
+        gr = requests.post(
+            f"{gateway_url}/admin/dash/generator/send_claim_message",
+            json={"zjwt": zcode_jwt},
+            headers={"Authorization": f"Bearer {internal}"},
+            timeout=15,
+        )
+        if gr.status_code == 200 and gr.json().get("ok"):
+            log("  invite: client message sent via gateway (200)")
+            return _send_confirmed(zcode_jwt, log)
+        log(f"  invite: gateway send -> {gr.status_code} {gr.text[:120]}")
+    except Exception as e:
+        log(f"  invite: gateway send skipped ({type(e).__name__}) — falling back to direct")
 
     url = 'https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages'
     last = None
-    for attempt in range(1, retries + 1):
+
+    try:
+        from zcode_gateway.upstream import build_headers as gw_headers
+        from zcode_gateway.config import Fingerprint
+        from zcode_gateway.zcode_protocol import build_body
+        fp = Fingerprint()
+        h = gw_headers(zcode_jwt, fp, include_device_mid=False)
+        body = build_body({"model": "GLM-5.3-Flash", "max_tokens": 10,
+                           "messages": [{"role": "user", "content": "hi"}], "stream": True})
+    except Exception:
+        from plan_check import build_headers
         h = build_headers(zcode_jwt)
-        session_id = h['x-session-id']
-        device_mid = h['x-device-mid']
-        # chat shape: device lives in metadata only, never in headers
         h.pop('x-device-mid', None)
-        h.pop('x-zcode-session-type', None)
-        if captcha_param:
-            h['x-aliyun-captcha-verify-param'] = captcha_param
+        h['anthropic-beta'] = 'mid-conversation-system-2026-04-07'
+        session_id = h.get('x-session-id', '')
+        device_mid = h.get('x-device-mid', '')
         body = {
-            'model': 'glm-5.3-flash',
-            'max_tokens': 512,
+            'model': 'GLM-5.3-Flash',
+            'max_tokens': 10,
             'stream': True,
-            'messages': [{'role': 'user',
-                          'content': [{'type': 'text', 'text': 'hi'}]}],
+            'messages': [{'role': 'user', 'content': [{'type': 'text', 'text': 'hi'}]}],
             'system': [{'type': 'text', 'text': ZCODE_IDENTITY},
                        {'type': 'text', 'text': ZCODE_HARNESS}],
             'thinking': {'type': 'enabled'},
-            'output_config': {'effort': 'low'},
-            'metadata': {'user_id': json.dumps(
-                {'device_id': device_mid, 'account_uuid': '', 'session_id': session_id},
-                separators=(',', ':'))},
+            'output_config': {'effort': 'max'},
         }
+
+    for attempt in range(1, retries + 1):
         try:
             r = requests.post(url, headers=h, json=body, stream=True,
                               timeout=120, verify=_VERIFY, proxies=_proxies())
@@ -346,31 +411,26 @@ def send_one_message(zcode_jwt, log=print, captcha_param=None, retries=4):
                         break
                 r.close()
                 log(f'  invite: client message sent ({n} bytes streamed)')
-                return True
+                return _send_confirmed(zcode_jwt, log)
             last = f'{r.status_code} {r.text[:150]}'
             log(f'  invite: client chat -> {last}')
-            # 3012 = risk control: refresh the captcha param and back off
-            if r.status_code == 405 or '3012' in (r.text or ''):
-                if attempt < retries:
-                    fresh = _captcha_param(log=log)
-                    if fresh:
-                        captcha_param = fresh
-                    time.sleep(4 * attempt)
-                    continue
-            break
+            time.sleep(3 * attempt)
         except Exception as e:
             last = f'{type(e).__name__}: {e}'
             log(f'  invite: client chat error {last}')
             time.sleep(3)
-    if last:
-        log(f'  invite: message not sent after {retries} attempt(s): {last}')
-    return False
+    return _send_confirmed(zcode_jwt, log, last)
 
 
 _NO_PROXY = {"", "0", "none", "null", "direct", "off", "false", "no"}
+_FORCE_DIRECT = False
 
 
 def _proxies():
+    # force_direct claims run on the real IP: suppressed here instead of mutating
+    # os.environ, so an exception can never strip the caller's signup proxy.
+    if _FORCE_DIRECT:
+        return None
     # ZAI_PROXY may carry a sentinel meaning 'no proxy' - the gateway sets
     # '0' for direct connections. Anything falsy or one of these tokens means
     # go direct; otherwise the value would be used as a proxy host and every
@@ -379,6 +439,38 @@ def _proxies():
     if raw.lower() in _NO_PROXY:
         return None
     return {'http': raw, 'https': raw}
+
+
+def _direct_proxy_while(fn):
+    """Run `fn` with direct mode when force_direct=True; always restore."""
+    import functools
+    import inspect
+
+    sig = inspect.signature(fn)
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        global _FORCE_DIRECT
+        try:
+            force = sig.bind_partial(*args, **kwargs).arguments.get('force_direct', False)
+        except TypeError:
+            force = kwargs.get('force_direct', False)
+        prev = _FORCE_DIRECT
+        _FORCE_DIRECT = bool(force) or prev
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            _FORCE_DIRECT = prev
+
+    return wrapper
+
+
+def per_account_device_mid(token: str) -> str:
+    """Stable per-account device id (uuid5 of the chat token) instead of the
+    hardcoded shared one — every account reporting the SAME x-device-mid in
+    telemetry is a direct cross-account correlation signal."""
+    import uuid as _u
+    return str(_u.uuid5(_u.NAMESPACE_URL, 'zcode-device:' + (token or '')))
 
 
 APP_HEADERS = {  # exact cli/init header set captured from the desktop app
@@ -421,7 +513,7 @@ def report_login_device(zjwt: str, user_id: str = None, device_mid: str = None, 
         except Exception:
             user_id = ''
 
-    mid = device_mid or APP_HEADERS.get('x-device-mid', '58aca3b3-3239-4cb7-9c70-df3e5488fb99')
+    mid = device_mid or per_account_device_mid(zjwt)
     h = dict(APP_HEADERS)
     h['authorization'] = 'Bearer ' + zjwt
     endpoint = 'https://zcode.z.ai/api/v1/event/report'
@@ -483,11 +575,16 @@ def report_login_device(zjwt: str, user_id: str = None, device_mid: str = None, 
         return False
 
 
-def device_login(chat_token, log=print):
+@_direct_proxy_while
+def device_login(chat_token, log=print, force_direct: bool = False):
     """Full desktop-app-equivalent login:
     cli/init -> authorize (chat token approves) -> cli/poll ready
     -> report_login_device (app_login_success telemetry) -> zai_login.
-    Returns (zcodeJWT, ok)."""
+    Returns (zcodeJWT, ok).
+
+    force_direct: the OAuth flow is authenticated by the chat token, not the IP,
+    so the 100M claim runs from the user's own connection instead of the
+    account-generation proxy."""
     import requests
     import secrets
     import re as _re
@@ -577,18 +674,35 @@ def zai_login(zai_access_token, log=print):
     return ok
 
 
+@_direct_proxy_while
 def claim_invite(chat_token: str, invite_code: str = 'MT9GNDQ8', log=print,
                  headless: bool = False, manual_accept: bool = False,
-                 zjwt: str = None, captcha_param: str = None) -> dict:
+                 zjwt: str = None, captcha_param: str = None,
+                 force_direct: bool = False) -> dict:
     """Full invite-claim chain. zjwt: pass a pre-minted zcodeJWT (from
     device_login run EARLIER) to skip step 4 — the proven order for fresh
     accounts is login FIRST, then bind, then message.
 
     captcha_param: an Aliyun traceless-captcha param captured earlier in the
     flow (e.g. the signup param) — used as the last-resort source for the
-    client message, which otherwise answers 405/3012."""
+    client message, which otherwise answers 405/3012.
+
+    force_direct: run the whole claim on the REAL IP — the bind is authenticated
+    by the account session, not by IP, so the signup proxy is neither needed nor
+    desirable here (verified 2026-10-18: same-account bind succeeded from a
+    different IP). The claim window stays visible: headless Chromium never
+    completes /api/v1/oauth/token, which leaves the invite page logged out and
+    bind-code can never fire."""
     result = {'bound': False, 'message_sent': False, 'summary': None,
               'zcode_jwt': None}
+    if force_direct:
+        # Headless is NOT safe for this step: Chromium silently drops the OAuth
+        # token exchange, the invite page renders logged out, and Accept never
+        # emits bind-code. Visible + manual accept is the working recipe.
+        if os.environ.get('ZAI_CLAIM_HEADLESS', '').strip().lower() not in ('1', 'true', 'yes', 'on'):
+            headless = False
+    if not headless:
+        manual_accept = True            # the window is visible: allow a human click
     suffix = os.environ.get('ZAI_OUT_SUFFIX', '')
     # per-account profile: a reused profile carries the PREVIOUS account's
     # zcode session and the consent page then names the wrong user.
@@ -609,7 +723,26 @@ def claim_invite(chat_token: str, invite_code: str = 'MT9GNDQ8', log=print,
             locale='en-US', timezone_id='America/New_York')
         _px = _proxies()
         if _px and _px.get('https'):
-            launch_kwargs['proxy'] = {'server': _px['https']}
+            # embedded credentials (http://user:pass@host:port) must be split
+            # into separate fields — Chromium drops them from 'server' alone
+            # and then shows an auth popup (net::ERR_INVALID_AUTH_CREDENTIALS)
+            from urllib.parse import urlparse
+            _u = urlparse(_px['https'])
+            _pd = {'server': f"{_u.scheme or 'http'}://{_u.hostname}:{_u.port}"}
+            if _u.username:
+                _pd['username'] = _u.username
+                _pd['password'] = _u.password or ''
+            launch_kwargs['proxy'] = _pd
+        elif force_direct:
+            log('  invite: direct mode — claiming on the real IP')
+
+        import fingerprint as _fp
+        _px_url = (_px or {}).get('https')
+        ident = _fp.make_identity(proxy_url=_px_url if not force_direct else None)
+        launch_kwargs['viewport'] = ident['viewport']
+        launch_kwargs['user_agent'] = ident['user_agent']
+        launch_kwargs['locale'] = ident['locale']
+        launch_kwargs['timezone_id'] = ident['timezone_id']
         ctx = p.chromium.launch_persistent_context(
             profile, **launch_kwargs)
         log('  invite: browser up')
@@ -642,7 +775,8 @@ def claim_invite(chat_token: str, invite_code: str = 'MT9GNDQ8', log=print,
 
         page = ctx.new_page()
         page.set_default_timeout(45000)
-        page.add_init_script(ANTI_DETECTION_SCRIPT)
+        page.add_init_script(_fp.base_script(ident))
+        page.add_init_script(_fp.noise_script(ident))
         page.add_init_script(CAPTCHA_HOOK)     # build the client-call captcha param
         page.on('response', on_response)
         page.on('request', on_request)
@@ -682,48 +816,184 @@ def claim_invite(chat_token: str, invite_code: str = 'MT9GNDQ8', log=print,
                 time.sleep(3)
         log(f'  invite: at {page.url[:90]}')
 
-        # 3. click the accept button (several phrasings seen in the UI), then
-        #    wait for the bind-code POST. If nothing lands, retry the click —
-        #    the button can appear before the page is interactive.
-        def _click_accept() -> bool:
-            for sel in ('button:has-text("Accept invitation")',
-                        'button:has-text("Accept Invitation")',
-                        'button:has-text("Accept")',
-                        'button:has-text("接受")'):
-                try:
+        # 3. click the accept button (several phrasings/renderings seen in the
+        #    UI — it also renders as a link), then wait for the bind-code POST.
+        def _logged_out() -> bool:
+            # localStorage is authoritative: the header can still render a
+            # "Log in" link (footer/account switcher) on a logged-in page, and
+            # the old visual check then re-ran the bridge for no reason.
+            try:
+                return not bool(page.evaluate(
+                    "() => { try { return !!localStorage.getItem('zcodejwttoken'); }"
+                    " catch (e) { return false; } }"))
+            except Exception:
+                pass
+            try:
+                for sel in ('a:has-text("Log in")', 'button:has-text("Log in")',
+                            'a:has-text("Sign in")'):
                     loc = page.locator(sel).first
-                    loc.wait_for(state='visible', timeout=5000)
-                    loc.click()
-                    log(f'  invite: clicked accept ({sel})')
+                    if loc.count() and loc.is_visible():
+                        return True
+            except Exception:
+                pass
+            return False
+
+        def _click_accept() -> bool:
+            # Security-verification failure detection: the page shows
+            # "Security verification failed. Please try again." under the
+            # button when the Aliyun risk engine rejected the captcha token.
+            # Reload + re-click earns a FRESH captcha score instead of
+            # hammering the rejected one.
+            def _security_failed() -> bool:
+                try:
+                    for sel in ('text=Security verification failed',
+                                'text=安全验证失败'):
+                        if page.locator(sel).first.count():
+                            return True
+                except Exception:
+                    pass
+                return False
+
+            def _fresh_page_and_click() -> bool:
+                try:
+                    page.goto(invite_url, wait_until='domcontentloaded',
+                              timeout=60000)
+                except Exception:
+                    pass
+                time.sleep(2.5)
+                return _click_buttons()
+
+            def _click_buttons() -> bool:
+                for sel in ('button:has-text("Accept invitation")',
+                            'button:has-text("Accept Invitation")',
+                            'button:has-text("Accept")',
+                            'button:has-text("接受")',
+                            'a:has-text("Accept invitation")',
+                            'a:has-text("Accept")',
+                            '[role="button"]:has-text("Accept")'):
+                    try:
+                        loc = page.locator(sel).first
+                        loc.wait_for(state='visible', timeout=4000)
+                        loc.click()
+                        log(f'  invite: clicked accept ({sel})')
+                        return True
+                    except Exception:
+                        continue
+                for role in ('button', 'link'):
+                    try:
+                        page.get_by_role(role, name='Accept invitation') \
+                            .first.click(timeout=4000)
+                        log(f'  invite: clicked accept (role={role})')
+                        return True
+                    except Exception:
+                        continue
+                try:
+                    page.get_by_text('Accept invitation').first.click(timeout=4000)
+                    log('  invite: clicked accept (text)')
                     return True
                 except Exception:
-                    continue
+                    return False
+
+            ok = _click_buttons()
+            if ok and _security_failed():
+                log('  invite: security verification failed — reloading for a fresh captcha')
+                return _fresh_page_and_click()
+            return ok
+
+        # the invite page is PUBLIC — it renders even logged out, so being on
+        # the right URL proves nothing. A "Log in" pill means the bridge
+        # failed: re-run it before trying to accept.
+        if _logged_out():
+            log('  invite: invite page is LOGGED OUT — re-running the OAuth bridge')
             try:
-                page.get_by_role('button', name='Accept invitation').click(timeout=5000)
-                log('  invite: clicked accept (role)')
-                return True
-            except Exception:
-                return False
+                _oauth_bridge(page, chat_token, log=log)
+            except Exception as e:
+                log(f'  invite: bridge retry failed ({type(e).__name__})')
+            for attempt in range(3):
+                if _on_invite_page() and not _logged_out():
+                    break
+                try:
+                    page.goto(invite_url, wait_until='domcontentloaded', timeout=60000)
+                except Exception:
+                    pass
+                time.sleep(3)
+            log(f'  invite: at {page.url[:90]} (after re-bridge)')
 
         clicked = _click_accept()
         if not clicked:
-            log('  invite: no accept button found (maybe already bound)')
+            if _logged_out():
+                log('  invite: no accept click — page is LOGGED OUT')
+            else:
+                log('  invite: no accept button found (maybe already bound)')
 
-        if manual_accept and not bind_seen['code']:
+        if manual_accept and not bind_seen['code'] and clicked:
+            try:
+                page.bring_to_front()      # make sure the human can see it
+            except Exception:
+                pass
             log('  invite: MANUAL — click "Accept invitation" in the window now')
-            log('  invite: watching for the bind-code POST (up to 300s)…')
+            log('  invite: watching for the bind-code POST (up to 90s)…')
 
         # wait for the bind-code POST (traceless captcha runs on-page). Retry
-        # the click a couple of times: a page that is still hydrating swallows it.
-        deadline = 300 if manual_accept else 90
+        # the click a couple of times: a page that is still hydrating swallows
+        # it. A click while logged out bounces to /login — re-bridge then.
+        # If no Accept button exists the code is already bound (or the page is
+        # logged out): don't burn the manual window on a POST that can't happen.
+        deadline = (90 if manual_accept else 90) if clicked else 12
         waited = 0
         while waited < deadline and not bind_seen['code']:
             time.sleep(1)
             waited += 1
-            if (not manual_accept and waited in (25, 55)
+            if 'zcode.z.ai' in page.url and '/login' in page.url:
+                log('  invite: bounced to login — re-running the OAuth bridge')
+                try:
+                    _oauth_bridge(page, chat_token, log=log)
+                except Exception as e:
+                    log(f'  invite: bridge retry failed ({type(e).__name__})')
+                try:
+                    page.goto(invite_url, wait_until='domcontentloaded', timeout=60000)
+                except Exception:
+                    pass
+                time.sleep(3)
+                _click_accept()
+                continue
+            if (waited in (15, 30, 45)
                     and _on_invite_page() and not bind_seen['code']):
                 log(f'  invite: no bind-code after {waited}s — retrying the click')
-                _click_accept()
+                reloaded = False
+                try:
+                    if page.locator('text=Security verification failed').first.count():
+                        log('  invite: security verification failed — reloading for a fresh captcha')
+                        try:
+                            page.goto(invite_url, wait_until='domcontentloaded',
+                                      timeout=60000)
+                        except Exception:
+                            pass
+                        time.sleep(2.5)
+                        reloaded = True
+                except Exception:
+                    pass
+                if not reloaded and not _click_accept() and _logged_out():
+                    log('  invite: accept vanished and page is LOGGED OUT')
+                    _oauth_bridge(page, chat_token, log=log)
+                    try:
+                        page.goto(invite_url, wait_until='domcontentloaded', timeout=60000)
+                    except Exception:
+                        pass
+                    time.sleep(3)
+                    _click_accept()
+            # the bind POST can fire from a different frame/popup the page-level
+            # request hook never sees. The server summary is the source of truth.
+            if zjwt and waited % 15 == 0 and not bind_seen['code']:
+                try:
+                    s_now = referral_summary(zjwt, log=lambda *a, **k: None)
+                    if s_now and s_now['tasks'].get('referral_bind_code'):
+                        bind_seen['code'] = 200
+                        bind_seen['body'] = {'data': {'bound': True}}
+                        log('  invite: bind confirmed by summary')
+                        break
+                except Exception:
+                    pass
         if bind_seen['code'] == 200:
             body = bind_seen.get('body') or {}
             result['bound'] = bool((body.get('data') or {}).get('bound', True))
@@ -764,19 +1034,13 @@ def claim_invite(chat_token: str, invite_code: str = 'MT9GNDQ8', log=print,
             time.sleep(1)
             s = referral_summary(zjwt, log=log)
 
-        # 6. send the one message — from inside the page if possible (only the
-        #    browser session reliably clears the Aliyun risk control), else via
-        #    a raw request carrying the bind's captcha param
+        # 6. send the one message — plain client-shape request through the
+        #    signup proxy. No captcha header, no device headers: that exact
+        #    shape is what passes risk control (the endpoint may still answer
+        #    405/3012 on the wire while crediting the task — the summary is
+        #    the only truth).
         if s and s['tasks'].get('referral_bind_code') and not s['tasks'].get('send_message'):
-            cap = _norm_captcha_param(bind_seen.get('captcha')
-                                      or bind_seen.get('verify_param')
-                                      or captcha_param)
-            sent = False
-            if _on_invite_page() or 'zcode.z.ai' in page.url:
-                sent = send_message_in_page(page, zjwt, log=log, captcha_param=cap)
-            if not sent:
-                sent = send_one_message(zjwt, log=log, captcha_param=cap)
-            result['message_sent'] = sent
+            result['message_sent'] = send_one_message(zjwt, log=log)
 
         try:
             ctx.close()
@@ -784,8 +1048,16 @@ def claim_invite(chat_token: str, invite_code: str = 'MT9GNDQ8', log=print,
             pass
 
     # 7. final summary & plan issuance check
-    time.sleep(3)
-    s = referral_summary(zjwt, log=log)
+    s = None
+    for attempt in range(6):
+        time.sleep(2)
+        s = referral_summary(zjwt, log=log)
+        if not s:
+            continue
+        if s.get('issued') or s.get('current', 0) < s.get('target', 3):
+            break
+        # All tasks complete (3/3) but issued is granting asynchronously: poll up to 12s
+        log(f"  invite: newcomer tasks 3/3 complete — waiting for plan issuance ({attempt + 1}/6)…")
     result['summary'] = s
     result['bound'] = bool(s and s['tasks'].get('referral_bind_code'))
     if s:
@@ -801,8 +1073,8 @@ if __name__ == '__main__':
         # try newest account from output
         import glob
         rows = []
-        for f in glob.glob(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                        'output', 'accounts*.txt')):
+        out_dir = os.environ.get('ZAI_OUTPUT_DIR') or os.path.join(os.path.dirname(os.path.abspath(__file__)), 'output')
+        for f in glob.glob(os.path.join(out_dir, 'accounts*.txt')):
             for ln in open(f, encoding='utf-8', errors='ignore'):
                 parts = ln.strip().split(':')
                 if len(parts) >= 3 and parts[-1].startswith('eyJ'):

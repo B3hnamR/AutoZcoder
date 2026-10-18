@@ -113,6 +113,36 @@ class Store:
             ],
         }
 
+    def daily_buckets(self, days: int = 14) -> list[dict]:
+        """Per-day request/token counts for the usage dashboard."""
+        import datetime as _dt
+        since = time.time() - days * 86400
+        try:
+            with self._lock:
+                rows = self._conn.execute(
+                    """SELECT ts, model, status, total_tokens FROM usage
+                       WHERE ts >= ? ORDER BY ts""", (since,)).fetchall()
+        except Exception:
+            return []
+        buckets: dict[str, dict] = {}
+        for ts, model, status, tokens in rows:
+            day = _dt.datetime.fromtimestamp(ts).strftime("%m-%d")
+            b = buckets.setdefault(day, {"day": day, "requests": 0,
+                                         "ok": 0, "tokens": 0, "models": {}})
+            b["requests"] += 1
+            if status == 200:
+                b["ok"] += 1
+            b["tokens"] += tokens or 0
+            b["models"][model] = b["models"].get(model, 0) + 1
+        out = []
+        for i in range(days - 1, -1, -1):
+            day = (_dt.datetime.now() - _dt.timedelta(days=i)).strftime("%m-%d")
+            b = buckets.get(day, {"day": day, "requests": 0, "ok": 0,
+                                  "tokens": 0, "models": {}})
+            b["models"] = sorted(b["models"].items(), key=lambda kv: -kv[1])[:5]
+            out.append(b)
+        return out
+
 
 class JsonlCapture:
     """Writes every upstream exchange in the same shape as the Phase-1 capture."""

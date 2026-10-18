@@ -70,7 +70,7 @@ class UpstreamConfig(BaseModel):
 
 
 class PoolConfig(BaseModel):
-    strategy: str = "least_in_flight"
+    strategy: str = "drain_first"
     min_balance_micro: int = 0
     refresh_lead_seconds: int = Field(default=600, ge=0)
     cooldown_seconds: int = Field(default=30, ge=0)
@@ -95,7 +95,7 @@ class AccountsConfig(BaseModel):
 
 class AutoFreeFallbackConfig(BaseModel):
     enabled: bool = False
-    chain: list[str] = Field(default_factory=list)
+    chain: list[str] = Field(default_factory=lambda: ["GLM-5.3", "GLM-5.3-Flash"])
 
 
 class ModelsConfig(BaseModel):
@@ -122,7 +122,7 @@ class StoreConfig(BaseModel):
 
 class UpdateConfig(BaseModel):
     enabled: bool = False
-    repo: str = "B3hnamR/ZcodeGate"     # GitHub releases feed
+    repo: str = "B3hnamR/AutoZcoder"     # GitHub releases feed
     interval_hours: float = 6.0
 
 
@@ -139,7 +139,13 @@ class GeneratorConfig(BaseModel):
     headless: bool = False             # only applies when captcha == 'auto'
     claim: bool = True                 # claim the invite Global Build after signup
     invite_code: str = "MT9GNDQ8"      # referral code to claim ('' = off)
-    socks_only: bool = True            # socks4/5 pool only (residential — passes Starter gate)
+    # Which proxy schemes the generator may pick from the pool:
+    #   all | socks | socks5 | socks4 | http  (or a comma list: "socks5,http")
+    # 'socks' = socks4+5 (default: residential-style passes the Starter gate).
+    proxy_types: str = "socks"
+    # Legacy bool kept for old config.yaml files; only read when proxy_types
+    # is left at its default.
+    socks_only: bool = True
 
 
 class Config(BaseModel):

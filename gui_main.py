@@ -119,12 +119,29 @@ def _run_server() -> None:
     from zcode_gateway.app import create_app
     from zcode_gateway.config import load_config
 
-    cfg = load_config(os.environ.get("ZCODE_GATEWAY_CONFIG") or None)
-    config = uvicorn.Config(
-        create_app(cfg), host=cfg.server.host, port=cfg.server.port,
-        log_level="info", access_log=False, log_config=None)
-    server = uvicorn.Server(config)
-    server.run()
+    # watchdog: if the gateway thread dies, rebuild and restart it (max 5
+    # attempts / 10 minutes) instead of leaving a dead UI behind
+    import datetime as _dt
+    attempts = 0
+    first_start = time.time()
+    while True:
+        try:
+            cfg = load_config(os.environ.get("ZCODE_GATEWAY_CONFIG") or None)
+            config = uvicorn.Config(
+                create_app(cfg), host=cfg.server.host, port=cfg.server.port,
+                log_level="info", access_log=False, log_config=None)
+            server = uvicorn.Server(config)
+            server.run()
+            return  # clean shutdown
+        except Exception:
+            attempts += 1
+            now = time.time()
+            print(f"[watchdog] gateway crashed ({_dt.datetime.now():%H:%M:%S}) "
+                  f"attempt {attempts}", file=sys.stderr, flush=True)
+            if attempts >= 5 or now - first_start > 600:
+                print("[watchdog] giving up", file=sys.stderr, flush=True)
+                raise
+            time.sleep(min(2 ** attempts, 15))
 
 
 def main() -> None:

@@ -104,9 +104,16 @@ class ChatService:
             # A busy model is not evidence of a bad account or spent quota.
             # Keep this account available for other models and delayed retries.
             return
+        # autopsy trail: keep the last errors for the dashboard "why" view
+        try:
+            account.error_history.append(
+                {"ts": time.time(), "status": status, "code": str(code),
+                 "message": str(message)[:200], "model": model})
+        except Exception:
+            pass
         if status == 401 or code == 'authentication_error':
-            await self.pool.kill(account, 'ZCode token revoked; sign in again')
-        elif is_block_code(code):
+            await self.pool.kill_after_strikes(account, 'ZCode token revoked; sign in again')
+        elif status == 405 or is_block_code(code, status):
             # 405/3012 "unusual activity": not a quota and not a bad account.
             # Park only this model on this account and let the caller rotate to
             # the next account; the account keeps serving every other model.
@@ -139,7 +146,7 @@ class ChatService:
                     variant=variant, dialect=dialect, client_key=client_key, is_disconnected=is_disconnected)
             except UpstreamFailure as exc:
                 if exc.code not in ('11113', 'MODEL_CAPPED', 'MODEL_PARKED', 'INFERENCE_CAP_ERROR',
-                                    'ENTITLEMENT_ERROR', 'UNUSUAL_ACTIVITY', '3012'):
+                                    'ENTITLEMENT_ERROR', 'UNUSUAL_ACTIVITY', '3012', '405', 'HTTP_405'):
                     raise
                 if candidate == candidates[-1]:
                     exc.details['attempted_models'] = attempted
@@ -174,9 +181,15 @@ class ChatService:
         if not body.get('messages'):
             raise UpstreamFailure(400, 'invalid_request_error', 'at least one user or assistant message is required')
         supplied_metadata = 'metadata' in body
+        target_account = (
+            payload.get("_anthropic", {}).pop("account", None)
+            or payload.get("_anthropic", {}).pop("account_id", None)
+            or payload.get("account")
+            or payload.get("account_id")
+        )
         tried, last = set(), None
         for attempt in range(max(1, self.cfg.upstream.max_attempts)):
-            account = await self.pool.acquire(tried, model=model)
+            account = await self.pool.acquire(tried, model=model, only_id=target_account)
             if account is None:
                 if last: raise last
                 reason = await self.pool.unavailable_reason(model)
@@ -214,11 +227,14 @@ class ChatService:
                                                 task_id=headers['x-session-id'], device_mid=account.notes.get('device_mid'),
                                                 include_device_mid=False)
                         resp = await self.client.send(headers, body, stream=True)
-                        if resp.status_code == 200:
+                        if resp.status_code == 200 and 'application/json' not in resp.headers.get('content-type', ''):
                             status = 200
                         else:
-                            info = parse_upstream_error(resp.status_code, await resp.aread())
+                            raw = await resp.aread()
+                            info = parse_upstream_error(resp.status_code, raw)
                             status, code, message = resp.status_code, str(info['code']), info['message']
+                            if status == 200:
+                                status = 429 if code == '11113' else 502
                     if status != 200:
                         await self._apply_error(account, model, status, code, message, resp.headers)
                         last = UpstreamFailure(429 if code == '11113' else status, code, message,
@@ -226,8 +242,8 @@ class ChatService:
                         self._record(account, headers, body, last.status, resp.headers,
                                      raw.decode('utf-8', 'replace'), 0, client_key, dialect, model, {})
                         if is_model_overload(status, code): raise last
-                        if (status < 500 and status not in (401, 402, 403, 429)
-                                and code != '11113' and not is_block_code(code)):
+                        if (status < 500 and status not in (401, 402, 403, 405, 429)
+                                and code != '11113' and not is_block_code(code, status)):
                             raise last
                         tried.add(account.id)
                         continue
@@ -242,7 +258,7 @@ class ChatService:
                     if first.get('type') == 'error':
                         info = first.get('error') or first
                         code, message = str(info.get('code') or info.get('type') or 'api_error'), info.get('message', 'ZCode stream failed')
-                        status = 529 if is_model_overload(502, code) else (429 if code in ('11113', 'rate_limit_error') else 502)
+                        status = 529 if is_model_overload(502, code) else (429 if code in ('11113', 'rate_limit_error') else (405 if is_block_code(code) else 502))
                         await self._apply_error(account, model, status, code, message)
                         last = UpstreamFailure(status, code, message)
                         if is_model_overload(status, code): raise last
@@ -343,7 +359,7 @@ class ChatService:
                 if event.get('type') == 'error':
                     info = event.get('error') or event
                     code = str(info.get('code') or info.get('type') or 'api_error')
-                    status = 529 if is_model_overload(502, code) else (429 if code in ('11113', 'rate_limit_error') else 502)
+                    status = 529 if is_model_overload(502, code) else (429 if code in ('11113', 'rate_limit_error') else (405 if is_block_code(code) else 502))
                     message = info.get('message', 'ZCode stream failed')
                     await self._apply_error(handle.account, model, status, code, message)
                     raise UpstreamFailure(status, code, message)
@@ -374,12 +390,27 @@ class ChatService:
 
     def _record(self, account, headers, body, status, response_headers, response, duration, key, dialect, model, usage):
         converted = usage_openai(usage)
-        self.store.record(account_id=account.id, client_key=key, dialect=dialect, model=model,
-                          variant='anthropic', stream=int(body.get('stream', True)), status=status,
-                          duration_ms=duration, prompt_tokens=converted['prompt_tokens'],
-                          completion_tokens=converted['completion_tokens'], total_tokens=converted['total_tokens'],
-                          error_code=None if status == 200 else f'http_{status}')
-        self.capture.write(request_headers=headers, request_body=body, status=status,
-                           response_headers=dict(response_headers), response_body=response,
-                           duration_ms=duration, account_id=account.id, dialect=dialect,
-                           model=model, variant='anthropic')
+        rec = dict(account_id=account.id, client_key=key, dialect=dialect, model=model,
+                   variant='anthropic', stream=int(body.get('stream', True)), status=status,
+                   duration_ms=duration, prompt_tokens=converted['prompt_tokens'],
+                   completion_tokens=converted['completion_tokens'], total_tokens=converted['total_tokens'],
+                   error_code=None if status == 200 else f'http_{status}')
+        cap = dict(request_headers=headers, request_body=body, status=status,
+                   response_headers=dict(response_headers), response_body=response)
+        # Disk I/O off the event loop: SQLite/JSONL writes (and AV scans on
+        # those files) used to stall every concurrent stream while they ran.
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is not None:
+            loop.run_in_executor(None, self._write_record, rec, cap)
+        else:
+            self._write_record(rec, cap)
+
+    def _write_record(self, rec, cap):
+        try:
+            self.store.record(**rec)
+            self.capture.write(**cap)
+        except Exception:
+            log.debug("store/capture write failed", exc_info=True)

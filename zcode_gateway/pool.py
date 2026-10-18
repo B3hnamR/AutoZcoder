@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -48,6 +49,9 @@ class Account:
     balance_micro: int | None = None
     balance_checked_at: float = 0.0
     last_error: str = ""
+    # rolling autopsy log: last N upstream errors with timestamps, for the
+    # dashboard "why did this account die" view and the health sparkline
+    error_history: deque = field(default_factory=lambda: deque(maxlen=50))
 
     # Credit exhaustion is per model-class, not per account: a paid model can 402
     # (insufficient_credits) while zcode-free/* models keep working on the same
@@ -147,6 +151,11 @@ class Account:
             "plans": self.notes.get("plans", []),
             "has_refresh_token": bool(self.refresh_token),
             "last_error": self.last_error,
+            "error_history": [
+                {**e, "ts": round(e.get("ts", 0), 1),
+                 "ago_s": int(time.time() - e.get("ts", 0))}
+                for e in list(self.error_history)[-20:]
+            ],
             "notes": self.notes,
             "has_plan": self.has_plan,
             "capped_models": sorted(m for m, until in self.model_caps.items()
@@ -342,6 +351,7 @@ class PoolManager:
                       require_paid: bool = False,
                       model: str | None = None,
                       wait_seconds: float | None = None,
+                      only_id: str | None = None,
                       ) -> Account | None:
         """Pick an account, optionally waiting for an in-flight slot.
 
@@ -349,6 +359,9 @@ class PoolManager:
         waits up to `wait_seconds` (default: `pool.acquire_wait_seconds`) for a
         slot instead of oversubscribing. Waits never happen when the blocker is
         absence (dead/cooling/excluded accounts) — only saturation.
+
+        `only_id` pins the choice to a single account (per-request routing,
+        e.g. a generator claim that must run on the account being claimed).
         """
         if wait_seconds is None:
             wait_seconds = self.cfg.acquire_wait_seconds
@@ -356,6 +369,8 @@ class PoolManager:
         while True:
             async with self._lock:
                 accounts = list(self._accounts.values())
+                if only_id:
+                    accounts = [a for a in accounts if a.id == only_id]
                 excl = exclude or set()
                 acc = self._router.acquire(accounts, excl, require_paid, model)
                 if acc is not None:
@@ -507,6 +522,7 @@ class PoolManager:
         async with self._lock:
             account.error_count = 0
             account.last_error = ""
+            account.auth_strikes = 0
             if account.state is AccountState.COOLING:
                 account.state = AccountState.READY
 
@@ -525,6 +541,9 @@ class PoolManager:
             account.cooldown_until = time.time() + (seconds or self.cfg.cooldown_seconds)
             account.error_count += 1
             account.last_error = reason or "cooling"
+            account.error_history.append(
+                {"ts": time.time(), "status": None, "code": reason or "cooling",
+                 "message": "", "state": "cooling"})
 
     async def retire(self, account: Account, reason: str = "insufficient_credits",
                      paid_only: bool = True) -> None:
@@ -543,6 +562,31 @@ class PoolManager:
         async with self._lock:
             account.state = AccountState.DEAD
             account.last_error = reason
+
+    async def kill_after_strikes(self, account: Account, reason: str = "",
+                                 strikes: int = 3) -> None:
+        """Kill only after N consecutive auth failures; earlier ones just cool.
+
+        A single transient upstream 401 blip used to permanently kill accounts
+        whose token never rotates on disk (admin-added / generator / device
+        login). Those accounts now cool for the normal cooldown window and get
+        re-tried; only repeated failures escalate to DEAD."""
+        async with self._lock:
+            n = getattr(account, 'auth_strikes', 0) + 1
+            account.auth_strikes = n
+            if n >= strikes:
+                account.state = AccountState.DEAD
+                account.last_error = reason
+                account.error_history.append(
+                    {"ts": time.time(), "status": 401, "code": "auth_dead",
+                     "message": reason, "state": "dead"})
+            else:
+                account.state = AccountState.COOLING
+                account.cooldown_until = time.time() + self.cfg.cooldown_seconds
+                account.last_error = f"{reason} (auth strike {n}/{strikes})"
+                account.error_history.append(
+                    {"ts": time.time(), "status": 401, "code": f"auth_strike_{n}",
+                     "message": reason, "state": "cooling"})
 
     async def enable(self, account_id: str) -> bool:
         async with self._lock:

@@ -99,17 +99,16 @@ class TokenManager:
         now = time.time()
         _cap_codes = ('MODEL_CAPPED', '11113', 'WINDOW_CLOSED')
         for model, quota in quotas.items():
-            starts = quota.get('starts_at') or 0
-            if starts > now:
-                # grant exists but its window (e.g. daily_night) is not open yet —
-                # park the model until then instead of sending doomed requests
-                await self.pool.cap_model(account, model, starts - now,
-                                          reason='WINDOW_CLOSED',
-                                          message='grant window not open yet (e.g. night-only)')
-            elif quota['remaining'] <= 0 and quota['resets_at'] > now:
-                await self.pool.cap_model(account, model, quota['resets_at'] - now,
-                                          reason='MODEL_CAPPED', message='daily ZCode token quota exhausted')
-            elif quota['remaining'] > 0 and account.model_cap_info.get(model, {}).get('code') in _cap_codes:
+            if quota.get('remaining', 0) <= 0:
+                starts = quota.get('starts_at') or 0
+                if starts > now:
+                    await self.pool.cap_model(account, model, starts - now,
+                                              reason='WINDOW_CLOSED',
+                                              message='grant window not open yet (e.g. night-only)')
+                elif quota.get('resets_at', 0) > now:
+                    await self.pool.cap_model(account, model, quota['resets_at'] - now,
+                                              reason='MODEL_CAPPED', message='daily ZCode token quota exhausted')
+            else:
                 account.model_caps.pop(model, None)
                 account.model_cap_info.pop(model, None)
         return data

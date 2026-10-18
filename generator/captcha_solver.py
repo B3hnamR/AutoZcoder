@@ -1413,7 +1413,7 @@ class CaptchaSolver:
                         and data.get('puzzle_natural_width', 0) > 10):
                     break
                 time.sleep(0.1)
-                data = page.evaluate("""
+                dims = page.evaluate("""
                     () => {
                         const bg = document.querySelector('#aliyunCaptcha-img');
                         const puzzle = document.querySelector('#aliyunCaptcha-puzzle');
@@ -1429,8 +1429,9 @@ class CaptchaSolver:
                         };
                     }
                 """)
-                if not data:
+                if not dims:
                     return None
+                data.update(dims)
 
             def get_bytes(b64):
                 if not b64:

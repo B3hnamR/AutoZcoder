@@ -245,3 +245,163 @@ def test_invite_captcha_param_is_header_safe():
     assert ic._norm_captcha_param(["q"]) == "q"
     assert ic._norm_captcha_param("abc") == "abc"
     assert isinstance(ic.CAPTCHA_HOOK, str) and "11xygtvd" in ic.CAPTCHA_HOOK
+
+
+def test_proxy_pool_respects_output_dir():
+    import tempfile, os, sys
+    gen = Path(__file__).resolve().parent.parent / "generator"
+    if not gen.is_dir():
+        return
+    sys.path.insert(0, str(gen))
+    import proxy_pool
+    with tempfile.TemporaryDirectory() as tmpdir:
+        proxy_pool.set_output_dir(tmpdir)
+        assert proxy_pool.OUTPUT_DIR == tmpdir
+        assert proxy_pool.GOOD_FILE == os.path.join(tmpdir, "proxies.txt")
+        assert proxy_pool.EVERGOOD_FILE == os.path.join(tmpdir, "proxies_evergood.txt")
+        assert proxy_pool.RAW_FILE == os.path.join(tmpdir, "proxies_raw.txt")
+        assert proxy_pool.LOCAL_SOURCES == os.path.join(tmpdir, "proxy_sources.txt")
+
+
+def test_generator_manager_proxy_migration_and_socks_count():
+    import tempfile
+    from zcode_gateway.generator import GeneratorManager
+
+    with tempfile.TemporaryDirectory() as gen_tmp, tempfile.TemporaryDirectory() as data_tmp:
+        gen_out = Path(gen_tmp) / "output"
+        gen_out.mkdir()
+        (gen_out / "proxies.txt").write_text(
+            "http://1.1.1.1:80\nsocks5://2.2.2.2:1080\nsocks4://3.3.3.3:1080\n",
+            encoding="utf-8"
+        )
+        (gen_out / "proxies_evergood.txt").write_text(
+            "socks5://4.4.4.4:1080\n",
+            encoding="utf-8"
+        )
+        data_path = Path(data_tmp)
+        mgr = GeneratorManager(Path(gen_tmp), data_dir=data_path)
+
+        # verified files were copied over into data_dir
+        assert (data_path / "proxies.txt").is_file()
+        assert (data_path / "proxies_evergood.txt").is_file()
+
+        # socks count reflects only live proxies in proxies.txt (2 unique live socks proxies)
+        assert mgr._socks_count() == 2
+        assert mgr.options()["socks_available"] == 2
+
+
+def test_proxy_types_option_flow():
+    import tempfile
+    from zcode_gateway.generator import GeneratorManager
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr = GeneratorManager(Path(tmpdir), data_dir=Path(tmpdir))
+
+        # default matches the old socks-only behavior
+        assert mgr.options()["proxy_types"] == "socks"
+        assert mgr.options()["ip_source"] == "direct"
+
+        mgr.set_options(ip_source="pool", proxy_types="socks5")
+        env = mgr._worker_env("g1")
+        assert env["ZAI_USE_POOL"] == "1"
+        assert env["ZAI_PROXY_TYPES"] == "socks5"
+        assert "ZAI_SOCKS_ONLY" not in env or env["ZAI_SOCKS_ONLY"] != "1"
+
+        mgr.set_options(proxy_types="http")
+        assert mgr._worker_env("g2")["ZAI_PROXY_TYPES"] == "http,https"
+
+        mgr.set_options(proxy_types="all")
+        assert "ZAI_PROXY_TYPES" not in mgr._worker_env("g3")
+
+        # csv of raw schemes survives normalization
+        mgr.set_options(proxy_types="Socks5, HTTP")
+        assert mgr.options()["proxy_types"] == "socks5,http"
+
+        # invalid values fall back to all
+        mgr.set_options(proxy_types="bogus")
+        assert mgr.options()["proxy_types"] == "all"
+
+        # legacy 'socks' ip_source is a pool alias
+        mgr.set_options(ip_source="socks")
+        assert mgr.ip_source == "pool"
+
+
+def test_proxy_types_legacy_config_mapping():
+    import tempfile
+    from zcode_gateway.generator import GeneratorManager
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # old socks_only: false meant "use the full pool"
+        assert GeneratorManager.normalize_proxy_types(
+            "socks", legacy_socks_only=False) == "all"
+        assert GeneratorManager.normalize_proxy_types(
+            "socks", legacy_socks_only=True) == "socks"
+
+
+def test_pool_type_counts_and_options():
+    import tempfile
+    from zcode_gateway.generator import GeneratorManager
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        data = Path(tmpdir)
+        (data / "proxies.txt").write_text(
+            "http://1.1.1.1:80\nhttp://1.1.1.2:80\n"
+            "socks5://2.2.2.2:1080\nsocks4://3.3.3.3:1080\n",
+            encoding="utf-8")
+        (data / "proxies_used.txt").write_text(
+            "socks5://2.2.2.2:1080\t2026-10-17T00:00:00Z\ttest\n", encoding="utf-8")
+        mgr = GeneratorManager(Path(tmpdir), data_dir=data)
+
+        tc = mgr._types_counts()
+        assert tc["all"] == 3          # used socks5 excluded
+        assert tc["socks"] == 1
+        assert tc["socks5"] == 0
+        assert tc["socks4"] == 1
+        assert tc["http"] == 2
+
+        # pool_available follows the selected type filter
+        mgr.set_options(proxy_types="http")
+        assert mgr.options()["pool_available"] == 2
+        mgr.set_options(proxy_types="socks5")
+        assert mgr.options()["pool_available"] == 0
+        mgr.set_options(proxy_types="all")
+        assert mgr.options()["pool_available"] == 3
+
+
+def test_proxy_pool_filter_types():
+    import sys
+    gen = Path(__file__).resolve().parent.parent / "generator"
+    if not gen.is_dir():
+        return
+    sys.path.insert(0, str(gen))
+    import proxy_pool
+    pool = ["http://1.1.1.1:80", "socks5://2.2.2.2:1080", "socks4://3.3.3.3:1080"]
+    assert proxy_pool.filter_types(pool, None) == pool
+    assert proxy_pool.filter_types(pool, ("socks5",)) == ["socks5://2.2.2.2:1080"]
+    assert proxy_pool.filter_types(pool, ("socks4", "socks5")) == pool[1:]
+    assert proxy_pool.filter_types(pool, ("http", "https")) == [pool[0]]
+    assert proxy_pool.socks_only(pool) == pool[1:]
+
+
+def test_proxy_pool_used_ledger_and_claim():
+    import tempfile, os, sys
+    gen = Path(__file__).resolve().parent.parent / "generator"
+    if not gen.is_dir():
+        return
+    sys.path.insert(0, str(gen))
+    import proxy_pool
+    with tempfile.TemporaryDirectory() as tmpdir:
+        proxy_pool.set_output_dir(tmpdir)
+        (Path(tmpdir) / "proxies.txt").write_text("socks5://1.2.3.4:1080\n", encoding="utf-8")
+        assert proxy_pool.load_used() == set()
+        
+        # claim succeeds
+        assert proxy_pool.claim_used("socks5://1.2.3.4:1080") is True
+        assert "socks5://1.2.3.4:1080" in proxy_pool.load_used()
+        
+        # already claimed: second claim fails
+        assert proxy_pool.claim_used("socks5://1.2.3.4:1080") is False
+        
+        # evicted from proxies.txt
+        good = proxy_pool.load_good()
+        assert "socks5://1.2.3.4:1080" not in good

@@ -447,6 +447,7 @@ async def test_overload_waits_and_reuses_single_account_without_blocking_flash(s
 
 @pytest.mark.asyncio
 async def test_overload_rotates_accounts_after_wait_without_cooling(service, monkeypatch):
+    service.cfg.pool.strategy = 'least_in_flight'
     await service.pool.upsert(Account(id='two', access_token='token-two'))
     waits = []
     async def wait(delay, disconnected=None): waits.append(delay)

@@ -73,8 +73,17 @@ def zcodeauto_candidates(configured: str = "") -> list[Path]:
     try:
         if getattr(sys, "frozen", False):
             exe_dir = Path(sys.executable).resolve().parent
+            add(exe_dir / "generator")
+            add(exe_dir / "gen")
+            # If bundled inside PyInstaller single-exe, use internal copy
+            meipass = getattr(sys, "_MEIPASS", None)
+            if meipass:
+                add(Path(meipass) / "generator")
+                add(Path(meipass) / "gen")
         else:
             exe_dir = Path(__file__).resolve().parent.parent
+            add(exe_dir / "generator")
+            add(exe_dir / "gen")
         roots.append(exe_dir)
         roots.extend(list(exe_dir.parents)[:3])
     except OSError:
@@ -212,8 +221,10 @@ class GenWorker:
         _px = env.get("ZAI_PROXY", "").strip()
         if _px in ("", "0"):
             _px = None
+        _ptypes = env.get("ZAI_PROXY_TYPES", "").strip()
         self.proxy = _px or (
-            "pool" + (" (socks)" if env.get("ZAI_SOCKS_ONLY") == "1" else "")
+            "pool" + (f" ({_ptypes})" if _ptypes else
+                      (" (socks)" if env.get("ZAI_SOCKS_ONLY") == "1" else ""))
             if env.get("ZAI_USE_POOL") == "1" else "direct IP")
         self.captcha = "manual" if env.get("ZAI_MANUAL") == "1" else "auto"
         self.email: str | None = None
@@ -254,7 +265,9 @@ class GenWorker:
 
     def _pump(self):
         import re
-        assert self.proc and self.proc.stdout
+        if not (self.proc and self.proc.stdout):
+            self.state = "failed"
+            return
         for line in self.proc.stdout:
             line = line.rstrip()
             self.lines.append(line)
@@ -270,7 +283,8 @@ class GenWorker:
                 self.starter = True
             elif "0 with Starter plan" in line and self.starter is None:
                 self.starter = False
-            if "100M Global Build active" in line or "issued=1" in line:
+            if ("100M Global Build active" in line or "issued=1" in line
+                    or "progress=3/3" in line or "tasks 3/3 complete" in line):
                 self.global_build = True
         self.proc.wait()
         code = self.proc.returncode
@@ -287,7 +301,9 @@ class GenWorker:
 
     def check_new_account(self):
         """A successful run leaves one more row in accounts<SUF>.txt — surface
-        the email/password for pool registration."""
+        the email/password for pool registration only if it received a plan."""
+        if self.starter is False:
+            return None
         try:
             rows = [ln for ln in self.account_file.read_text(
                 encoding="utf-8", errors="ignore").splitlines() if ln.strip()]
@@ -336,8 +352,15 @@ class GenWorker:
 
 
 class ProxyChecker:
-    """Runs `proxy_pool.py <action>` (fetch | verify | recheck) and parses the
-    funnel: raw -> alive -> pool, latency, ever-good, MITM blacklist."""
+    """Runs `proxy_pool.py <action>` and tracks the funnel in live state.
+
+    The child emits JSONL events (`@event {...}`) alongside its human lines, so
+    stats no longer depend on regexing prose. Legacy prose parsing stays as a
+    fallback for older generator folders.
+    """
+
+    ACTIONS = ("fetch", "verify", "recheck", "all", "geo", "stats", "prune",
+               "clear-bad", "clear-used", "clear-dead")
 
     def __init__(self, gen_dir: Path, python_exe: str = "", data_dir: Path | None = None):
         self.gen_dir = gen_dir
@@ -351,13 +374,51 @@ class ProxyChecker:
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
         self.stats: dict = {}
+        # background auto-verify (feature: pool never goes stale)
+        self.auto_verify = False
+        self.auto_interval_min = 45
+        self._auto_thread: threading.Thread | None = None
+        self._auto_stop = threading.Event()
+        self.last_verified_at: float | None = None
+
+    def set_auto_verify(self, enabled: bool, interval_min: int | None = None) -> dict:
+        """Background re-verify loop: re-probes the usable pool so the claim
+        picker never faces an all-stale candidate set."""
+        with self._lock:
+            self.auto_verify = bool(enabled)
+            if interval_min:
+                self.auto_interval_min = max(5, int(interval_min))
+        if enabled and not (self._auto_thread and self._auto_thread.is_alive()):
+            self._auto_stop.clear()
+            self._auto_thread = threading.Thread(target=self._auto_loop, daemon=True)
+            self._auto_thread.start()
+        if not enabled:
+            self._auto_stop.set()
+        return {"auto_verify": self.auto_verify,
+                "interval_min": self.auto_interval_min}
+
+    def _auto_loop(self) -> None:
+        while not self._auto_stop.wait(self.auto_interval_min * 60):
+            try:
+                if not self.auto_verify:
+                    continue
+                # recheck = re-probe the existing usable pool (fast, no fetch)
+                res = self.run("recheck")
+                if "error" not in res:
+                    self.last_verified_at = time.time()
+            except Exception:
+                log.exception("proxy auto-verify failed")
 
     def alive(self) -> bool:
         return bool(self.proc and self.proc.poll() is None)
 
-    def run(self, action: str, timeout: int = 8, concurrency: int = 400,
-            max_latency: float = 6.0) -> dict:
-        action = action if action in ("fetch", "verify", "recheck", "all") else "verify"
+    def run(self, action: str = "verify", timeout: int | None = None,
+            concurrency: int | None = None, max_latency: float | None = None,
+            preset: str | None = None, prefilter: bool | None = None,
+            retry_failed: bool | None = None, dead_cache_hours: float | None = None,
+            probe_timeout: float | None = None,
+            probe_concurrency: int | None = None) -> dict:
+        action = action if action in self.ACTIONS else "verify"
         with self._lock:
             if self.alive():
                 return {"error": "checker already running", "action": self.action}
@@ -365,17 +426,34 @@ class ProxyChecker:
             self.state = "running"
             self.started = time.time()
             self.lines.clear()
-            self.stats.pop("probed", None)
-            self.stats.pop("alive", None)
-            self.stats.pop("total", None)
-            self.stats.pop("best", None)
-            self.stats.pop("median", None)
+            for key in ("probed", "alive", "total", "best", "median", "raw",
+                        "pool", "scanned", "ever_good", "reasons", "labels",
+                        "second_chance", "prefilter", "geo_ok", "geo_updated",
+                        "elapsed"):
+                self.stats.pop(key, None)
             self.refresh_stats()
             env = os.environ.copy()
             env.update({"PYTHONUNBUFFERED": "1",
-                        "PROXY_TIMEOUT": str(timeout),
-                        "PROXY_CONC": str(concurrency),
-                        "PROXY_MAX_LATENCY": str(max_latency)})
+                        "ZAI_OUTPUT_DIR": str(self.data_dir),
+                        "PROXY_EVENTS": "1"})
+            if preset:
+                env["ZAI_SCAN_PRESET"] = str(preset)
+            if timeout is not None:
+                env["PROXY_TIMEOUT"] = str(timeout)
+            if concurrency is not None:
+                env["PROXY_CONC"] = str(concurrency)
+            if max_latency is not None:
+                env["PROXY_MAX_LATENCY"] = str(max_latency)
+            if probe_timeout is not None:
+                env["PROXY_PROBE_TIMEOUT"] = str(probe_timeout)
+            if probe_concurrency is not None:
+                env["PROXY_PROBE_CONC"] = str(probe_concurrency)
+            if prefilter is not None:
+                env["PROXY_PREFILTER"] = "1" if prefilter else "0"
+            if retry_failed is not None:
+                env["PROXY_RETRY_FAILED"] = "1" if retry_failed else "0"
+            if dead_cache_hours is not None:
+                env["PROXY_DEAD_HOURS"] = str(dead_cache_hours)
             self.proc = subprocess.Popen(
                 [self.python_exe, "-u", "proxy_pool.py", action],
                 cwd=str(self.gen_dir), env=env,
@@ -386,12 +464,63 @@ class ProxyChecker:
             self._thread.start()
         return {"started": action}
 
+    def _apply_event(self, ev: dict) -> None:
+        t = ev.get("t")
+        if t == "start":
+            self.stats.update(total=ev.get("total", 0), probed=0, alive=0)
+            for key in ("timeout", "concurrency", "prefilter"):
+                if key in ev:
+                    self.stats[key] = ev[key]
+        elif t == "prefilter":
+            self.stats.update(prefilter={"endpoints": ev.get("endpoints", 0),
+                                         "open": ev.get("open", 0),
+                                         "remaining": ev.get("remaining", 0)})
+        elif t == "reasons":
+            self.stats.update(probed=ev.get("probed", 0), total=ev.get("total", 0),
+                              alive=ev.get("alive", 0), reasons=ev.get("reasons") or {})
+            if ev.get("labels"):
+                self.stats["labels"] = ev["labels"]
+        elif t == "second_chance":
+            self.stats["second_chance"] = ev.get("count", 0)
+        elif t == "summary":
+            self.stats.update(total=ev.get("total", 0), alive=ev.get("alive", 0),
+                              pool=ev.get("pool"), slow=ev.get("slow", 0),
+                              reasons=ev.get("reasons") or {},
+                              labels=ev.get("by_reason_labels") or {})
+            if ev.get("best") is not None:
+                self.stats["best"] = ev["best"]
+            if ev.get("median") is not None:
+                self.stats["median"] = ev["median"]
+        elif t == "done":
+            if ev.get("ever_good") is not None:
+                self.stats["ever_good"] = ev["ever_good"]
+            if ev.get("elapsed") is not None:
+                self.stats["elapsed"] = ev["elapsed"]
+        elif t == "fetch_done":
+            self.stats["raw"] = ev.get("raw", 0)
+        elif t == "geo":
+            self.stats.update(geo_ok=bool(ev.get("ok")), geo_updated=ev.get("updated"),
+                              geo_size_mb=ev.get("size_mb"))
+        elif t == "stats":
+            for key in ("count", "usable", "healthy", "failed", "bad", "used",
+                        "avg_latency", "by_proto"):
+                if key in ev:
+                    self.stats[key] = ev[key]
+
     def _pump(self):
-        import re
-        assert self.proc and self.proc.stdout
+        import json as _json
+        if not (self.proc and self.proc.stdout):
+            self.state = "failed"
+            return
         for line in self.proc.stdout:
             line = line.rstrip()
             self.lines.append(line)
+            if line.startswith('@event '):
+                try:
+                    self._apply_event(_json.loads(line[7:]))
+                except (ValueError, TypeError):
+                    pass
+                continue
             m = re.search(r"\[\s*checkpoint\]\s*(\d+)/(\d+)\s+probed,\s*(\d+)\s+alive", line)
             if m:
                 self.stats.update(probed=int(m.group(1)), total=int(m.group(2)),
@@ -418,8 +547,16 @@ class ProxyChecker:
             m = re.search(r"ever-good[^:]*:\s*(\d+)", line)
             if m:
                 self.stats["ever_good"] = int(m.group(1))
+            m = re.search(r"second chance:\s*(\d+)", line)
+            if m:
+                self.stats["second_chance"] = int(m.group(1))
+            m = re.search(r"why they failed:\s*(.+)$", line)
+            if m:
+                self.stats["failure_line"] = m.group(1)
         self.proc.wait()
         self.state = "exited" if self.proc.returncode == 0 else "failed"
+        if self.state == "exited" and self.action in ("verify", "recheck", "all"):
+            self.last_verified_at = time.time()
         self.refresh_stats()
 
     def stop(self):
@@ -443,25 +580,110 @@ class ProxyChecker:
         except OSError:
             return 0
 
+    def _load_bad(self) -> set[str]:
+        try:
+            return {ln.split("\t")[0].strip()
+                    for ln in (self.data_dir / "proxies_bad.txt").read_text(
+                        encoding="utf-8", errors="ignore").splitlines()
+                    if ln.strip()}
+        except OSError:
+            return set()
+
+    def _load_used(self) -> set[str]:
+        try:
+            return {ln.split("\t")[0].strip()
+                    for ln in (self.data_dir / "proxies_used.txt").read_text(
+                        encoding="utf-8", errors="ignore").splitlines()
+                    if ln.strip()}
+        except OSError:
+            return set()
+
     def _socks(self) -> int:
+        bad = self._load_bad()
+        used = self._load_used()
+        excluded = bad | used
         seen = set()
-        for f in ("proxies.txt", "proxies_evergood.txt"):
-            try:
-                for ln in (self.data_dir / f).read_text(
-                        encoding="utf-8", errors="ignore").splitlines():
-                    p = ln.strip()
-                    if p and p.split("://", 1)[0].lower() in ("socks4", "socks5"):
-                        seen.add(p)
-            except OSError:
-                pass
+        try:
+            for ln in (self.data_dir / "proxies.txt").read_text(
+                    encoding="utf-8", errors="ignore").splitlines():
+                p = ln.strip()
+                if p and p not in excluded and p.split("://", 1)[0].lower() in ("socks4", "socks5"):
+                    seen.add(p)
+        except OSError:
+            pass
         return len(seen)
 
     def refresh_stats(self):
         self.stats.update(pool_file=self._count("proxies.txt"),
                           ever_good_file=self._count("proxies_evergood.txt"),
                           bad=self._count("proxies_bad.txt"),
+                          used=self._count("proxies_used.txt"),
                           socks=self._socks(),
                           raw=self._count("proxies_raw.txt"))
+        # pool.json is the source of truth now: health, types, usable count
+        pool = self._read_json("pool.json")
+        entries = pool if isinstance(pool, dict) else {}
+        if entries:
+            usable = healthy = failed = unverified = 0
+            by_proto: dict[str, int] = {}
+            lat = 0.0
+            bad = self._load_bad()
+            used = self._load_used()
+            for url, e in entries.items():
+                if not isinstance(e, dict):
+                    continue
+                fails = int(e.get("fails", 0) or 0)
+                if fails == 0:
+                    healthy += 1
+                if fails > 0:
+                    failed += 1
+                if e.get("vouched") and not int(e.get("last_ok", 0) or 0):
+                    unverified += 1
+                last_ok = int(e.get("last_ok", 0) or 0)
+                last_check = int(e.get("last_check", 0) or 0)
+                result = e.get("last_result")
+                if result is None:
+                    result = "ok" if last_check <= last_ok else "fail"
+                verified_now = last_ok > 0 and result == "ok"
+                if url not in bad and url not in used and verified_now and fails <= 3:
+                    usable += 1
+                proto = str(e.get("proto") or url.split("://", 1)[0]).lower()
+                by_proto[proto] = by_proto.get(proto, 0) + 1
+                try:
+                    lat += float(e.get("latency", 0) or 0)
+                except (TypeError, ValueError):
+                    pass
+            self.stats.update(pool_json=len(entries), usable=usable, healthy=healthy,
+                              failed=failed, unverified=unverified, types=by_proto,
+                              avg_latency=round(lat / len(entries), 2) if entries else 0)
+        geo = self.data_dir / "geo" / "dbip-country-lite.csv.gz"
+        try:
+            st = geo.stat()
+            self.stats["geo"] = {"available": True, "size_mb": round(st.st_size / 1e6, 1),
+                                 "updated": time.strftime("%Y-%m-%d", time.localtime(st.st_mtime))}
+        except OSError:
+            self.stats["geo"] = {"available": False}
+
+    def _read_json(self, name: str):
+        try:
+            return json.loads((self.data_dir / name).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+
+    def sources_yield(self) -> list[dict]:
+        """Per-source yield from the last scans (best first)."""
+        data = self._read_json("proxy_sources_stats.json")
+        rows = []
+        if isinstance(data, dict):
+            for url, row in data.items():
+                if not isinstance(row, dict):
+                    continue
+                runs = max(1, int(row.get("runs", 1) or 1))
+                rows.append({**row, "url": url,
+                             "avg": round(int(row.get("found", 0) or 0) / runs, 1)})
+        rows.sort(key=lambda r: (int(r.get("found", 0) or 0), -int(r.get("errors", 0) or 0)),
+                  reverse=True)
+        return rows
 
     def status(self) -> dict:
         self.refresh_stats()
@@ -471,44 +693,48 @@ class ProxyChecker:
                 "stats": self.stats, "lines": list(self.lines)[-100:]}
 
     # ---- import + editable sources ----------------------------------------- #
-    # Implemented here (not via proxy_pool) so the frozen gateway never needs the
-    # generator's third-party deps (requests/pysocks) just to manage files.
+    # Parsing is shared with the generator (generator/proxy_parse.py) so a pasted
+    # list is understood identically in the CLI and the dashboard.
 
-    _IPPORT = re.compile(r'^(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})$')
+    def _proxy_pool(self):
+        sys.path.insert(0, str(self.gen_dir))
+        import proxy_pool
+        proxy_pool.set_output_dir(str(self.data_dir))
+        return proxy_pool
 
-    def import_proxies(self, text: str, into_good: bool = True) -> int:
-        """Add pasted/uploaded proxies to the pool. Accepts proto://ip:port or
-        bare ip:port (defaults http); splits on whitespace/comma/semicolon."""
-        entries = []
-        for raw in re.split(r'[\s,;]+', (text or '').strip()):
-            if not raw:
-                continue
-            if '://' in raw:
-                proto, rest = raw.split('://', 1)
-                if proto in ('http', 'https', 'socks4', 'socks5') and self._IPPORT.match(rest):
-                    entries.append(f'{proto}://{rest}')
-            elif self._IPPORT.match(raw):
-                entries.append(f'http://{raw}')
+    def import_proxies(self, text: str, into_good: bool = True,
+                       default_proto: str = "http") -> int:
+        """Add pasted/uploaded proxies to the pool.
+
+        Accepts schemeful URLs, bare ip:port, user:pass@, provider style
+        host:port:user:pass, CIDR ranges, HTML tables and JSON. ``default_proto``
+        decides what a bare ip:port means ("http", "socks5", "all", ...).
+        """
+        try:
+            n = self._proxy_pool().import_proxies(text, into_good=into_good,
+                                                  default_proto=default_proto or "http")
+        except Exception as e:
+            log.warning("proxy import via pool failed (%s); using local parser", e)
+            n = self._import_local(text, into_good, default_proto)
+        self.refresh_stats()
+        return n
+
+    def _import_local(self, text: str, into_good: bool, default_proto: str) -> int:
+        sys.path.insert(0, str(self.gen_dir))
+        import proxy_parse as pp
+        entries = [pp.to_url(e["proto"], e["host"], e["port"], e["auth"])
+                   for e in pp.parse_proxy_list(text, default_proto or "http")]
         if not entries:
             return 0
         out = self.data_dir
         out.mkdir(parents=True, exist_ok=True)
-        with open(out / 'proxies_raw.txt', 'a', encoding='utf-8') as f:
-            f.write('\n'.join(entries) + '\n')
+        with open(out / "proxies_raw.txt", "a", encoding="utf-8") as f:
+            f.write("\n".join(entries) + "\n")
         if into_good:
-            existing = set()
-            try:
-                existing = set((out / 'proxies.txt').read_text(
-                    encoding='utf-8').split())
-            except OSError:
-                pass
-            fresh = [e for e in entries if e not in existing]
-            if fresh:
-                with open(out / 'proxies.txt', 'a', encoding='utf-8') as f:
-                    f.write('\n'.join(fresh) + '\n')
-                with open(out / 'proxies_evergood.txt', 'a', encoding='utf-8') as f:
-                    f.write('\n'.join(fresh) + '\n')
-        self.refresh_stats()
+            with open(out / "proxies.txt", "a", encoding="utf-8") as f:
+                f.write("\n".join(entries) + "\n")
+            with open(out / "proxies_evergood.txt", "a", encoding="utf-8") as f:
+                f.write("\n".join(entries) + "\n")
         return len(entries)
 
     def sources_text(self) -> str:
@@ -530,6 +756,110 @@ class ProxyChecker:
                    if ln.strip() and not ln.strip().startswith('#'))
 
 
+class ClaimJob:
+    """Standalone 100M claim for one account (generator/claim100.py).
+
+    Runs with a visible browser and manual accept, like a normal claim; the
+    final `CLAIM_RESULT {...}` line carries the referral summary."""
+    _RES = "CLAIM_RESULT "
+
+    def __init__(self, name: str, email: str, mode: str, proxy: str,
+                 gen_dir: Path, python_exe: str, invite_code: str,
+                 data_dir: Path | None = None):
+        self.name, self.email, self.mode, self.proxy = name, email, mode, proxy
+        self.gen_dir = Path(gen_dir)
+        self.data_dir = Path(data_dir) if data_dir else self.gen_dir / "output"
+        argv = [python_exe, "-u", "claim100.py", email]
+        if mode == "direct":
+            argv.append("--direct")
+        elif proxy:
+            argv += ["--proxy", proxy]
+        self.argv = argv
+        self.invite_code = invite_code
+        self.proc: subprocess.Popen | None = None
+        self.state = "starting"      # starting|running|exited|failed|killed
+        self.stopped = False
+        self.started = 0.0
+        self.result: dict | None = None
+        self.lines: deque[str] = deque(maxlen=220)
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+
+    def alive(self) -> bool:
+        return bool(self.proc and self.proc.poll() is None)
+
+    def start(self):
+        env = os.environ.copy()
+        env.update({"PYTHONUNBUFFERED": "1",
+                    "ZAI_OUTPUT_DIR": str(self.data_dir),
+                    "ZAI_INVITE_CODE": self.invite_code or ""})
+        if getattr(self, "_internal_token", ""):
+            env["ZAI_GATEWAY_INTERNAL_TOKEN"] = self._internal_token
+        self.started = time.time()
+        self.state = "running"
+        try:
+            self.proc = subprocess.Popen(
+                self.argv, cwd=str(self.gen_dir), env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="replace", bufsize=1,
+                **_child_kwargs())
+        except Exception as e:
+            self.state = "failed"
+            self.lines.append(f"launch error: {e}")
+            return
+        self._thread = threading.Thread(target=self._pump, daemon=True)
+        self._thread.start()
+
+    def to_public(self) -> dict:
+        # strip the private claim JWT before the result reaches the dashboard
+        res = self.result
+        if isinstance(res, dict):
+            res = {k: v for k, v in res.items() if k != "_claim_jwt"}
+        return {"name": self.name, "email": self.email, "mode": self.mode,
+                "proxy": re.sub(r"//[^/]*@", "//", self.proxy) if self.proxy else "", "state": self.state,
+                "elapsed": int(time.time() - self.started) if self.started else 0,
+                "result": res,
+                "lines": list(self.lines)[-12:]}
+
+    def _pump(self):
+        import json as _json
+        assert self.proc and self.proc.stdout
+        for line in self.proc.stdout:
+            line = (line or "").rstrip()
+            if not line:
+                continue
+            if line.startswith(self._RES):
+                try:
+                    self.result = _json.loads(line[len(self._RES):])
+                except (ValueError, TypeError):
+                    self.result = {"raw": line[len(self._RES):][:400]}
+                continue
+            if line.startswith("CLAIM_RESULT"):
+                try:
+                    self.result = _json.loads(line.split(" ", 1)[1])
+                except (ValueError, TypeError, IndexError):
+                    self.result = {"raw": line[:400]}
+                continue
+            self.lines.append(line)
+        self.proc.wait()
+        self.state = "exited" if self.proc.returncode == 0 else "failed"
+
+    def stop(self):
+        self.stopped = True
+        if self.proc and self.proc.poll() is None:
+            try:
+                subprocess.run(["taskkill", "/PID", str(self.proc.pid), "/T", "/F"],
+                               capture_output=True, timeout=5, **_child_kwargs())
+            except Exception:
+                pass
+            try:
+                if self.proc and self.proc.poll() is None:
+                    self.proc.kill()
+            except Exception:
+                pass
+        self.state = "killed"
+
+
 class GeneratorManager:
     """Owns worker processes + pipeline options. One manager per gateway."""
 
@@ -542,14 +872,32 @@ class GeneratorManager:
         # (./generator-data); a source run uses ZCODEAUTO's own output/.
         self.data_dir = Path(data_dir) if data_dir else self.gen_dir / "output"
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        os.environ["ZAI_OUTPUT_DIR"] = str(self.data_dir)
+
+        # Migrate/preserve existing proxies from gen_dir/output if data_dir is empty
+        try:
+            if self.data_dir.resolve() != (self.gen_dir / "output").resolve():
+                import shutil
+                for fname in ("proxies.txt", "proxies_evergood.txt", "proxies_raw.txt", "proxy_sources.txt"):
+                    target = self.data_dir / fname
+                    src = self.gen_dir / "output" / fname
+                    if not target.exists() and src.exists():
+                        shutil.copy2(src, target)
+        except OSError:
+            pass
         self.workers: dict[str, GenWorker] = {}
+        self.claims: dict[str, ClaimJob] = {}
         self.checker = ProxyChecker(self.gen_dir, self.python_exe,
                                     data_dir=self.data_dir)
         self._seq = 0
         self._lock = threading.Lock()
+        # per-run internal auth token for gateway admin calls from children
+        self.internal_token = ""
         # options (dashboard-editable)
         self.captcha = "manual"             # auto | manual — default: you solve it
-        self.ip_source = "socks"            # socks | pool | direct | pin
+        self.ip_source = "direct"           # socks | pool | direct | pin — default: my network (no proxy)
+        self.proxy_types = "socks"          # all | socks | socks5 | socks4 | http | csv
+        self.country = "ALL"                # ALL | US | DE | ...
         self.pin_proxy = ""
         self.retries = 5
         self.claim = True                   # invite Global Build claim on/off
@@ -656,7 +1004,7 @@ class GeneratorManager:
         leaving successful signups out of rotation."""
         done = self.registered_emails()
         out, seen = [], set()
-        for pat in ("accounts*.txt", "starter*.txt"):
+        for pat in ("starter*.txt",):
             for f in sorted(self.data_dir.glob(pat)):
                 try:
                     lines = f.read_text(encoding="utf-8", errors="ignore").splitlines()
@@ -1117,11 +1465,49 @@ class GeneratorManager:
 
     # ---- options ------------------------------------------------------------
 
+    PROXY_TYPE_SCHEMES = {
+        "all": (),
+        "socks": ("socks4", "socks5"),
+        "socks5": ("socks5",),
+        "socks4": ("socks4",),
+        "http": ("http", "https"),
+    }
+
+    @classmethod
+    def normalize_proxy_types(cls, value: str, *, legacy_socks_only: bool | None = None) -> str:
+        """Validate/canonicalize a proxy_types setting. Accepts the keywords
+        above or a comma list of schemes. Returns '' for 'all'."""
+        v = str(value or "").strip().lower()
+        if legacy_socks_only is not None and v == "socks" and not legacy_socks_only:
+            v = "all"      # old socks_only: false config meant the full pool
+        if not v or v == "all":
+            return "all"
+        if v in cls.PROXY_TYPE_SCHEMES:
+            return v
+        # comma list of raw schemes
+        parts = [p.strip().lower() for p in v.split(",") if p.strip()]
+        valid = [p for p in parts if p in ("http", "https", "socks4", "socks5")]
+        return ",".join(valid) if valid else "all"
+
+    def _proxy_type_schemes(self) -> tuple[str, ...]:
+        v = self.normalize_proxy_types(self.proxy_types)
+        if v == "all":
+            return ()
+        if v in self.PROXY_TYPE_SCHEMES:
+            return self.PROXY_TYPE_SCHEMES[v]
+        return tuple(v.split(","))
+
     def set_options(self, **kw):
         if "captcha" in kw and kw["captcha"] in ("auto", "manual"):
             self.captcha = kw["captcha"]
         if "ip_source" in kw and kw["ip_source"] in ("socks", "pool", "direct", "pin"):
-            self.ip_source = kw["ip_source"]
+            # 'socks' was the old socks-only pool entry — now the pool with the
+            # proxy_types filter applied; normalize so the UI shows one option
+            self.ip_source = "pool" if kw["ip_source"] == "socks" else kw["ip_source"]
+        if "country" in kw:
+            self.country = str(kw["country"] or "ALL").strip().upper()
+        if "proxy_types" in kw:
+            self.proxy_types = self.normalize_proxy_types(kw["proxy_types"])
         if "pin_proxy" in kw:
             self.pin_proxy = str(kw["pin_proxy"] or "").strip()
         if "retries" in kw:
@@ -1142,31 +1528,161 @@ class GeneratorManager:
         if "invite_code" in kw:
             self._invite_code = str(kw["invite_code"] or "").strip()
 
+    def _geo_db(self):
+        """Offline DB-IP lookup if the generator downloaded it; never network."""
+        try:
+            sys.path.insert(0, str(self.gen_dir))
+            import proxy_geo
+            proxy_geo.set_data_dir(str(self.data_dir))
+            return proxy_geo
+        except Exception:
+            return None
+
+    def _country_counts(self) -> dict[str, int]:
+        bad = self._load_bad()
+        used = self._load_used()
+        excluded = bad | used
+        try:
+            lines = [ln.strip() for ln in self.pool_file.read_text(
+                encoding="utf-8", errors="ignore").splitlines()
+                if ln.strip() and ln.strip() not in excluded]
+        except OSError:
+            return {}
+        cache_file = self.data_dir / "ip_country.json"
+        cache = {}
+        if cache_file.exists():
+            try:
+                raw = json.loads(cache_file.read_text(encoding="utf-8", errors="ignore"))
+                if isinstance(raw, dict):
+                    cache = {k: str(v).upper() for k, v in raw.items() if v}
+            except Exception:
+                pass
+        # the verified pool already carries the country it was scored with
+        try:
+            pool = json.loads((self.data_dir / "pool.json").read_text(encoding="utf-8"))
+            for e in (pool.values() if isinstance(pool, dict) else []):
+                if not isinstance(e, dict):
+                    continue
+                cc = str(e.get("country") or "").upper()
+                host = e.get("host") or ""
+                if cc and host and host not in cache:
+                    cache[host] = cc
+        except (OSError, ValueError):
+            pass
+
+        ip_re = re.compile(r"://(?:[^@/]+@)?([^:/]+)")
+        missing = list(dict.fromkeys(
+            m.group(1) for p in lines
+            for m in [ip_re.search(p)] if m and m.group(1) not in cache))
+        if missing:
+            db = self._geo_db()
+            if db is not None and db.available():
+                added = False
+                for ip in missing[:5000]:
+                    cc = db.lookup(ip).get("country", "")
+                    if cc:
+                        cache[ip] = cc.upper()
+                        added = True
+                if added:
+                    try:
+                        cache_file.write_text(json.dumps(cache, indent=2), encoding="utf-8")
+                    except OSError:
+                        pass
+
+        from collections import Counter
+        counts = Counter()
+        schemes = self._proxy_type_schemes()
+        for p in lines:
+            if schemes and p.split("://", 1)[0].lower() not in schemes:
+                continue
+            m = ip_re.search(p)
+            if m:
+                cc = cache.get(m.group(1), "")
+                if cc:
+                    counts[cc] += 1
+        return dict(counts.most_common(20))
+
+    def _pool_type_counts(self) -> dict[str, int]:
+        """Distinct usable proxies per scheme in the live pool (bad/used
+        excluded, country-filtered). Scheme keys: http/https/socks4/socks5."""
+        bad = self._load_bad()
+        used = self._load_used()
+        excluded = bad | used
+        counts: dict[str, int] = {}
+        cache_file = self.data_dir / "ip_country.json"
+        cache = {}
+        target_country = str(getattr(self, "country", "ALL") or "ALL").upper()
+        if target_country != "ALL" and cache_file.exists():
+            try:
+                raw = json.loads(cache_file.read_text(encoding="utf-8", errors="ignore"))
+                if isinstance(raw, dict):
+                    cache = {k: str(v).upper() for k, v in raw.items() if v}
+            except Exception:
+                pass
+        if target_country != "ALL":
+            try:
+                pool = json.loads((self.data_dir / "pool.json").read_text(encoding="utf-8"))
+                for e in (pool.values() if isinstance(pool, dict) else []):
+                    if isinstance(e, dict):
+                        cc = str(e.get("country") or "").upper()
+                        if cc and e.get("host") and e["host"] not in cache:
+                            cache[e["host"]] = cc
+            except (OSError, ValueError):
+                pass
+        try:
+            for ln in self.pool_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+                v = ln.strip()
+                if not v or v in excluded or "://" not in v:
+                    continue
+                if target_country != "ALL":
+                    m = re.search(r"://(?:[^@/]+@)?([^:/]+)", v)
+                    if not m or cache.get(m.group(1), "") != target_country:
+                        continue
+                scheme = v.split("://", 1)[0].lower()
+                counts[scheme] = counts.get(scheme, 0) + 1
+        except OSError:
+            pass
+        return counts
+
+    def _types_counts(self) -> dict[str, int]:
+        """Usable pool size for each proxy_types keyword (for the dropdown)."""
+        c = self._pool_type_counts()
+        return {
+            "all": sum(c.values()),
+            "socks": c.get("socks4", 0) + c.get("socks5", 0),
+            "socks5": c.get("socks5", 0),
+            "socks4": c.get("socks4", 0),
+            "http": c.get("http", 0) + c.get("https", 0),
+        }
+
+    def _socks_count(self) -> int:
+        """Number of distinct SOCKS proxies currently available in the live pool."""
+        return self._types_counts()["socks"]
+
     def options(self) -> dict:
+        tc = self._types_counts()
         return {"captcha": self.captcha, "ip_source": self.ip_source,
+                "proxy_types": self.normalize_proxy_types(self.proxy_types),
+                "types_counts": tc,
+                "pool_available": tc.get(
+                    self.normalize_proxy_types(self.proxy_types), tc["all"]),
+                "country": getattr(self, "country", "ALL"),
+                "countries_available": self._country_counts(),
                 "pin_proxy": self.pin_proxy, "retries": self.retries,
                 "claim": self.claim, "headless": self.headless,
                 "invite_code": self._invite_code,
-                "socks_available": self._socks_count(),
+                "socks_available": tc["socks"],
                 "mail": self.mail_config(),
                 "data_dir": str(self.data_dir)}
 
-    def _socks_count(self) -> int:
-        """Number of distinct SOCKS proxies available (pool + ever-good).
-        (It used to add scheme names to a set and return its size, so the UI
-        could never show more than 2.)"""
-        seen = set()
-        for f in (self.pool_file, self.evergood_file):
-            try:
-                for ln in f.read_text(encoding="utf-8", errors="ignore").splitlines():
-                    v = ln.strip()
-                    if "://" not in v:
-                        continue
-                    if v.split("://", 1)[0].lower() in ("socks4", "socks5"):
-                        seen.add(v)
-            except OSError:
-                continue
-        return len(seen)
+    def _load_used(self) -> set[str]:
+        try:
+            return {ln.split("\t")[0].strip()
+                    for ln in (self.data_dir / "proxies_used.txt").read_text(
+                        encoding="utf-8", errors="ignore").splitlines()
+                    if ln.strip()}
+        except OSError:
+            return set()
 
     def _load_bad(self) -> set[str]:
         try:
@@ -1178,12 +1694,13 @@ class GeneratorManager:
             return set()
 
     def _pick_proxy(self, socks_only: bool, tries: int = 25) -> str | None:
-        """Verify-on-pick from the pool + ever-good ledger (socks4/5 only when
-        asked). Uses proxy_pool.pick_verified."""
-        sys.path.insert(0, str(self.gen_dir))
+        """Verify-on-pick from the pool, honouring the configured type filter."""
         try:
-            import proxy_pool
-            return proxy_pool.pick_verified(tries=tries, socks=socks_only)
+            proxy_pool = self._proxy_pool()
+            schemes = self._proxy_type_schemes()
+            return proxy_pool.pick_verified(tries=tries, socks=socks_only,
+                                            country=self.country,
+                                            types=schemes or None)
         except Exception as e:
             log.warning("proxy_pool.pick_verified failed: %s", e)
         return None
@@ -1209,10 +1726,13 @@ class GeneratorManager:
             "ZAI_OUT_SUFFIX": name,
             "ZAI_OUTPUT_DIR": str(self.data_dir),
             "ZAI_PROXY": "0", "ZAI_USE_POOL": "0", "ZAI_SOCKS_ONLY": "0",
+            "ZAI_PROXY_COUNTRY": self.country or "ALL",
             "ZAI_MANUAL": "1" if self.captcha == "manual" else "0",
             "ZAI_HEADLESS": "0" if self.captcha == "manual" else ("1" if self.headless else "0"),
             "ZAI_PROXY_RETRIES": str(self.retries),
         }
+        if self.internal_token:
+            env["ZAI_GATEWAY_INTERNAL_TOKEN"] = self.internal_token
         if self.claim and self._invite_code:
             env["ZAI_INVITE_CODE"] = self._invite_code
         else:
@@ -1225,11 +1745,11 @@ class GeneratorManager:
             env["ZAI_INBOX_URL"] = m["inbox_url"]
         if m.get("inbox_secret"):
             env["ZAI_INBOX_SECRET"] = m["inbox_secret"]
-        if self.ip_source == "socks":
+        if self.ip_source in ("socks", "pool"):
             env["ZAI_USE_POOL"] = "1"
-            env["ZAI_SOCKS_ONLY"] = "1"
-        elif self.ip_source == "pool":
-            env["ZAI_USE_POOL"] = "1"
+            schemes = self._proxy_type_schemes()
+            if schemes:
+                env["ZAI_PROXY_TYPES"] = ",".join(schemes)
         elif self.ip_source == "pin" and self.pin_proxy:
             env["ZAI_PROXY"] = self.pin_proxy
         elif self.ip_source == "direct":
@@ -1256,9 +1776,149 @@ class GeneratorManager:
             if w.alive():
                 w.stop()
 
+    def remove_worker(self, name: str) -> bool:
+        """Drop one worker card (running ones are killed first)."""
+        w = self.workers.get(name)
+        if not w:
+            return False
+        if w.alive():
+            w.stop()
+        self.workers.pop(name, None)
+        return True
+
+    def remove_finished_workers(self) -> int:
+        names = [n for n, w in self.workers.items() if not w.alive()]
+        for n in names:
+            self.workers.pop(n, None)
+        return len(names)
+
+    # ---- per-account 100M claims (Accounts tab) ------------------------------ #
+
+    def start_claim(self, email: str, mode: str = "proxy", allow_direct_fallback: bool = True) -> dict:
+        """Claim 100M for one account, separately from the generator flow.
+
+        mode: 'proxy' — a pool proxy (pinned proxy first), 'direct' — no proxy.
+        The claim browser is visible and waits for a manual Accept like a
+        generator claim. When the pool pick fails in proxy mode, a quick
+        re-verify runs once and the pick retries; if it still fails, the claim
+        falls back to direct (the bind is session-authenticated, not
+        IP-bound) instead of dead-ending."""
+        email = (email or "").strip().lower()
+        if not email:
+            return {"error": "account has no email"}
+        alive = [j for j in self.claims.values() if j.alive()]
+        if len(alive) >= 3:
+            return {"error": "too many claims running"}
+        if any(j.alive() and j.email == email for j in self.claims.values()):
+            return {"error": "a claim for this account is already running"}
+        if mode == "proxy":
+            proxy = self._proxy_for_claim()
+            if not proxy:
+                # one quick background recheck of the usable pool, then retry
+                log.info("claim: pool pick empty — running a quick recheck")
+                try:
+                    self.checker.run("recheck")
+                    # wait briefly for the recheck to finish (bounded)
+                    for _ in range(120):
+                        if not self.checker.alive():
+                            break
+                        time.sleep(1)
+                    proxy = self._proxy_for_claim()
+                except Exception:
+                    log.exception("claim: auto-recheck failed")
+            if not proxy:
+                if not allow_direct_fallback:
+                    return {"error": "no usable proxy in the pool (run a proxy scan first)"}
+                log.info("claim: pool still empty — falling back to DIRECT")
+                mode = "direct"
+        else:
+            proxy = ""
+        name = f"claim-{int(time.time())}"
+        job = ClaimJob(name, email, mode, proxy, self.gen_dir,
+                       self.python_exe, self._invite_code,
+                       data_dir=self.data_dir)
+        job._internal_token = self.internal_token
+        job.start()
+        self.claims[name] = job
+        return {"started": name, "proxy": job.proxy, "mode": mode}
+
+    def socks_ready_count(self) -> int:
+        """Live socks count for the claim health badge (cheap heuristic:
+        usable + socks entries in the current pool snapshot)."""
+        try:
+            pool = self._proxy_pool()
+            bad = pool.load_bad()
+            used = pool.load_used()
+            entries = pool._load_pool_map()
+            return sum(1 for e in entries.values()
+                       if pool._is_usable(e, bad, used, pool.MAX_FAILS)
+                       and 'socks' in str(e.get('url', '')).lower())
+        except Exception:
+            return -1
+
+    def claim_all_pending(self, mode: str = "proxy") -> dict:
+        """Queue 100M claims sequentially for every starter account whose
+        referral summary shows the Global Build not yet issued."""
+        started, skipped, errors = [], [], []
+        for info in self.pending_accounts():
+            email = (info.get("email") or "").strip().lower()
+            if not email:
+                continue
+            if any(j.email == email for j in self.claims.values()):
+                skipped.append(email)
+                continue
+            res = self.start_claim(email, mode=mode)
+            if res.get("started"):
+                started.append(email)
+                # throttle: wait for the job to finish before the next one
+                job = self.claims.get(res["started"])
+                while job and job.alive():
+                    time.sleep(2)
+            else:
+                errors.append(f"{email}: {res.get('error', '?')}")
+        return {"started": started, "skipped": skipped, "errors": errors}
+
+    def _proxy_for_claim(self) -> str:
+        o = self.options()
+        pinned = str(o.get("pinned") or "").strip()
+        if pinned:
+            return pinned
+        try:
+            pool = self._proxy_pool()
+            return pool.pick_verified(tries=8, socks=True) or ""
+        except Exception as e:
+            log.warning("claim pool pick failed: %s", e)
+            return ""
+
+    def claims_public(self) -> list[dict]:
+        return [j.to_public() for j in self.claims.values()]
+
+    def stop_claim(self, name: str) -> bool:
+        j = self.claims.get(name)
+        if j and j.alive():
+            j.stop()
+            return True
+        return False
+
+    def remove_claim(self, name: str) -> bool:
+        j = self.claims.get(name)
+        if not j:
+            return False
+        if j.alive():
+            j.stop()
+        self.claims.pop(name, None)
+        return True
+
+    def clear_finished_claims(self) -> int:
+        names = [n for n, j in self.claims.items() if not j.alive()]
+        for n in names:
+            self.claims.pop(n, None)
+        return len(names)
+
     def status(self) -> dict:
         return {
             "options": self.options(),
             "workers": [w.to_public() for w in self.workers.values()],
+            "claims": self.claims_public(),
             "alive": sum(1 for w in self.workers.values() if w.alive()),
         }

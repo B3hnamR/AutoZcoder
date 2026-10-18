@@ -1,3 +1,4 @@
+import os
 import time
 import base64
 import logging
@@ -113,8 +114,8 @@ def fetch_image(url, referer='https://chat.z.ai/'):
 
 
 def save_debug_images(shadow_bytes, bg_bytes, prefix="captcha"):
-    output_dir = Path('output')
-    output_dir.mkdir(exist_ok=True)
+    output_dir = Path(os.environ.get('ZAI_OUTPUT_DIR') or 'output')
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     timestamp = int(time.time())
     shadow_path = output_dir / f"{prefix}_shadow_{timestamp}.png"
@@ -129,8 +130,8 @@ def save_debug_images(shadow_bytes, bg_bytes, prefix="captcha"):
 
 
 def take_screenshot(page, name="screenshot"):
-    screenshot_dir = Path('output')
-    screenshot_dir.mkdir(exist_ok=True)
+    screenshot_dir = Path(os.environ.get('ZAI_OUTPUT_DIR') or 'output')
+    screenshot_dir.mkdir(parents=True, exist_ok=True)
 
     timestamp = int(time.time())
     path = screenshot_dir / f"{name}_{timestamp}.png"

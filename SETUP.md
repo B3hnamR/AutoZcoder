@@ -40,7 +40,7 @@ generator:
   python_exe: ""            # blank = auto-detect; else full path to a python that
                             # has the generator deps (playwright/ddddocr/...)
   invite_code: ""           # your referral code ('' = off; empty by default)
-  socks_only: true          # residential-style proxies (see Proxy tools)
+  proxy_types: "socks"      # pool scheme filter: all | socks | socks5 | socks4 | http
 ```
 
 You can also set this from the UI (**Generator → Locate generator**) — it

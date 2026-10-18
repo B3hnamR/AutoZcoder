@@ -189,6 +189,11 @@ async def dash_settings_put(request: Request, body: dict = Body(...),
         if dotted == "pool.max_in_flight_per_account" and val < 1:
             raise HTTPException(status_code=400,
                                 detail="pool.max_in_flight_per_account must be >= 1")
+        if dotted == "pool.balance_poll_seconds" and val < 10:
+            raise HTTPException(status_code=400,
+                                detail="pool.balance_poll_seconds must be >= 10 "
+                                       "(matches the startup validation; a lower "
+                                       "value would refuse to boot next restart)")
         if dotted == "server.port" and not (0 <= val <= 65535):
             raise HTTPException(status_code=400,
                                 detail="server.port must be 0-65535")
@@ -210,9 +215,12 @@ async def dash_settings_put(request: Request, body: dict = Body(...),
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from None
     if changed:
-        cfg_path.write_text(yaml.safe_dump(raw, sort_keys=False,
-                                           allow_unicode=True),
-                            encoding="utf-8")
+        # atomic write: a crash mid-save must not corrupt config.yaml
+        tmp = cfg_path.with_suffix(".yaml.tmp")
+        tmp.write_text(yaml.safe_dump(raw, sort_keys=False,
+                                      allow_unicode=True),
+                       encoding="utf-8")
+        os.replace(tmp, cfg_path)
     return {"changed": changed, "restart_required": bool(changed)}
 
 
@@ -629,6 +637,13 @@ def _generator(request: Request):
                     return
                 plan_info = get_plan(zjwt) or {}
                 plans = plan_info.get("plans") or []
+                if not plans:
+                    log.info("generator: %s has no plan — skipping pool registration", email)
+                    try:
+                        mgr.mark_registered(email)
+                    except Exception:
+                        pass
+                    return
                 chosen_plan = "zcode-v3-start-plan-referral" if "zcode-v3-start-plan-referral" in plans else (plans[0] if plans else "")
                 account = mint_and_register(
                     state.cfg.accounts.dir, email, zjwt,
@@ -666,6 +681,7 @@ def _generator(request: Request):
         mgr = GeneratorManager(gen_dir, on_account=register_account,
                                python_exe=getattr(gc, "python_exe", ""),
                                data_dir=data_dir)
+        mgr.internal_token = state.internal_token
         # defaults come from config.yaml; '' invite_code would mean "off", but
         # the shipped default is the project's referral code (claim stays on)
         mgr.claim = bool(gc.claim)
@@ -673,7 +689,9 @@ def _generator(request: Request):
         if gc.captcha in ("auto", "manual"):
             mgr.captcha = gc.captcha
         mgr.headless = bool(gc.headless) and mgr.captcha != "manual"
-        mgr.set_options(ip_source="socks" if gc.socks_only else "pool")
+        mgr.set_options(ip_source="direct",
+                        proxy_types=GeneratorManager.normalize_proxy_types(
+                            gc.proxy_types, legacy_socks_only=gc.socks_only))
         state.generator = mgr
 
         # catch-up: signups that never reached the pool (gateway was closed, or
@@ -772,7 +790,8 @@ async def generator_mail_test(request: Request, key: str = Depends(admin_key)) -
         # async: a sync httpx.get in an async route stalls the whole event
         # loop (all /v1/* streaming) for up to the full timeout
         import httpx as _hx
-        async with _hx.AsyncClient(timeout=15) as client:
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        async with _hx.AsyncClient(timeout=15, headers=headers) as client:
             r = await client.get(url, params={"k": mgr.mail_cfg.get("inbox_secret", "")})
         ok = r.status_code == 200
         mgr.mark_inbox_verified(ok)   # drives the wizard's step 3 checkmark
@@ -788,7 +807,9 @@ async def generator_mail_test(request: Request, key: str = Depends(admin_key)) -
 @router.get("/admin/dash/generator/status")
 async def generator_status(request: Request, key: str = Depends(admin_key)) -> dict:
     try:
-        return _generator(request).status()
+        # status() counts pool countries and may read the offline geo DB; that is
+        # blocking disk work and must not run on the event loop
+        return await asyncio.to_thread(_generator(request).status)
     except HTTPException:
         raise
 
@@ -820,6 +841,45 @@ async def generator_stopall(request: Request, key: str = Depends(admin_key)) -> 
     return {"ok": True}
 
 
+@router.post("/admin/dash/generator/workers/remove")
+async def generator_worker_remove(request: Request, body: dict = Body(...),
+                                  key: str = Depends(admin_key)) -> dict:
+    name = str(body.get("name") or "")
+    ok = _generator(request).remove_worker(name)
+    if not ok:
+        raise HTTPException(status_code=404, detail="no such worker")
+    return {"removed": name}
+
+
+@router.post("/admin/dash/generator/workers/clear")
+async def generator_workers_clear(request: Request, key: str = Depends(admin_key)) -> dict:
+    n = _generator(request).remove_finished_workers()
+    return {"cleared": n}
+
+
+@router.post("/admin/dash/generator/send_claim_message")
+async def generator_send_claim_message(request: Request, body: dict = Body(...),
+                                       key: str = Depends(admin_key)) -> dict:
+    zjwt = str(body.get("zjwt") or "").strip()
+    if not zjwt:
+        raise HTTPException(status_code=400, detail="missing zjwt")
+    state = get_state(request)
+    from .upstream import build_headers
+    from .zcode_protocol import build_body
+    headers = build_headers(zjwt, state.cfg.upstream.fingerprint, include_device_mid=False)
+    upstream_body = build_body({
+        "model": "GLM-5.3-Flash",
+        "max_tokens": 10,
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": True,
+    })
+    resp = await state.service.client.send(headers, upstream_body, stream=True)
+    raw = await resp.aread()
+    await resp.aclose()
+    ok = resp.status_code == 200 and b"message_start" in raw
+    return {"status": resp.status_code, "ok": ok, "snippet": raw[:120].decode("utf-8", "replace")}
+
+
 # ---- proxy checker (scrape / verify / recheck) ----------------------------- #
 
 @router.get("/admin/dash/generator/proxies")
@@ -832,11 +892,31 @@ async def generator_proxies_run(request: Request, body: dict = Body(default={}),
                                 key: str = Depends(admin_key)) -> dict:
     checker = _generator(request).checker
     action = body.get("action", "verify")
+
+    def _num(name, cast=float):
+        v = body.get(name)
+        if v is None or v == "":
+            return None
+        try:
+            return cast(v)
+        except (TypeError, ValueError):
+            return None
+
+    def _flag(name):
+        v = body.get(name)
+        return None if v is None else bool(v)
+
     return checker.run(
         action,
-        timeout=int(body.get("timeout", 8)),
-        concurrency=int(body.get("concurrency", 400)),
-        max_latency=float(body.get("max_latency", 6.0)),
+        timeout=_num("timeout", int),
+        concurrency=_num("concurrency", int),
+        max_latency=_num("max_latency"),
+        preset=(body.get("preset") or None),
+        prefilter=_flag("prefilter"),
+        retry_failed=_flag("retry_failed"),
+        dead_cache_hours=_num("dead_cache_hours"),
+        probe_timeout=_num("probe_timeout"),
+        probe_concurrency=_num("probe_concurrency", int),
     )
 
 
@@ -854,7 +934,8 @@ async def generator_proxies_import(request: Request, body: dict = Body(...),
     if not isinstance(text, str):
         raise HTTPException(status_code=400, detail="text must be a string")
     n = _generator(request).checker.import_proxies(
-        text, into_good=bool(body.get("into_good", True)))
+        text, into_good=bool(body.get("into_good", True)),
+        default_proto=str(body.get("default_proto") or "http"))
     return {"imported": n}
 
 
@@ -871,3 +952,113 @@ async def generator_proxies_sources_set(request: Request, body: dict = Body(...)
         raise HTTPException(status_code=400, detail="text must be a string")
     n = _generator(request).checker.set_sources(text)
     return {"saved": True, "sources": n}
+
+
+@router.get("/admin/dash/generator/proxies/yield")
+async def generator_proxies_yield(request: Request, key: str = Depends(admin_key)) -> dict:
+    """Per-source yield: which lists actually produce working proxies."""
+    return {"sources": _generator(request).checker.sources_yield()}
+
+
+@router.post("/admin/dash/generator/proxies/maintain")
+async def generator_proxies_maintain(request: Request, body: dict = Body(...),
+                                     key: str = Depends(admin_key)) -> dict:
+    """Pool housekeeping: prune | clear-bad | clear-used | clear-dead."""
+    action = str(body.get("action") or "").strip()
+    if action not in ("prune", "clear-bad", "clear-used", "clear-dead"):
+        raise HTTPException(status_code=400, detail="unknown maintenance action")
+    return _generator(request).checker.run(action)
+
+
+@router.post("/admin/dash/generator/proxies/geo")
+async def generator_proxies_geo(request: Request, key: str = Depends(admin_key)) -> dict:
+    """Download the offline country/ASN database (one explicit click)."""
+    return _generator(request).checker.run("geo")
+
+
+# ---- Edge Relays (Cloudflare, Vercel, Deno, Netlify) ------------------------ #
+
+def _relay_mgr(request: Request):
+    state = get_state(request)
+    mgr = getattr(state, "relay_manager", None)
+    if mgr is None:
+        from .relay_manager import RelayManager
+        data_dir = (Path(state.cfg.accounts.dir).resolve().parent / "generator-data") if state.cfg.accounts.dir else Path("./generator-data")
+        mgr = RelayManager(data_dir=data_dir)
+        state.relay_manager = mgr
+        if getattr(state, "client", None) and not getattr(state.client, "relay_manager", None):
+            state.client.relay_manager = mgr
+    return mgr
+
+
+@router.get("/admin/dash/relays")
+async def get_relays(request: Request, key: str = Depends(admin_key)) -> dict:
+    mgr = _relay_mgr(request)
+    return mgr.get_settings()
+
+
+@router.post("/admin/dash/relays/deploy")
+async def deploy_relay_endpoint(request: Request, body: dict = Body(...),
+                                key: str = Depends(admin_key)) -> dict:
+    mgr = _relay_mgr(request)
+    relay_type = str(body.get("type") or "").strip().lower()
+    try:
+        return await asyncio.to_thread(mgr.deploy_and_add, relay_type, body)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/admin/dash/relays/add")
+async def add_relay_endpoint(request: Request, body: dict = Body(...),
+                             key: str = Depends(admin_key)) -> dict:
+    mgr = _relay_mgr(request)
+    name = str(body.get("name") or "").strip()
+    url = str(body.get("url") or "").strip()
+    type_name = str(body.get("type") or "custom").strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="Relay URL is required")
+    entry = mgr.add_relay(name, url, type_name)
+    return {"ok": True, "relay": entry}
+
+
+@router.post("/admin/dash/relays/test")
+async def test_relay_endpoint(request: Request, body: dict = Body(...),
+                              key: str = Depends(admin_key)) -> dict:
+    mgr = _relay_mgr(request)
+    relay_id = str(body.get("id") or "").strip()
+    url = str(body.get("url") or "").strip()
+    if relay_id:
+        res = await asyncio.to_thread(mgr.test_relay_by_id, relay_id)
+    elif url:
+        from .relay_deploy import ping_relay
+        res = await asyncio.to_thread(ping_relay, url)
+    else:
+        raise HTTPException(status_code=400, detail="Relay ID or URL is required")
+    return res
+
+
+@router.post("/admin/dash/relays/settings")
+async def save_relay_settings(request: Request, body: dict = Body(...),
+                              key: str = Depends(admin_key)) -> dict:
+    mgr = _relay_mgr(request)
+    models = body.get("models")
+    enabled = body.get("enabled")
+    active_id = body.get("active_id")
+    strategy = body.get("strategy")
+    try:
+        st = mgr.update_options(models=models, enabled=enabled,
+                                active_id=active_id, strategy=strategy)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    return {"ok": True, "settings": st}
+
+
+@router.delete("/admin/dash/relays/{relay_id}")
+async def delete_relay_endpoint(request: Request, relay_id: str,
+                                key: str = Depends(admin_key)) -> dict:
+    mgr = _relay_mgr(request)
+    ok = mgr.delete_relay(relay_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Relay not found")
+    return {"ok": True, "deleted": relay_id}
+

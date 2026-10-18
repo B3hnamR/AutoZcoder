@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 from uuid import uuid4
 
 from fastapi import FastAPI
@@ -60,9 +61,19 @@ async def lifespan(app: FastAPI):
         log.warning("could not load accounts from %s: %s", cfg.accounts.source, exc)
         accounts = []
 
+    from .relay_manager import RelayManager
+    relays_data_dir = (Path(cfg.accounts.dir).resolve().parent / "generator-data") if cfg.accounts.dir else Path("./generator-data")
+    relay_manager = RelayManager(data_dir=relays_data_dir)
+    # relay health loop: background ping every 5 minutes; failures feed the
+    # rotation cooldown and the dashboard health column
+    try:
+        relay_manager.start_health_loop(300)
+    except Exception:
+        log.warning("relay health loop failed to start", exc_info=True)
+
     pool = PoolManager(cfg.pool, accounts)
     tokens = TokenManager(cfg, pool)
-    client = UpstreamClient(cfg.upstream)
+    client = UpstreamClient(cfg.upstream, relay_manager=relay_manager)
     service = ChatService(cfg, pool, tokens, client, registry, store, capture)
 
     # feed the dashboard's log view: one ring-buffer handler on the package log
@@ -75,6 +86,7 @@ async def lifespan(app: FastAPI):
         registry=registry, store=store, capture=capture, service=service,
         limiter=RateLimiter(),
         catalog=catalog,
+        relay_manager=relay_manager,
     )
     app.state.app_state.log_buffer = log_buffer
 

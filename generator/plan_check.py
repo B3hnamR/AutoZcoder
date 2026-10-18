@@ -69,14 +69,25 @@ STATIC_HEADERS = {
     "anthropic-version": "2023-06-01",
     "anthropic-beta": "mid-conversation-system-2026-04-07",
 }
-DEVICE_MID = "58aca3b3-3239-4cb7-9c70-df3e5488fb99"
+# Stable PER-ACCOUNT device id: every account using one shared hardcoded
+# x-device-mid is a direct cross-account correlation signal for risk control.
+# uuid5 of the chat token keeps the id deterministic per account (the gateway
+# plan-checker and the message flow then report a consistent device).
+DEVICE_MID = "58aca3b3-3239-4cb7-9c70-df3e5488fb99"   # legacy fallback only
+
+
+def per_account_device_mid(token: str) -> str:
+    import uuid as _u
+    if not token:
+        return DEVICE_MID
+    return str(_u.uuid5(_u.NAMESPACE_URL, 'zcode-device:' + token))
 
 
 def build_headers(access_token=None, device_mid=None, include_api_key=True):
     h = dict(STATIC_HEADERS)
     h.update({
         "user-agent": "ZCode/3.15.3 ai-sdk/provider-utils/4.0.27 runtime/node.js/24",
-        "x-device-mid": device_mid or DEVICE_MID,
+        "x-device-mid": device_mid or per_account_device_mid(access_token),
         "x-client-language": "en-US",
         "x-client-timezone": "Asia/Tehran",
         "x-os-category": "windows",
