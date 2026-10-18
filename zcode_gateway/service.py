@@ -131,6 +131,12 @@ class ChatService:
             await self.pool.cap_model(account, model, seconds, reason='MODEL_CAPPED', message=message)
         elif status == 403:
             await self.pool.cap_model(account, model, 300, reason='ENTITLEMENT_ERROR', message=message)
+        elif status == 451:
+            # Geo/legal block tied to this account's egress context: park the
+            # model on THIS account only and let the caller rotate to another
+            # account (different IP) — the account itself stays healthy.
+            await self.pool.cap_model(account, model, 600,
+                                      reason='GEO_BLOCKED', message=message or 'HTTP 451')
         elif status >= 500:
             await self.pool.cool(account, reason='upstream_error')
 
@@ -146,7 +152,8 @@ class ChatService:
                     variant=variant, dialect=dialect, client_key=client_key, is_disconnected=is_disconnected)
             except UpstreamFailure as exc:
                 if exc.code not in ('11113', 'MODEL_CAPPED', 'MODEL_PARKED', 'INFERENCE_CAP_ERROR',
-                                    'ENTITLEMENT_ERROR', 'UNUSUAL_ACTIVITY', '3012', '405', 'HTTP_405'):
+                                    'ENTITLEMENT_ERROR', 'UNUSUAL_ACTIVITY', '3012', '405', 'HTTP_405',
+                                    'HTTP_451', 'http_451'):
                     raise
                 if candidate == candidates[-1]:
                     exc.details['attempted_models'] = attempted
@@ -242,7 +249,7 @@ class ChatService:
                         self._record(account, headers, body, last.status, resp.headers,
                                      raw.decode('utf-8', 'replace'), 0, client_key, dialect, model, {})
                         if is_model_overload(status, code): raise last
-                        if (status < 500 and status not in (401, 402, 403, 405, 429)
+                        if (status < 500 and status not in (401, 402, 403, 405, 429, 451)
                                 and code != '11113' and not is_block_code(code, status)):
                             raise last
                         tried.add(account.id)
