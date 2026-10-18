@@ -158,14 +158,14 @@ def _webview2_available() -> bool:
         return True          # not Windows: let webview decide
     probes = (
         (winreg.HKEY_LOCAL_MACHINE,
-         r"Software\WOW6432Node\Microsoft\EdgeUpdate\Clients\"
-         r"{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"),
+         r"Software\WOW6432Node\Microsoft\EdgeUpdate\Clients" + "\\" +
+         "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"),
         (winreg.HKEY_LOCAL_MACHINE,
-         r"Software\Microsoft\EdgeUpdate\Clients\"
-         r"{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"),
+         r"Software\Microsoft\EdgeUpdate\Clients" + "\\" +
+         "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"),
         (winreg.HKEY_CURRENT_USER,
-         r"Software\Microsoft\EdgeUpdate\Clients\"
-         r"{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"),
+         r"Software\Microsoft\EdgeUpdate\Clients" + "\\" +
+         "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"),
     )
     for hive, path in probes:
         try:
