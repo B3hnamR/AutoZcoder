@@ -101,7 +101,12 @@ async def lifespan(app: FastAPI):
     # release feed: one GitHub call on startup, then every interval; the
     # dashboard polls this cache, never GitHub directly
     from .updater import UpdateChecker
-    updater = UpdateChecker(cfg.update.repo, __version__,
+    update_repo = cfg.update.repo
+    if update_repo in getattr(cfg.update, "legacy_repos", ()):
+        # config written before the repo rename: follow the current feed so
+        # existing installs receive updates without a manual config edit
+        update_repo = "B3hnamR/AutoZcoder"
+    updater = UpdateChecker(update_repo, __version__,
                             enabled=cfg.update.enabled,
                             interval_hours=cfg.update.interval_hours)
     app.state.app_state.updater = updater

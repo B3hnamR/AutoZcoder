@@ -20,6 +20,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections import deque
@@ -205,6 +206,342 @@ def resolve_python(explicit: str = "") -> str:
     return found or sys.executable
 
 
+# modules the generator scripts import at runtime (generator/requirements.txt)
+GEN_DEPS = ["playwright", "ddddocr", "cv2", "PIL", "numpy", "requests",
+            "urllib3", "certifi", "socks"]
+# pip names for the ones whose import name differs or that are missing
+GEN_PIP_NAMES = {"cv2": "opencv-python", "PIL": "Pillow", "socks": "PySocks"}
+
+
+class EnvSetup:
+    """First-run environment installer with live progress + retries.
+
+    Checks the full generator chain — real Python (not the Microsoft Store
+    stub), all pip dependencies, and the Playwright Chromium browser — and
+    installs whatever is missing, streaming progress lines the dashboard
+    setup modal polls. Runs in a background thread; one installation at a
+    time; Retry just restarts the missing-items list."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self.lines: deque[str] = deque(maxlen=400)
+        self.state = "idle"            # idle|checking|installing|done|failed
+        self.missing: list[dict] = []
+        self.error: str = ""
+        self.python_exe: str = ""
+        self.started_at: float = 0.0
+        self.finished_at: float = 0.0
+
+    # ---------------------------------------------------------------- emit
+    def _emit(self, line: str) -> None:
+        stamp = time.strftime("%H:%M:%S")
+        self.lines.append(f"[{stamp}] {line}")
+        log.info("env-setup: %s", line)
+
+    # ------------------------------------------------------------ python
+    def _python_real(self, candidate: str) -> bool:
+        """A real runnable CPython >= 3.9 — not the WindowsApps Store stub."""
+        if not candidate:
+            return False
+        try:
+            p = Path(candidate)
+            if not p.is_file():
+                return False
+            low = str(p).lower().replace("/", "\\")
+            if "\\microsoft\\windowsapps\\" in low \
+                    and "pythonsoftwarefoundation" not in low:
+                return False          # Store alias: opens the Store, exit 9009
+            r = subprocess.run(
+                [str(p), "-c",
+                 "import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)"],
+                capture_output=True, timeout=20, **_child_kwargs())
+            return r.returncode == 0
+        except Exception:
+            return False
+
+    def _find_python(self) -> str:
+        import shutil
+        import glob
+        # explicit/configured path first
+        if self.python_exe and self._python_real(self.python_exe):
+            return self.python_exe
+        # PATH (verified — the Store alias must never win)
+        for cand in ("python", "python3"):
+            found = shutil.which(cand)
+            if found and self._python_real(found):
+                return found
+        # standard install locations
+        for pat in (
+            os.path.expandvars(r"%LOCALAPPDATA%\Programs\Python\Python3*\python.exe"),
+            r"C:\Program Files\Python*\python.exe",
+            r"C:\Python*\python.exe",
+            # real Store package install (runnable, unlike the alias)
+            os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WindowsApps"
+                               r"\PythonSoftwareFoundation.Python.3*\python.exe"),
+        ):
+            for match in sorted(glob.glob(pat)):
+                if self._python_real(match):
+                    return match
+        # py launcher with an installed 3.x
+        launcher = shutil.which("py")
+        if launcher:
+            try:
+                r = subprocess.run(
+                    [launcher, "-3", "-c",
+                     "import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)"],
+                    capture_output=True, timeout=20, **_child_kwargs())
+                if r.returncode == 0:
+                    return launcher            # callers use `py -3` form
+            except Exception:
+                pass
+        return ""
+
+    def _install_python(self) -> bool:
+        """No real Python on the machine: install one for the user.
+
+        Order: winget (silent, no UAC for user scope) → official installer
+        download (per-user, /passive). PATH is stale afterwards, so the
+        caller must re-scan, not trust os.environ."""
+        self._emit("no usable Python found — installing Python 3.12 (one-time, ~70 MB)…")
+        # 1) winget
+        try:
+            r = subprocess.run(
+                ["winget", "install", "--id", "Python.Python.3.12",
+                 "--scope", "user", "--silent",
+                 "--accept-package-agreements", "--accept-source-agreements",
+                 "--disable-interactivity"],
+                capture_output=True, text=True, timeout=900, **_child_kwargs())
+            if r.returncode == 0:
+                self._emit("Python installed via winget ✓")
+                return True
+            self._emit(f"  winget failed (exit {r.returncode}) — trying direct download")
+        except FileNotFoundError:
+            self._emit("  winget not available — trying direct download")
+        except Exception as e:
+            self._emit(f"  winget error: {type(e).__name__} — trying direct download")
+        # 2) official per-user installer
+        url = ("https://www.python.org/ftp/python/3.12.10/"
+               "python-3.12.10-amd64.exe")
+        dest = Path(tempfile.gettempdir()) / "AutoZCoder-python-install.exe"
+        try:
+            self._emit("  downloading Python installer…")
+            import urllib.request
+            with urllib.request.urlopen(url, timeout=120) as resp, \
+                    open(dest, "wb") as out:
+                total = int(resp.headers.get("Content-Length", 0) or 0)
+                got = 0
+                while True:
+                    chunk = resp.read(1 << 16)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    got += len(chunk)
+                    if total and got % (1 << 22) < (1 << 16):
+                        self._emit(f"  downloaded {got // (1 << 20)} / {total // (1 << 20)} MB")
+            self._emit("  running installer (per-user, passive)…")
+            r = subprocess.run(
+                [str(dest), "/quiet", "InstallAllUsers=0", "PrependPath=1",
+                 "Include_launcher=1", "Include_pip=1"],
+                capture_output=True, timeout=900, **_child_kwargs())
+            try:
+                dest.unlink(missing_ok=True)
+            except OSError:
+                pass
+            if r.returncode == 0:
+                self._emit("Python installed ✓")
+                return True
+            self._emit(f"  installer exited {r.returncode}")
+        except Exception as e:
+            self._emit(f"  download/install failed: {type(e).__name__}: {e}")
+        return False
+
+    def _rediscover_python(self) -> str:
+        """PATH is stale right after an install: re-scan the disk."""
+        import glob
+        for pat in (
+            os.path.expandvars(r"%LOCALAPPDATA%\Programs\Python\Python312\python.exe"),
+            os.path.expandvars(r"%LOCALAPPDATA%\Programs\Python\Python3*\python.exe"),
+            r"C:\Program Files\Python*\python.exe",
+        ):
+            for match in sorted(glob.glob(pat)):
+                if self._python_real(match):
+                    return match
+        # Store package installs land here too
+        return self._find_python()
+
+    # --------------------------------------------------------------- deps
+    def _missing_deps(self, py: str) -> list[str]:
+        """Which generator imports fail in the resolved Python."""
+        script = "import importlib\nimport sys\nmods = " + repr(
+            [m for m in GEN_DEPS]) + "\nbad = []\n" + \
+            "for m in mods:\n    try:\n        importlib.import_module(m)\n" + \
+            "    except Exception:\n        bad.append(m)\nprint(','.join(bad))"
+        try:
+            r = subprocess.run([py, "-c", script], capture_output=True,
+                               text=True, timeout=120, **_child_kwargs())
+            if r.returncode != 0:
+                return list(GEN_DEPS)      # can't even run: install everything
+            return [m for m in (r.stdout or "").strip().split(",") if m]
+        except Exception:
+            return list(GEN_DEPS)
+
+    def _chromium_ok(self, py: str) -> bool:
+        """Playwright's own cache check: `install` is idempotent and fast
+        when the browser is present, but a dry existence probe is cheaper
+        for the status panel."""
+        try:
+            script = ("from playwright.sync_api import sync_playwright\n"
+                      "with sync_playwright() as p:\n"
+                      "    import os\n"
+                      "    exe = p.chromium.executable_path\n"
+                      "    print('1' if exe and os.path.exists(exe) else '0')")
+            r = subprocess.run([py, "-c", script], capture_output=True,
+                               text=True, timeout=60, **_child_kwargs())
+            return (r.stdout or "").strip().endswith("1")
+        except Exception:
+            return False
+
+    def _pip_install(self, py: str, pkgs: list[str]) -> bool:
+        self._emit(f"pip install {' '.join(pkgs)} …")
+        return self._run([py, "-m", "pip", "install", "--upgrade"] + pkgs)
+
+    def _run(self, argv: list[str], timeout: int = 1200) -> bool:
+        try:
+            proc = subprocess.Popen(
+                argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="replace",
+                **_child_kwargs())
+        except Exception as e:
+            self._emit(f"  failed to start: {type(e).__name__}: {e}")
+            return False
+        last = 0.0
+        for line in proc.stdout or []:
+            line = line.rstrip()
+            if not line:
+                continue
+            # stream installer output but throttle to keep the log readable
+            now = time.time()
+            if now - last > 0.5 or "%" not in line:
+                self._emit("  " + line[:200])
+                last = now
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            self._emit("  step timed out — killed")
+            return False
+        return proc.returncode == 0
+
+    # ---------------------------------------------------------- the flow
+    def check(self) -> dict:
+        """Synchronous full check (fast, read-only). Returns the status the
+        modal shows: each step ok/missing."""
+        with self._lock:
+            steps = []
+            py = self._find_python()
+            self.python_exe = py
+            steps.append({"id": "python", "label": "Python 3.9+",
+                          "ok": bool(py), "detail": py or "not found"})
+            if py:
+                missing = self._missing_deps(py)
+                steps.append({"id": "deps", "label": "Python packages (9)",
+                              "ok": not missing,
+                              "detail": "all present" if not missing
+                              else f"missing: {', '.join(missing)}"})
+                chromium = self._chromium_ok(py)
+                steps.append({"id": "chromium", "label": "Chromium browser",
+                              "ok": chromium,
+                              "detail": "installed" if chromium
+                              else "not installed"})
+            else:
+                steps.append({"id": "deps", "label": "Python packages (9)",
+                              "ok": False, "detail": "needs Python first"})
+                steps.append({"id": "chromium", "label": "Chromium browser",
+                              "ok": False, "detail": "needs Python first"})
+            self.missing = [s for s in steps if not s["ok"]]
+            return {"steps": steps, "all_ok": not self.missing,
+                    "state": self.state, "python": py}
+
+    def start_install(self) -> bool:
+        """Kick off the background installer thread (False if one runs)."""
+        with self._lock:
+            if self._thread and self._thread.is_alive():
+                return False
+            self.state = "installing"
+            self.error = ""
+            self.started_at = time.time()
+            self._thread = threading.Thread(target=self._install_flow,
+                                            daemon=True, name="env-setup")
+            self._thread.start()
+            return True
+
+    def _install_flow(self) -> None:
+        try:
+            # -- 1) python
+            py = self._find_python()
+            if not py:
+                if not self._install_python():
+                    self.state = "failed"
+                    self.error = ("Python could not be installed automatically. "
+                                  "Install Python 3.12 from python.org, then "
+                                  "press Retry.")
+                    return
+                py = self._rediscover_python()
+                if not py:
+                    self.state = "failed"
+                    self.error = ("Python installed but not found afterwards — "
+                                  "restart the tool and press Retry.")
+                    return
+                self.python_exe = py
+            self._emit(f"using Python: {py}")
+
+            # -- 2) pip deps (full requirement set in one shot)
+            missing = self._missing_deps(py)
+            if missing:
+                pip_names = [GEN_PIP_NAMES.get(m, m) for m in missing]
+                if not self._pip_install(py, pip_names):
+                    self.state = "failed"
+                    self.error = "pip install failed — see the log lines above"
+                    return
+                still = self._missing_deps(py)
+                if still:
+                    self.state = "failed"
+                    self.error = f"still missing after install: {', '.join(still)}"
+                    return
+            else:
+                self._emit("all Python packages already installed ✓")
+
+            # -- 3) chromium
+            if not self._chromium_ok(py):
+                self._emit("installing Playwright Chromium (one-time, ~170 MB)…")
+                if not self._run([py, "-m", "playwright", "install", "chromium"]):
+                    self.state = "failed"
+                    self.error = "chromium install failed — see the log above"
+                    return
+            else:
+                self._emit("Chromium already installed ✓")
+
+            self.state = "done"
+            self.finished_at = time.time()
+            self._emit("environment ready ✓ — you can start workers / claims now")
+        except Exception as e:
+            self.state = "failed"
+            self.error = f"{type(e).__name__}: {e}"
+            log.exception("env setup failed")
+
+    def status(self) -> dict:
+        return {
+            "state": self.state,           # idle|checking|installing|done|failed
+            "error": self.error,
+            "python": self.python_exe,
+            "missing": self.missing,
+            "running": bool(self._thread and self._thread.is_alive()),
+            "lines": list(self.lines)[-60:],
+            "elapsed": int(time.time() - self.started_at) if self.started_at else 0,
+        }
+
+
 class PlaywrightSetup:
     """On-demand installer for the generator's browser dependency.
 
@@ -228,7 +565,7 @@ class PlaywrightSetup:
                 argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding="utf-8", errors="replace",
                 cwd=str(Path(argv[0]).parent) if os.path.isfile(argv[0]) else None,
-                **_no_window())
+                **_child_kwargs())
         except Exception as e:
             emit(f"  playwright setup failed to start: {type(e).__name__}: {e}")
             return False
@@ -250,7 +587,7 @@ class PlaywrightSetup:
             py = python_exe
             # 1) package present?
             chk = subprocess.run([py, "-c", "import playwright"],
-                                 capture_output=True, **_no_window())
+                                 capture_output=True, **_child_kwargs())
             if chk.returncode != 0:
                 emit("playwright not found — installing into your Python "
                      "(one-time, ~40 MB)…")
@@ -962,6 +1299,8 @@ class GeneratorManager:
         self.internal_token = ""
         # on-demand playwright installer (signup workers + 100M claims)
         self.playwright = PlaywrightSetup()
+        # full first-run environment setup (python + deps + chromium)
+        self.env_setup = EnvSetup()
         # options (dashboard-editable)
         self.captcha = "manual"             # auto | manual — default: you solve it
         self.ip_source = "direct"           # socks | pool | direct | pin — default: my network (no proxy)
@@ -978,6 +1317,8 @@ class GeneratorManager:
         # email system: user-owned domains + their own Cloudflare Worker inbox
         self.mail_cfg_path = self.data_dir / "mail_config.json"
         self._load_mail_config()
+        # re-apply dashboard options saved by the previous run
+        self.load_options()
 
     # ---- email system -------------------------------------------------------
 
@@ -1566,6 +1907,47 @@ class GeneratorManager:
             return self.PROXY_TYPE_SCHEMES[v]
         return tuple(v.split(","))
 
+    def _options_path(self) -> Path:
+        return self.data_dir / "generator_options.json"
+
+    _OPTION_FIELDS = ("captcha", "ip_source", "country", "proxy_types",
+                      "pin_proxy", "retries", "claim", "headless",
+                      "invite_code")
+
+    def save_options(self) -> None:
+        """Persist dashboard generator options so they survive restarts."""
+        data = {
+            "captcha": self.captcha,
+            "ip_source": self.ip_source,
+            "country": getattr(self, "country", "ALL"),
+            "proxy_types": self.normalize_proxy_types(self.proxy_types),
+            "pin_proxy": self.pin_proxy,
+            "retries": self.retries,
+            "claim": self.claim,
+            "headless": self.headless,
+            "invite_code": self._invite_code,
+        }
+        try:
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+            tmp = self._options_path().with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(data, indent=1), encoding="utf-8")
+            os.replace(tmp, self._options_path())
+        except OSError:
+            log.warning("could not persist generator options", exc_info=True)
+
+    def load_options(self) -> None:
+        """Re-apply saved options at manager creation (missing file = defaults)."""
+        try:
+            raw = json.loads(self._options_path().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if not isinstance(raw, dict):
+            return
+        # reuse the validation in set_options; invite_code maps to the field
+        kw = {k: v for k, v in raw.items() if k in self._OPTION_FIELDS}
+        if kw:
+            self.set_options(**kw)
+
     def set_options(self, **kw):
         if "captcha" in kw and kw["captcha"] in ("auto", "manual"):
             self.captcha = kw["captcha"]
@@ -1596,6 +1978,8 @@ class GeneratorManager:
             self.headless = False
         if "invite_code" in kw:
             self._invite_code = str(kw["invite_code"] or "").strip()
+        # options changed from the dashboard: persist for the next start
+        self.save_options()
 
     def _geo_db(self):
         """Offline DB-IP lookup if the generator downloaded it; never network."""

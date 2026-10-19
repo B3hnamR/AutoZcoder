@@ -111,6 +111,13 @@ class TokenManager:
             else:
                 account.model_caps.pop(model, None)
                 account.model_cap_info.pop(model, None)
+        # fully drained: every known quota bucket at zero and none waiting on
+        # a reset window -> retire the whole account, not just per-model caps
+        if quotas and all(q.get('remaining', 0) <= 0 for q in quotas.values()):
+            if account.state.name != 'EXHAUSTED':
+                log.info('account %s drained (all quotas 0) — retired from rotation', account.id)
+            account.state = AccountState.EXHAUSTED
+            account.last_error = 'no tokens remaining on any model'
         return data
 
     async def fetch_balance(self, account):

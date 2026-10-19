@@ -202,7 +202,7 @@ th .arr{font-size:9px; margin-left:3px; color:var(--accent-soft)}
   padding:1px 7px; font:12px "Cascadia Mono",monospace}
 
 /* ---------- confirm modal ---------- */
-#confirm-modal, #login-modal, #relay-modal{position:fixed; inset:0; background:rgba(5,7,10,.72);
+#confirm-modal, #login-modal, #relay-modal, #setup-modal{position:fixed; inset:0; background:rgba(5,7,10,.72);
   display:none; align-items:center; justify-content:center; z-index:70}
 .confirm-card{background:var(--card); border:1px solid var(--border);
   border-radius:12px; padding:18px 20px; width:380px; max-width:90vw;
@@ -336,6 +336,27 @@ input[type=number]{min-width:0}
     <div class="confirm-actions">
       <button class="btn btn-ghost btn-sm" id="cf-cancel">Cancel</button>
       <button class="btn btn-pri btn-sm" id="cf-ok">OK</button>
+    </div>
+  </div>
+</div>
+
+<!-- first-run environment setup modal (python + packages + chromium) -->
+<div id="setup-modal">
+  <div class="confirm-card" style="max-width:560px;max-height:82vh;display:flex;flex-direction:column">
+    <b id="su-title">Environment Setup</b>
+    <p style="color:var(--muted); font-size:12.5px; margin-top:6px">
+      The account generator needs a real Python, its packages and a Chromium
+      browser. Everything installs automatically — one time, ~250 MB.</p>
+    <div id="su-steps" style="margin:8px 0"></div>
+    <div id="su-log" class="mono" style="
+        background:var(--bg); border:1px solid var(--border); border-radius:8px;
+        padding:8px 10px; font-size:11px; line-height:1.5; height:180px;
+        overflow-y:auto; white-space:pre-wrap; display:none; margin-top:6px"></div>
+    <div id="su-error" style="color:var(--err); font-size:12.5px; margin-top:8px; display:none"></div>
+    <div class="confirm-actions" style="margin-top:10px">
+      <button class="btn btn-ghost btn-sm" id="su-close">Close</button>
+      <button class="btn btn-ghost btn-sm" id="su-recheck">↻ Check again</button>
+      <button class="btn btn-pri btn-sm" id="su-install">Install missing</button>
     </div>
   </div>
 </div>
@@ -551,6 +572,92 @@ const App = (() => {
     });
   }
 
+  /* ------------ first-run environment setup modal ------------ */
+  let suTimer = null;
+  let suAuto = false;          // opened automatically (first run)
+  async function setupOpen(auto=false){
+    suAuto = auto;
+    const m = $("#setup-modal");
+    m.style.display = "flex";
+    $("#su-close").onclick = setupClose;
+    $("#su-recheck").onclick = () => setupRefresh();
+    $("#su-install").onclick = () => setupInstall();
+    await setupRefresh();
+  }
+  function setupClose(){
+    $("#setup-modal").style.display = "none";
+    if (suTimer) { clearInterval(suTimer); suTimer = null; }
+  }
+  async function setupRefresh(){
+    const stepsEl = $("#su-steps");
+    const logEl = $("#su-log");
+    const errEl = $("#su-error");
+    const btn = $("#su-install");
+    let st;
+    try { st = await api("/admin/dash/setup/status"); }
+    catch (e) { stepsEl.innerHTML = `<span style="color:var(--err)">${esc(e.message)}</span>`; return; }
+    if (st.state === "idle" || st.state === "done" || st.state === "failed") {
+      // run a live check for fresh step statuses
+      let chk = null;
+      try { chk = await api("/admin/dash/setup/check"); } catch (e) {}
+      if (chk && chk.steps) {
+        stepsEl.innerHTML = chk.steps.map(s => `
+          <div style="display:flex;align-items:center;gap:8px;padding:5px 0">
+            <span style="color:${s.ok ? "var(--ok)" : "var(--warn)"}">${s.ok ? "✓" : "○"}</span>
+            <b style="min-width:150px;font-size:12.5px">${esc(s.label)}</b>
+            <span style="color:var(--faint);font-size:11.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(s.detail)}</span>
+          </div>`).join("");
+        btn.disabled = chk.all_ok;
+        btn.textContent = chk.all_ok ? "Everything installed ✓" : "Install missing";
+      }
+      if (st.state === "done") {
+        errEl.style.display = "none";
+        if (suTimer) { clearInterval(suTimer); suTimer = null; }
+        if (suAuto) { toast("environment ready ✓", "ok"); setupClose(); }
+      } else if (st.state === "failed") {
+        errEl.textContent = st.error || "installation failed — press Install to retry";
+        errEl.style.display = "block";
+      }
+    }
+    // live log while installing / after failure
+    if (st.lines && st.lines.length) {
+      logEl.style.display = "block";
+      const atBottom = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 40;
+      logEl.textContent = st.lines.join("\n");
+      if (atBottom) logEl.scrollTop = logEl.scrollHeight;
+    }
+    if (st.state === "installing" && !suTimer) {
+      suTimer = setInterval(setupRefresh, 1500);
+      btn.disabled = true;
+      btn.textContent = "Installing…";
+    }
+  }
+  async function setupInstall(){
+    const btn = $("#su-install");
+    btn.disabled = true; btn.textContent = "Installing…";
+    $("#su-error").style.display = "none";
+    $("#su-log").style.display = "block";
+    $("#su-log").textContent = "starting installer…";
+    try {
+      await api("/admin/dash/setup/install", { method: "POST", body: "{}" });
+    } catch (e) {
+      toast("setup: " + e.message, "err");
+      btn.disabled = false; btn.textContent = "Install missing";
+      return;
+    }
+    if (suTimer) clearInterval(suTimer);
+    suTimer = setInterval(setupRefresh, 1500);
+  }
+  async function setupFirstRunCheck(){
+    // auto-open the modal once for new installs (dismissed = manual only)
+    if (localStorage.getItem("gw-setup-seen")) return;
+    try {
+      const chk = await api("/admin/dash/setup/check");
+      localStorage.setItem("gw-setup-seen", "1");
+      if (!chk.all_ok) setupOpen(true);
+    } catch (e) { /* non-fatal */ }
+  }
+
   /* ------------ updates ------------ */
   let updStatus = null;
   async function pollUpdate(){
@@ -652,6 +759,7 @@ const App = (() => {
       <button class="btn btn-ghost" onclick="App.doImport()">⤓ Import from Zcode app</button>
       <button class="btn btn-ghost" onclick="App.doReload()">Reload pool</button>
       <button class="btn btn-ghost" id="claim-all-btn" onclick="App.claimAllPending()">⚡ Claim all pending</button>
+      <button class="btn btn-ghost" id="purge-btn" onclick="App.purgeDrained()" title="remove accounts with 0 tokens remaining on every model (deletes their files)">🧹 Purge drained</button>
       <span id="socks-badge" class="badge" style="background:var(--elev);color:var(--muted)">… socks</span>
       <button class="btn btn-quiet" onclick="App.refresh()">Refresh</button>
       <div class="grow"></div>
@@ -788,6 +896,20 @@ const App = (() => {
     } catch(e) {
       toast("claim failed: " + e.message, "err");
     }
+  }
+
+  async function purgeDrained(){
+    if (!(await confirmDlg("Purge drained accounts?",
+        "Removes every account with 0 tokens remaining on ALL models from the pool " +
+        "and DELETES its snapshot file from the accounts/ folder.\n" +
+        "Accounts whose daily quota resets later today are kept.",
+        "Purge", true))) return;
+    try {
+      const r = await api("/admin/accounts/purge_drained", { method: "POST", body: "{}" });
+      toast(`purged ${r.count} drained account${r.count === 1 ? "" : "s"}` +
+            (r.unknown_state_kept ? ` · ${r.unknown_state_kept} unchecked kept` : ""), "ok");
+      refresh();
+    } catch(e) { toast("purge failed: " + e.message, "err"); }
   }
 
   async function claimAllPending(){
@@ -1449,6 +1571,7 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
         <div style="margin:10px 0; display:flex; gap:8px; align-items:center">
           <button class="btn btn-pri" onclick="App.genStart()">▶ START</button>
           <button class="btn btn-ghost" onclick="App.genStopAll()">⏹ STOP ALL</button>
+          <button class="btn btn-ghost btn-sm" onclick="App.setupOpen()">🧰 Environment setup</button>
           <div class="grow"></div>
           <button class="btn btn-quiet btn-sm" onclick="App.genClearWorkers()" title="clear finished workers from the list">✕ clear finished</button>
         </div>
@@ -1486,6 +1609,12 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
     }
   }
   async function genStart(){
+    // environment gate: never spawn workers into a broken python/deps setup —
+    // open the setup modal instead so the user sees what's missing
+    try {
+      const chk = await api("/admin/dash/setup/check");
+      if (!chk.all_ok) { setupOpen(false); return; }
+    } catch (e) { /* check unavailable: let the old path try */ }
     const n = parseInt(($("#gen-n")||{}).value || "1", 10);
     await api("/admin/dash/generator/start", {method:"POST", body: JSON.stringify({count: n})});
     refresh();
@@ -2859,6 +2988,7 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
   async function boot(){
     paintChips();
     tab("accounts");
+    setupFirstRunCheck();
     try {
       const s = await api("/admin/dash/server");
       $("#foot-ver").textContent = "v" + s.version + " · " + s.host + ":" + s.port;
@@ -2884,7 +3014,8 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
           loginStart, loginCancel, genStart, genStop, genStopAll, genSaveOptions, genAutoSave, genIpChanged,
           proxyRun, proxyStop, genProxyImport, genProxyFile, genLoadSources, genSaveSources,
           proxyMaintain, proxyGeo, proxyYield, pxPresetChanged, pxAutoVerify,
-          genClearWorkers, genRemove, claimStop, claimRemove, acctClaim, claimAllPending,
+          genClearWorkers, genRemove, claimStop, claimRemove, acctClaim, claimAllPending, purgeDrained,
+          setupOpen, setupClose, setupInstall,
           openRelayModal, closeRelayModal, relayDeploy, relayAddCustom, loadRelays,
           saveRelayOptions, setActiveRelay, testRelay, deleteRelay};
 })();

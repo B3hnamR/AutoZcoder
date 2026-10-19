@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
@@ -116,6 +117,53 @@ async def delete_account(request: Request, account_id: str,
         raise HTTPException(status_code=404, detail="account not found")
     state.tokens.drop_lock(account_id)
     return {"removed": account_id}
+
+
+@router.post("/accounts/purge_drained")
+async def purge_drained_accounts(request: Request,
+                                 key: str = Depends(admin_key)) -> dict:
+    """Remove every account with zero tokens remaining on ALL models.
+
+    Takes them out of rotation, deletes their snapshot file from the
+    accounts/ folder, and drops token locks. Accounts whose quotas were never
+    fetched (no data) are left alone — only proven-drained ones go."""
+    state = get_state(request)
+    from .pool import AccountState
+    import time as _time
+    purged, kept_unknown = [], 0
+    for account in list(state.pool._accounts.values()):
+        quotas = (account.notes or {}).get("quotas") or {}
+        # proven-drained: quota data exists AND every bucket is empty
+        drained = bool(quotas) and all(
+            (q.get("remaining", 0) or 0) <= 0 for q in quotas.values())
+        # any model still capped-with-reset means tokens come back later
+        recovers = any(
+            (q.get("resets_at", 0) or 0) > _time.time()
+            for q in quotas.values())
+        if not drained:
+            if not quotas:
+                kept_unknown += 1
+            continue
+        if recovers:
+            continue          # daily quota: it will refill — keep the account
+        # 1) drop from the running pool
+        await state.pool.remove(account.id)
+        state.tokens.drop_lock(account.id)
+        # 2) delete the snapshot file so a restart doesn't resurrect it
+        fname = (account.notes or {}).get("file")
+        deleted = False
+        if fname:
+            snap = Path(state.cfg.accounts.dir) / fname
+            try:
+                if snap.is_file():
+                    snap.unlink()
+                    deleted = True
+            except OSError:
+                pass
+        purged.append({"id": account.id, "email": account.email,
+                       "file_deleted": deleted})
+    return {"purged": purged, "count": len(purged),
+            "unknown_state_kept": kept_unknown}
 
 
 @router.post("/accounts/{account_id}/refresh")

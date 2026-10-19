@@ -121,9 +121,14 @@ class StoreConfig(BaseModel):
 
 
 class UpdateConfig(BaseModel):
-    enabled: bool = False
+    # on by default: users get the update badge automatically. Set false only
+    # to run fully offline.
+    enabled: bool = True
     repo: str = "B3hnamR/AutoZcoder"     # GitHub releases feed
     interval_hours: float = 6.0
+    # legacy repos this tool shipped under before the rename; a config that
+    # still points at one is migrated to the current repo at runtime
+    legacy_repos: tuple[str, ...] = ("B3hnamR/ZcodeGate", "B3hnamR/AutoZCoder-old")
 
 
 class GeneratorConfig(BaseModel):

@@ -834,6 +834,28 @@ async def generator_start(request: Request, body: dict = Body(default={}),
     return await asyncio.to_thread(mgr.start_workers_checked, count, _emit)
 
 
+@router.get("/admin/dash/setup/check")
+async def setup_check(request: Request, key: str = Depends(admin_key)) -> dict:
+    """Full environment check for the setup modal (python/deps/chromium)."""
+    mgr = _generator(request)
+    return await asyncio.to_thread(mgr.env_setup.check)
+
+
+@router.post("/admin/dash/setup/install")
+async def setup_install(request: Request, key: str = Depends(admin_key)) -> dict:
+    """Kick off (or retry) the background environment installer."""
+    mgr = _generator(request)
+    started = mgr.env_setup.start_install()
+    return {"started": started, "status": mgr.env_setup.status()}
+
+
+@router.get("/admin/dash/setup/status")
+async def setup_status(request: Request, key: str = Depends(admin_key)) -> dict:
+    """Polled by the setup modal while installing: log lines + state."""
+    mgr = _generator(request)
+    return mgr.env_setup.status()
+
+
 @router.post("/admin/dash/generator/stop")
 async def generator_stop(request: Request, body: dict = Body(...),
                          key: str = Depends(admin_key)) -> dict:

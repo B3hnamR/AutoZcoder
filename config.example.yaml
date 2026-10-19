@@ -45,7 +45,7 @@ logging:
 store:
   sqlite_path: ./gateway.db
 update:
-  enabled: false
+  enabled: true    # update badge in the dashboard; set false for fully offline
   repo: B3hnamR/AutoZcoder
 generator:
   enabled: false
