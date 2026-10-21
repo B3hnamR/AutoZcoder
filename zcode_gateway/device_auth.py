@@ -38,12 +38,18 @@ class DeviceLogin:
         resp.raise_for_status()
         envelope = resp.json()
         data = envelope.get('data') or {}
-        if envelope.get('code') != 0 or not all(data.get(k) for k in ('flow_id', 'poll_token', 'authorize_url')):
+        # flow_id + authorize_url are required; a poll_token ECHO is optional.
+        # We generated the token ourselves and the poll authorizes with it —
+        # requiring the server to echo it back (and adopting the echoed value)
+        # broke the whole login the day Z.ai stops echoing. Keep OUR token.
+        if envelope.get('code') != 0 or not all(data.get(k) for k in ('flow_id', 'authorize_url')):
             raise ValueError('ZCode did not return a valid login flow')
         parsed = urlparse(data['authorize_url'])
         if parsed.scheme != 'https' or parsed.hostname not in ('chat.z.ai', 'zcode.z.ai'):
             raise ValueError('ZCode returned an unexpected login URL')
-        self._flow_id, self._poll_token = data['flow_id'], data['poll_token']
+        self._flow_id = data['flow_id']
+        if data.get('poll_token'):
+            self._poll_token = data['poll_token']
         self.verification_url = data['authorize_url']
         self._expires_at = data.get('expires_at') or time.time()+300
         self._interval = max(1, min(30, data.get('poll_interval_sec') or 2))

@@ -635,9 +635,10 @@ class GenWorker:
         self.starter: bool | None = None
         self.stopped = False
         self.created = time.time()
-        # outcomes observed on the output files (set by the watcher)
+        # outcomes observed on the output files (set by the watcher);
+        # v1.0.5 sorted layout: workers write results under <data>/results/
         out_dir = Path(env.get("ZAI_OUTPUT_DIR", gen_dir / "output"))
-        self.account_file = out_dir / f"accounts{env.get('ZAI_OUT_SUFFIX', '')}.txt"
+        self.account_file = out_dir / "results" / f"accounts{env.get('ZAI_OUT_SUFFIX', '')}.txt"
         self._account_rows_at_start = self._rows_now()
 
     def _rows_now(self) -> int:
@@ -1297,12 +1298,25 @@ class GeneratorManager:
         self._lock = threading.Lock()
         # per-run internal auth token for gateway admin calls from children
         self.internal_token = ""
+        # AI-captcha fallback: port + client key children use for /v1 calls
+        self._gateway_port = 8788
+        self._client_key_for_children = ""
+        # gateway accounts dir (config accounts.dir) — _pool_health() counts
+        # account snapshots here; set from api_dash at manager creation.
+        self.accounts_dir = ""
         # on-demand playwright installer (signup workers + 100M claims)
         self.playwright = PlaywrightSetup()
         # full first-run environment setup (python + deps + chromium)
         self.env_setup = EnvSetup()
         # options (dashboard-editable)
-        self.captcha = "manual"             # auto | manual — default: you solve it
+        self.captcha = "manual"             # manual | ai | classic | auto
+        self.captcha_strategy = "auto"      # strategy when captcha != manual
+        # custom OpenAI-compatible vision endpoint for the AI judge. Empty
+        # fields = use the gateway's own GLM-5.3-Flash. When set, workers get
+        # ZAI_GATEWAY_URL/KEY/MODEL pointing at the user's endpoint instead.
+        self.custom_ai_url = ""
+        self.custom_ai_key = ""
+        self.custom_ai_model = ""
         self.ip_source = "direct"           # socks | pool | direct | pin — default: my network (no proxy)
         self.proxy_types = "socks"          # all | socks | socks5 | socks4 | http | csv
         self.country = "ALL"                # ALL | US | DE | ...
@@ -1317,8 +1331,13 @@ class GeneratorManager:
         # email system: user-owned domains + their own Cloudflare Worker inbox
         self.mail_cfg_path = self.data_dir / "mail_config.json"
         self._load_mail_config()
+        # True when a previous run persisted dashboard options — api_dash
+        # reads this to apply config.yaml's captcha seed on the first run only
+        self._has_saved_options = self._options_path().is_file()
         # re-apply dashboard options saved by the previous run
         self.load_options()
+        # tidy a legacy-flat data dir into the sorted layout (once, best-effort)
+        self._cleanup_layout()
 
     # ---- email system -------------------------------------------------------
 
@@ -1414,8 +1433,15 @@ class GeneratorManager:
         leaving successful signups out of rotation."""
         done = self.registered_emails()
         out, seen = [], set()
-        for pat in ("starter*.txt",):
-            for f in sorted(self.data_dir.glob(pat)):
+        # v1.0.5 sorted layout puts starter*.txt under results/; older folders
+        # (and catch-up scans of legacy data) still have them flat — read both.
+        files: list[Path] = []
+        for base in (self.data_dir / "results", self.data_dir):
+            try:
+                files.extend(sorted(base.glob("starter*.txt")))
+            except OSError:
+                continue
+        for f in files:
                 try:
                     lines = f.read_text(encoding="utf-8", errors="ignore").splitlines()
                 except OSError:
@@ -1547,8 +1573,22 @@ class GeneratorManager:
         if parts:
             os.environ["PATH"] = ";".join(parts) + ";" + os.environ.get("PATH", "")
 
+    _NODE_MIN_MAJOR = 22      # wrangler@4 requires node >= 22 (engines field)
+
+    def _node_version_ok(self) -> bool:
+        """node --version must be >= 22: wrangler 4.x refuses on older runtimes
+        with a cryptic npx error instead of triggering our auto-install."""
+        try:
+            r = subprocess.run(["node", "--version"], capture_output=True, text=True,
+                               timeout=15, shell=False, encoding="utf-8", errors="replace",
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            m = re.match(r"v(\d+)", (r.stdout or "").strip())
+            return bool(m and int(m.group(1)) >= self._NODE_MIN_MAJOR)
+        except (OSError, subprocess.SubprocessError):
+            return False
+
     def _ensure_node(self, progress=None) -> dict:
-        """Node.js present? If not, INSTALL it for the user right now:
+        """Node.js present AND >= 22? If not, INSTALL it for the user right now:
         winget first (handles UAC), else the official MSI downloaded from
         nodejs.org. Returns {"ok", "node", "npm", "npx"}."""
         import shutil as _sh
@@ -1561,11 +1601,14 @@ class GeneratorManager:
                 except Exception:
                     pass
 
-        if _sh.which("node") and _sh.which("npm"):
+        if _sh.which("node") and _sh.which("npm") and self._node_version_ok():
             npx = self._npx()
             if npx:
                 return {"ok": True, "node": _sh.which("node"),
                         "npm": _sh.which("npm"), "npx": npx}
+        if _sh.which("node") and not self._node_version_ok():
+            say(f"Node.js is installed but older than {self._NODE_MIN_MAJOR} "
+                "(wrangler 4 needs >= 22) — installing a current LTS…")
 
         say("Node.js not found — installing it now (one time)…")
 
@@ -1652,12 +1695,20 @@ class GeneratorManager:
             info["wrangler_authed"] = None
             info["node_missing"] = True
             return info
-        # whoami tells us wrangler auth without opening a browser
-        r = subprocess.run(
-            [npx, "wrangler", "whoami"], cwd=str(wdir),
-            capture_output=True, text=True, timeout=60,
-            shell=False, encoding="utf-8", errors="replace",
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        # whoami tells us wrangler auth without opening a browser.
+        # A cold npx download on a slow link can exceed the 60s cap; report
+        # "unknown" instead of an error — the files ARE exported and the
+        # Email card must not show a red error before the user did anything.
+        try:
+            r = subprocess.run(
+                [npx, "wrangler", "whoami"], cwd=str(wdir),
+                capture_output=True, text=True, timeout=60,
+                shell=False, encoding="utf-8", errors="replace",
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except subprocess.TimeoutExpired:
+            info["wrangler_authed"] = None
+            info["whoami_timeout"] = True
+            return info
         out = _clean_output((r.stdout or "") + (r.stderr or ""))
         info["wrangler_authed"] = "You are logged in" in out
         if "@" in out and "logged in" in out:
@@ -1672,6 +1723,19 @@ class GeneratorManager:
         missing), wrangler login (browser only if needed), create KV namespace
         + patch wrangler.toml, deploy, set INBOX_SECRET, return the worker URL.
         `progress` gets human strings."""
+        # one deploy at a time: two tabs (or a double-click) racing wrangler
+        # interleaved wrangler.toml writes and double KV creation
+        if getattr(self, "_deploy_lock", None) is None:
+            self._deploy_lock = threading.Lock()
+        if not self._deploy_lock.acquire(blocking=False):
+            return {"ok": False,
+                    "error": "a deploy is already running — wait for it to finish"}
+        try:
+            return self._deploy_worker_locked(progress)
+        finally:
+            self._deploy_lock.release()
+
+    def _deploy_worker_locked(self, progress=None) -> dict:
         import re as _re
 
         def say(msg):
@@ -1692,16 +1756,33 @@ class GeneratorManager:
         wdir = Path(exp["path"])
         say("worker files exported")
 
-        def run(args, timeout=300):
+        def run(args, timeout=300, env_extra=None):
+            env = None
+            if env_extra:
+                env = dict(os.environ)
+                env.update({k: v for k, v in env_extra.items() if v})
             return subprocess.run(args, cwd=str(wdir), capture_output=True,
                                   text=True, timeout=timeout, shell=False,
                                   encoding="utf-8", errors="replace",
+                                  env=env,
                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+        # Multi-account Cloudflare logins: wrangler cannot pick an account in
+        # non-interactive mode (our capture_output pipes make it non-TTY) and
+        # dies with "More than one account available…". Surface the account
+        # list from whoami and pin CLOUDFLARE_ACCOUNT_ID for every wrangler
+        # call. The account is only cached by wrangler AFTER one successful
+        # selection, so the very first deploy used to fail with no way forward.
+        def _pin_account_id() -> str:
+            m = _re.search(r"([0-9a-f]{32})", out)   # whoami prints the id hex
+            return m.group(1) if m else ""
+
+        account_id = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
 
         def kv_id_for_title(title: str = "MAIL") -> str:
             """Find an existing KV namespace by title. Idempotent deploys: the
             namespace is reused instead of failing with 'already exists'."""
-            r = run([npx, "wrangler", "kv", "namespace", "list"], timeout=120)
+            r = run([npx, "wrangler", "kv", "namespace", "list"], timeout=120, env_extra=wrangler_env)
             out = _clean_output((r.stdout or "") + (r.stderr or ""))
             # wrangler prints a JSON array; fall back to the table form
             a, b = out.find("["), out.rfind("]")
@@ -1733,6 +1814,23 @@ class GeneratorManager:
                 if "You are logged in" not in out2:
                     return {"ok": False,
                             "error": "Cloudflare login did not complete — try again"}
+            r = run([npx, "wrangler", "whoami"], timeout=90)
+            out = _clean_output((r.stdout or "") + (r.stderr or ""))
+
+        # pin the account for every subsequent wrangler call when the login
+        # has more than one account (non-interactive selection is impossible)
+        if not account_id:
+            account_id = _pin_account_id()
+            if account_id:
+                say(f"using Cloudflare account {account_id[:8]}…")
+        wrangler_env = {"CLOUDFLARE_ACCOUNT_ID": account_id} if account_id else {}
+        if "More than one account" in out and not account_id:
+            return {"ok": False,
+                    "error": "Your Cloudflare login has multiple accounts and "
+                             "wrangler cannot pick one non-interactively. Set "
+                             "CLOUDFLARE_ACCOUNT_ID in the environment (or "
+                             "log out with `npx wrangler logout` and log into "
+                             "the single account you want) and retry."}
 
         # 2) KV namespace: REUSE an existing one titled MAIL (idempotent),
         #    else create it; always write the resolved id back into wrangler.toml
@@ -1749,7 +1847,8 @@ class GeneratorManager:
             cand = m.group(1) if m else ""
             if cand and set(cand) != {"0"}:
                 chk = run([npx, "wrangler", "kv", "namespace", "info",
-                           "--namespace-id", cand], timeout=120)
+                           "--namespace-id", cand], timeout=120,
+                           env_extra=wrangler_env)
                 if chk.returncode == 0:
                     kv_id = cand
                     say("reusing KV namespace from wrangler.toml")
@@ -1757,7 +1856,7 @@ class GeneratorManager:
         if not kv_id:
             say("creating KV namespace…")
             r = run([npx, "wrangler", "kv", "namespace", "create", "MAIL"],
-                    timeout=180)
+                    timeout=180, env_extra=wrangler_env)
             out = _clean_output((r.stdout or "") + (r.stderr or ""))
             m = _re.search(r'id\s*=\s*"([0-9a-f]{32})"', out) \
                 or _re.search(r"\b([0-9a-f]{32})\b", out)
@@ -1776,12 +1875,15 @@ class GeneratorManager:
 
         # 3) deploy
         say("deploying worker…")
-        r = run([npx, "wrangler", "deploy"], timeout=600)
+        r = run([npx, "wrangler", "deploy"], timeout=600, env_extra=wrangler_env)
         out = _clean_output((r.stdout or "") + (r.stderr or ""))
         # the URL is https://<worker>.<account-subdomain>.workers.dev — the
         # subdomain is its own label, so allow dotted labels before .workers.dev
         m = _re.search(r"https://[a-z0-9][a-z0-9.\-]*\.workers\.dev", out, _re.I)
-        if r.returncode != 0 and not m:
+        if r.returncode != 0:
+            # a FAILED deploy can still print a workers.dev URL (wrangler
+            # prints the route in several error paths) — the URL alone must
+            # never turn a failed deploy into a success
             return {"ok": False, "error": "deploy failed: " + _tail(out)}
         base_url = m.group(0).rstrip(".,)") if m else None
         if not base_url:
@@ -1809,11 +1911,13 @@ class GeneratorManager:
             self.mail_cfg["inbox_secret"] = secret
             self._save_mail_config()
         say("uploading INBOX_SECRET…")
+        _secret_env = dict(os.environ)
+        _secret_env.update(wrangler_env)
         proc = subprocess.Popen(
             [npx, "wrangler", "secret", "put", "INBOX_SECRET"],
             cwd=str(wdir), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True, encoding="utf-8",
-            errors="replace", shell=False,
+            errors="replace", shell=False, env=_secret_env,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         out, _ = proc.communicate(input=secret + "\n", timeout=180)
         clean = _clean_output(out or "")
@@ -1834,20 +1938,40 @@ class GeneratorManager:
                 import httpx as _hx
                 resp = _hx.get(base_url + "/inbox",
                                params={"k": secret}, timeout=15)
-                test = {"ok": resp.status_code == 200}
-                break
+                # 200 alone is not proof: the worker used to answer 200 'ok'
+                # to EVERY path except exactly /inbox. Require the response
+                # to look like the inbox endpoint's JSON body.
+                body_txt = (resp.text or "")[:200].strip()
+                test = {"ok": resp.status_code == 200
+                        and body_txt.startswith(("{", "[")),
+                        "status": resp.status_code}
+                if test["ok"]:
+                    break
             except Exception as e:
                 test = {"ok": False, "error": str(e)}
                 _time.sleep(3)
         # remember the result so the wizard can mark step 3 done (persisted)
         self.mark_inbox_verified(bool(test.get("ok")))
+        if not test.get("ok"):
+            # Deploy + secret succeeded but the inbox smoke test failed:
+            # report failure so the user fixes it NOW instead of every
+            # signup silently polling a dead/misrouted URL for 90 s.
+            return {"ok": False, "inbox_url": self.mail_cfg["inbox_url"],
+                    "worker_url": base_url, "kv_id": kv_id,
+                    "secret_generated": True, "test": test,
+                    "error": "worker deployed but the inbox test failed: "
+                             + str(test.get("error") or f"HTTP {test.get('status', '?')}")}
         return {"ok": True, "inbox_url": self.mail_cfg["inbox_url"],
                 "worker_url": base_url, "kv_id": kv_id,
                 "secret_generated": True, "test": test}
 
     def set_mail_config(self, **kw) -> dict:
         cfg = self.mail_cfg
-        if "domains" in kw:
+        # `domains: null` arrives from the dashboard's inbox-URL autosave —
+        # it means "not editing domains", NOT "clear them". The old
+        # `if "domains" in kw` read the key's presence as replace-with-empty
+        # and every keystroke in the URL box wiped the user's domain list.
+        if kw.get("domains") is not None:
             doms = []
             for d in (kw["domains"] or []):
                 d = str(d or "").strip().lower().lstrip('@')
@@ -1912,12 +2036,17 @@ class GeneratorManager:
 
     _OPTION_FIELDS = ("captcha", "ip_source", "country", "proxy_types",
                       "pin_proxy", "retries", "claim", "headless",
-                      "invite_code")
+                      "invite_code", "captcha_strategy",
+                      "custom_ai_url", "custom_ai_key", "custom_ai_model")
 
     def save_options(self) -> None:
         """Persist dashboard generator options so they survive restarts."""
         data = {
             "captcha": self.captcha,
+            "captcha_strategy": self.captcha_strategy,
+            "custom_ai_url": self.custom_ai_url,
+            "custom_ai_key": self.custom_ai_key,
+            "custom_ai_model": self.custom_ai_model,
             "ip_source": self.ip_source,
             "country": getattr(self, "country", "ALL"),
             "proxy_types": self.normalize_proxy_types(self.proxy_types),
@@ -1949,8 +2078,16 @@ class GeneratorManager:
             self.set_options(**kw)
 
     def set_options(self, **kw):
-        if "captcha" in kw and kw["captcha"] in ("auto", "manual"):
+        if "captcha" in kw and kw["captcha"] in ("manual", "ai", "classic", "auto"):
             self.captcha = kw["captcha"]
+        if "captcha_strategy" in kw and kw["captcha_strategy"] in ("ai", "classic", "auto"):
+            self.captcha_strategy = kw["captcha_strategy"]
+        if "custom_ai_url" in kw:
+            self.custom_ai_url = str(kw["custom_ai_url"] or "").strip()
+        if "custom_ai_key" in kw:
+            self.custom_ai_key = str(kw["custom_ai_key"] or "").strip()
+        if "custom_ai_model" in kw:
+            self.custom_ai_model = str(kw["custom_ai_model"] or "").strip()
         if "ip_source" in kw and kw["ip_source"] in ("socks", "pool", "direct", "pin"):
             # 'socks' was the old socks-only pool entry — now the pool with the
             # proxy_types filter applied; normalize so the UI shows one option
@@ -2115,6 +2252,12 @@ class GeneratorManager:
     def options(self) -> dict:
         tc = self._types_counts()
         return {"captcha": self.captcha, "ip_source": self.ip_source,
+                "captcha_strategy": self.captcha_strategy,
+                "custom_ai_url": self.custom_ai_url,
+                "custom_ai_model": self.custom_ai_model,
+                # never leak the key back to the browser; the UI keeps its own
+                # value and only sends non-empty when the user edits it
+                "custom_ai_key_set": bool(self.custom_ai_key),
                 "proxy_types": self.normalize_proxy_types(self.proxy_types),
                 "types_counts": tc,
                 "pool_available": tc.get(
@@ -2170,6 +2313,25 @@ class GeneratorManager:
 
     def start_workers(self, count: int = 1) -> dict:
         with self._lock:
+            # AI judge against the GATEWAY's own model needs a live account
+            # pool to serve /v1/chat/completions. A fresh install has zero
+            # accounts: warn instead of spawning workers whose every AI call
+            # would fail. (A custom endpoint bypasses this — it's the user's
+            # own AI, not the pool.)
+            if (self.captcha != "manual" and self.captcha_strategy == "ai"
+                    and not self.custom_ai_url):
+                pool = self._pool_health()
+                if pool["ready"] is False:
+                    return {
+                        "error": (
+                            f"AI captcha uses the gateway's own model, which "
+                            f"needs at least one working account (pool has "
+                            f"{pool['active']} active, {pool['total']} total). "
+                            f"Create one first — set captcha to Manual or "
+                            f"Classic, sign up an account, then switch back "
+                            f"to AI. Or configure a custom AI endpoint below."
+                        )
+                    }
             started = []
             for _ in range(max(1, min(count, 8))):
                 self._seq += 1
@@ -2181,6 +2343,134 @@ class GeneratorManager:
                 w.start()
                 started.append(name)
         return {"started": started}
+
+    def _worker_log_path(self, name: str) -> Path:
+        """Sorted per-worker logs: <data>/logs/workers/<name>_<HHMMSS>.log"""
+        d = self.data_dir / "logs" / "workers"
+        d.mkdir(parents=True, exist_ok=True)
+        return d / f"{name}_{time.strftime('%H%M%S')}.log"
+
+    def _pool_health(self) -> dict:
+        """Is the gateway account pool able to serve AI-judge requests?
+
+        Counts the gateway's ACCOUNT pool, not a pool.json: the data dir's
+        pool.json is the PROXY ledger (dict keyed by proxy URL), and the
+        account pool lives wherever accounts.dir points (<app>/accounts/
+        *.txt snapshots). `accounts_dir` (set at construction from the
+        gateway's config) wins; fall back to the exe/data-dir neighbours so
+        a portable install with a renamed folder still works."""
+        try:
+            total = active = 0
+            roots: list[Path] = []
+            acc_dir = getattr(self, "accounts_dir", None)
+            if acc_dir:
+                roots.append(Path(acc_dir))
+            # portable fallbacks: accounts lives beside the exe (frozen) or
+            # beside the data dir — resolve WITHOUT trusting cwd.
+            if getattr(sys, "frozen", False):
+                roots.append(Path(sys.executable).resolve().parent / "accounts")
+            roots.append(self.data_dir.parent / "accounts")
+            seen: set[Path] = set()
+            files: list[Path] = []
+            for root in roots:
+                try:
+                    r = root.resolve()
+                except OSError:
+                    continue
+                if r in seen or not r.is_dir():
+                    continue
+                seen.add(r)
+                files.extend(p for p in r.glob("*.txt") if p.is_file())
+            uniq = {p.name: p for p in files}   # same file reached twice counts once
+            total = len(uniq)
+            for p in uniq.values():
+                try:
+                    text = p.read_text(encoding="utf-8", errors="ignore")
+                except OSError:
+                    continue
+                # a usable snapshot carries a bearer token line; disabled /
+                # placeholder files (no token) don't count as active
+                if "token:" in text or "token=" in text or text.count(":") >= 2:
+                    active += 1
+            # no accounts found -> ready False (block AI mode with a clear
+            # message); found some -> ready True. Never returns the old
+            # ambiguous None for "file missing" — that made the guard dead.
+            ready = total > 0 and active > 0
+            return {"total": total, "active": active, "ready": ready}
+        except Exception:
+            return {"total": 0, "active": 0, "ready": False}
+
+    def _cleanup_layout(self) -> None:
+        """One-time tidy of a legacy-flat generator-data folder into the
+        sorted v1.0.5 layout (best effort, never raises):
+
+            accounts/  results/ (accounts*/plans*/starter*)   [flat files]
+            logs/workers/      worker solve logs              [new location]
+            profiles/          .pw-profile-* leftovers        [orphaned]
+            screenshots/       *.png debug images             [flat files]
+
+        Old builds wrote everything flat next to pool.json; 74 orphan chromium
+        profiles and 900MB accumulated that way. Live files (pool.json,
+        proxies*, mail_config.json, generator_options.json, relays.json,
+        registered.json, pending_referral.json) stay where they are — the
+        gateway reads them from the data dir root.
+        """
+        try:
+            import shutil as _sh
+            moves = {
+                "results": ("accounts*.txt", "plans*.jsonl", "starter*.txt"),
+                "screenshots": ("*.png",),
+                "profiles": tuple(),
+            }
+            for sub, pats in moves.items():
+                d = self.data_dir / sub
+                d.mkdir(parents=True, exist_ok=True)
+                if not pats:
+                    # orphaned profiles from crashed runs
+                    for p in self.data_dir.glob(".pw-profile-*"):
+                        if p.is_dir():
+                            _sh.rmtree(p, ignore_errors=True)
+                    continue
+                for pat in pats:
+                    for p in self.data_dir.glob(pat):
+                        if p.is_file():
+                            try:
+                                _sh.move(str(p), str(d / p.name))
+                            except OSError:
+                                pass
+            # legacy single mega-log: archive under logs/
+            old_log = self.data_dir / "output.txt"
+            if old_log.exists():
+                lg = self.data_dir / "logs"
+                lg.mkdir(parents=True, exist_ok=True)
+                stamp = time.strftime("%Y%m%d_%H%M%S")
+                try:
+                    _sh.move(str(old_log), str(lg / f"legacy_output_{stamp}.txt"))
+                except OSError:
+                    pass
+            # debug PNGs (ai_bg_* / ai_piece_* / captcha_failed / error) grow
+            # unbounded at 3+ per AI attempt (~40-60 MB per 8-worker batch).
+            # Keep the newest 40; the rest were write-before-request debug
+            # copies with no diagnostic value once the batch is over.
+            try:
+                shots = sorted(self.data_dir.glob("screenshots/*.png"),
+                               key=lambda p: p.stat().st_mtime, reverse=True)
+                for p in shots[40:]:
+                    try:
+                        p.unlink()
+                    except OSError:
+                        pass
+                wlogs = sorted(self.data_dir.glob("logs/workers/*.log"),
+                               key=lambda p: p.stat().st_mtime, reverse=True)
+                for p in wlogs[60:]:
+                    try:
+                        p.unlink()
+                    except OSError:
+                        pass
+            except OSError:
+                pass
+        except Exception:
+            log.debug("generator-data layout cleanup skipped", exc_info=True)
 
     def start_workers_checked(self, count: int = 1, emit=print) -> dict:
         """start_workers, but with a guaranteed Playwright setup first
@@ -2196,11 +2486,34 @@ class GeneratorManager:
             "ZAI_PROXY": "0", "ZAI_USE_POOL": "0", "ZAI_SOCKS_ONLY": "0",
             "ZAI_PROXY_COUNTRY": self.country or "ALL",
             "ZAI_MANUAL": "1" if self.captcha == "manual" else "0",
-            "ZAI_HEADLESS": "0" if self.captcha == "manual" else ("1" if self.headless else "0"),
+            # headless signup is always-lose (F001, see below) — forced off
+            # whenever a captcha must be solved
+            "ZAI_HEADLESS": "0",
             "ZAI_PROXY_RETRIES": str(self.retries),
+            # per-worker log file: every browser gets its own full solve log
+            # under <data>/logs/workers/<name>_<timestamp>.log
+            "ZAI_LOG_FILE": str(self._worker_log_path(name)),
         }
-        if self.internal_token:
+        if self.captcha != "manual":
+            env["ZAI_CAPTCHA_STRATEGY"] = self.captcha_strategy
+            # F001 (measured A/B, GLM-Free-API's Aliyun report): the signup
+            # captcha is judged by the BROWSER that registered the device —
+            # a headless browser is rejected exactly like an HTTP client, no
+            # fingerprint fixes it. Headless signup is a guaranteed burn of
+            # email+proxy per attempt; force the window on.
+            env["ZAI_HEADLESS"] = "0"
+        if self.internal_token and not self.custom_ai_url:
             env["ZAI_GATEWAY_INTERNAL_TOKEN"] = self.internal_token
+            # gateway-AI captcha method: workers call the gateway's own
+            # /v1/chat/completions with a client key as the vision fallback
+            env["ZAI_GATEWAY_URL"] = f"http://127.0.0.1:{self._gateway_port}"
+            env["ZAI_GATEWAY_KEY"] = self._client_key_for_children
+        if self.custom_ai_url:
+            # user's own OpenAI-compatible endpoint overrides the gateway's
+            # model for the AI judge (strategy ai, and auto's fallback)
+            env["ZAI_GATEWAY_URL"] = self.custom_ai_url
+            env["ZAI_GATEWAY_KEY"] = self.custom_ai_key
+            env["ZAI_GATEWAY_AI_MODEL"] = self.custom_ai_model or "gpt-4o-mini"
         if self.claim and self._invite_code:
             env["ZAI_INVITE_CODE"] = self._invite_code
         else:

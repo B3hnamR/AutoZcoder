@@ -8,7 +8,7 @@ import uuid
 from .zcode_bootstrap import bootstrap_system
 
 
-def reasoning(payload: dict) -> dict:
+def reasoning(payload: dict, default_effort: str = 'high') -> dict:
     thinking = payload.get('thinking')
     effort = (payload.get('output_config') or {}).get('effort')
     effort = effort or payload.get('reasoning_effort') or payload.get('reasoningEffort')
@@ -20,7 +20,7 @@ def reasoning(payload: dict) -> dict:
     if disabled:
         return {'thinking': {'type': 'disabled'}}
     mapped = {'minimal': 'low', 'low': 'low', 'medium': 'high', 'high': 'high',
-              'xhigh': 'max', 'extra': 'max', 'max': 'max'}.get(effort or 'max')
+              'xhigh': 'max', 'extra': 'max', 'max': 'max'}.get(effort or default_effort)
     if mapped is None:
         raise ValueError('reasoning effort must be low, medium, high, max, or none')
     return {'thinking': {'type': 'enabled'}, 'output_config': {'effort': mapped}}
@@ -60,11 +60,43 @@ def content_blocks(content):
     return out
 
 
-def build_body(payload: dict, default_max_tokens=128000) -> dict:
-    """Native requests preserve blocks, caching, signatures and metadata exactly."""
+def _strip_image_blocks(messages) -> None:
+    """Drop image blocks (and empty image-only tool_result contents) from an
+    Anthropic-shape message list, in place. Used for non-vision models: the
+    upstream would 400 the whole request; the text proceeds instead."""
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get('content')
+        if not isinstance(content, list):
+            continue
+        message['content'] = [b for b in content
+                              if not (isinstance(b, dict) and b.get('type') == 'image')]
+
+
+def _strip_image_blocks_system(system) -> None:
+    pass  # system is always text-only; images there already 400 in content_blocks
+
+
+def build_body(payload: dict, default_max_tokens=128000, model_caps=None,
+               default_effort='high') -> dict:
+    """Native requests preserve blocks, caching, signatures and metadata exactly.
+
+    `model_caps` (optional): the registry's per-model capability dict — when
+    present, image blocks are stripped for non-vision models (the request
+    proceeds text-only instead of a guaranteed upstream 400) and max_tokens is
+    clamped to the model's real output cap."""
+    vision = None
+    if isinstance(model_caps, dict):
+        vision = bool(model_caps.get('vision'))
     if payload.get('_anthropic'):
         body = copy.deepcopy(payload['_anthropic'])
         body['model'] = payload['model']
+        # capability gate applies to the native path too: an Anthropic client
+        # can send image blocks to a text-only model just like an OpenAI one
+        if vision is False:
+            _strip_image_blocks(body.get('messages') or [])
+            _strip_image_blocks_system(body.get('system'))
     else:
         body = {'model': payload['model'], 'messages': []}
         system = []
@@ -92,6 +124,8 @@ def build_body(payload: dict, default_max_tokens=128000) -> dict:
                                    'name': function.get('name'), 'input': args})
             if role not in ('user', 'assistant'):
                 raise ValueError(f'unsupported message role: {role}')
+            if vision is False:
+                blocks = [b for b in blocks if b.get('type') != 'image']
             # Anthropic expects tool results in user messages and alternating turns.
             if body['messages'] and body['messages'][-1]['role'] == role:
                 body['messages'][-1]['content'].extend(blocks)
@@ -107,12 +141,19 @@ def build_body(payload: dict, default_max_tokens=128000) -> dict:
                 fn = tool['function']
                 body['tools'].append({'name': fn['name'], 'description': fn.get('description', ''),
                                       'input_schema': fn.get('parameters') or {'type': 'object'}})
-            choice = payload.get('tool_choice', 'auto')
-            if isinstance(choice, str):
+            choice = payload.get('tool_choice')
+            if choice is None:
+                # explicit JSON null (or absent) — let the upstream default.
+                # The old code skipped setting the key entirely and the
+                # parallel_tool_calls branch below then crashed on KeyError.
+                body['tool_choice'] = {'type': 'auto'} if payload.get('parallel_tool_calls') is False else None
+                if body['tool_choice'] is None:
+                    body.pop('tool_choice', None)
+            elif isinstance(choice, str):
                 body['tool_choice'] = {'type': {'required': 'any'}.get(choice, choice)}
             elif isinstance(choice, dict):
                 body['tool_choice'] = {'type': 'tool', 'name': choice['function']['name']}
-            if payload.get('parallel_tool_calls') is False:
+            if payload.get('parallel_tool_calls') is False and body.get('tool_choice') is not None:
                 body['tool_choice']['disable_parallel_tool_use'] = True
         for key in ('temperature', 'top_p', 'top_k', 'metadata'):
             if payload.get(key) is not None:
@@ -122,7 +163,7 @@ def build_body(payload: dict, default_max_tokens=128000) -> dict:
             body['stop_sequences'] = [stop] if isinstance(stop, str) else stop
         if payload.get('response_format') is not None:
             raise ValueError('response_format is not supported by the captured ZCode API')
-        body.update(reasoning(payload))
+        body.update(reasoning(payload, default_effort))
     limit = body.get('max_tokens')
     if limit is None:
         limit = payload.get('max_tokens')
@@ -132,10 +173,16 @@ def build_body(payload: dict, default_max_tokens=128000) -> dict:
         limit = default_max_tokens
     if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
         raise ValueError('max_tokens must be a positive integer')
+    # clamp to the model's real output cap so a client asking for 500k on a
+    # 128k model gets 128k instead of an upstream rejection
+    if isinstance(model_caps, dict):
+        cap = int(model_caps.get('max_output_tokens', 0) or 0)
+        if cap > 0:
+            limit = min(limit, cap)
     body['max_tokens'] = limit
     body['stream'] = True
     if 'thinking' not in body:
-        body.update(reasoning(body))
+        body.update(reasoning(body, default_effort))
     if (body.get('thinking') or {}).get('type') == 'disabled':
         raise ValueError('ZCode GLM models always use reasoning. Use reasoning_effort low, high, or max; disabling reasoning is not supported.')
     body['system'] = bootstrap_system(body.get('system'))

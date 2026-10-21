@@ -10,12 +10,14 @@ from dataclasses import dataclass
 
 import httpx
 from .aggregate import aggregate_openai_stream
-from .pool import Account
+from .pool import Account, AccountState
+from .breaker import EdgeBlockBreaker
 from .model_retry import is_model_overload, overload_delay, retry_after_seconds, wait_for_retry
 from .zcode_protocol import MessageAccumulator, OpenAITranslator, usage_openai
 from .upstream import (build_headers, build_upstream_body, iter_sse_events, sse_frame,
                        parse_upstream_error, anthropic_error, openai_error, TransportError,
                        is_block_code)
+from .registry import model_caps
 
 log = logging.getLogger('zcode_gateway.service')
 
@@ -86,19 +88,59 @@ class ChatService:
     def __init__(self, cfg, pool, tokens, client, registry, store, capture):
         self.cfg, self.pool, self.tokens, self.client = cfg, pool, tokens, client
         self.registry, self.store, self.capture = registry, store, capture
+        # IP-wide CDN edge-block breaker: shared by every account (one egress
+        # IP, one block). Replaces the old behaviour where an HTML 403 was
+        # mislabelled ENTITLEMENT_ERROR and parked accounts one by one until
+        # the pool drained for a condition no account caused.
+        self.breaker = EdgeBlockBreaker()
 
-    def _build(self, payload, variant='anthropic'):
-        return build_upstream_body(payload, variant, self.cfg.models.default_max_tokens)
+        def _on_edge_block(count: int) -> None:
+            try:
+                self.pool.notify('edge_block',
+                                 f"upstream edge block #{count} — requests paused, "
+                                 f"probing to resume automatically",
+                                 level='error')
+            except Exception:
+                pass
+        self.breaker.on_block = _on_edge_block
 
+    def _build(self, payload, variant='anthropic', model=None):
+        caps = model_caps(self.registry.resolve(model or payload.get('model') or '')) \
+            if hasattr(self, 'registry') and self.registry is not None else None
+        return build_upstream_body(payload, variant, self.cfg.models.default_max_tokens,
+                                   model_caps=caps,
+                                   default_effort=getattr(self.cfg.models, 'default_effort', 'high'))
+
+    async def _edge_probe(self):
+        """Cheap GET against the upstream host for the breaker's prober.
+
+        Any HTTP answer that is NOT the CDN's HTML block page means the edge
+        is no longer intercepting (a 404/401 JSON from the API is fine — the
+        point is the request reached the API at all). Returns (status, body).
+        """
+        base = self.cfg.upstream.base_url.rstrip('/')
+        resp = await self.client._client.get(base + '/zcode-plan/billing/balance',
+                                             timeout=10)
+        return resp.status_code, resp.text
     async def _close(self, handle):
         if handle.closed: return
         handle.closed = True
         try:
             if handle.events is not None: await handle.events.aclose()
         finally:
-            try: await handle.resp.aclose()
-            finally: await self.pool.release(handle.account)
-
+            try:
+                await handle.resp.aclose()
+            finally:
+                # Shield the release: on a client disconnect Starlette cancels
+                # the scope this runs in, and an await on the pool lock here
+                # would leak the in-flight slot FOREVER (cap reached after a
+                # few disconnects). Counter hygiene must not be cancellable.
+                try:
+                    await asyncio.shield(self.pool.release(handle.account))
+                except asyncio.CancelledError:
+                    # the shield's outer await was cancelled even though the
+                    # release itself completed — re-raise after the fact
+                    raise
     async def _apply_error(self, account, model, status, code, message, headers=None):
         if is_model_overload(status, code):
             # A busy model is not evidence of a bad account or spent quota.
@@ -120,11 +162,35 @@ class ChatService:
             await self.pool.cap_model(account, model,
                                       self.cfg.pool.blocked_model_cooldown_seconds,
                                       reason='UNUSUAL_ACTIVITY', message=message)
-        elif code == '11113' or status == 402:
+        elif code in ('11113', '1005') or status == 402:
+            # 1005 is the SAME "exceed quota limit" rejection under an HTTP
+            # 502 (captured live 2026-10-21: 10x/10min on a plan-less
+            # account) — treating it as a generic 5xx only cooled the
+            # account 30s and the router picked it again, forever.
             quota = account.notes.get('quotas', {}).get(model, {})
-            seconds = max(1, quota.get('resets_at', 0) - time.time())
-            if seconds <= 1: seconds = self.cfg.pool.cooldown_seconds
-            await self.pool.cap_model(account, model, seconds, reason='11113', message=message)
+            seconds = max(1, quota.get('resets_at', 0) - time.time()) if quota else 0
+            if seconds <= 1:
+                # no bucket data to schedule around: if the account HAS no
+                # entitlement (plans empty, quotas empty), parking one model
+                # still leaves it churning on the other — strike toward
+                # EXHAUSTED; the balance loop restores it the moment real
+                # quota appears.
+                account.quota_strikes = getattr(account, 'quota_strikes', 0) + 1
+                if account.quota_strikes >= 3:
+                    account.state = AccountState.EXHAUSTED
+                    account.last_error = 'repeated quota rejection with no visible buckets'
+                    try:
+                        self.pool.notify('quota',
+                                         f"account {account.id} EXHAUSTED — repeated "
+                                         f"quota rejections, no visible plan/buckets",
+                                         level='warning')
+                    except Exception:
+                        pass
+                    return
+                seconds = 900      # park the model past the churn window
+            await self.pool.cap_model(account, model, seconds,
+                                      reason='11113' if code == '11113' else '1005',
+                                      message=message)
         elif status == 429 or code == 'rate_limit_error':
             try: seconds = min(3600, max(1, float((headers or {}).get('retry-after', self.cfg.pool.cooldown_seconds))))
             except ValueError: seconds = self.cfg.pool.cooldown_seconds
@@ -151,8 +217,14 @@ class ChatService:
                 return await self._open_model_stream({**payload, 'model': candidate}, model=candidate,
                     variant=variant, dialect=dialect, client_key=client_key, is_disconnected=is_disconnected)
             except UpstreamFailure as exc:
-                if exc.code not in ('11113', 'MODEL_CAPPED', 'MODEL_PARKED', 'INFERENCE_CAP_ERROR',
-                                    'ENTITLEMENT_ERROR', 'UNUSUAL_ACTIVITY', '3012', '405', 'HTTP_405',
+                # Try the next model in the fallback chain for every error the
+                # account-parking path already handled (its own codes) AND the
+                # upstream's real rate-limit code — `rate_limit_error` was
+                # missing from this list, so a 429 on the paid model never
+                # fell back to the free one (measured: 0 retries on 429).
+                if exc.code not in ('11113', '1005', 'rate_limit_error', 'MODEL_CAPPED', 'MODEL_PARKED',
+                                    'INFERENCE_CAP_ERROR', 'ENTITLEMENT_ERROR',
+                                    'UNUSUAL_ACTIVITY', '3012', '405', 'HTTP_405',
                                     'HTTP_451', 'http_451'):
                     raise
                 if candidate == candidates[-1]:
@@ -182,7 +254,14 @@ class ChatService:
     async def _open_model_stream_once(self, payload, *, model, variant='anthropic', dialect='openai', client_key='anonymous'):
         if not self.registry.knows(model):
             raise UpstreamFailure(400, 'unknown_model', f'unknown ZCode model: {model}')
-        try: body = self._build(payload, variant)
+        # fail fast while the egress IP is edge-blocked: every account would
+        # return the same HTML 403, and trying parks them one by one
+        blocked = self.breaker.check()
+        if blocked is not None:
+            raise UpstreamFailure(blocked['status'], blocked['code'],
+                                  blocked['message'],
+                                  retry_after=blocked['retry_in_s'])
+        try: body = self._build(payload, variant, model=model)
         except (ValueError, KeyError, TypeError, AttributeError) as exc:
             raise UpstreamFailure(400, 'invalid_request_error', str(exc)) from exc
         if not body.get('messages'):
@@ -210,10 +289,22 @@ class ChatService:
                 device_mid = account.notes.get('device_mid') or self.cfg.upstream.fingerprint.device_mid
                 body['metadata'] = {'user_id': json.dumps({'device_id': device_mid,
                     'account_uuid': '', 'session_id': headers['x-session-id']}, separators=(',', ':'))}
+            elif isinstance(body.get('metadata'), dict) and 'user_id' not in body['metadata']:
+                # A client-supplied Anthropic `metadata` field used to skip the
+                # device binding entirely — every such request went upstream
+                # with no device id (an "unusual activity" signal). Merge it.
+                device_mid = account.notes.get('device_mid') or self.cfg.upstream.fingerprint.device_mid
+                body['metadata'] = {**body['metadata'],
+                    'user_id': json.dumps({'device_id': device_mid,
+                        'account_uuid': '', 'session_id': headers['x-session-id']}, separators=(',', ':'))}
             resp, handle, transferred = None, None, False
             try:
                 if account.expires_in() <= 0 and not await self.tokens.refresh(account):
-                    await self.pool.kill(account, 'ZCode token expired; sign in again')
+                    # Expired token: strike-and-cool (like upstream 401s), not
+                    # an instant permanent kill — an expired token whose file
+                    # simply hasn't rotated yet used to DEAD the account with
+                    # no recovery path (enable() -> next request kills again).
+                    await self.pool.kill_after_strikes(account, 'ZCode token expired; sign in again')
                     last = UpstreamFailure(401, 'authentication_error', 'ZCode token expired; sign in again')
                     tried.add(account.id)
                     continue
@@ -226,7 +317,7 @@ class ChatService:
                     info = parse_upstream_error(resp.status_code, raw)
                     status, code, message = resp.status_code, str(info['code']), info['message']
                     if status == 200:
-                        status = 429 if code == '11113' else 502
+                        status = 429 if code in ('11113', '1005') else 502
                     if status == 401 and await self.tokens.refresh(account, force=True):
                         # Retry a newly imported token once, without a second pool reservation.
                         await resp.aclose()
@@ -241,8 +332,20 @@ class ChatService:
                             info = parse_upstream_error(resp.status_code, raw)
                             status, code, message = resp.status_code, str(info['code']), info['message']
                             if status == 200:
-                                status = 429 if code == '11113' else 502
+                                status = 429 if code in ('11113', '1005') else 502
                     if status != 200:
+                        # IP-wide CDN edge block (HTML body, not API JSON)?
+                        # Detect BEFORE _apply_error — this is not an account
+                        # problem, and parking the account for it is the bug
+                        # the breaker exists to prevent.
+                        if self.breaker.note_edge_block(raw):
+                            await resp.aclose()
+                            self.breaker.ensure_prober(self._edge_probe)
+                            raise UpstreamFailure(
+                                503, 'waf_block',
+                                'upstream edge block (IP-wide): requests '
+                                'rejected for every account; retry shortly',
+                                retry_after=35)
                         await self._apply_error(account, model, status, code, message, resp.headers)
                         last = UpstreamFailure(429 if code == '11113' else status, code, message,
                                                retry_after=retry_after_seconds(resp.headers))
@@ -256,13 +359,23 @@ class ChatService:
                         continue
                 handle = StreamHandle(account, headers, body, resp, variant, time.time())
                 handle.events = upstream_events(resp)
+                # a clean stream through the CDN is evidence any prior edge
+                # block has lifted
+                self.breaker.note_success()
                 # An immediate SSE error must reach the client before HTTP 200 is committed.
                 while True:
                     first = await anext(handle.events, None)
                     if first is None:
                         raise UpstreamFailure(502, 'empty_stream', 'ZCode returned an empty event stream')
                     if first.get('type') == 'ping': continue
-                    if first.get('type') == 'error':
+                    # Two error shapes reach this loop:
+                    #   1) Anthropic event form:  {"type":"error","error":{...}}
+                    #   2) OpenAI-shaped frame (captured 2026-09-16):
+                    #      {"error":{"code":"stream_initialization_failed", ...}}
+                    # The second has no "type" key — checking only the first
+                    # form masked the real code/message into a generic 502
+                    # invalid_stream and never cooled/parked the account.
+                    if first.get('type') == 'error' or (first.get('type') is None and 'error' in first):
                         info = first.get('error') or first
                         code, message = str(info.get('code') or info.get('type') or 'api_error'), info.get('message', 'ZCode stream failed')
                         status = 529 if is_model_overload(502, code) else (429 if code in ('11113', 'rate_limit_error') else (405 if is_block_code(code) else 502))
@@ -279,6 +392,22 @@ class ChatService:
                     handle, resp = None, None
                     return result
             except (TransportError, httpx.HTTPError) as exc:
+                # A block that arrived THROUGH a relay is the relay's exit-IP
+                # problem: UpstreamClient already rotated+cooled every relay
+                # it could. Do NOT cool the account (the same request through
+                # the next relay on the next attempt is fine) and do NOT burn
+                # attempts rotating accounts — every account uses the same
+                # relay set, so the next attempt would go DIRECT (all relays
+                # are cooling) and burn the home IP. Fail the request now
+                # with the real code; relays uncool in 60s.
+                from .upstream import UpstreamBlockThroughRelay
+                if isinstance(exc, UpstreamBlockThroughRelay):
+                    raise UpstreamFailure(
+                        405, '3012',
+                        'relay exit IP(s) flagged (unusual activity): all relays '
+                        'cooled ~60s — retry shortly; a different relay '
+                        'rotation is not needed, it happens automatically'
+                    ) from exc
                 await self.pool.cool(account, reason='transport_error')
                 last = UpstreamFailure(502, 'transport_error', 'could not reach ZCode')
                 tried.add(account.id)
@@ -316,7 +445,12 @@ class ChatService:
                     text = json.dumps(event, ensure_ascii=False)
                     captured.append(text)
                     capture_size += len(text)
-                if kind == 'error':
+                # OpenAI-shaped mid-stream error frame: {"error":{...}} with
+                # no "type" key (captured 2026-09-16). Without this branch it
+                # fell through to the Anthropic passthrough as `event: None`
+                # — not in the Anthropic SSE vocabulary — and the account was
+                # never parked for the failure.
+                if kind == 'error' or (kind is None and 'error' in event):
                     info = event.get('error') or event
                     code, message = str(info.get('code') or info.get('type') or 'api_error'), info.get('message', 'ZCode stream failed')
                     status = 529 if is_model_overload(502, code) else (429 if code in ('11113', 'rate_limit_error') else 502)

@@ -19,10 +19,23 @@ def _is_loopback(request: Request) -> bool:
     return client in ("127.0.0.1", "::1", "localhost")
 
 
+def _compare(a: str, b: str) -> bool:
+    """Constant-time compare that tolerates non-ASCII strings.
+
+    hmac.compare_digest raises TypeError on non-ASCII str (a latin-1-decoded
+    header byte >= 0x80), turning a malformed bearer into a pre-auth 500.
+    Compare UTF-8 bytes instead.
+    """
+    try:
+        return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
+    except Exception:
+        return False
+
+
 def _is_internal(request: Request, state: AppState, supplied: str) -> bool:
     if not supplied:
         return False
-    if hmac.compare_digest(state.internal_token, supplied):
+    if _compare(state.internal_token, supplied):
         return True
     return supplied == _LEGACY_INTERNAL and _is_loopback(request)
 
@@ -51,11 +64,11 @@ async def client_key(request: Request) -> str:
         raise HTTPException(status_code=401, detail="missing API key")
 
     # Admin key or internal sentinel can also authenticate client routes
-    if hmac.compare_digest(state.cfg.server.admin_key, supplied) or _is_internal(request, state, supplied):
+    if _compare(state.cfg.server.admin_key, supplied) or _is_internal(request, state, supplied):
         return "admin"
 
     for entry in cfg.client_keys:
-        if hmac.compare_digest(entry.key, supplied):
+        if _compare(entry.key, supplied):
             if entry.rpm > 0:
                 allowed, retry_after = state.limiter.check(entry.key, entry.rpm)
                 if not allowed:
@@ -71,6 +84,6 @@ async def client_key(request: Request) -> str:
 async def admin_key(request: Request) -> str:
     state = get_state(request)
     supplied = _bearer(request)
-    if _is_internal(request, state, supplied) or hmac.compare_digest(state.cfg.server.admin_key, supplied):
+    if _is_internal(request, state, supplied) or _compare(state.cfg.server.admin_key, supplied):
         return "admin"
     raise HTTPException(status_code=403, detail="invalid admin key")

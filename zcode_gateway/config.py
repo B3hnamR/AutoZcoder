@@ -98,14 +98,32 @@ class AutoFreeFallbackConfig(BaseModel):
     chain: list[str] = Field(default_factory=lambda: ["GLM-5.3", "GLM-5.3-Flash"])
 
 
+class PacingConfig(BaseModel):
+    """Shared randomized gap between upstream sends (WAF/ban prevention).
+
+    With dozens of accounts and parallel workers we otherwise hammer one
+    egress IP with zero gap — the exact traffic shape CDN edge blocks are
+    trained on. The gap is GLOBAL (one egress), randomized so parallel
+    requests don't self-synchronize, and off-able for throughput-first use.
+    """
+    enabled: bool = True
+    min_gap_ms: int = 150
+    max_gap_ms: int = 400
+
+
 class ModelsConfig(BaseModel):
     aliases: dict[str, str] = Field(default_factory=dict)
     default: str = "GLM-5.3-Flash"
     default_anthropic: str = "GLM-5.3"
     default_max_tokens: int = 128000
     probe_unknown: bool = False
+    # Reasoning effort used when the client doesn't specify one. 'max' made
+    # every unspecified request pay maximum reasoning latency/tokens silently;
+    # 'high' is near-identical in quality for coding use. low|high|max.
+    default_effort: str = "high"
     auto_free_fallback: AutoFreeFallbackConfig = Field(
         default_factory=AutoFreeFallbackConfig)
+    pacing: PacingConfig = Field(default_factory=PacingConfig)
 
 
 class LoggingConfig(BaseModel):

@@ -214,11 +214,21 @@ def emit(**kw):
 
 
 def _atomic_write(path, content):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + '.tmp'
-    with open(tmp, 'w', encoding='utf-8', newline='\n') as f:
-        f.write(content)
-    os.replace(tmp, path)
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    # UNIQUE tmp name per process: eight workers share this code path, and a
+    # fixed '<path>.tmp' let two processes interleave bytes into one file —
+    # the loser's os.replace then installed corrupt JSON as the pool.
+    tmp = f'{path}.{os.getpid()}.tmp'
+    try:
+        with open(tmp, 'w', encoding='utf-8', newline='\n') as f:
+            f.write(content)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 class _FileLock:
@@ -722,6 +732,17 @@ def _load_pool_map() -> dict:
             return {e['url']: e for e in data if isinstance(e, dict) and 'url' in e}
     except (ValueError, KeyError):
         pass
+    # corrupt/unparsable pool.json: fall back to the .bak instead of reading
+    # as permanently empty (_ensure_seeded skips re-seeding whenever
+    # pool.json EXISTS, so an empty parse used to strand the whole ledger)
+    try:
+        bak = json.loads(_read_text(POOL_FILE + '.bak') or '{}')
+        if isinstance(bak, dict) and bak:
+            print('[proxy_pool] WARNING: pool.json corrupt — recovered from '
+                  'pool.json.bak', flush=True)
+            return {url: e for url, e in bak.items() if isinstance(e, dict) and 'url' in e}
+    except (ValueError, KeyError, OSError):
+        pass
     return {}
 
 
@@ -797,7 +818,15 @@ def _save_pool_map(pool: dict) -> None:
     # never leak credentials into the JSON in a readable dashboard field, but
     # keep the full URL so the proxy can actually be used
     try:
-        _atomic_write(POOL_FILE, json.dumps(pool, indent=0))
+        payload = json.dumps(pool, indent=0)
+        # keep the last good copy beside the live file: a crash/corruption
+        # event then costs at most one save, not the whole 1 MB ledger
+        try:
+            if os.path.exists(POOL_FILE):
+                os.replace(POOL_FILE, POOL_FILE + '.bak')
+        except OSError:
+            pass
+        _atomic_write(POOL_FILE, payload)
         _write_exports(pool)
     except OSError:
         pass

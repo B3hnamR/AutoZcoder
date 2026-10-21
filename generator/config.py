@@ -32,8 +32,14 @@ CONFIG = {
     'drag_dead_zone': 60.0,
     'drag_ratio': 1.0,
     'mail_domains': [],            # extra personal domains; ZAI_MAIL_DOMAIN picks one per signup
-    'mail_domain': 'behnamrjd.me', # default/fallback domain
+    'mail_domain': '',             # REQUIRED: user's own catch-all domain (dashboard/env sets it). No bundled default — signing up on a stranger's domain burns accounts.
     'manual_captcha': False,       # True (or env ZAI_MANUAL=1): you solve the slider by hand
+    # Captcha strategy when not manual:
+    #   'auto'    — CV ensemble + gateway-AI judge fused by the weighted vote
+    #   'ai'      — ONLY the gateway-AI judge (one judge, one answer)
+    #   'classic' — ONLY the pre-AI CV ensemble (ddddocr/cv2/variance/energy)
+    # ZAI_CAPTCHA_STRATEGY overrides per run; the gateway sets it per worker.
+    'captcha_strategy': os.environ.get('ZAI_CAPTCHA_STRATEGY', 'auto'),
     'proxy': None,                 # single proxy URL, or use env ZAI_PROXY
     'proxy_retries': 5,            # auto-rotate to a fresh proxy on failure (proxy mode only)
     'invite_code': 'MT9GNDQ8',     # referral Global Build claim; '' disables, ZAI_INVITE_CODE overrides
@@ -59,4 +65,12 @@ CONFIG = {
     'data_dir': _out,
     'output_dir': _out,
     'debug_dir': _out,
+    # gateway-AI captcha method: the local ZcodeGateway's GLM vision model
+    # as a fallback distance estimator when the CV methods all fail.
+    # ZAI_GATEWAY_URL / ZAI_GATEWAY_KEY are set by the gateway when it
+    # spawns workers; standalone runs can export them manually.
+    'gateway_url': os.environ.get('ZAI_GATEWAY_URL', 'http://127.0.0.1:8788'),
+    'gateway_key': os.environ.get('ZAI_GATEWAY_KEY', ''),
+    'gateway_ai_model': os.environ.get('ZAI_GATEWAY_AI_MODEL', 'GLM-5.3-Flash'),
+    'enable_gateway_ai': True,
 }

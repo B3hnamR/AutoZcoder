@@ -257,9 +257,23 @@ def deploy_cloudflare(account_id: str, api_token: str, project_name: str = "") -
         msg = (err.get("errors") or [{}])[0].get("message") or f"Cloudflare upload failed ({upload_res.status_code})"
         raise RuntimeError(msg)
 
-    # 2. Enable workers.dev subdomain
+    # 2. Enable workers.dev subdomain — per script. Enabling is per-script,
+    # not account-wide: a failed enable used to produce a stored-but-dead
+    # URL. Check the response and refuse to return a URL that isn't live.
     subdomain_url = f"{script_url}/subdomain"
-    requests.post(subdomain_url, headers=headers, json={"enabled": True}, timeout=30)
+    enable_res = requests.post(subdomain_url, headers=headers, json={"enabled": True}, timeout=30)
+    enabled = False
+    if enable_res.ok:
+        try:
+            enabled = bool((enable_res.json().get("result") or {}).get("enabled"))
+        except ValueError:
+            enabled = False
+    if not enabled:
+        raise RuntimeError(
+            "Worker deployed but enabling its workers.dev route failed "
+            f"(HTTP {enable_res.status_code}). Enable it in the Cloudflare "
+            "dashboard (Workers → your worker → Settings → Domains & Routes)."
+        )
 
     # 3. Retrieve account workers.dev subdomain
     account_subdomain_url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/workers/subdomain"
@@ -499,12 +513,15 @@ def deploy_netlify(netlify_token: str, site_name: str = "") -> dict[str, Any]:
     required_files = set(deploy_data.get("required") or [])
     required_functions = set(deploy_data.get("required_functions") or [])
 
-    # 3. Upload files asked by digest
+    # 3. Upload files asked for. Netlify's `required` lists FILE PATHS and
+    # `required_functions` lists FUNCTION NAMES — comparing them against the
+    # SHA digests we computed (old code) always failed both membership tests,
+    # so NOTHING was ever uploaded and every deploy timed out.
     oct_headers = {"Authorization": f"Bearer {netlify_token}", "Content-Type": "application/octet-stream", "User-Agent": UA}
-    if index_sha1 in required_files:
+    if "/index.html" in required_files or index_sha1 in required_files:
         requests.put(f"https://api.netlify.com/api/v1/deploys/{deploy_id}/files/index.html", headers=oct_headers, data=index_bytes, timeout=30)
 
-    if fn_sha256 in required_functions:
+    if "relay" in required_functions or fn_sha256 in required_functions:
         requests.put(f"https://api.netlify.com/api/v1/deploys/{deploy_id}/functions/relay?runtime=js", headers=oct_headers, data=zip_bytes, timeout=45)
 
     # 4. Poll until ready (up to 90s)

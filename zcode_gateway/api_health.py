@@ -11,8 +11,18 @@ router = APIRouter(tags=["ops"])
 
 
 @router.get("/health")
-async def health() -> dict:
-    return {"status": "ok"}
+async def health(request: Request) -> dict:
+    state = request.app.state.app_state
+    out = {"status": "ok"}
+    try:
+        # surface the IP-wide edge-block breaker so clients/ops can see WHY
+        # everything is 503-ing instead of guessing account problems
+        out["edge_block"] = state.service.breaker.status()
+        if out["edge_block"]["blocked"]:
+            out["status"] = "degraded"
+    except AttributeError:
+        pass
+    return out
 
 
 @router.get("/ready")

@@ -6,6 +6,7 @@ or the body variants without re-capturing — the upstream fingerprints the clie
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -37,9 +38,29 @@ VARIANTS = ("anthropic",)
 def new_task_id():
     return str(uuid.uuid4())
 
-def build_headers(access_token, fp, task_id=None, *, device_mid=None, include_device_mid=True):
+def merge_anthropic_beta(base: str, extra: str | None) -> str:
+    """Comma-merge the captured static beta with a client-supplied one.
+
+    A client sending its own `anthropic-beta` used to be silently overridden
+    by the static captured value; when Z.ai rotates the beta, clients that
+    already know the new one had no way to pass it through. Order-stable,
+    dedupes, keeps our captured beta first.
+    """
+    parts = [p.strip() for p in (base or '').split(',') if p.strip()]
+    for p in (extra or '').split(','):
+        p = p.strip()
+        if p and p not in parts:
+            parts.append(p)
+    return ','.join(parts)
+
+
+def build_headers(access_token, fp, task_id=None, *, device_mid=None, include_device_mid=True,
+                  anthropic_beta: str | None = None):
     token = access_token.removeprefix("Bearer ").strip()
     h = dict(STATIC_HEADERS)
+    if anthropic_beta:
+        h["anthropic-beta"] = merge_anthropic_beta(
+            STATIC_HEADERS.get("anthropic-beta", ""), anthropic_beta)
     h.update({"authorization": "Bearer " + token, "x-api-key": token,
         "user-agent": fp.user_agent, "x-device-mid": device_mid or fp.device_mid,
         "x-client-language": fp.language, "x-client-timezone": fp.timezone,
@@ -56,9 +77,11 @@ def build_headers(access_token, fp, task_id=None, *, device_mid=None, include_de
     return h
 
 def build_upstream_body(payload, variant="anthropic", default_max_tokens=128000,
-                        anthropic_cache_control=True):
+                        anthropic_cache_control=True, model_caps=None,
+                        default_effort='high'):
     from .zcode_protocol import build_body
-    return build_body(payload, default_max_tokens)
+    return build_body(payload, default_max_tokens, model_caps=model_caps,
+                      default_effort=default_effort)
 
 
 # --------------------------------------------------------------------------- #
@@ -283,11 +306,25 @@ class UpstreamResponse:
 
 
 class UpstreamClient:
-    """Thin httpx wrapper. Adds nothing to the request the caller did not set."""
+    """Thin httpx wrapper. Adds nothing to the request the caller did not set.
 
-    def __init__(self, cfg: UpstreamConfig, relay_manager: Any = None) -> None:
+    A GLOBAL randomized pacing gate spaces out upstream sends (config
+    upstream.pacing): one egress IP hammering the CDN with zero gap is the
+    traffic shape edge blocks are trained on. The gate is shared across all
+    accounts and workers, randomized so parallel requests don't
+    self-synchronize into lockstep.
+    """
+
+    _last_send_at: float = 0.0            # class-level: shared per process
+    _pace_lock: asyncio.Lock | None = None
+
+    def __init__(self, cfg: UpstreamConfig, relay_manager: Any = None,
+                 pacing=None) -> None:
         self.cfg = cfg
         self.relay_manager = relay_manager
+        self.pacing = pacing               # PacingConfig or None = off
+        if UpstreamClient._pace_lock is None:
+            UpstreamClient._pace_lock = asyncio.Lock()
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(cfg.timeout_read, connect=cfg.timeout_connect),
             limits=httpx.Limits(max_connections=200, max_keepalive_connections=50),
@@ -295,6 +332,22 @@ class UpstreamClient:
             follow_redirects=False,
             http2=False,
         )
+
+    async def _pace(self) -> None:
+        """Hold the shared lock for a randomized gap after the previous send.
+        Waiting INSIDE the lock is what serializes the gap: concurrent callers
+        queue, and each observes the gap of the one before it."""
+        if self.pacing is None or not getattr(self.pacing, 'enabled', False):
+            return
+        import random as _random
+        gap = _random.uniform(self.pacing.min_gap_ms / 1000.0,
+                              self.pacing.max_gap_ms / 1000.0)
+        async with UpstreamClient._pace_lock:
+            elapsed = time.monotonic() - UpstreamClient._last_send_at
+            wait = gap - elapsed
+            if wait > 0:
+                await asyncio.sleep(wait)
+            UpstreamClient._last_send_at = time.monotonic()
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -310,6 +363,7 @@ class UpstreamClient:
 
         last_exc: Exception | None = None
         for attempt in range(max_relay_tries):
+            await self._pace()
             relay_url = None
             if self.relay_manager:
                 req_model = str(body.get("model") or "")
@@ -357,6 +411,30 @@ class UpstreamClient:
                 last_exc = TransportError(f"relay {relay_url} returned {resp.status_code}")
                 continue
 
+            if relay_url and resp.status_code == 405 and self.relay_manager:
+                # 405/3012 through a relay = the RELAY'S exit IP is flagged
+                # by risk control ("unusual activity"). Rotating ACCOUNTS
+                # cannot help — every account goes through the same relay —
+                # so cool this relay and immediately try the next one before
+                # the error ever reaches the account layer. The 405 body is
+                # a small JSON error (never a real stream), so reading it
+                # here is safe on this branch.
+                body_peek = await resp.aread()
+                await resp.aclose()
+                if b"3012" in body_peek or b"unusual activity" in body_peek:
+                    self.relay_manager.mark_relay_failed(relay_url)
+                    tried_relay_urls.append(relay_url)
+                    last_exc = UpstreamBlockThroughRelay(
+                        f"relay {relay_url} exit IP flagged (405/3012)")
+                    continue
+                # plain 405 without 3012: a request-shape block, not the
+                # relay's IP — fall through to the caller (account layer)
+                synthetic = httpx.Response(status_code=405, content=body_peek,
+                                           headers=dict(resp.headers))
+                return UpstreamResponse(status_code=405,
+                                        headers={k.lower(): v for k, v in resp.headers.items()},
+                                        _resp=synthetic)
+
             if relay_url and self.relay_manager:
                 self.relay_manager.mark_relay_ok(relay_url)
             return UpstreamResponse(
@@ -372,6 +450,12 @@ class UpstreamClient:
 
 class TransportError(Exception):
     """Network-level failure — safe to retry on another account."""
+
+
+class UpstreamBlockThroughRelay(Exception):
+    """405/3012 'unusual activity' arrived THROUGH a relay: the relay's exit
+    IP is flagged, not the account. The client layer must rotate the RELAY
+    (already done in UpstreamClient.send) rather than park the account."""
 
 
 # --------------------------------------------------------------------------- #

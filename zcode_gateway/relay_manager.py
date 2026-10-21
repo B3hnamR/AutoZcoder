@@ -39,10 +39,16 @@ class RelayManager:
     def __init__(self, data_dir: Path | str | None = None) -> None:
         self.data_dir = Path(data_dir) if data_dir else Path("./generator-data")
         self.path = self.data_dir / "relays.json"
-        self._lock = threading.Lock()
+        # RLock: add/delete/update hold it across their whole
+        # read-modify-write AND call get_settings/save_settings, which take
+        # it again internally — a plain Lock would self-deadlock.
+        self._lock = threading.RLock()
         self._cache: dict[str, Any] | None = None
         self._rr_index = 0                 # round-robin cursor
         self._failed: dict[str, float] = {}  # relay id -> cooldown-unix-ts
+        # notification center (optional, attached in app setup): relay
+        # cooldowns surface in the bell
+        self._notify = None
         # background health loop: ping every relay on a timer, feed failures
         # into the rotation cooldown, keep last_* fields fresh for the table
         self._health_thread: threading.Thread | None = None
@@ -189,7 +195,17 @@ class RelayManager:
         if not relay_url:
             return
         with self._lock:
+            first_fail = relay_url not in self._failed
             self._failed[relay_url] = time.time() + FAIL_COOLDOWN_S
+        if first_fail and self._notify is not None:
+            try:
+                host = relay_url.split("//")[-1].split("/")[0]
+                self._notify.emit("relay_cooled",
+                                  f"relay {host} cooled {FAIL_COOLDOWN_S:.0f}s "
+                                  f"after a failure — rotation switched",
+                                  level="warning")
+            except Exception:
+                pass
 
     def mark_relay_ok(self, relay_url: str) -> None:
         with self._lock:
@@ -216,44 +232,50 @@ class RelayManager:
         return url or (st.get("active_url") or "").strip() or None
 
     def add_relay(self, name: str, url: str, type_name: str = "custom") -> dict[str, Any]:
-        st = self.get_settings()
-        # uuid4: timestamp-based ids collided when two adds landed in the same
-        # millisecond (delete then removed both)
-        import uuid as _uuid
-        relay_id = f"relay-{_uuid.uuid4().hex[:12]}"
-        entry = {
-            "id": relay_id,
-            "name": name or f"{type_name}-relay",
-            "type": type_name,
-            "url": url.strip(),
-            "created_at": time.time(),
-            "last_status": None,
-            "last_error": None,
-            "last_latency_ms": None,
-            "last_tested_at": None,
-        }
-        st["relays"].append(entry)
-        if not st.get("active_url"):
-            st["active_url"] = entry["url"]
-            st["active_id"] = entry["id"]
-        self.save_settings(st)
-        return entry
+        # Hold the lock across the whole read-modify-write: a concurrent
+        # delete_relay building its filtered list between our get and save
+        # used to drop the just-added relay from the persisted file.
+        with self._lock:
+            st = self.get_settings()
+            # uuid4: timestamp-based ids collided when two adds landed in the same
+            # millisecond (delete then removed both)
+            import uuid as _uuid
+            relay_id = f"relay-{_uuid.uuid4().hex[:12]}"
+            entry = {
+                "id": relay_id,
+                "name": name or f"{type_name}-relay",
+                "type": type_name,
+                "url": url.strip(),
+                "created_at": time.time(),
+                "last_status": None,
+                "last_error": None,
+                "last_latency_ms": None,
+                "last_tested_at": None,
+            }
+            st["relays"].append(entry)
+            if not st.get("active_url"):
+                st["active_url"] = entry["url"]
+                st["active_id"] = entry["id"]
+            self.save_settings(st)
+            return entry
 
     def delete_relay(self, relay_id: str) -> bool:
-        st = self.get_settings()
-        orig_len = len(st["relays"])
-        st["relays"] = [r for r in st["relays"] if r.get("id") != relay_id]
-        if len(st["relays"]) == orig_len:
-            return False
-        if st.get("active_id") == relay_id:
-            if st["relays"]:
-                st["active_id"] = st["relays"][0]["id"]
-                st["active_url"] = st["relays"][0]["url"]
-            else:
-                st["active_id"] = ""
-                st["active_url"] = ""
-        self.save_settings(st)
-        return True
+        # Same whole-operation lock as add_relay (see above).
+        with self._lock:
+            st = self.get_settings()
+            orig_len = len(st["relays"])
+            st["relays"] = [r for r in st["relays"] if r.get("id") != relay_id]
+            if len(st["relays"]) == orig_len:
+                return False
+            if st.get("active_id") == relay_id:
+                if st["relays"]:
+                    st["active_id"] = st["relays"][0]["id"]
+                    st["active_url"] = st["relays"][0]["url"]
+                else:
+                    st["active_id"] = ""
+                    st["active_url"] = ""
+            self.save_settings(st)
+            return True
 
     def set_active(self, relay_id: str) -> bool:
         st = self.get_settings()
@@ -273,24 +295,26 @@ class RelayManager:
         # The old flow delegated active_id to set_active(), which re-read the
         # cache BEFORE this call's models/enabled were persisted — so saving
         # options with an active relay silently discarded the toggles.
-        st = self.get_settings()
-        if models is not None:
-            st["models"] = list(dict.fromkeys(models))
-        if enabled is not None:
-            st["enabled"] = bool(enabled)
-        if strategy is not None:
-            s = str(strategy).lower().strip()
-            if s not in STRATEGIES:
-                raise ValueError(f"strategy must be one of {', '.join(STRATEGIES)}")
-            st["strategy"] = s
-        if active_id:
-            for r in st["relays"]:
-                if r.get("id") == active_id:
-                    st["active_id"] = r["id"]
-                    st["active_url"] = r["url"]
-                    break
-        self.save_settings(st)
-        return st
+        # Whole read-modify-write under the lock (see add_relay).
+        with self._lock:
+            st = self.get_settings()
+            if models is not None:
+                st["models"] = list(dict.fromkeys(models))
+            if enabled is not None:
+                st["enabled"] = bool(enabled)
+            if strategy is not None:
+                s = str(strategy).lower().strip()
+                if s not in STRATEGIES:
+                    raise ValueError(f"strategy must be one of {', '.join(STRATEGIES)}")
+                st["strategy"] = s
+            if active_id:
+                for r in st["relays"]:
+                    if r.get("id") == active_id:
+                        st["active_id"] = r["id"]
+                        st["active_url"] = r["url"]
+                        break
+            self.save_settings(st)
+            return st
 
     def test_relay_by_id(self, relay_id: str) -> dict[str, Any]:
         st = self.get_settings()

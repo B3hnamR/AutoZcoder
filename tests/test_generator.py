@@ -227,7 +227,9 @@ def test_zai_proxy_direct_sentinel_is_not_a_proxy():
     except ImportError:
         pass   # requests not installed in this env — skip
 
-def test_invite_captcha_param_is_header_safe():
+def test_invite_captcha_chain_is_in_page():
+    """The external Go captcha service is gone; params are minted in the
+    live page and the hook also captures the verify region."""
     import sys
     gen = Path(__file__).resolve().parent.parent / "generator"
     if not gen.is_dir():
@@ -237,13 +239,29 @@ def test_invite_captcha_param_is_header_safe():
         import invite_claim as ic
     except ImportError:
         return    # playwright not installed in this env — generator-side only
-    # the old _captcha_param returned (param, region) and that tuple was used
-    # directly as an HTTP header value -> InvalidHeader crash
-    assert ic._norm_captcha_param(None) is None
-    assert ic._norm_captcha_param("") is None
-    assert ic._norm_captcha_param(("p", "region")) == "p"
-    assert ic._norm_captcha_param(["q"]) == "q"
-    assert ic._norm_captcha_param("abc") == "abc"
+    # no external-service fetcher, no embedded default credential
+    assert not hasattr(ic, '_captcha_param')
+    src = Path(ic.__file__).read_text(encoding='utf-8')
+    assert 'admin' not in src.split('_deleted_captcha_service_stub')[0].split('def ')[-1]
+    assert '8687' not in src
+    # the hook captures the region alongside the verdict
+    assert isinstance(ic.CAPTCHA_HOOK, str) and "11xygtvd" in ic.CAPTCHA_HOOK
+    assert '__captchaRegion' in ic.CAPTCHA_HOOK
+    # fresh-mint helper exists and clears stale params before waiting
+    assert hasattr(ic, '_page_captcha_param')
+
+
+def test_invite_captcha_param_is_header_safe():
+    import sys
+    gen = Path(__file__).resolve().parent.parent / "generator"
+    if not gen.is_dir():
+        return
+    sys.path.insert(0, str(gen))
+    try:
+        import invite_claim as ic
+    except ImportError:
+        return
+    # legacy tuple input is still tolerated by the in-page sender path
     assert isinstance(ic.CAPTCHA_HOOK, str) and "11xygtvd" in ic.CAPTCHA_HOOK
 
 

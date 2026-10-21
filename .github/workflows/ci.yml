@@ -1,0 +1,33 @@
+name: ci
+
+# Fast test gate on every push/PR to main: catches breakage BEFORE it lands
+# in a tagged release (release.yml only runs on v* tags, so a broken main
+# used to build a broken exe with no warning).
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Create venv + install deps
+        run: |
+          python -m venv .venv
+          .\.venv\Scripts\python -m pip install --upgrade pip
+          .\.venv\Scripts\python -m pip install -r requirements.txt -r requirements-dev.txt
+      - name: Run tests
+        run: .\.venv\Scripts\python -m pytest tests -q
+      - name: Syntax check generator package
+        run: |
+          .\.venv\Scripts\python -m py_compile generator\main.py generator\invite_claim.py generator\captcha_solver.py generator\proxy_pool.py generator\fingerprint.py generator\claim100.py

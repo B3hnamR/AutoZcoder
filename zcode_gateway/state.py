@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .config import Config
+from .notify import NotificationCenter
 from .pool import PoolManager
 from .ratelimit import RateLimiter
 from .registry import Registry
@@ -31,6 +32,8 @@ class AppState:
     catalog: Any = None          # model_catalog.ModelCatalog, wired in lifespan
     generator: Any = None        # generator.GeneratorManager, lazily created
     relay_manager: Any = None    # relay_manager.RelayManager, wired in app setup
+    # notification center: cross-thread event bus for the dashboard bell
+    notifications: NotificationCenter = field(default_factory=NotificationCenter)
     # Per-run internal token for loopback service-to-service calls (generator
     # children -> gateway admin). Random on every process start, exposed to
     # local children via env; the static legacy value only works from loopback.

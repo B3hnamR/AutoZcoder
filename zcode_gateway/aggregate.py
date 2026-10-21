@@ -30,10 +30,16 @@ def aggregate_openai_stream(text: str, model: str, fallback_id: str) -> dict:
             if delta.get("content"):
                 content_parts.append(delta["content"])
             # Reasoning models stream their thinking in a `reasoning` delta
-            # (captured 2026-09-19, zcode-free/kimi-k3). Collect it so
-            # non-streaming callers receive it instead of losing it.
+            # (captured 2026-09-19, zcode-free/kimi-k3) and/or the OpenAI
+            # `reasoning_content` delta. Collect BOTH so non-streaming
+            # callers receive it instead of losing it, and emit both keys
+            # so every dialect of consumer (OpenAI readers look for
+            # reasoning_content, OpenRouter-style readers look for
+            # reasoning) finds it.
             if delta.get("reasoning"):
                 reasoning_parts.append(delta["reasoning"])
+            elif delta.get("reasoning_content"):
+                reasoning_parts.append(delta["reasoning_content"])
             # Providers signal a policy refusal with a `refusal` delta, not
             # `content`. Dropping it leaves the caller with an empty answer and
             # only a `content_filter` code, so they invent their own message.
@@ -56,13 +62,21 @@ def aggregate_openai_stream(text: str, model: str, fallback_id: str) -> dict:
                 finish_reason = choice["finish_reason"]
 
     message: dict[str, Any] = {"role": "assistant",
-                               "content": "".join(content_parts) or None}
+                               # '' not None when only reasoning streamed:
+                               # None is only correct for tool-call-only
+                               # messages, and clients doing
+                               # msg["content"].strip() crash on it.
+                               "content": "".join(content_parts)}
     if reasoning_parts:
-        # OpenRouter-style additive field: clients that understand reasoning
-        # read it, everyone else ignores it
+        # OpenRouter-style additive field AND the OpenAI-style field: clients
+        # that understand either key read it, everyone else ignores it.
         message["reasoning"] = "".join(reasoning_parts)
+        message["reasoning_content"] = "".join(reasoning_parts)
     if tool_calls:
         message["tool_calls"] = [tool_calls[k] for k in sorted(tool_calls)]
+        if not content_parts:
+            # tool-call-only message: None is the OpenAI-correct value here
+            message["content"] = None
     if refusal:
         # OpenAI's message object has a `refusal` field for exactly this
         message["refusal"] = refusal

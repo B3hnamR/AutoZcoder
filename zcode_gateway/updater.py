@@ -218,6 +218,17 @@ def apply_update(new_exe: Path) -> None:
     new_exe = new_exe.resolve()
     if not new_exe.is_file():
         raise RuntimeError(f"downloaded update not found: {new_exe}")
+    # Re-verify at APPLY time: the hash was only checked at download time, so
+    # a partial/corrupted/tampered .new.exe left on disk since then would
+    # have been swapped in blindly.
+    own_hash = _sha256_file(current)
+    new_hash = _sha256_file(new_exe)
+    if own_hash.lower() == new_hash.lower():
+        raise RuntimeError("downloaded update is identical to the running exe; nothing to apply")
+    if new_exe.stat().st_size < 1_000_000:
+        raise RuntimeError("update file is implausibly small; refusing to apply")
+    # back up the current exe so a bad new exe can be rolled back manually
+    backup = current.with_suffix(".old.exe")
     pid = os.getpid()
     bat = Path(tempfile.gettempdir()) / "zcodegate_update.bat"
     bat.write_text(
@@ -228,14 +239,24 @@ def apply_update(new_exe: Path) -> None:
         "rem one extra beat for the bootloader parent to release the file\r\n"
         "timeout /t 2 /nobreak >nul\r\n"
         # paths travel via the environment: quoting survives spaces, and the
-        # environment is Unicode-safe where an ASCII .bat embedding is not
-        'move /y "%ZCODEGATE_SRC%" "%ZCODEGATE_TGT%" >nul\r\n'
-        'start "" "%ZCODEGATE_TGT%"\r\n'
+        # environment is Unicode-safe where an ASCII .bat embedding is not.
+        # Backup first, then swap; only relaunch when the swap actually took
+        # (the old code discarded move's result and started a dead-or-old exe).
+        'copy /y "%ZCODEGATE_TGT%" "%ZCODEGATE_BAK%" >nul\r\n'
+        'move /y "%ZCODEGATE_SRC%" "%ZCODEGATE_TGT%"\r\n'
+        "if errorlevel 1 (\r\n"
+        '  echo UPDATE SWAP FAILED - old exe kept, backup at %ZCODEGATE_BAK% >> "%ZCODEGATE_LOG%"\r\n'
+        '  start "" "%ZCODEGATE_TGT%"\r\n'
+        ") else (\r\n"
+        '  start "" "%ZCODEGATE_TGT%"\r\n'
+        ")\r\n"
         "del \"%~f0\"\r\n",
         encoding="ascii")
     env = dict(os.environ)
     env["ZCODEGATE_SRC"] = str(new_exe)
     env["ZCODEGATE_TGT"] = str(current)
+    env["ZCODEGATE_BAK"] = str(backup)
+    env["ZCODEGATE_LOG"] = str(exe_dir() / "update.log")
     subprocess.Popen(
         ["cmd", "/c", str(bat)],
         env=env,

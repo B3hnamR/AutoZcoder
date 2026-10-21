@@ -113,9 +113,16 @@ def fetch_image(url, referer='https://chat.z.ai/'):
         return None
 
 
+def _sub_dir(name: str) -> Path:
+    """Sorted v1.0.5 layout: debug images under screenshots/, logs under logs/."""
+    root = Path(os.environ.get('ZAI_OUTPUT_DIR') or 'output')
+    d = root / name
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 def save_debug_images(shadow_bytes, bg_bytes, prefix="captcha"):
-    output_dir = Path(os.environ.get('ZAI_OUTPUT_DIR') or 'output')
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = _sub_dir("screenshots")
 
     timestamp = int(time.time())
     shadow_path = output_dir / f"{prefix}_shadow_{timestamp}.png"
@@ -130,8 +137,7 @@ def save_debug_images(shadow_bytes, bg_bytes, prefix="captcha"):
 
 
 def take_screenshot(page, name="screenshot"):
-    screenshot_dir = Path(os.environ.get('ZAI_OUTPUT_DIR') or 'output')
-    screenshot_dir.mkdir(parents=True, exist_ok=True)
+    screenshot_dir = _sub_dir("screenshots")
 
     timestamp = int(time.time())
     path = screenshot_dir / f"{name}_{timestamp}.png"

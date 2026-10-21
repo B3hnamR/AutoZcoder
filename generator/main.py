@@ -1,5 +1,6 @@
 import logging, os
 import shutil
+import urllib.parse
 # silence PIL/pngjs chunk-stream debug spam
 logging.getLogger('PIL').setLevel(logging.WARNING)
 os.environ.setdefault('PYTHONWARNINGS', 'ignore')
@@ -33,10 +34,11 @@ console_handler = logging.StreamHandler(sys.stdout)
 console_handler.setLevel(logging.INFO)
 console_handler.setFormatter(logging.Formatter('[%(asctime)s] %(message)s', datefmt='%H:%M:%S'))
 
-# The gateway sets ZAI_OUTPUT_DIR per worker; CONFIG['log_file'] is a
-# repo-relative default that ignores it. Honor the env var so redirected
-# workers never hit FileNotFoundError from a nonexistent output/ dir.
-_log_file = os.environ.get('ZAI_LOG_FILE') or os.path.join(OUTPUT_DIR, 'output.txt')
+# The gateway sets ZAI_LOG_FILE per worker (a dedicated file under
+# <data>/logs/workers/); standalone runs keep the shared output.txt but under
+# the sorted logs/ folder.
+_log_file = (os.environ.get('ZAI_LOG_FILE')
+             or os.path.join(OUTPUT_DIR, 'logs', 'output.txt'))
 os.makedirs(os.path.dirname(_log_file) or '.', exist_ok=True)
 main_log_handler = logging.FileHandler(_log_file, encoding='utf-8')
 main_log_handler.setLevel(logging.DEBUG)
@@ -134,14 +136,22 @@ AVATAR_DATA_URI = ("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAA
                    "AAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
 
 # Per-process output suffix so parallel runs (ZAI_OUT_SUFFIX=1,2,3) don't clobber.
+# Sorted layout (v1.0.5): results/ (accounts+plans+starter), profiles/ (chromium),
+# screenshots/ (debug png), logs/ (worker solve logs) — all under OUTPUT_DIR.
 OUT_SUFFIX = os.environ.get('ZAI_OUT_SUFFIX', '')
-ACC_FILE = os.path.join(OUTPUT_DIR, f'accounts{OUT_SUFFIX}.txt')
-PLANS_FILE = os.path.join(OUTPUT_DIR, f'plans{OUT_SUFFIX}.jsonl')
-STARTER_FILE = os.path.join(OUTPUT_DIR, f'starter{OUT_SUFFIX}.txt')
+RESULTS_DIR = os.path.join(OUTPUT_DIR, 'results')
+PROFILES_DIR = os.path.join(OUTPUT_DIR, 'profiles')
+SHOTS_DIR = os.path.join(OUTPUT_DIR, 'screenshots')
+LOGS_DIR = os.path.join(OUTPUT_DIR, 'logs')
+for _d in (RESULTS_DIR, PROFILES_DIR, SHOTS_DIR, LOGS_DIR):
+    os.makedirs(_d, exist_ok=True)
+ACC_FILE = os.path.join(RESULTS_DIR, f'accounts{OUT_SUFFIX}.txt')
+PLANS_FILE = os.path.join(RESULTS_DIR, f'plans{OUT_SUFFIX}.jsonl')
+STARTER_FILE = os.path.join(RESULTS_DIR, f'starter{OUT_SUFFIX}.txt')
 
 # Dedicated chromium profile per process: lets us identify (and kill) browsers left
 # behind by a killed run without ever touching the user's own Chrome.
-PROFILE_DIR = os.path.join(OUTPUT_DIR, '.pw-profile' + OUT_SUFFIX)
+PROFILE_DIR = os.path.join(PROFILES_DIR, '.pw-profile' + OUT_SUFFIX)
 LAST_CAPTCHA_PARAM = None
 
 
@@ -495,7 +505,7 @@ def signup(email, password, mail=None):
                         f"{ident['hardware_concurrency']}c/{ident['device_memory']}G · "
                         f"cc={ident['country']} · tz={ident['timezone_id']} · locale={ident['locale']}")
 
-            account_profile = os.path.join(OUTPUT_DIR, '.pw-profile-' + re.sub(r'[^a-zA-Z0-9]', '_', email.split('@')[0])[:24])
+            account_profile = os.path.join(PROFILES_DIR, '.pw-profile-' + re.sub(r'[^a-zA-Z0-9]', '_', email.split('@')[0])[:24])
             try:
                 shutil.rmtree(account_profile, ignore_errors=True)
             except Exception:
@@ -659,6 +669,15 @@ def signup(email, password, mail=None):
                 manual = (CONFIG.get('manual_captcha') if _manual_env is None
                           else _manual_env)
 
+                # strategy: ai | classic | auto (manual handled above).
+                # Mirror into CONFIG so CaptchaSolver/DistanceCalculator see it.
+                _strategy = os.environ.get('ZAI_CAPTCHA_STRATEGY', '').lower()
+                if _strategy in ('ai', 'classic', 'auto'):
+                    CONFIG['captcha_strategy'] = _strategy
+                strategy = CONFIG.get('captcha_strategy', 'auto')
+                if not manual:
+                    logger.info(f"Captcha strategy: {strategy}")
+
                 if not slider_ok and not manual:
                     # The widget never rendered (page shows "Please complete the
                     # verification first"). In practice this is an IP/edge block: Aliyun
@@ -772,18 +791,57 @@ def signup(email, password, mail=None):
 
                 # --- Direct-API verify + finish --------------------------------------
                 verify_token = None
+                verify_link_bad = False
                 if signup_status in (200, 201) and mail:
                     logger.info("Waiting for the verification email...")
                     link = mail.get_verification_link(timeout=90)
                     if link:
                         logger.info(f"verify link: {link[:100]}...")
-                        m = re.search(r'token=(verify-[0-9a-fA-F]+)', link)
+                        # capture the FULL token value (any chars until & or
+                        # end) — the old hex-only regex silently TRUNCATED
+                        # tokens containing other characters, and the
+                        # truncated token 400'd at verify_email while the
+                        # account already existed on z.ai (unrecoverable: the
+                        # password was never written anywhere).
+                        m = re.search(r'[?&]token=([^&\s"\'<>]+)', link)
                         if m:
                             verify_token = m.group(1)
+                            if not re.fullmatch(r'verify-[0-9a-fA-F]+', verify_token):
+                                logger.warning(
+                                    f"verify token has an unexpected shape "
+                                    f"(len={len(verify_token)}) — trying it as-is")
+                        else:
+                            verify_link_bad = True
+                            logger.error(
+                                "verification link carries no token= parameter "
+                                "— link shape changed?")
                     else:
                         logger.warning("No verification email arrived")
                 elif signup_status not in (200, 201):
                     logger.warning(f"signup not OK (status={signup_status}) — skipping verify")
+
+                if signup_status in (200, 201) and not verify_token:
+                    # The account EXISTS on z.ai but we cannot finish it
+                    # (no mail / bad link). Retrying burns a fresh email AND
+                    # proxy while the created account is orphaned forever —
+                    # its password exists nowhere. Persist credentials for
+                    # manual recovery and make this a HARD failure.
+                    try:
+                        rec = Path(CONFIG.get('output_dir') or 'output') / 'recovery_accounts.txt'
+                        rec.parent.mkdir(parents=True, exist_ok=True)
+                        with open(rec, 'a', encoding='utf-8') as fh:
+                            fh.write(f"{email}:{password}:unverified"
+                                     f"{'|bad_link' if verify_link_bad else '|no_link'}\n")
+                        logger.error(
+                            f"account created but unverified — credentials "
+                            f"appended to {rec.name} for manual recovery; "
+                            f"NOT retrying (a retry cannot verify this account)")
+                    except OSError:
+                        logger.error("account created but unverified, and writing "
+                                     "the recovery file failed", exc_info=True)
+                    browser.close()
+                    _rm_profile(account_profile)
+                    return 'SIGNUP_UNVERIFIED'
 
                 finish_token = None
                 if verify_token:
@@ -867,7 +925,7 @@ class CatchAllMail:
     def __init__(self, domain=None, logger_instance=None):
         self.logger = logger_instance or logging.getLogger(__name__)
         self.domain = (os.environ.get('ZAI_MAIL_DOMAIN') or domain
-                       or CONFIG.get('mail_domain', 'behnamrjd.me'))
+                       or CONFIG.get('mail_domain', ''))
         self.user = os.environ.get('ZAI_GMAIL_USER')
         self.app_pw = os.environ.get('ZAI_GMAIL_APP_PW')
         self.inbox_url = os.environ.get('ZAI_INBOX_URL') or CONFIG.get('mail_inbox_url')
@@ -896,6 +954,13 @@ class CatchAllMail:
         return random.choice(domains) if domains else self.domain
 
     def create_account(self) -> bool:
+        if not self.domain:
+            self.logger.error(
+                "No mail domain configured — add your own domain in the "
+                "dashboard's Email tab (or set ZAI_MAIL_DOMAIN). Refusing "
+                "to sign up: without a domain you own, the verification "
+                "mail goes nowhere and the account is burned.")
+            return False
         local = 'zai' + ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
         self.email = f"{local}@{self._pick_domain()}"
         self.password = ''.join(random.choices(
@@ -953,13 +1018,20 @@ class CatchAllMail:
             _verify = certifi.where()  # never MITM-able: this request carries inbox_secret
         except Exception:
             _verify = True
-        url = self.inbox_url + ('&' if '?' in self.inbox_url else '?') + 'to=' + self.email
+        url = self.inbox_url + ('&' if '?' in self.inbox_url else '?') + 'to=' + urllib.parse.quote(self.email, safe='')
         if self.inbox_secret:
-            url += '&k=' + self.inbox_secret
+            url += '&k=' + urllib.parse.quote(self.inbox_secret, safe='')
         ua = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
               '(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36')
         try:
             r = requests.get(url, timeout=15, verify=_verify, headers={'User-Agent': ua})
+            if r.status_code != 200:
+                # 401 = wrong secret, 503 = INBOX_SECRET not set on the worker,
+                # 404 = wrong URL — polling longer will never fix any of these,
+                # and silence made every signup spin the full 90 s timeout.
+                self.logger.error(
+                    f"inbox poll got HTTP {r.status_code}: {str(r.text)[:120]}")
+                return None
             j = r.json()
         except Exception as e:
             self.logger.debug(f"inbox poll error: {e}")
@@ -996,7 +1068,7 @@ class CatchAllMail:
 def main():
     global IS_HEADLESS
     print("\n" + "="*50)
-    print(f"Z.ai Auto Signup ({CONFIG.get('mail_domain', 'behnamrjd.me')} catch-all)")
+    print(f"Z.ai Auto Signup ({CONFIG.get('mail_domain') or 'no mail domain set'} catch-all)")
     print("="*50)
 
     kill_stale_browsers()   # clear windows orphaned by a previously killed run
@@ -1051,6 +1123,7 @@ def main():
     verification_needed = 0
     starter_count = 0
     skipped = 0
+    unverified = 0
 
     # Retry count + routing mode resolved ONCE, before the loop — the panel
     # sends ZAI_PROXY_RETRIES and it must govern the retry loop below.
@@ -1094,6 +1167,8 @@ def main():
         result = None
         for pr in range(max_proxy_retries + 1):
             result = signup(email, password, mail)
+            # SIGNUP_UNVERIFIED is a HARD failure (account exists, cannot be
+            # completed) — never retry it with a fresh email/proxy
             retryable = (result is None) or (result == 'CAPTCHA_NOT_LOADED')
             if not retryable or pr >= max_proxy_retries:
                 break
@@ -1116,9 +1191,18 @@ def main():
         if result == 'CAPTCHA_NOT_LOADED':
             skipped += 1
             logger.warning(f"Account {i+1} SKIPPED — captcha widget never loaded "
-                           f"(IP-blocked). Change IP and retry.")
+                            f"(IP-blocked). Change IP and retry.")
             if i < count - 1:
                 time.sleep(2)
+            continue
+
+        if result == 'SIGNUP_UNVERIFIED':
+            # hard failure: the account exists but could not be verified —
+            # credentials were already appended to recovery_accounts.txt
+            # inside signup(); do NOT burn another email+proxy on it
+            unverified += 1
+            logger.error(f"Account {i+1} created but UNVERIFIED — see "
+                         f"recovery_accounts.txt (no retry possible)")
             continue
 
         if result:
@@ -1180,10 +1264,12 @@ def main():
                             # claim from the SAME exit IP as signup — the whole
                             # 100M flow is risk-scored, and a direct-IP claim
                             # after a proxy signup reads as unusual activity.
+                            # No captcha_param reuse: the signup's certifyId is
+                            # single-use (F008) and would read as a bad token —
+                            # the claim mints its own params in-page.
                             inv = claim_invite(token, invite_code, log=logger.info,
                                                zjwt=zjwt, headless=IS_HEADLESS,
-                                               force_direct=False,
-                                               captcha_param=LAST_CAPTCHA_PARAM)
+                                               force_direct=False)
                             s = inv.get('summary') or {}
                             global_build = bool(s.get('issued')) or bool(
                                 s.get('current') and s.get('target') and s['current'] >= s['target']

@@ -155,8 +155,18 @@ def test_no_cors_headers_for_foreign_origins(tmp_path):
 
 def test_dash_does_not_inject_the_admin_key_for_a_foreign_host(tmp_path):
     app = create_app(_cfg(tmp_path))
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000)) as client:
         r = client.get("/dash", headers={"Host": "evil.example:8788"})
+    assert r.status_code == 200
+    assert "adm-test" not in r.text
+
+
+def test_dash_does_not_inject_the_admin_key_for_a_non_loopback_peer(tmp_path):
+    """A loopback Host from a NON-loopback TCP peer (local forwarder, ssh -R)
+    must not receive the admin key either."""
+    app = create_app(_cfg(tmp_path))
+    with TestClient(app, client=("10.0.0.5", 50000)) as client:
+        r = client.get("/dash", headers={"Host": "127.0.0.1:8788"})
     assert r.status_code == 200
     assert "adm-test" not in r.text
 
@@ -165,7 +175,7 @@ def test_dash_does_not_inject_the_admin_key_for_a_foreign_host(tmp_path):
                                   "[::1]:8788"])
 def test_dash_injects_the_admin_key_for_loopback_hosts(tmp_path, host):
     app = create_app(_cfg(tmp_path))
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000)) as client:
         r = client.get("/dash", headers={"Host": host})
     assert r.status_code == 200
     assert '"adm-test"' in r.text        # injected into the sessionStorage fallback

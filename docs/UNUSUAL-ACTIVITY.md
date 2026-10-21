@@ -28,8 +28,8 @@ Each imported account was probed once per model with a minimal reasoning body:
 | --- | --- | --- |
 | dahlia.balistreri.4745@bluenode.cc | 405 / 3012 | 200 |
 | essential.bat.oxli@hidingpost.com | 405 / 3012 | 200 |
-| zai4p0iupp70z@behnamrjd.me | 405 / 3012 | 502 / 1005 (quota) |
-| zai9y9838zs8h@behnamrjd.me | 405 / 3012 | 502 / 1005 (quota) |
+| zai4p0iupp70z@<redacted-owner-domain> | 405 / 3012 | 502 / 1005 (quota) |
+| zai9y9838zs8h@<redacted-owner-domain> | 405 / 3012 | 502 / 1005 (quota) |
 
 GLM-5.3 request-shape variants (effort low/high, with/without a caller system
 message, 64–4096 max_tokens) all returned 405/3012 on a healthy account, so the

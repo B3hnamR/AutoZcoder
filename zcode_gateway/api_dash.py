@@ -51,8 +51,11 @@ _EDITABLE = {
     "accounts.source": str, "accounts.dir": str, "accounts.pool_file": str,
     "logging.level": str, "logging.capture": bool,
     "models.default": str, "models.default_anthropic": str,
-    "models.probe_unknown": bool,
     "models.auto_free_fallback.enabled": bool,
+    "models.default_effort": str,
+    "models.pacing.enabled": bool,
+    "models.pacing.min_gap_ms": int,
+    "models.pacing.max_gap_ms": int,
     "update.enabled": bool, "update.interval_hours": float,
 }
 
@@ -92,6 +95,17 @@ def _request_is_loopback(request: Request) -> bool:
     return (request.url.hostname or "").strip().lower() in _LOOPBACK_HOSTS
 
 
+def _peer_is_loopback(request: Request) -> bool:
+    """The TCP peer must ALSO be loopback before the admin key is injected.
+
+    Host-header checks alone are spoofable by a local forwarder that preserves
+    the Host (e.g. `ssh -R 8788:127.0.0.1:8788`): the remote user's request
+    arrives with Host: 127.0.0.1 from a non-loopback peer.
+    """
+    peer = request.client.host if request.client else ""
+    return peer in _LOOPBACK_HOSTS
+
+
 @router.get("/dash", response_class=HTMLResponse)
 def dashboard(request: Request) -> HTMLResponse:
     index = DASH_DIR / "index.html"
@@ -106,7 +120,8 @@ def dashboard(request: Request) -> HTMLResponse:
     try:
         cfg = get_state(request).cfg
         if ((cfg.server.host or "").strip() in _LOOPBACK_HOSTS
-                and _request_is_loopback(request)):
+                and _request_is_loopback(request)
+                and _peer_is_loopback(request)):
             marker = 'sessionStorage.getItem("gw-admin-key") || ""'
             injected = ('sessionStorage.getItem("gw-admin-key") || '
                         + json.dumps(cfg.server.admin_key))
@@ -169,6 +184,16 @@ async def dash_settings_put(request: Request, body: dict = Body(...),
                             detail=f"not editable: {', '.join(unknown)}")
 
     raw = _read_config_raw(cfg_path)
+    if not raw:
+        # An empty parse means unreadable/corrupt/missing — writing `raw`
+        # back would replace the user's whole config.yaml with only the
+        # edited key (next boot: default admin key, "accounts disappear").
+        # Refuse and tell the user to fix the file first.
+        raise HTTPException(
+            status_code=409,
+            detail="config.yaml is missing or unparsable — fix or restore it "
+                   "before saving settings (saving now would wipe every "
+                   "other key)")
     changed: list[str] = []
     for dotted, val in values.items():
         cast = _EDITABLE[dotted]
@@ -186,6 +211,9 @@ async def dash_settings_put(request: Request, body: dict = Body(...),
         if cast is int and val < 0:
             raise HTTPException(status_code=400,
                                 detail=f"{dotted}: must be >= 0")
+        if dotted == "models.default_effort" and val not in ("low", "high", "max"):
+            raise HTTPException(status_code=400,
+                                detail="models.default_effort must be low, high, or max")
         if dotted == "pool.max_in_flight_per_account" and val < 1:
             raise HTTPException(status_code=400,
                                 detail="pool.max_in_flight_per_account must be >= 1")
@@ -438,13 +466,142 @@ async def update_apply(request: Request, key: str = Depends(admin_key)) -> dict:
 
 @router.get("/admin/dash/logs")
 async def dash_logs(request: Request, limit: int = 300, level: str = "",
-                    key: str = Depends(admin_key)) -> dict:
-    """Recent log lines from the in-process ring buffer."""
+                    q: str = "", key: str = Depends(admin_key)) -> dict:
+    """Recent log lines from the in-process ring buffer.
+
+    `q` (optional) case-insensitively filters logger+message — the live log
+    viewer's search box."""
     state = get_state(request)
     buf: LogBuffer | None = getattr(state, "log_buffer", None)
     if buf is None:
         return {"records": [], "note": "log buffer not attached"}
-    return {"records": buf.tail(limit=max(1, min(limit, 1000)), level=level)}
+    records = buf.tail(limit=max(1, min(limit, 1000)), level=level)
+    if q:
+        needle = q.lower()
+        records = [r for r in records
+                   if needle in r.get("message", "").lower()
+                   or needle in r.get("logger", "").lower()]
+    return {"records": records}
+
+
+@router.get("/admin/dash/analytics")
+async def dash_analytics(request: Request, hours: int = 24,
+                         key: str = Depends(admin_key)) -> dict:
+    """Pro analytics: hourly series, latency percentiles, error breakdown,
+    per-key usage, account burn-down. All from the existing sqlite ledger."""
+    state = get_state(request)
+    hours = max(1, min(hours, 168))
+    window = hours * 3600
+    series = await asyncio.to_thread(state.store.hourly_series, hours)
+    lat = await asyncio.to_thread(state.store.latency_percentiles, window)
+    errors = await asyncio.to_thread(state.store.error_breakdown, window)
+    keys = await asyncio.to_thread(state.store.by_client_key, window)
+    summary = await asyncio.to_thread(state.store.summary, window)
+    # account burn-down: usage per account in-window joined with pool state
+    snapshot = await state.pool.snapshot()
+    by_acct = {a["id"]: a for a in (snapshot.get("detail") or [])}
+    for k in keys:
+        pass  # keys are client keys, not accounts — kept separate on purpose
+    burn = []
+    for row in summary.get("by_account", []):
+        aid = row.get("account_id") or "?"
+        pub = by_acct.get(aid) or {}
+        burn.append({
+            "account_id": aid,
+            "email": pub.get("email", ""),
+            "state": pub.get("state", ""),
+            "requests": row.get("requests", 0),
+            "tokens": row.get("tokens", 0),
+            "expires_in_s": pub.get("expires_in_s"),
+        })
+    return {"hours": hours, "series": series, "latency": lat,
+            "errors": errors, "by_key": keys, "summary": summary,
+            "accounts": burn}
+
+
+# --------------------------------------------------------------------------- #
+# notifications
+# --------------------------------------------------------------------------- #
+
+@router.get("/admin/dash/notifications")
+async def dash_notifications(request: Request, since: int = 0,
+                             key: str = Depends(admin_key)) -> dict:
+    """Events for the bell + panel. `since` enables incremental polling."""
+    state = get_state(request)
+    return {"events": state.notifications.list(since_id=since),
+            "state": state.notifications.unread_state()}
+
+
+@router.post("/admin/dash/notifications/clear")
+async def dash_notifications_clear(request: Request,
+                                   key: str = Depends(admin_key)) -> dict:
+    get_state(request).notifications.clear()
+    return {"ok": True}
+
+
+# --------------------------------------------------------------------------- #
+# proxy health
+# --------------------------------------------------------------------------- #
+
+@router.get("/admin/dash/proxies/health")
+async def dash_proxy_health(request: Request, key: str = Depends(admin_key)) -> dict:
+    """Health view of the proxy pool ledger (pool.json): per-proxy stats with
+    country breakdown, plus summary KPIs. Read-only; the proxy checker itself
+    stays on its existing endpoints."""
+    state = get_state(request)
+    mgr = getattr(state, "generator", None)
+    data_dir = None
+    if mgr is not None:
+        data_dir = getattr(mgr, "data_dir", None)
+    if data_dir is None:
+        # fall back to the same default the manager itself uses
+        from pathlib import Path as _P
+        data_dir = _P(state.cfg.accounts.dir).resolve().parent / "generator-data" \
+            if state.cfg.accounts.dir else _P("./generator-data")
+    pool_file = data_dir / "pool.json"
+    proxies: list[dict] = []
+    countries: dict[str, int] = {}
+    kpis = {"total": 0, "healthy": 0, "unverified": 0, "bad": 0,
+            "socks": 0, "http": 0}
+    try:
+        raw = json.loads(pool_file.read_text(encoding="utf-8"))
+        entries = raw if isinstance(raw, dict) else {}
+        for url, e in entries.items():
+            if not isinstance(e, dict):
+                continue
+            cc = str(e.get("country") or e.get("cc") or "??").upper()
+            ok = bool(e.get("ok") or e.get("healthy"))
+            bad = bool(e.get("bad") or e.get("dead"))
+            scheme = url.split("://")[0].lower() if "://" in url else "http"
+            kpis["total"] += 1
+            kpis["socks" if scheme.startswith("socks") else "http"] += 1
+            if ok:
+                kpis["healthy"] += 1
+            elif bad:
+                kpis["bad"] += 1
+            else:
+                kpis["unverified"] += 1
+            countries[cc] = countries.get(cc, 0) + 1
+            proxies.append({
+                "url": url, "country": cc, "ok": ok, "bad": bad,
+                "latency": e.get("latency") or e.get("last_latency"),
+                "checked_at": e.get("checked_at") or e.get("last_check"),
+                "used": e.get("used_count") or e.get("used"),
+            })
+    except FileNotFoundError:
+        return {"available": False, "note": "no proxy pool yet — run the proxy "
+                "checker or import proxies first", "proxies": [], "countries": {},
+                "kpis": kpis, "pool_file": str(pool_file)}
+    except (ValueError, OSError):
+        return {"available": False, "note": "proxy pool file unreadable "
+                "(corrupt?) — the checker's next save rebuilds it from .bak",
+                "proxies": [], "countries": {}, "kpis": kpis,
+                "pool_file": str(pool_file)}
+    proxies.sort(key=lambda p: (not p["ok"], p["country"], p["url"]))
+    return {"available": True, "kpis": kpis,
+            "countries": dict(sorted(countries.items(), key=lambda kv: -kv[1])),
+            "proxies": proxies[:500], "total_in_file": len(proxies),
+            "pool_file": str(pool_file)}
 
 
 @router.get("/admin/dash/server")
@@ -682,11 +839,24 @@ def _generator(request: Request):
                                python_exe=getattr(gc, "python_exe", ""),
                                data_dir=data_dir)
         mgr.internal_token = state.internal_token
+        # AI-captcha fallback: children hit the gateway's own /v1 endpoint
+        # AND the pool-health guard counts the gateway's real account dir
+        try:
+            mgr._gateway_port = state.cfg.server.port
+            mgr.accounts_dir = str(Path(state.cfg.accounts.dir))
+            ck = (state.cfg.server.client_keys or [None])[0]
+            mgr._client_key_for_children = ck.key if ck else state.cfg.server.admin_key
+        except Exception:
+            log.warning("could not wire gateway-key for AI captcha", exc_info=True)
         # defaults come from config.yaml; '' invite_code would mean "off", but
         # the shipped default is the project's referral code (claim stays on)
         mgr.claim = bool(gc.claim)
         mgr._invite_code = gc.invite_code
-        if gc.captcha in ("auto", "manual"):
+        if gc.captcha in ("auto", "manual", "ai", "classic") and not mgr._has_saved_options:
+            # First run only (no generator_options.json yet): seed from
+            # config.yaml. On later runs the dashboard's SAVED choice wins —
+            # overriding every start reset the user's "ai" back to config's
+            # "manual" while captcha_strategy stayed "ai" (inconsistent pair).
             mgr.captcha = gc.captcha
         mgr.headless = bool(gc.headless) and mgr.captcha != "manual"
         mgr.set_options(ip_source="direct",
@@ -834,26 +1004,41 @@ async def generator_start(request: Request, body: dict = Body(default={}),
     return await asyncio.to_thread(mgr.start_workers_checked, count, _emit)
 
 
+def _env_setup_shared(request: Request):
+    """EnvSetup without requiring the generator checkout: the setup modal's
+    whole job is to INSTALL python/deps/chromium, so it must work before the
+    generator folder has even been located. Shares the instance with the
+    GeneratorManager when one exists so install state is not duplicated."""
+    state = get_state(request)
+    mgr = getattr(state, "generator", None)
+    if mgr is not None and getattr(mgr, "env_setup", None) is not None:
+        return mgr.env_setup
+    cached = getattr(state, "_env_setup", None)
+    if cached is None:
+        from .generator import EnvSetup
+        cached = EnvSetup()
+        state._env_setup = cached
+    return cached
+
+
 @router.get("/admin/dash/setup/check")
 async def setup_check(request: Request, key: str = Depends(admin_key)) -> dict:
     """Full environment check for the setup modal (python/deps/chromium)."""
-    mgr = _generator(request)
-    return await asyncio.to_thread(mgr.env_setup.check)
+    return await asyncio.to_thread(_env_setup_shared(request).check)
 
 
 @router.post("/admin/dash/setup/install")
 async def setup_install(request: Request, key: str = Depends(admin_key)) -> dict:
     """Kick off (or retry) the background environment installer."""
-    mgr = _generator(request)
-    started = mgr.env_setup.start_install()
-    return {"started": started, "status": mgr.env_setup.status()}
+    es = _env_setup_shared(request)
+    started = es.start_install()
+    return {"started": started, "status": es.status()}
 
 
 @router.get("/admin/dash/setup/status")
 async def setup_status(request: Request, key: str = Depends(admin_key)) -> dict:
     """Polled by the setup modal while installing: log lines + state."""
-    mgr = _generator(request)
-    return mgr.env_setup.status()
+    return _env_setup_shared(request).status()
 
 
 @router.post("/admin/dash/generator/stop")

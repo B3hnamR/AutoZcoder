@@ -122,17 +122,22 @@ async def delete_account(request: Request, account_id: str,
 @router.post("/accounts/purge_drained")
 async def purge_drained_accounts(request: Request,
                                  key: str = Depends(admin_key)) -> dict:
-    """Remove every account with zero tokens remaining on ALL models.
+    """Remove drained AND dead accounts.
 
+    Drained: quota data exists AND every bucket is empty with no pending
+    reset. Dead: state is DEAD (plan lost / credential invalid / auth
+    strikes) — the user clicking purge after seeing red accounts expects
+    them GONE, files included; keeping them as "unknown" (empty quotas)
+    left plan-lost zombies un-purgeable.
     Takes them out of rotation, deletes their snapshot file from the
-    accounts/ folder, and drops token locks. Accounts whose quotas were never
-    fetched (no data) are left alone — only proven-drained ones go."""
+    accounts/ folder, and drops token locks."""
     state = get_state(request)
     from .pool import AccountState
     import time as _time
     purged, kept_unknown = [], 0
     for account in list(state.pool._accounts.values()):
         quotas = (account.notes or {}).get("quotas") or {}
+        is_dead = account.state is AccountState.DEAD
         # proven-drained: quota data exists AND every bucket is empty
         drained = bool(quotas) and all(
             (q.get("remaining", 0) or 0) <= 0 for q in quotas.values())
@@ -140,11 +145,11 @@ async def purge_drained_accounts(request: Request,
         recovers = any(
             (q.get("resets_at", 0) or 0) > _time.time()
             for q in quotas.values())
-        if not drained:
+        if not is_dead and not drained:
             if not quotas:
                 kept_unknown += 1
             continue
-        if recovers:
+        if not is_dead and recovers:
             continue          # daily quota: it will refill — keep the account
         # 1) drop from the running pool
         await state.pool.remove(account.id)

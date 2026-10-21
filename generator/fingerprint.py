@@ -79,23 +79,51 @@ DEFAULT_LOCALE_TZ = ('en-US', ['America/New_York', 'America/Chicago', 'America/L
 _COUNTRY_CACHE = {}
 
 
+def _proxy_host(proxy_url: str) -> str:
+    """host:port out of any scheme://[user:pass@]host:port URL."""
+    try:
+        from urllib.parse import urlparse
+        return urlparse(proxy_url or "").hostname or ""
+    except ValueError:
+        return ""
+
+
 def exit_ip_country(proxy_url=None, timeout=6):
-    """2-letter country of the exit IP (through the proxy when given)."""
+    """2-letter country of the exit IP (through the proxy when given).
+
+    Order: live ip-api lookup when the proxy scheme allows it (http/https),
+    then the OFFLINE geo DB (proxy_geo) by the proxy's host IP. The offline
+    path is what makes SOCKS work at all: a socks5:// URL fed to urllib's
+    HTTP ProxyHandler is a plain HTTP request to the SOCKS port — it always
+    failed and every SOCKS-sourced account fell back to US/New_York, exactly
+    the mismatch fraud systems look for. The pool already resolves proxy
+    countries offline; reuse it."""
     key = proxy_url or '__direct__'
     if key in _COUNTRY_CACHE:
         return _COUNTRY_CACHE[key]
     cc = None
-    try:
-        proxies = ({'http': proxy_url, 'https': proxy_url}
-                   if proxy_url and proxy_url != '0' else None)
-        req = urllib.request.Request(
-            'http://ip-api.com/json/?fields=countryCode', headers={'User-Agent': 'Mozilla/5.0'})
-        opener = urllib.request.build_opener(
-            urllib.request.ProxyHandler(proxies) if proxies else urllib.request.ProxyHandler({}))
-        with opener.open(req, timeout=timeout) as resp:
-            cc = (json.loads(resp.read().decode()).get('countryCode') or None)
-    except Exception:
-        cc = None
+    socks = bool(proxy_url) and proxy_url != '0' and \
+        str(proxy_url).lower().startswith(('socks4://', 'socks5://', 'socks://'))
+    if not socks:
+        try:
+            proxies = ({'http': proxy_url, 'https': proxy_url}
+                       if proxy_url and proxy_url != '0' else None)
+            req = urllib.request.Request(
+                'http://ip-api.com/json/?fields=countryCode', headers={'User-Agent': 'Mozilla/5.0'})
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler(proxies) if proxies else urllib.request.ProxyHandler({}))
+            with opener.open(req, timeout=timeout) as resp:
+                cc = (json.loads(resp.read().decode()).get('countryCode') or None)
+        except Exception:
+            cc = None
+    if cc is None and proxy_url and proxy_url != '0':
+        host = _proxy_host(str(proxy_url))
+        if host:
+            try:
+                import proxy_geo
+                cc = proxy_geo.country(host) or None
+            except Exception:
+                cc = None
     _COUNTRY_CACHE[key] = cc
     return cc
 

@@ -51,7 +51,9 @@ async def lifespan(app: FastAPI):
         aliases=cfg.models.aliases,
         default=cfg.models.default,
         default_anthropic=cfg.models.default_anthropic,
-        probe_unknown=cfg.models.probe_unknown,
+        # probe_unknown intentionally not forwarded: probing unknown ids
+        # against a plan-gated upstream burns quota for no benefit; the
+        # registry no longer implements it and the config field is inert.
     )
     catalog = ModelCatalog(cfg.upstream.base_url, registry)
 
@@ -81,7 +83,8 @@ async def lifespan(app: FastAPI):
     except Exception:
         log.warning("model-cap persistence unavailable", exc_info=True)
     tokens = TokenManager(cfg, pool)
-    client = UpstreamClient(cfg.upstream, relay_manager=relay_manager)
+    client = UpstreamClient(cfg.upstream, relay_manager=relay_manager,
+                            pacing=cfg.models.pacing)
     service = ChatService(cfg, pool, tokens, client, registry, store, capture)
 
     # feed the dashboard's log view: one ring-buffer handler on the package log
@@ -97,6 +100,9 @@ async def lifespan(app: FastAPI):
         relay_manager=relay_manager,
     )
     app.state.app_state.log_buffer = log_buffer
+    # pool + relay events (drained, DEAD, expiring, cooled) feed the bell
+    pool.attach_notifications(app.state.app_state.notifications)
+    relay_manager._notify = app.state.app_state.notifications
 
     # release feed: one GitHub call on startup, then every interval; the
     # dashboard polls this cache, never GitHub directly

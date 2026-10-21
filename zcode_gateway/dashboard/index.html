@@ -53,6 +53,11 @@ a:hover{text-decoration:underline}
 #top h1{font:600 15px "Segoe UI Semibold","Segoe UI",sans-serif; margin-right:auto}
 .chip{display:inline-flex; align-items:center; gap:7px; background:var(--card);
   border:1px solid var(--border); border-radius:999px; padding:5px 12px; font-size:12px; color:var(--muted)}
+#notify-panel{position:fixed; inset:0; background:rgba(5,7,10,.72); display:none;
+  z-index:220; overflow-y:auto}
+#notify-panel .card{max-width:640px; width:min(640px, calc(100vw - 32px));
+  margin:9vh auto 24px; box-shadow:0 18px 48px rgba(0,0,0,.5);
+  border:1px solid var(--border); background:var(--panel)}
 .dot{width:7px; height:7px; border-radius:50%; background:var(--muted); flex:none}
 .dot.ok{background:var(--ok); box-shadow:0 0 0 3px rgba(61,220,132,.15)}
 .dot.warn{background:var(--warn); box-shadow:0 0 0 3px rgba(255,200,87,.14)}
@@ -161,6 +166,7 @@ summary:hover{color:var(--fg)}
   #side .foot{border-top:0; padding:0 10px; margin-left:auto}
   #top{flex-wrap:wrap; padding:10px 14px}
   #view{padding:14px 14px 40px; overflow:visible}
+  #notify-panel .card{margin-top:6vh}
   .grid2{grid-template-columns:1fr}
   .dense-grid{grid-template-columns:1fr}
   .dense .field{grid-template-columns:1fr}
@@ -304,6 +310,7 @@ input[type=number]{min-width:0}
   <button class="nav-btn" data-tab="settings" onclick="App.tab('settings')"><span class="ico">⚙</span>Settings</button>
   <button class="nav-btn" data-tab="stats" onclick="App.tab('stats')"><span class="ico">∑</span>Stats</button>
   <button class="nav-btn" data-tab="usage" onclick="App.tab('usage')"><span class="ico">▤</span>Usage</button>
+  <button class="nav-btn" data-tab="analytics" onclick="App.tab('analytics')"><span class="ico">▲</span>Analytics</button>
   <button class="nav-btn" data-tab="logs" onclick="App.tab('logs')"><span class="ico">≡</span>Logs</button>
   <button class="nav-btn" data-tab="guide" onclick="App.tab('guide')"><span class="ico">?</span>Guide</button>
   <div class="spacer"></div>
@@ -316,6 +323,12 @@ input[type=number]{min-width:0}
     <span class="chip"><span class="dot off" id="dot-server"></span><span id="chip-server">gateway</span></span>
     <span class="chip"><span class="dot off" id="dot-zcode"></span><span id="chip-zcode">Zcode: …</span></span>
     <span class="chip" id="chip-ready"></span>
+    <button class="btn btn-quiet btn-sm" id="btn-notify" title="notifications"
+      style="display:none; position:relative" onclick="App.toggleNotify()">
+      🔔
+      <span id="notify-dot" style="position:absolute; top:2px; right:2px; width:8px; height:8px;
+        border-radius:50%; background:var(--err,#e5484d); box-shadow:0 0 6px var(--err,#e5484d); display:none"></span>
+    </button>
     <button class="btn btn-quiet btn-sm" id="btn-update" title="updates"
       style="display:none; position:relative" onclick="App.showUpdate()">🔔
       <span id="update-dot" style="position:absolute; top:2px; right:2px; width:8px; height:8px;
@@ -339,6 +352,9 @@ input[type=number]{min-width:0}
     </div>
   </div>
 </div>
+
+<!-- notifications modal (same overlay pattern as confirm-modal) -->
+<div id="notify-panel" onclick="if(event.target===this)App.toggleNotify()"></div>
 
 <!-- first-run environment setup modal (python + packages + chromium) -->
 <div id="setup-modal">
@@ -667,7 +683,8 @@ const App = (() => {
     const skipped = localStorage.getItem("gw-skip-version") || "";
     const show = updStatus && updStatus.update_available
       && updStatus.latest !== skipped;
-    $("#btn-update").style.display = show ? "" : "none";
+    // explicit value ("" would fall back to the inline display:none attr)
+    $("#btn-update").style.display = show ? "inline-flex" : "none";
   }
   function showUpdate(){
     if (!updStatus || !updStatus.update_available) return;
@@ -1024,9 +1041,12 @@ const App = (() => {
     }
     if (!e.target.closest(".dd-menu")) closeDropdowns();
   });
-  document.addEventListener("keydown", e => {
-    if (e.key === "Escape") closeDropdowns();
-  });
+   document.addEventListener("keydown", e => {
+     if (e.key === "Escape") {
+       if (notifyOpen) { toggleNotify(); return; }
+       closeDropdowns();
+     }
+   });
 
   /* ------------ tab: models ------------ */
   const STATUS_RANK = {available:0, cooling:1, partial:1, capped:2,
@@ -1213,8 +1233,11 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
     ${grp("Models", [
       ["models.default","text","Default model",""],
       ["models.default_anthropic","text","Default Anthropic",""],
-      ["models.probe_unknown","bool","Probe unknown","learn body variant on first 400"],
-      ["models.auto_free_fallback.enabled","bool","Fallback to another model","off by default; when on, a blocked/capped model is served by the next in models.auto_free_fallback.chain (set the chain in the desktop Settings or config.yaml)"]])}
+      ["models.default_effort","text","Default reasoning effort","used when the client doesn't specify: low | high | max"],
+      ["models.auto_free_fallback.enabled","bool","Fallback to another model","off by default; when on, a blocked/capped model is served by the next in models.auto_free_fallback.chain (set the chain in the desktop Settings or config.yaml)"],
+      ["models.pacing.enabled","bool","Pacing gate","randomized gap between upstream sends — prevents CDN/WAF IP blocks"],
+      ["models.pacing.min_gap_ms","int","Pacing min gap (ms)","with max gap, defines the randomized window"],
+      ["models.pacing.max_gap_ms","int","Pacing max gap (ms)",""]])}
     ${grp("Logging", [
       ["logging.level","text","Level","INFO · DEBUG · WARNING"],
       ["logging.capture","bool","Capture exchanges","JSONL of every upstream call"]])}
@@ -1297,10 +1320,12 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
 
   /* ------------ tab: logs ------------ */
   let logsCleared = false;
+  let logSearch = "";
   async function renderLogs(v){
     v = v || $("#view");
     const level = document.getElementById("log-level")?.value || "";
-    const data = await api("/admin/dash/logs?limit=400" + (level ? "&level="+level : ""));
+    const data = await api("/admin/dash/logs?limit=400" + (level ? "&level="+level : "")
+                           + (logSearch ? "&q="+encodeURIComponent(logSearch) : ""));
     if (curTab !== "logs") return;
     let html = `<div class="toolbar">
       <select id="log-level" class="sel" style="max-width:130px" onchange="App.renderLogs()"
@@ -1308,6 +1333,8 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
         ${["","INFO","WARNING","ERROR"].map(l =>
           `<option value="${l}" ${l===level?"selected":""}>${l||"all levels"}</option>`).join("")}
       </select>
+      <input type="text" id="log-q" class="inp" style="max-width:220px" placeholder="search logs…"
+        value="${esc(logSearch)}" oninput="App.logSearchDebounce(this.value)" aria-label="Search logs">
       <div class="grow"></div>
       <button class="btn btn-ghost btn-sm" onclick="App.clearLogs()">Clear</button>
     </div>
@@ -1371,7 +1398,35 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
 
   function genCaptchaChanged(){
     genCaptchaGuard();
+    genStrategyVisibility();
+    genAiHint();
     genAutoSave();
+  }
+  function genStrategyVisibility(){
+    /* the mode select doubles as the strategy picker: auto/ai/classic pick the
+       strategy directly; only "manual" is separate. Keep the second select
+       hidden — it exists for saved-state compat — and show the AI card only
+       when an AI-including mode is active. */
+    const cap = ($("#gen-captcha") || {}).value;
+    const st = $("#gen-strategy");
+    if (st) st.value = (cap === "manual") ? "auto" : cap;
+    const aiCard = $("#gen-ai-card");
+    if (aiCard) aiCard.style.display = (cap === "manual" || cap === "classic") ? "none" : "";
+    genAiHint();
+  }
+  function genAiHint(){
+    const hint = $("#gen-ai-hint");
+    if (!hint) return;
+    const cap = ($("#gen-captcha") || {}).value;
+    const url = (($("#gen-ai-url") || {}).value || "").trim();
+    if (cap === "manual" || cap === "classic") { hint.textContent = ""; return; }
+    if (!url) {
+      hint.innerHTML = "using <b>this gateway's own GLM-5.3-Flash</b> — needs at least one working account in the pool (the AI judge spends its tokens)";
+      hint.style.color = "var(--muted)";
+    } else {
+      hint.innerHTML = "⚠ your custom model <b>must support image input</b> (vision) — it receives the captcha as images and returns where the piece fits. Text-only models cannot solve it.";
+      hint.style.color = "var(--warn,#d29922)";
+    }
   }
   /* ------------ generator setup card (shared by Generator + Proxy tabs) ---- */
   function genSetupCard(msg){
@@ -1504,9 +1559,18 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
               <input type="number" id="gen-n" value="1" min="1" max="8" style="width:100%"></div>
             <div><label class="lbl">captcha</label>
               <select id="gen-captcha" class="sel" style="width:100%" onchange="App.genCaptchaChanged()">
-                <option value="auto" ${o.captcha==='auto'?'selected':''}>auto — solver</option>
+                <option value="auto" ${o.captcha==='auto'?'selected':''}>auto — CV + AI vote</option>
+                <option value="ai" ${o.captcha==='ai'?'selected':''}>ai — AI judge only</option>
+                <option value="classic" ${o.captcha==='classic'?'selected':''}>classic — CV solver</option>
                 <option value="manual" ${o.captcha==='manual'?'selected':''}>manual — I solve</option>
               </select></div>
+            <div id="gen-strategy-wrap" style="display:none"><label class="lbl">ai judge model</label>
+              <select id="gen-strategy" class="sel" style="width:100%" onchange="App.genAutoSave();App.genAiHint()">
+                <option value="auto" ${(o.captcha_strategy||'auto')==='auto'?'selected':''}>auto — CV + AI vote</option>
+                <option value="ai" ${o.captcha_strategy==='ai'?'selected':''}>ai — AI judge only</option>
+                <option value="classic" ${o.captcha_strategy==='classic'?'selected':''}>classic — CV solver</option>
+              </select>
+              <div class="help" style="margin-top:3px">how the solver decides the drag distance when captcha isn't manual</div></div>
             <div><label class="lbl">ip source</label>
               <select id="gen-ip" class="sel" style="width:100%" onchange="App.genIpChanged()">
                 <option value="pool" id="opt-pool" ${['pool','socks'].includes(o.ip_source)?'selected':''}>proxy pool (${o.pool_available || 0})</option>
@@ -1550,6 +1614,18 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
             </div>
           </div>
         </div>
+        <div class="card" id="gen-ai-card">
+          <h2>AI judge endpoint <span style="font-weight:400;color:var(--muted);font-size:12px">— optional, your own OpenAI-compatible vision model</span></h2>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px 14px;align-items:end">
+            <div><label class="lbl">endpoint url</label>
+              <input type="text" id="gen-ai-url" value="${esc(o.custom_ai_url||'')}" placeholder="https://api.openai.com/v1 (empty = this gateway's GLM-5.3-Flash)" style="width:100%" oninput="App.genAutoSave()"></div>
+            <div><label class="lbl">model id</label>
+              <input type="text" id="gen-ai-model" value="${esc(o.custom_ai_model||'')}" placeholder="e.g. gpt-4o-mini" style="width:100%" oninput="App.genAutoSave()"></div>
+            <div><label class="lbl">api key</label>
+              <input type="password" id="gen-ai-key" value="" placeholder="${o.custom_ai_key_set ? 'saved — type to replace' : 'sk-...'}" style="width:100%" oninput="App.genAutoSave()"></div>
+          </div>
+          <div id="gen-ai-hint" class="help" style="margin-top:8px"></div>
+        </div>
         <div class="card" id="gen-mail-card">
           <h2>Email setup <span style="font-weight:400;color:var(--muted);font-size:12px">— your own domains, 3 steps</span></h2>
 
@@ -1585,6 +1661,7 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
       genLoadSources();
       mailRender();
       genCaptchaGuard();   // reflect manual=>visible rule on first paint
+      genStrategyVisibility();  // reflect captcha mode -> AI card + hints
       return;
     }
 
@@ -1616,7 +1693,12 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
       if (!chk.all_ok) { setupOpen(false); return; }
     } catch (e) { /* check unavailable: let the old path try */ }
     const n = parseInt(($("#gen-n")||{}).value || "1", 10);
-    await api("/admin/dash/generator/start", {method:"POST", body: JSON.stringify({count: n})});
+    try {
+      const r = await api("/admin/dash/generator/start", {method:"POST", body: JSON.stringify({count: n})});
+      if (r && r.error) toast(r.error, "err");   // e.g. AI mode with empty pool
+    } catch (e) {
+      toast(String(e.message || e).split('\n')[0].slice(0, 160), "err");
+    }
     refresh();
   }
   async function genStop(name){
@@ -1629,9 +1711,15 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
   }
   async function genSaveOptions(silent = false){
     const val = id => ($("#"+id)||{}).value;
+    const cap = val("gen-captcha");
     const body = {
-      captcha: val("gen-captcha"),
+      captcha: cap,
+      captcha_strategy: cap === "manual" ? "auto" : cap,
+      custom_ai_url: val("gen-ai-url") || "",
+      custom_ai_model: val("gen-ai-model") || "",
       ip_source: val("gen-ip"),
+      // key: only send when the user typed one (empty = keep the saved key)
+      ...( (val("gen-ai-key")||"").trim() ? {custom_ai_key: val("gen-ai-key").trim()} : {} ),
       proxy_types: val("gen-ptypes"),
       country: val("gen-country") || "ALL",
       pin_proxy: val("gen-pin"),
@@ -1841,14 +1929,27 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
     // Step 3 verify — done.
     const box = $("#mail-steps");
     if (!box) return;
-    let m = {}, st = {};
-    try { m = await api("/admin/dash/generator/mail"); } catch (e) { return; }
-    try { st = await api("/admin/dash/generator/mail/deploy-status"); } catch (e) { st = {}; }
+    // instant placeholder so the card never looks missing while loading
+    // (first Generator-tab visit previously showed an empty Email card for
+    // the duration of two sequential API round-trips)
+    if (!box.children.length) {
+      box.innerHTML = `<div class="empty" style="padding:12px;color:var(--muted);font-size:12.5px">loading email setup…</div>`;
+    }
+    // parallel fetch: mail config and deploy status don't depend on each other
+    const [mR, stR] = await Promise.allSettled([
+      api("/admin/dash/generator/mail"),
+      api("/admin/dash/generator/mail/deploy-status"),
+    ]);
+    if (mR.status === "rejected") { return; }
+    const m = mR.value || {};
+    const st = stR.status === "fulfilled" ? (stR.value || {}) : {};
 
     const doms = m.domains || [];
     mailSel = mailSel && doms.includes(mailSel) ? mailSel : (m.active || doms[0] || null);
     const hasUrl = !!(m.inbox_url || st.has_url);
-    const deployed = hasUrl && st.wrangler_authed !== false;
+    // `undefined !== false` is true, so an ERRORED deploy-status call used to
+    // tick step 2 — require a non-error status explicitly.
+    const deployed = hasUrl && st.wrangler_authed === true;
     // step 3 = the MANUAL Cloudflare routing. There is no API to verify it, so
     // it completes only on an explicit per-domain confirmation — never from the
     // inbox test (which just proves the worker itself answers).
@@ -2088,7 +2189,12 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
   }
   async function mailSave(silent){
     const val = id => ($("#"+id)||{}).value;
-    const body = {domains: null, inbox_url: val("mail-inbox-url")};
+    const url = (val("mail-inbox-url")||"").trim();
+    // autosave guard: a half-typed URL and a cleared field are not config —
+    // persisting them gave workers a dead/truncated inbox. Manual save still
+    // allows an explicit clear (empty = "not configured").
+    if (silent && !url) return;
+    const body = {inbox_url: url};
     const sec = val("mail-inbox-secret");
     if (sec && sec.trim()) body.inbox_secret = sec;
     try {
@@ -2584,6 +2690,7 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
       `<div class="mono" style="font-size:11px;color:var(--faint)">${esc(l)}</div>`).join("");
     const shell = `
       <div id="px-container">
+        <div id="px-health"></div>
         <div class="card">
           <h2>Proxy checker</h2>
           <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px">
@@ -2799,6 +2906,11 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
       genLoadSources();
       proxyYield();
       loadRelays();
+      // proxy pool health card rides along with the tab's first mount and
+      // refreshes with the tab's own 2s poll only on remount (it reads the
+      // ledger file — no need to re-read it every 2s)
+      const ph = $("#px-health");
+      if (ph) renderProxyHealth(ph);
       return;
     }
     // dynamic-only update: stats + buttons + log
@@ -2875,6 +2987,38 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
         <p class="note">More accounts = more free-tier daily caps to spread across.
           Zcode tokens are long-lived; revoked credentials need a new login or import.</p>
       </div>
+      <div class="card"><h2>Auto-signup &amp; captcha modes</h2>
+        <p style="color:var(--muted); font-size:13px">On the
+          <a href="#" onclick="App.tab('generator');return false">Generator</a> tab,
+          pick how the signup slider captcha is solved:</p>
+        <ul style="color:var(--muted); font-size:13px; margin:8px 0; padding-left:18px">
+          <li><b>manual</b> — you solve it in the visible browser window.</li>
+          <li><b>ai</b> — an AI vision judge looks at the puzzle and decides the drag.
+            Uses <b>this gateway's own GLM-5.3-Flash</b> (needs at least one working
+            account in the pool — the judge spends its tokens), or your own
+            OpenAI-compatible endpoint configured in <i>AI judge endpoint</i>.</li>
+          <li><b>classic</b> — the original local CV solver (ddddocr + OpenCV ensemble),
+            no AI involved.</li>
+          <li><b>auto</b> — CV ensemble + AI judge fused by a weighted vote; on
+            ambiguous puzzles the AI leads.</li>
+        </ul>
+        <p class="note">Custom endpoint? The model <b>must support image input
+          (vision)</b> — it receives the captcha background and piece as images.
+          Text-only models cannot judge it.</p>
+      </div>
+      <div class="card"><h2>Where the output goes</h2>
+        <p style="color:var(--muted); font-size:13px">Everything a browser run
+          produces is sorted under <span class="mono">generator-data\\</span> next
+          to the exe:</p>
+        <ul class="mono" style="font-size:12px;color:var(--muted);margin:8px 0;padding-left:18px">
+          <li>results\\ — accounts*.txt, plans*.jsonl, starter*.txt</li>
+          <li>logs\\workers\\ — one full solve log per browser (every attempt,
+              AI verdict, drag telemetry)</li>
+          <li>screenshots\\ — captcha debug images incl. the exact pictures the
+              AI judge saw with its verdict drawn on</li>
+          <li>profiles\\ — throwaway chromium profiles (auto-deleted)</li>
+        </ul>
+      </div>
       <div class="card"><h2>Accounts from another machine</h2>
         <p style="color:var(--muted); font-size:13px">Copy any account snapshot
           (<span class="mono">&lt;email&gt;.txt</span>) into the
@@ -2893,7 +3037,7 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
           again to start it back up.</p>
       </div>
       <div class="card"><h2>Updates</h2>
-        <p style="color:var(--muted); font-size:13px">Update checks are disabled by default until ZcodeGate releases are published. You can enable the ZcodeGate release feed in Settings. When one exists, a <b>🔔</b> appears in the top bar — click it,
+        <p style="color:var(--muted); font-size:13px">Update checks are disabled by default until ZcodeGate releases are published. You can enable the ZcodeGate release feed in Settings. When one exists, a <b>🔔</b> appears in the top bar (left of the notifications bell) — click it,
           then <kbd>Update now</kbd>. The tool downloads the new exe, swaps it in, and
           relaunches itself. Turn this off in Settings → Updates.</p>
       </div>
@@ -2944,10 +3088,226 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
   }
   function fmtTok(n){ n = n||0; if (n >= 1e9) return (n/1e9).toFixed(1)+'B'; if (n >= 1e6) return (n/1e6).toFixed(1)+'M'; if (n >= 1e3) return (n/1e3).toFixed(1)+'k'; return String(n); }
 
+  /* ------------ tab: analytics ------------ */
+  let analyticsHours = 24;
+  async function renderAnalytics(v){
+    v = v || $("#view");
+    const res = await api("/admin/dash/analytics?hours=" + analyticsHours);
+    if (curTab !== "analytics") return;
+    const s = res.summary || {}, lat = res.latency || {};
+    const series = res.series || [];
+    const maxTok = Math.max(1, ...series.map(x => x.tokens));
+    const bars = series.slice(-24).map(x => {
+      const h = Math.round((x.tokens/maxTok)*110);
+      const err = x.requests && x.errors ? `<span style="position:absolute;top:0;left:0;right:0;height:${Math.round((x.errors/Math.max(x.requests,1))*100)}%;max-height:100%;background:rgba(229,72,77,.45);border-radius:3px 3px 0 0"></span>` : "";
+      return `<div title="${esc(x.hour)}: ${x.requests} req (${x.ok} ok, ${x.errors} err), ${fmtTok(x.tokens)} tok"
+        style="flex:1;display:flex;flex-direction:column;justify-content:flex-end;min-width:0;position:relative;padding-top:14px">
+        <span style="position:absolute;top:0;left:0;right:0;text-align:center;font-size:8.5px;color:var(--faint)">${x.hour.slice(-4)}</span>
+        <div style="width:100%;height:${Math.max(h,2)}px;border-radius:3px 3px 0 0;background:linear-gradient(180deg,var(--accent-soft,#4f8cff),rgba(79,140,255,.25));position:relative;overflow:hidden">${err}</div>
+      </div>`;
+    }).join("");
+    const errRows = (res.errors||[]).map(e => `
+      <tr><td class="mono">${e.status}</td><td class="mono">${esc(e.code||"—")}</td>
+      <td style="text-align:right">${e.count}</td>
+      <td style="text-align:right;color:var(--faint)">${e.last_ts?timeAgo(e.last_ts):"—"}</td></tr>`).join("");
+    const keyRows = (res.by_key||[]).map(k => {
+      const name = k.client_key==="admin" ? "admin" : (k.client_key||"—");
+      const shown = name.length>14 ? name.slice(0,8)+"…"+name.slice(-4) : name;
+      const okPct = k.requests ? Math.round(k.ok/k.requests*100) : 100;
+      return `<tr><td class="mono" title="${esc(name)}">${esc(shown)}</td>
+        <td style="text-align:right">${k.requests}</td>
+        <td style="text-align:right">${okPct}%</td>
+        <td style="text-align:right">${fmtTok(k.tokens)}</td>
+        <td style="text-align:right;color:var(--faint)">${k.last_ts?timeAgo(k.last_ts):"—"}</td></tr>`;
+    }).join("");
+    const acctRows = (res.accounts||[]).slice(0,12).map(a => {
+      const stCol = a.state==="ready" ? "var(--ok)" : a.state==="dead"||a.state==="exhausted" ? "var(--err)" : "var(--warn)";
+      const exp = a.expires_in_s==null ? "—" : a.expires_in_s>1e8 ? "∞"
+        : (a.expires_in_s/3600).toFixed(1)+"h";
+      return `<tr><td class="mono">${esc(a.account_id||"—")}</td><td>${esc(a.email||"")}</td>
+        <td style="color:${stCol}">${esc(a.state||"—")}</td>
+        <td style="text-align:right">${a.requests}</td>
+        <td style="text-align:right">${fmtTok(a.tokens)}</td>
+        <td style="text-align:right">${exp}</td></tr>`;
+    }).join("");
+    v.innerHTML = `
+      <div class="toolbar">
+        <b style="font-size:14px">Usage analytics</b>
+        <select class="sel" style="max-width:120px" onchange="App.setAnalyticsHours(this.value)">
+          ${[1,6,24,72,168].map(h=>`<option value="${h}" ${h===analyticsHours?"selected":""}>${h>=24?(h/24)+"d":h+"h"}</option>`).join("")}
+        </select>
+        <div class="grow"></div>
+        <span style="color:var(--faint);font-size:12px">from gateway.db — nothing leaves this machine</span>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:12px 0">
+        <div class="card" style="padding:12px"><div style="font-size:11px;color:var(--muted)">REQUESTS</div>
+          <div style="font-size:24px;font-weight:700">${s.requests||0}</div>
+          <div style="font-size:11px;color:var(--faint)">${s.ok||0} ok · ${(s.rate_limited||0)+(s.insufficient_credits||0)} failed</div></div>
+        <div class="card" style="padding:12px"><div style="font-size:11px;color:var(--muted)">TOKENS</div>
+          <div style="font-size:24px;font-weight:700">${fmtTok(s.total_tokens)}</div>
+          <div style="font-size:11px;color:var(--faint)">${fmtTok(s.prompt_tokens)} in · ${fmtTok(s.completion_tokens)} out</div></div>
+        <div class="card" style="padding:12px"><div style="font-size:11px;color:var(--muted)">SUCCESS</div>
+          <div style="font-size:24px;font-weight:700">${s.requests?Math.round(s.ok/s.requests*100):100}%</div></div>
+        <div class="card" style="padding:12px"><div style="font-size:11px;color:var(--muted)">LATENCY p50 / p90 / p99</div>
+          <div style="font-size:20px;font-weight:700">${((lat.p50||0)/1000).toFixed(1)}s <span style="color:var(--muted);font-size:14px">/ ${((lat.p90||0)/1000).toFixed(1)}s / ${((lat.p99||0)/1000).toFixed(1)}s</span></div>
+          <div style="font-size:11px;color:var(--faint)">${lat.samples||0} samples</div></div>
+      </div>
+      <div class="card"><h2>Tokens per hour <span style="font-weight:400;font-size:11px;color:var(--faint)">(red = error share)</span></h2>
+        <div style="display:flex;align-items:flex-end;gap:3px;height:130px;padding:6px 2px">${bars}</div>
+      </div>
+      <div class="grid2">
+        <div class="card"><h2>Errors</h2>
+          <div class="scroll"><table><thead><tr><th>Status</th><th>Code</th><th style="text-align:right">Count</th><th style="text-align:right">Last</th></tr></thead>
+          <tbody>${errRows || '<tr><td colspan="4" style="padding:12px;color:var(--faint)">no errors in window 🎉</td></tr>'}</tbody></table></div></div>
+        <div class="card"><h2>By API key</h2>
+          <div class="scroll"><table><thead><tr><th>Key</th><th style="text-align:right">Req</th><th style="text-align:right">OK</th><th style="text-align:right">Tokens</th><th style="text-align:right">Last</th></tr></thead>
+          <tbody>${keyRows || '<tr><td colspan="5" style="padding:12px;color:var(--faint)">no keyed traffic</td></tr>'}</tbody></table></div></div>
+      </div>
+      <div class="card"><h2>Account burn-down</h2>
+        <div class="scroll"><table><thead><tr><th>Account</th><th>Email</th><th>State</th><th style="text-align:right">Requests</th><th style="text-align:right">Tokens</th><th style="text-align:right">Token expiry</th></tr></thead>
+        <tbody>${acctRows || '<tr><td colspan="6" style="padding:12px;color:var(--faint)">no usage in window</td></tr>'}</tbody></table></div></div>`;
+  }
+  function setAnalyticsHours(h){ analyticsHours = parseInt(h)||24; refresh(); }
+  function timeAgo(ts){
+    const s = Math.max(0, Date.now()/1000 - ts);
+    if (s < 60) return Math.round(s)+"s ago";
+    if (s < 3600) return Math.round(s/60)+"m ago";
+    if (s < 86400) return Math.round(s/3600)+"h ago";
+    return Math.round(s/86400)+"d ago";
+  }
+
+  /* ------------ notifications bell + panel ------------ */
+  let notifySince = 0, notifyOpen = false, notifyPanelBuilt = false;
+  async function pollNotify(){
+    try {
+      const r = await api("/admin/dash/notifications?since=" + notifySince);
+      const btn = $("#btn-notify");
+      if (!btn) return;
+      btn.style.display = "inline-flex";   // explicit: "" would fall back to the inline display:none attr
+      const st = r.state || {};
+      const dot = $("#notify-dot");
+      if (dot) dot.style.display = (st.errors_24h || st.warnings_24h) ? "block" : "none";
+      btn.title = `${st.total_24h||0} events (24h)` +
+        (st.errors_24h ? ` · ${st.errors_24h} errors` : "") +
+        (st.warnings_24h ? ` · ${st.warnings_24h} warnings` : "");
+      if (r.events && r.events.length) {
+        notifySince = r.events[r.events.length-1].id;
+        if (notifyOpen) renderNotifyPanel(r.events.concat(getPanelCache()));
+      }
+    } catch (e) { /* bell hidden on error */ }
+  }
+  let panelCache = [];
+  function getPanelCache(){ return panelCache; }
+  function renderNotifyPanel(newEvents){
+    panelCache = (newEvents||[]).concat(panelCache).slice(0, 80);
+    const p = $("#notify-panel");
+    if (!p) return;
+    const col = {error:"var(--err,#e5484d)", warning:"var(--warn,#f5a524)",
+                 success:"var(--ok,#30a46c)", info:"var(--muted)"};
+    p.innerHTML = `
+      <div class="card" style="padding:14px 18px" onclick="event.stopPropagation()">
+        <div class="toolbar" style="margin:0 0 8px">
+          <b style="font-size:14px">Notifications</b>
+          <span style="color:var(--faint);font-size:11.5px">${panelCache.length ? panelCache.length + " recent" : ""}</span>
+          <div class="grow"></div>
+          <button class="btn btn-ghost btn-sm" onclick="App.clearNotify()">Clear all</button>
+          <button class="btn btn-ghost btn-sm" onclick="App.toggleNotify()" title="close">✕</button>
+        </div>
+        <div style="max-height:56vh;overflow:auto">
+        ${panelCache.length ? panelCache.map((e,i)=>`
+          <div style="display:flex;gap:8px;padding:7px 0;${i?"border-top:1px solid var(--border)":""}">
+            <span style="color:${col[e.level]||col.info};flex:0 0 auto">${e.level==="error"?"✖":e.level==="warning"?"⚠":e.level==="success"?"✔":"·"}</span>
+            <div style="min-width:0;flex:1;overflow-wrap:anywhere">
+              <div style="font-size:12.5px">${esc(e.message)}${e.count>1?` <span style="color:var(--faint)">×${e.count}</span>`:""}</div>
+              <div style="font-size:10.5px;color:var(--faint)">${esc(e.category)} · ${timeAgo(e.ts)}</div>
+            </div>
+          </div>`).join("") : '<div style="color:var(--faint);padding:16px 0;text-align:center">nothing yet — events land here as they happen</div>'}
+        </div>
+      </div>`;
+  }
+  async function toggleNotify(){
+    notifyOpen = !notifyOpen;
+    const p = $("#notify-panel");
+    if (!p) return;
+    // explicit value both ways: setting style.display="" would fall back to
+    // the stylesheet's #notify-panel{display:none} and the modal never showed
+    p.style.display = notifyOpen ? "block" : "none";
+    if (!notifyOpen) return;
+    if (!notifyPanelBuilt) {
+      try {
+        const r = await api("/admin/dash/notifications?since=0");
+        notifySince = r.events && r.events.length ? r.events[r.events.length-1].id : 0;
+        panelCache = []; renderNotifyPanel(r.events||[]);
+      } catch (e) { panelCache = []; renderNotifyPanel([]); }
+      notifyPanelBuilt = true;
+    }
+  }
+  async function clearNotify(){
+    panelCache = [];
+    try { await api("/admin/dash/notifications/clear", {method:"POST", body:"{}"}); } catch (e) {}
+    renderNotifyPanel([]);
+  }
+  function logSearchDebounce(val){
+    logSearch = val;
+    clearTimeout(logSearchTimer);
+    logSearchTimer = setTimeout(() => { if (curTab === "logs") refresh(); }, 350);
+  }
+  let logSearchTimer = null;
+
+  /* ------------ proxy health card (inside Proxy tab) ------------ */
+  async function renderProxyHealth(container){
+    try {
+      const h = await api("/admin/dash/proxies/health");
+      const k = h.kpis || {};
+      const countryRows = Object.entries(h.countries||{}).slice(0,12).map(([c,n])=>{
+        const total = k.total||1;
+        const pct = Math.round(n/total*100);
+        return `<div style="display:flex;align-items:center;gap:8px;margin:3px 0">
+          <span class="mono" style="width:26px">${esc(c)}</span>
+          <div style="flex:1;height:10px;background:var(--border);border-radius:5px;overflow:hidden">
+            <div style="width:${pct}%;height:100%;background:var(--accent-soft,#4f8cff)"></div></div>
+          <span style="width:36px;text-align:right;color:var(--muted);font-size:12px">${n}</span></div>`;
+      }).join("") || '<div style="color:var(--faint);font-size:12px">no country data</div>';
+      const rows = (h.proxies||[]).slice(0,100).map(p=>{
+        const st = p.ok ? '<span style="color:var(--ok)">●</span>' : p.bad ? '<span style="color:var(--err)">●</span>' : '<span style="color:var(--faint)">●</span>';
+        return `<tr><td>${st}</td><td class="mono" style="max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(p.url)}">${esc(p.url)}</td>
+          <td class="mono">${esc(p.country)}</td>
+          <td style="text-align:right">${p.latency!=null?p.latency+"s":"—"}</td>
+          <td style="text-align:right;color:var(--faint)">${p.checked_at?timeAgo(p.checked_at):"—"}</td>
+          <td style="text-align:right">${p.used!=null?p.used:"—"}</td></tr>`;
+      }).join("");
+      container.innerHTML = `
+        <div class="card">
+          <h2>Proxy pool health</h2>
+          ${!h.available ? `<p style="color:var(--faint);font-size:12.5px">${esc(h.note||"pool unavailable")}</p>` : `
+          <div style="display:flex;gap:14px;flex-wrap:wrap;margin-bottom:12px;font-size:13px">
+            <span><b>${k.total||0}</b> <span style="color:var(--muted)">total</span></span>
+            <span style="color:var(--ok)"><b>${k.healthy||0}</b> healthy</span>
+            <span style="color:var(--warn)"><b>${k.unverified||0}</b> unverified</span>
+            <span style="color:var(--err)"><b>${k.bad||0}</b> bad</span>
+            <span><b>${k.socks||0}</b> socks</span>
+            <span><b>${k.http||0}</b> http</span>
+          </div>
+          <div class="grid2">
+            <div><h3 style="font-size:12px;color:var(--muted);margin:6px 0">BY COUNTRY</h3>${countryRows}</div>
+            <div><h3 style="font-size:12px;color:var(--muted);margin:6px 0">TOP PROXIES (first 100)</h3>
+              <div class="scroll" style="max-height:230px"><table style="font-size:11.5px">
+                <thead><tr><th></th><th style="text-align:left">Proxy</th><th>CC</th><th style="text-align:right">Latency</th><th style="text-align:right">Checked</th><th style="text-align:right">Used</th></tr></thead>
+                <tbody>${rows || '<tr><td colspan="6" style="color:var(--faint);padding:8px">empty pool</td></tr>'}</tbody>
+              </table></div>
+            </div>
+          </div>`}
+        </div>`;
+    } catch (e) {
+      container.innerHTML = `<div class="card"><h2>Proxy pool health</h2>
+        <p style="color:var(--faint);font-size:12.5px">${esc(e.message)}</p></div>`;
+    }
+  }
+
   /* ------------ tab switching + polling ------------ */
   const RENDER = {accounts:renderAccounts, generator:renderGenerator, proxy:renderProxyTab, models:renderModels, server:renderServer,
                   settings:renderSettings, stats:renderStats, logs:renderLogs,
-                  usage:renderUsage, guide:renderGuide};
+                  usage:renderUsage, analytics:renderAnalytics, guide:renderGuide};
 
   function tab(name){
     if (curTab === "generator" || name !== "generator") {
@@ -2980,7 +3340,7 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
   function restartTimer(){
     clearInterval(timer);
     // live tabs poll; static tabs don't
-    const live = {accounts:4000, generator:3000, proxy:2000, models:6000, logs:3000, stats:8000, usage:15000}[curTab];
+    const live = {accounts:4000, generator:3000, proxy:2000, models:6000, logs:3000, stats:8000, usage:15000, analytics:15000}[curTab];
     if (live) timer = setInterval(() => refresh(), live);
   }
 
@@ -2994,6 +3354,8 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
       $("#foot-ver").textContent = "v" + s.version + " · " + s.host + ":" + s.port;
     } catch (e) {}
     setInterval(paintChips, 10000);   // chips poll independently of tab polling
+    setInterval(pollNotify, 15000);   // bell polls on every tab
+    pollNotify();
   }
   async function start(){
     if (!key) {
@@ -3006,8 +3368,9 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
   }
 
   return {start, login, tab, refresh, renderAccounts, renderGenerator, renderProxyTab, renderModels, renderLogs,
+          renderAnalytics, setAnalyticsHours, toggleNotify, clearNotify, pollNotify, logSearchDebounce,
           mailRender, mailAddDomain, mailRemoveDomain, mailRemoveOne, mailSelDomain, mailSave, mailTest, mailAutoSave, mailDeploy, mailRoutingDone, pxClearLog,
-          genLocate, genCaptchaChanged, genCaptchaGuard,
+          genLocate, genCaptchaChanged, genCaptchaGuard, genStrategyVisibility, genAiHint,
           sortModels, filterModels, filterAccounts, syncModels, doImport, doReload, acct, acctRemove, saveSettings,
           regenKeys, clearLogs, toggleServer, copy,
           showUpdate, hideUpdate, skipUpdate, doUpdate,

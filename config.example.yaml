@@ -34,7 +34,11 @@ models:
   default: GLM-5.3-Flash
   default_anthropic: GLM-5.3
   default_max_tokens: 128000
-  probe_unknown: false
+  default_effort: high          # reasoning effort when the client doesn't say: low | high | max
+  pacing:
+    enabled: true               # randomized gap between upstream sends (WAF prevention)
+    min_gap_ms: 150
+    max_gap_ms: 400
   auto_free_fallback:
     enabled: false
     chain: [GLM-5.3, GLM-5.3-Flash]

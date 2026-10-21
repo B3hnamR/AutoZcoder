@@ -30,7 +30,12 @@ def _find_token(email: str) -> str:
     roots = [out_dir, here]
     if out_dir:
         parent = os.path.dirname(os.path.abspath(out_dir))
-        roots.extend([parent, os.path.join(parent, 'accounts'), os.path.join(parent, 'generator-data')])
+        # results/ first: v1.0.5+ workers write accounts*/starter* ledgers
+        # there (the old flat-only scan missed every generated account)
+        roots.extend([os.path.join(out_dir, 'results'), parent,
+                      os.path.join(parent, 'accounts'),
+                      os.path.join(parent, 'generator-data'),
+                      os.path.join(parent, 'generator-data', 'results')])
     seen = set()
     for root in roots:
         if not os.path.isdir(root) or root in seen:

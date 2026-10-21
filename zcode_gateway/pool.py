@@ -16,6 +16,10 @@ from typing import Iterable
 
 from .config import AccountsConfig, PoolConfig
 
+# grant-window clock-skew grace: a starts_at less than this far in the future
+# counts as "open now" both for routing and for WINDOW_CLOSED parking
+WINDOW_GRACE_S = 30
+
 
 log = logging.getLogger("zcode_gateway.pool")
 
@@ -78,6 +82,12 @@ class Account:
     # when has_plan was last verified (epoch seconds) — the balance loop
     # re-checks hourly so a subscription bought later is actually picked up
     plan_checked_at: float = 0.0
+    # one-shot "<24h to token expiry" warning flag (see tokens.refresh_loop)
+    expires_warned: bool = False
+    # consecutive quota rejections with NO visible quota buckets (1005/11113):
+    # 3 strikes -> EXHAUSTED. Observed live: a plan-less account churning
+    # "exceed quota limit" every 30s cool-off for 10+ minutes.
+    quota_strikes: int = 0
 
     # ------------------------------------------------------------------ #
 
@@ -119,9 +129,21 @@ class Account:
         now = time.time() if now is None else now
         if not self.plan_active(now): return False
         quotas = self.notes.get("quotas")
-        if quotas is None: return True
+        # Unknown quotas (never checked) and KNOWN-EMPTY quotas ({} — a free
+        # account, or a plan whose buckets are all outside their window)
+        # both stay routable: an empty map must not silently drop a healthy
+        # account from rotation (the API 503s with "no usable account" while
+        # /ready still says ready). Hard state (DEAD / EXHAUSTED / caps)
+        # handles real removals, and the upstream's own 11113/402 parks it.
+        if not quotas: return True
         quota = quotas.get(model)
         if quota is None: return False
+        # a not-yet-open grant window (night-only referral grant) must NOT be
+        # routed to — the upstream rejects it with "exceed quota limit".
+        # WINDOW_GRACE_S absorbs server clock skew / window boundaries: a
+        # starts_at 1-2s in the future is "open now", and parking for it
+        # flashed quota errors at clients for 1-2s until the cap expired.
+        if quota.get("starts_at", 0) > now + WINDOW_GRACE_S: return False
         return quota.get("remaining", 0) > 0 or (quota.get("resets_at", 0) > 0 and quota["resets_at"] < now)
 
     def expires_in(self, now: float | None = None) -> float:
@@ -344,6 +366,20 @@ class PoolManager:
         # persisted per-model parks (UNUSUAL_ACTIVITY / GEO_BLOCKED / caps):
         # a gateway restart must not forget them and re-burn every account
         self.caps_path: Path | None = None
+        # notification center (attached in app setup); pool events worth a
+        # human's attention go through here, safe from any thread
+        self._notify = None
+
+    def attach_notifications(self, center) -> None:
+        self._notify = center
+
+    def notify(self, category: str, message: str, level: str = "info") -> None:
+        """Emit a dashboard notification if a center is attached. Never raises."""
+        try:
+            if self._notify is not None:
+                self._notify.emit(category, message, level=level)
+        except Exception:
+            pass
 
     def set_caps_path(self, path: Path | str) -> None:
         """Enable park persistence to <sqlite-dir>/model-caps.json."""
@@ -485,6 +521,15 @@ class PoolManager:
         """
         async with self._lock:
             release_at = time.time() + max(seconds, 1.0)
+            # no-op short-circuit: re-parking the same model with the same
+            # release window happens on every balance poll while a cap is
+            # active; each one rewrote model-caps.json for nothing (and a
+            # 1-2s skew cap wrote garbage parks to disk every boundary)
+            existing_until = account.model_caps.get(model, 0.0)
+            existing_code = (account.model_cap_info.get(model) or {}).get("code")
+            if existing_until > time.time() and existing_code == reason \
+                    and abs(existing_until - release_at) < 5.0:
+                return
             account.model_caps[model] = release_at
             account.model_cap_info[model] = {
                 "code": reason,
@@ -509,7 +554,23 @@ class PoolManager:
         async with self._lock:
             accounts = list(self._accounts.values())
 
-            # 1) the model is parked (daily cap / no entitlement)
+            # 1) every account is cooling: transient, retry in seconds
+            #    (checked BEFORE per-model caps: a saturated-but-parked pool
+            #    used to be reported as a 10-minute cap with release_in_s=599
+            #    — the wrong cause and a 10-minute client backoff)
+            if accounts and all(a.state is AccountState.COOLING for a in accounts):
+                wait = max(a.cooldown_until - time.time() for a in accounts)
+                reason = next((a.last_error for a in accounts if a.last_error), "")
+                return {
+                    "status": 503,
+                    "code": "ACCOUNT_COOLING",
+                    "message": (f"account cooling after {reason}; "
+                                f"retry in {int(max(wait, 0))}s"),
+                    "release_at": None,
+                    "release_in_s": int(max(wait, 0)),
+                }
+
+            # 2) the model is parked (daily cap / no entitlement)
             for account in accounts:
                 if not account.is_model_capped(model):
                     continue
@@ -526,19 +587,6 @@ class PoolManager:
 
             if not accounts:
                 return None
-
-            # 2) every account is cooling: transient, retry in seconds
-            if all(a.state is AccountState.COOLING for a in accounts):
-                wait = max(a.cooldown_until - time.time() for a in accounts)
-                reason = next((a.last_error for a in accounts if a.last_error), "")
-                return {
-                    "status": 503,
-                    "code": "ACCOUNT_COOLING",
-                    "message": (f"account cooling after {reason}; "
-                                f"retry in {int(max(wait, 0))}s"),
-                    "release_at": None,
-                    "release_in_s": int(max(wait, 0)),
-                }
 
             # 3) nothing usable at all
             if all(not a.is_ready() for a in accounts):
@@ -598,6 +646,11 @@ class PoolManager:
             if account.state is AccountState.EXHAUSTED:
                 account.state = AccountState.READY
             account.last_error = ""
+            # fresh strike budget: without this, an account that recovered
+            # from quota-strike EXHAUSTION died again on its FIRST future
+            # rejection (2 strikes already banked)
+            account.quota_strikes = 0
+            account.auth_strikes = 0
 
     async def cool(self, account: Account, seconds: int | None = None,
                    reason: str = "") -> None:
@@ -627,6 +680,9 @@ class PoolManager:
         async with self._lock:
             account.state = AccountState.DEAD
             account.last_error = reason
+        self.notify('account_dead',
+                    f"account {account.id} marked DEAD — {reason}",
+                    level='error')
 
     async def kill_after_strikes(self, account: Account, reason: str = "",
                                  strikes: int = 3) -> None:
@@ -645,6 +701,10 @@ class PoolManager:
                 account.error_history.append(
                     {"ts": time.time(), "status": 401, "code": "auth_dead",
                      "message": reason, "state": "dead"})
+                self.notify('account_dead',
+                            f"account {account.id} DEAD after {strikes} auth "
+                            f"failures — {reason}",
+                            level='error')
             else:
                 account.state = AccountState.COOLING
                 account.cooldown_until = time.time() + self.cfg.cooldown_seconds
@@ -666,8 +726,30 @@ class PoolManager:
             return True
 
     async def upsert(self, account: Account) -> None:
+        """Insert or UPDATE-IN-PLACE.
+
+        Replacing the stored object outright reset in_flight to 0 while old
+        in-flight requests still held the previous instance — with a cap of 2
+        and 2 running requests, a re-login handed out 2 MORE slots (4 against
+        a cap of 2), and the orphaned object's release() decremented nothing.
+        Live fields (in_flight, state, caps, history) survive; credentials and
+        identity fields are refreshed from the new snapshot."""
         async with self._lock:
-            self._accounts[account.id] = account
+            existing = self._accounts.get(account.id)
+            if existing is None:
+                self._accounts[account.id] = account
+                return
+            existing.access_token = account.access_token
+            existing.refresh_token = account.refresh_token
+            existing.expires_at = account.expires_at
+            existing.email = account.email or existing.email
+            existing.state = account.state if account.state is not AccountState.DEAD else existing.state
+            existing.paid_exhausted = account.paid_exhausted
+            if account.notes:
+                existing.notes.update(account.notes)
+            # a re-login is a fresh credential: clear auth strikes but keep
+            # model caps (they persist on disk and are model-scoped facts)
+            existing.auth_strikes = 0
 
     async def remove(self, account_id: str) -> bool:
         async with self._lock:

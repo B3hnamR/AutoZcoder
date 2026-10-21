@@ -1,10 +1,12 @@
 import time
+import os
 import random
 import math
 import logging
 import base64
 import io
 import hashlib
+import json
 from typing import Optional, Dict, Tuple, List, Any
 from dataclasses import dataclass, field
 from playwright.sync_api import Page
@@ -200,48 +202,151 @@ class DistanceCalculator:
         'cv2_edge':        0.85,
         'cv2_gray':        0.80,
         'variance':        0.50,
+        'gateway_ai':      0.70,
     }
 
     def __init__(self, ocr, logger, config: Optional[Dict] = None):
         self.ocr = ocr
         self.logger = logger
         self.config = config or {}
+        self._ocr_factory = None      # set when `ocr` is a lazy zero-arg callable
+        if callable(ocr) and not hasattr(ocr, 'slide_match'):
+            self._ocr_factory = ocr
+            self.ocr = None
         self.min_hole_x = self.config.get('min_hole_x_native', 20)
         self.cv2_threshold = self.config.get('template_match_threshold', 0.30)
         self.voting_tolerance = self.config.get('distance_voting_tolerance', 5.0)
 
+    def _need_ocr(self):
+        """Import ddddocr on first actual use.
+
+        The gateway-AI path must work without ddddocr installed; eagerly
+        importing it in the constructor made the AI-only fallback dead code.
+        Returns None (and logs) when ddddocr is missing instead of raising
+        out of calculate().
+        """
+        if self.ocr is None and self._ocr_factory is not None:
+            self.ocr = self._ocr_factory()
+        if self.ocr is None:
+            try:
+                return self._get_ocr()
+            except RuntimeError as e:
+                self.logger.warning(str(e))
+                return None
+        return self.ocr
+
     def calculate(self, captcha_data: Dict) -> Optional[VoteResult]:
-        if not _HAS_PIL or not _HAS_CV2:
-            self.logger.warning("PIL/cv2 unavailable — falling back to ddddocr-only")
-            return self._fallback_ddddocr_only(captcha_data)
+        """Dispatch by strategy.
 
+        'ai'      — ONLY the gateway-AI judge (one judge, one answer).
+        'classic' — ONLY the pre-AI CV ensemble (ddddocr/cv2/variance/energy).
+        'auto'    — the hybrid ensemble: CV methods + AI judge fused by the
+                    weighted-median vote (the original experiment).
+        Manual solving never reaches this method (handled in wait_for_manual_solve).
+        """
+        strategy = (self.config.get('captcha_strategy', 'auto') or 'auto').lower()
         results: List[DistanceResult] = []
+        ai_done = False
 
-        r = self._method_ddddocr_cropped(captcha_data)
-        if r:
-            results.append(r)
+        if strategy == 'ai':
+            # Single-judge mode: nothing local runs at all — no ddddocr import,
+            # no CV, no fusion. The AI's answer IS the candidate list.
+            gw_key = self.config.get('gateway_key', '')
+            if not gw_key:
+                self.logger.warning(
+                    "ai strategy: no AI endpoint key configured (ZAI_GATEWAY_KEY "
+                    "empty). The gateway sets it for spawned workers; standalone "
+                    "runs must export it, or set a custom endpoint in the "
+                    "dashboard. Switch strategy to classic/manual to proceed.")
+                return None
+            if not self.config.get('enable_gateway_ai', True):
+                self.logger.warning(
+                    "ai strategy selected but gateway AI is disabled "
+                    "(enable_gateway_ai off) — nothing to solve with")
+                return None
+            r = self._method_gateway_ai(captcha_data)
+            if not r:
+                return None
+            return VoteResult(distance=r.distance,
+                              confidence=r.confidence,
+                              methods={r.method: r.distance},
+                              spread=0.0)
 
-        r = self._method_ddddocr_full(captcha_data)
-        if r:
-            results.append(r)
+        if not _HAS_PIL or not _HAS_CV2:
+            # CV stack unavailable: the gateway-AI method still works (it
+            # only needs PIL for image prep). Try it FIRST; the ddddocr
+            # fallback below stays as the last resort. The shared gateway_ai
+            # call at the bottom of this method is skipped via `ai_done`
+            # so the same result is never appended (and never fetched) twice.
+            ai_done = False
+            # classic strategy must NOT consult the AI — that gate was
+            # missing, so classic-with-missing-cv2 silently called the judge
+            if (strategy in ('auto', 'ai') and _HAS_PIL
+                    and self.config.get('enable_gateway_ai', True)):
+                r = self._method_gateway_ai(captcha_data)
+                ai_done = True
+                if r:
+                    results.append(r)
+            if not results:
+                self.logger.warning("PIL/cv2 unavailable — falling back to ddddocr-only")
+                try:
+                    if self._need_ocr() is None:
+                        return None
+                    return self._fallback_ddddocr_only(captcha_data)
+                except Exception as e:
+                    self.logger.warning(f"ddddocr fallback failed: {e}")
+                    return None
+        else:
+            if self._need_ocr() is None:
+                results = []
+            else:
+                r = self._method_ddddocr_cropped(captcha_data)
+                if r:
+                    results.append(r)
 
-        r = self._method_cv2_edge(captcha_data)
-        if r:
-            results.append(r)
+                r = self._method_ddddocr_full(captcha_data)
+                if r:
+                    results.append(r)
 
-        r = self._method_cv2_gray(captcha_data)
-        if r:
-            results.append(r)
-
-        r = self._method_variance(captcha_data)
-        if r:
-            results.append(r)
-
-        if self.config.get('enable_energy_methods', True):
-            r = self._method_energy(captcha_data, 'gradient')
+            r = self._method_cv2_edge(captcha_data)
             if r:
                 results.append(r)
-            r = self._method_energy(captcha_data, 'laplacian')
+
+            r = self._method_cv2_gray(captcha_data)
+            if r:
+                results.append(r)
+
+            r = self._method_variance(captcha_data)
+            if r:
+                results.append(r)
+
+            if self.config.get('enable_energy_methods', True):
+                r = self._method_energy(captcha_data, 'gradient')
+                if r:
+                    results.append(r)
+                r = self._method_energy(captcha_data, 'laplacian')
+                if r:
+                    results.append(r)
+
+        # Gateway-AI method: the local gateway's GLM vision model reads the
+        # gridded background + enlarged piece and estimates the hole center.
+        # On wisp-type puzzles the CV methods all fail; this keeps the vote
+        # alive so the proven drag pipeline still gets a target.
+        # 'classic' strategy never fuses the AI in; 'auto' does, with a
+        # short-circuit: when the local CV methods already agree tightly,
+        # skip the (blocking, token-costing) AI call entirely.
+        ai_needed = (strategy == 'auto'
+                     and self.config.get('enable_gateway_ai', True) and not ai_done)
+        if ai_needed and results:
+            local = [r.distance for r in results]
+            spread = max(local) - min(local)
+            agreeing = sum(1 for d in local
+                           if abs(d - sorted(local)[len(local) // 2]) <= self.voting_tolerance)
+            if spread <= self.voting_tolerance and agreeing == len(local):
+                ai_needed = False
+                self.logger.debug("gateway_ai: local methods agree — skipping AI call")
+        if ai_needed:
+            r = self._method_gateway_ai(captcha_data)
             if r:
                 results.append(r)
 
@@ -524,6 +629,290 @@ class DistanceCalculator:
             self.logger.debug(f"cv2_gray failed: {e}")
             return None
 
+    def _method_gateway_ai(self, data: Dict) -> Optional[DistanceResult]:
+        """Ask the local gateway's GLM vision model where the hole is.
+
+        Sends the background with a labeled 5% grid + the piece enlarged on
+        a light plate; converts the model's percent answer into the same
+        native-coordinate distance the other methods produce. Enabled via
+        enable_gateway_ai (default True) + a gateway key; config errors,
+        network problems, or a non-JSON reply -> None (the vote proceeds
+        without it).
+        """
+        import urllib.request as _ur
+        gw_url = self.config.get('gateway_url', 'http://127.0.0.1:8788')
+        gw_key = self.config.get('gateway_key', '')
+        model = self.config.get('gateway_ai_model', 'GLM-5.3-Flash')
+        if not gw_key:
+            return None
+        if not (_HAS_PIL and data.get('bg_bytes') and data.get('shadow_bytes')):
+            return None
+        try:
+            import io as _io
+            from PIL import Image, ImageDraw
+
+            # background + grid (native px), then UPSCALE 2x so the labels
+            # are legible for the vision model. The default ~6px bitmap font
+            # was unreadable at 300px width and the model miscounted grid
+            # lines (live-measured: answered 40% when the hole was at 60%).
+            bg = Image.open(_io.BytesIO(data['bg_bytes'])).convert('RGB')
+            W, H = bg.size
+            UP = 2
+            bg = bg.resize((W * UP, H * UP), Image.LANCZOS)
+            W, H = bg.size
+            dr = ImageDraw.Draw(bg)
+            label_font = None
+            try:
+                from PIL import ImageFont
+                label_font = ImageFont.load_default(size=max(16, W // 26))
+            except Exception:
+                try:
+                    from PIL import ImageFont
+                    label_font = ImageFont.load_default()
+                except Exception:
+                    label_font = None
+
+            def _draw_pct(pct, x):
+                dr.line([(x, 0), (x, H)], fill=(255, 255, 0), width=2)
+                txt = f"{pct}"
+                # outlined text: black stroke keeps it readable on any bg
+                if label_font is not None:
+                    dr.text((x + 4, 4), txt, font=label_font,
+                            fill=(255, 255, 0), stroke_width=2,
+                            stroke_fill=(0, 0, 0))
+                else:
+                    dr.text((x + 4, 4), txt, fill=(255, 255, 0))
+
+            # every 10% gets a line+label; 5% marks get a short top tick only
+            for pct in range(0, 101, 5):
+                x = int(W * pct / 100)
+                if pct % 10 == 0:
+                    _draw_pct(pct, x)
+                else:
+                    dr.line([(x, 0), (x, H // 12)], fill=(255, 255, 0), width=1)
+
+            # piece cropped to alpha bbox, on a plate, 4x
+            pz = Image.open(_io.BytesIO(data['shadow_bytes'])).convert('RGBA')
+            bb = pz.getbbox() or (0, 0, pz.width, pz.height)
+            pz = pz.crop(bb)
+            plate = Image.new('RGB', pz.size, (245, 245, 245))
+            plate.paste(pz, mask=pz.split()[-1])
+            plate = plate.resize((plate.width * 4, plate.height * 4))
+
+            def _b64(img):
+                buf = _io.BytesIO()
+                img.save(buf, format='PNG')
+                return 'data:image/png;base64,' + base64.b64encode(buf.getvalue()).decode()
+
+            # debug: persist the EXACT images sent to the AI + its answer
+            # (sorted layout: screenshots/)
+            ai_dbg = None
+            if self.config.get('save_captcha_images', True):
+                try:
+                    dbg_dir = os.path.join(os.environ.get('ZAI_OUTPUT_DIR')
+                                           or 'output', 'screenshots')
+                    os.makedirs(dbg_dir, exist_ok=True)
+                    ts = int(time.time() * 1000)
+                    bg_png = os.path.join(dbg_dir, f'ai_bg_{ts}.png')
+                    plate_png = os.path.join(dbg_dir, f'ai_piece_{ts}.png')
+                    bg.save(bg_png)
+                    plate.save(plate_png)
+                    ai_dbg = (bg_png, plate_png)
+                except Exception as e:
+                    self.logger.debug(f"ai debug save failed: {e}")
+
+            prompt = (
+                "You are solving an Aliyun slider captcha.\n"
+                "Image 1: the captcha background. Vertical yellow lines mark "
+                "percentage positions of the image width; the number labels "
+                "are printed at the top (every 10). Short top ticks are the "
+                "5s between them.\n"
+                "Image 2: the puzzle piece (enlarged), cut out of image 1.\n"
+                "Find the hole in image 1 where the piece fits (matching "
+                "outline and vertical position). Read the nearest label, then "
+                "interpolate. Answer with the horizontal position of the "
+                "CENTER of the hole as a percentage of image width.\n"
+                'Reply with ONLY: {"percent": <number>}'
+            )
+            # Conditional reasoning_effort: only the gateway's GLM models
+            # accept it (registry: low/high/max). OpenAI gpt-4o-mini and
+            # most third-party endpoints 400 on it. Send it only when the
+            # target IS the local gateway (no custom_ai_url override set).
+            is_gateway = not self.config.get('custom_ai_url')
+            body = json.dumps({
+                'model': model,
+                # GLM ALWAYS thinks (zcode_protocol forces it) — 512 total
+                # output tokens had to cover thinking + JSON answer and ran
+                # out (finish_reason=length, empty content). 4096 leaves
+                # room for thinking plus the answer.
+                'max_tokens': 4096 if is_gateway else 2048,
+                **({'reasoning_effort': 'low'} if is_gateway else {}),
+                'messages': [{'role': 'user', 'content': [
+                    {'type': 'text', 'text': prompt},
+                    {'type': 'image_url', 'image_url': {'url': _b64(bg)}},
+                    {'type': 'image_url', 'image_url': {'url': _b64(plate)}},
+                ]}],
+            }).encode()
+            req = _ur.Request(gw_url.rstrip('/') + '/v1/chat/completions', data=body,
+                              headers={'Authorization': f'Bearer {gw_key}',
+                                       'Content-Type': 'application/json'})
+            # Hard wall-clock deadline around the whole call. urlopen's
+            # timeout is PER SOCKET OPERATION — the gateway retries upstream
+            # overloads for up to ~6 minutes, and a fresh socket op resets
+            # the timer. Wrap the request in a worker thread and cap the
+            # total wait so one judgement can never stall the drag loop.
+            timeout = int(self.config.get('gateway_ai_timeout', 45))
+            deadline = time.monotonic() + timeout
+            opener = _ur.build_opener(_ur.ProxyHandler({}))  # never route 127.0.0.1 via a system proxy
+            import threading as _threading
+            box = {}
+
+            def _fetch():
+                try:
+                    with opener.open(req, timeout=timeout) as resp:
+                        box['out'] = json.loads(resp.read().decode('utf-8', 'replace'))
+                except Exception as e:  # noqa: BLE001 - transported to caller
+                    box['err'] = e
+
+            t = _threading.Thread(target=_fetch, daemon=True)
+            t.start()
+            while t.is_alive() and time.monotonic() < deadline:
+                t.join(0.5)
+            if t.is_alive():
+                self.logger.warning(
+                    f"gateway_ai: no answer within {timeout}s hard deadline — giving up")
+                return None
+            if 'err' in box:
+                raise box['err']
+            out = box['out']
+            msg = (out.get('choices') or [{}])[0].get('message') or {}
+            # answer lives in content; reasoning models may put everything in
+            # the reasoning channel when content is empty — check both keys.
+            content = msg.get('content') or msg.get('reasoning_content') or msg.get('reasoning') or ''
+            js = content[content.find('{'):content.rfind('}') + 1]
+            pct = float(json.loads(js)['percent'])
+            if not (2.0 <= pct <= 98.0):
+                return None
+            if ai_dbg:
+                self.logger.info(
+                    f"    gateway_ai: hole={pct:.1f}% "
+                    f"(imgs: {os.path.basename(ai_dbg[0])}, {os.path.basename(ai_dbg[1])})")
+                # verdict copy: red line at the AI's answer for human review
+                try:
+                    from PIL import Image as _PILImage
+                    v = _PILImage.open(ai_dbg[0]).convert('RGB')
+                    _vd = ImageDraw.Draw(v)
+                    _vx = int(v.size[0] * pct / 100.0)
+                    _vd.line([(_vx, 0), (_vx, v.size[1])], fill=(255, 0, 0), width=3)
+                    _vd.text((_vx + 4, v.size[1] - 14), f'AI:{pct:.0f}%',
+                             fill=(255, 0, 0))
+                    v.save(os.path.splitext(ai_dbg[0])[0] + '_verdict.png')
+                except Exception as e:
+                    self.logger.debug(f"verdict save failed: {e}")
+
+            # percent -> hole center in SCREEN px, then subtract the piece's
+            # on-screen center: the drag pipeline works in screen coordinates
+            # (see _to_drag_distance), so the AI answer must live there too.
+            hole_center_screen = pct / 100.0 * float(data['bg_css_width'])
+            # Piece centre MUST match every other method (_to_drag_distance):
+            # the alpha-bbox centre of the ACTUAL shape, scaled — not the CSS
+            # box centre, which includes the sprite's transparent padding and
+            # biases every AI drag by that padding's asymmetry.
+            pz_img = Image.open(_io.BytesIO(data['shadow_bytes'])).convert('RGBA')
+            bb = pz_img.getbbox() or (0, 0, pz_img.width, pz_img.height)
+            piece_center_native = (bb[0] + bb[2]) / 2.0
+            puzzle_natural = data.get('puzzle_natural_width') or pz_img.width
+            puzzle_css = data.get('puzzle_css_width') or puzzle_natural
+            puzzle_scale = (puzzle_css / puzzle_natural) if puzzle_natural else 1.0
+            piece_center_screen = (float(data.get('puzzle_left_css', 0.0))
+                                   + piece_center_native * puzzle_scale)
+
+            # AI-seeded CV refinement: the judge lands within a few percent but
+            # rarely pixel-perfect (live-measured ~3% right of the hole).
+            # Global CV fails on wisps, but restricted to a narrow window
+            # around the AI seed it only has to fine-tune — so run the piece
+            # template against that window and shift to the best local match.
+            refined = self._ai_seed_refine(data, hole_center_screen)
+            if refined is not None:
+                self.logger.info(
+                    f"    gateway_ai: CV refine {hole_center_screen:.1f} -> {refined:.1f}px")
+                hole_center_screen = refined
+
+            distance = hole_center_screen - piece_center_screen
+            if distance <= 5:
+                return None
+            return DistanceResult(method='gateway_ai', distance=distance,
+                                  hole_x1=hole_center_screen - 20,
+                                  hole_x2=hole_center_screen + 20,
+                                  confidence=self.DEFAULT_CONFIDENCE['gateway_ai'])
+        except Exception as e:
+            # AI judge failures must be visible: this is the single call that
+            # decides the whole drag in ai/auto mode, and a silent DEBUG line
+            # left users staring at "all distance methods failed" x15.
+            self.logger.warning(f"gateway_ai failed: {type(e).__name__}: {e}")
+            return None
+
+    def _ai_seed_refine(self, data: Dict, hole_center_screen: float) -> Optional[float]:
+        """Fine-tune the AI's coarse hole estimate with local template matching.
+
+        The judge reads percentages off the gridded image, so its answers carry
+        an inherent +-2-3% quantization error — enough to land on the hole's
+        edge instead of its center. Matching the piece template against ONLY a
+        narrow window around the AI seed (instead of the whole background,
+        where wisps fool CV) usually recovers the exact center. Returns the
+        refined hole center in SCREEN px, or None to keep the AI answer.
+        """
+        if not _HAS_CV2:
+            return None
+        try:
+            bg = Image.open(io.BytesIO(data['bg_bytes'])).convert('L')
+            pz = Image.open(io.BytesIO(data['shadow_bytes'])).convert('RGBA')
+            bb = pz.getbbox() or (0, 0, pz.width, pz.height)
+            pz = pz.crop(bb)
+
+            bg_w, bg_h = bg.size
+            scale = float(data['bg_css_width']) / max(1.0, bg_w)  # native->screen
+            win = int(bg_w * 0.12)          # +-12% of width around the seed
+            seed_x = int(hole_center_screen / scale)
+            x0 = max(0, seed_x - win)
+            x1 = min(bg_w, seed_x + win)
+            if x1 - x0 < pz.width + 4:
+                return None
+
+            crop = np.array(bg.crop((x0, 0, x1, bg_h)), dtype=np.float32)
+            tmpl = np.array(pz.convert('L'), dtype=np.float32)
+            # mask out the piece's transparent padding
+            alpha = np.array(pz.split()[-1], dtype=np.float32) / 255.0
+
+            best_x, best_score = None, -1.0
+            # slide vertically only within a small band (the hole is at the
+            # piece's own height); full-height search wastes the window
+            for dy in range(0, max(1, bg_h - tmpl.shape[0]), 4):
+                if dy + tmpl.shape[0] > bg_h:
+                    break
+                for dx in range(0, crop.shape[1] - tmpl.shape[1] + 1, 2):
+                    region = crop[dy:dy + tmpl.shape[0], dx:dx + tmpl.shape[1]]
+                    num = float((region * tmpl * alpha).sum())
+                    den = float((alpha * (region * region + tmpl * tmpl)).sum()) or 1.0
+                    score = 2.0 * num / den
+                    if score > best_score:
+                        best_score, best_x, _best_dy = score, dx, dy
+
+            if best_x is None or best_score < 0.55:
+                return None
+            center_native = x0 + best_x + tmpl.shape[1] / 2.0
+            refined = center_native * scale
+            # sanity: refuse wild corrections (>8% of width) — keep the AI seed
+            if abs(refined - hole_center_screen) > float(data['bg_css_width']) * 0.08:
+                self.logger.debug(
+                    f"ai_seed_refine: rejected {refined:.1f} (too far from "
+                    f"{hole_center_screen:.1f})")
+                return None
+            return refined
+        except Exception as e:
+            self.logger.debug(f"ai_seed_refine failed: {e}")
+            return None
+
     def _method_variance(self, data: Dict) -> Optional[DistanceResult]:
         if not self.config.get('enable_variance_method', False):
             return None
@@ -800,7 +1189,16 @@ class CaptchaSolver:
 
     def _get_ocr(self):
         if self._ddddocr is None:
-            import ddddocr
+            try:
+                import ddddocr
+            except ImportError as e:
+                # surface a clear message instead of raising out of
+                # _need_ocr()/calculate() — one missing wheel used to kill
+                # the whole auto/classic calculation path
+                raise RuntimeError(
+                    "ddddocr is not installed (pip install ddddocr) — CV "
+                    "methods unavailable; use the 'ai' strategy or install it"
+                ) from e
             try:
                 self._ddddocr = ddddocr.DdddOcr(det=False, ocr=False, show_ad=False)
             except TypeError:
@@ -1040,6 +1438,26 @@ class CaptchaSolver:
         cands = [round(sum(c) / len(c), 1) for c in clusters]
         if all(abs(vote.distance - c) > tol for c in cands):
             cands.insert(0, round(vote.distance, 1))
+
+        # High spread == wisp puzzle == every CV cluster is essentially noise
+        # (validated live: the AI judge was right but its cluster ranked 3rd
+        # behind garbage, burning the low-risk first attempts). When the AI
+        # participated and the spread is this large, trust the AI first.
+        # On TIGHT votes the CV cluster still leads, but the AI answer is
+        # promoted to rank 2 if it isn't already at/near the top — live data:
+        # necklace puzzle, spread=30, CV said 153 / AI said 176; cand #1 (CV)
+        # failed, the AI answer was never reached that attempt.
+        ai_d = vote.methods.get('gateway_ai')
+        if ai_d is not None:
+            ai_d = round(float(ai_d), 1)
+            if vote.spread > self.config.get('ai_first_spread', 80.0):
+                cands = ([ai_d] + [c for c in cands if abs(c - ai_d) > tol]) \
+                    or [ai_d]
+            elif any(abs(c - ai_d) <= tol for c in cands[:1]):
+                pass  # AI already effectively rank 1
+            else:
+                rest = [c for c in cands if abs(c - ai_d) > tol]
+                cands = [cands[0], ai_d] + rest
         return cands
 
     def _human_solve(self, page: Page, min_confidence: float) -> str:
@@ -1074,6 +1492,12 @@ class CaptchaSolver:
                 self._candidates = self._build_candidates(vote)
                 self._cand_idx = 0
                 self._cand_sig = sig
+                # Fresh puzzle -> restart rotation. The site serves a NEW image
+                # after every failed slide, so carrying `_rotate` across puzzles
+                # skipped past the rank-1 (AI) answer of each fresh list before
+                # it was ever tried (live: AI=40% correct, but attempt dragged
+                # cand #3 of the NEW puzzle instead).
+                self._rotate = 0
                 self.logger.info(
                     f"    Candidates [{len(self._candidates)}]: "
                     f"{[round(c, 1) for c in self._candidates]} "
@@ -1084,14 +1508,34 @@ class CaptchaSolver:
             if not self._candidates:
                 return 'refresh'
 
-            # ROTATE through candidates across attempts. The puzzle refreshes after
-            # every failed slide, so `_cand_idx` reset to 0 each time and candidate #1
-            # of every fresh puzzle absorbed ALL the attempts. On wisps the ranking is
-            # essentially arbitrary (every cluster is a singleton), so we were sampling
-            # one biased guess 15 times and never exploring the rest. `_rotate` persists.
+            # ROTATE through candidates across attempts. NOTE: the site serves
+            # a NEW image after every failed slide, so the fresh-signature
+            # branch above normally rebuilds candidates and resets `_rotate`
+            # to 0 before we get here — each attempt drags rank-1 of the NEW
+            # list. Rotation below only engages when the SAME image survives
+            # a failed attempt (rare refresh glitch): then, and only then,
+            # advancing to the next candidate is meaningful. The counter is
+            # NOT carried across different puzzles (rank-2 of an unrelated
+            # image is noise).
             idx = self._rotate % len(self._candidates)
             base_distance = self._candidates[idx] + random.uniform(-0.5, 0.5)
-            target = int(max(30, min(350, base_distance)))
+            # Clamp against nonsense AND against the physical track: the drag
+            # can never need more than (bg width - piece width) px. The old
+            # 10000 default let an 800px outlier drag the mouse out of the
+            # window, past the point where the creep loop could correct it.
+            bg_css_w = float(captcha_data.get('bg_css_width') or 0)
+            puzzle_css_w = float(captcha_data.get('puzzle_css_width') or 0)
+            track_max = (bg_css_w - puzzle_css_w) if (bg_css_w > 0 and puzzle_css_w > 0) else None
+            max_drag = self.config.get('max_drag_distance', 0) or None
+            ceiling = min(x for x in (max_drag, track_max) if x) if (max_drag or track_max) else None
+            target = int(min(ceiling, base_distance)) if (base_distance > 3 and ceiling) else (int(base_distance) if base_distance > 3 else None)
+            if target is None:
+                self.logger.info(
+                    f"    Candidate {idx + 1} distance {base_distance:.1f}px out of "
+                    f"range — rotating to next candidate"
+                )
+                self._rotate += 1
+                return 'failed'
 
             self.logger.info(
                 f"    Try cand {idx + 1}/{len(self._candidates)} (attempt {self._rotate + 1}): "
@@ -1132,10 +1576,13 @@ class CaptchaSolver:
             except Exception:
                 pass
 
-            # Conservative initial drag (~75% of the way) then let the correction loop
-            # converge upward. Sending the full target+dead_zone slammed the slider to
-            # the end and crawled back, which is an obvious bot trajectory and looked
-            # wrong on screen. Approach from below instead.
+            # Conservative initial drag (~75% of the way) then a HUMAN-SHAPED
+            # correction: continuous micro-creep toward the target, never a
+            # discrete jump. The old loop did `mouse.move(new, steps=10)`
+            # corrections — the piece teleported 20-50px backward/forward
+            # while the button was held, a textbook bot trajectory that
+            # Aliyun's risk engine rejects even when the final position is
+            # correct (verified live: piece visually in the hole, failed).
             mouse_distance = int(drag_dead_zone + target * 0.75)
             start_x = slider_cx
 
@@ -1171,49 +1618,87 @@ class CaptchaSolver:
 
                 piece_after = _piece_x()
                 if piece_after is not None and piece_before is not None:
-                    # ITERATIVE correction. The piece-per-mouse slope is not constant
-                    # (short drags move the piece far more per pixel than long ones),
-                    # so one fixed-ratio nudge leaves a large residual — long slides
-                    # undershoot, short slides overshoot. Use the slope between
-                    # CONSECUTIVE points (cancels the dead-zone bias) and iterate to <2px.
+                    # HUMAN CORRECTION PHASE. After the initial undershoot the
+                    # hand creeps forward in a continuous decelerating motion
+                    # (like aligning a slider), reading the piece position
+                    # between micro-moves. Slope feedback still adapts to the
+                    # piece-per-mouse ratio, but every emitted move is small
+                    # (<= ~12px) and densely sampled, so the trajectory stays
+                    # smooth from press to release.
                     max_corr = int(self.config.get('max_drag_corrections', 5))
                     pieces = [piece_before, piece_after]
                     mouses = [slider_cx, end_x]
+                    # split the remaining distance into small continuous steps;
+                    # +12px planning margin so the last micro-steps can close a
+                    # few-px residual instead of releasing short (live: released
+                    # 4.5px early because the planned steps were exhausted)
+                    creep_total = (target - (piece_after - piece_before)) * 1.0 + 12.0
+                    if creep_total < 0:
+                        creep_total = 0.0  # never creep backward; release short instead
 
-                    for step in range(max_corr):
+                    # split the remaining distance into small continuous steps
+                    micro_n = max(6, min(24, int(abs(creep_total) / 2) + 6))
+                    # decelerating profile: many steps near the end
+                    weights = [(1.0 - (i / micro_n)) ** 0.6 + 0.15
+                               for i in range(micro_n)]
+                    wsum = sum(weights) or 1.0
+                    steps_px = [creep_total * (w / wsum) for w in weights]
+
+                    si = 0
+                    cur_x = end_x
+                    last_px = piece_after
+                    for step in range(max_corr * 8):
+                        if si >= micro_n:
+                            break
                         moved = pieces[-1] - pieces[0]
                         error = target - moved
-                        self.logger.info(
-                            f"    Step {step}: piece moved {moved:.1f}px "
-                            f"(target={target}px, error={error:+.1f}px)")
+                        if step % 3 == 0:
+                            self.logger.info(
+                                f"    Creep {step}: piece moved {moved:.1f}px "
+                                f"(target={target}px, error={error:+.1f}px)")
                         if abs(error) <= 2:
                             break
+                        # planned steps exhausted but still >2px short: extend
+                        # with one more gentle mini-arc rather than releasing short
+                        if si >= micro_n - 1 and abs(error) <= 12:
+                            steps_px.append(min(abs(error) + 2.0, 10.0))
+                            micro_n += 1
 
-                        if len(pieces) >= 3 and (mouses[-1] - mouses[-2]) != 0:
+                        # piece pinned (track end / slider wall): stop immediately,
+                        # further micro-moves only wiggle the mouse pointlessly
+                        if len(pieces) >= 3 and pieces[-1] == pieces[-2] == pieces[-3]:
+                            self.logger.info("    Creep: piece pinned — releasing here")
+                            break
+
+                        # adaptive slope: shrink/expand remaining micro steps
+                        if len(pieces) >= 2 and (mouses[-1] - mouses[-2]) != 0:
                             slope = (pieces[-1] - pieces[-2]) / (mouses[-1] - mouses[-2])
                         else:
-                            slope = (pieces[-1] - pieces[0]) / ((mouses[-1] - mouses[0]) or 1)
-                        if not slope or abs(slope) < 0.08:
-                            slope = 1.0 / drag_ratio
+                            slope = 1.0
+                        if slope <= 0.05:
+                            slope = 1.0
+                        delta_mouse = steps_px[si] / slope
+                        si += 1
+                        # hard-cap each emitted move to keep continuity
+                        delta_mouse = max(-14.0, min(14.0, delta_mouse))
+                        cur_x += delta_mouse
 
-                        new_mouse = mouses[-1] + error / slope * 0.85  # damp to avoid oscillation
+                        # emit as a smooth mini-arc of 1px-ish submoves
+                        sub_from = cur_x - delta_mouse
+                        sub_n = max(2, min(8, int(abs(delta_mouse))))
+                        for k in range(1, sub_n + 1):
+                            xx = sub_from + delta_mouse * (k / sub_n)
+                            yy = slider_cy + math.sin(k / sub_n * math.pi) * random.uniform(-0.4, 0.4)
+                            page.mouse.move(xx, yy)
+                            time.sleep(random.uniform(0.012, 0.03))
+                        time.sleep(random.uniform(0.04, 0.10))
 
-                        try:
-                            trk = page.locator('#aliyunCaptcha-sliding-track')
-                            if trk.count() > 0:  # bounding_box() auto-waits 30s if missing!
-                                tb = trk.bounding_box()
-                                if tb:
-                                    new_mouse = min(new_mouse, tb['x'] + tb['width'])
-                        except Exception:
-                            pass
-
-                        mouses.append(new_mouse)
-                        page.mouse.move(new_mouse, slider_cy, steps=10)
-                        time.sleep(random.uniform(0.1, 0.2))
                         px = _piece_x()
                         if px is None:
                             break
                         pieces.append(px)
+                        mouses.append(cur_x)
+                        last_px = px
                 # small human-like settle + jitter before releasing
                 try:
                     slider_now = page.locator('#aliyunCaptcha-sliding-slider').bounding_box()
@@ -1461,7 +1946,7 @@ class CaptchaSolver:
     def _calculate_distance_v2(self, captcha_data: Dict) -> Optional[VoteResult]:
         try:
             calc = DistanceCalculator(
-                ocr=self._get_ocr(),
+                ocr=self._get_ocr,   # lazy: ddddocr imported only if a method needs it
                 logger=self.logger,
                 config=self.config,
             )

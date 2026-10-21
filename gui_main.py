@@ -86,6 +86,11 @@ def _notify(message: str) -> None:
         sys.stderr.write(message + "\n")
 
 
+# origin of the running gateway (host:port from config); remembered so the
+# window-close cleanup stops workers on CUSTOM-port installs too
+_last_gateway_origin: str | None = None
+
+
 def _fix_streams() -> None:
     """A --windowed frozen exe has no console; sys.stdout/err may be None.
     pywebview and the app log through these — give them a real file."""
@@ -133,15 +138,23 @@ def _run_server() -> None:
             server = uvicorn.Server(config)
             server.run()
             return  # clean shutdown
+        except SystemExit as exc:
+            # uvicorn's startup failure (port already in use is the common
+            # one) raises SystemExit, which `except Exception` never caught —
+            # the thread died silently and the UI opened a dead URL. Treat it
+            # like any other crash so the watchdog retries / reports.
+            print(f"[watchdog] uvicorn exited with {exc!r} "
+                  f"(port in use?)", file=sys.stderr, flush=True)
         except Exception:
-            attempts += 1
-            now = time.time()
-            print(f"[watchdog] gateway crashed ({_dt.datetime.now():%H:%M:%S}) "
-                  f"attempt {attempts}", file=sys.stderr, flush=True)
-            if attempts >= 5 or now - first_start > 600:
-                print("[watchdog] giving up", file=sys.stderr, flush=True)
-                raise
-            time.sleep(min(2 ** attempts, 15))
+            pass
+        attempts += 1
+        now = time.time()
+        print(f"[watchdog] gateway crashed ({_dt.datetime.now():%H:%M:%S}) "
+              f"attempt {attempts}", file=sys.stderr, flush=True)
+        if attempts >= 5 or now - first_start > 600:
+            print("[watchdog] giving up", file=sys.stderr, flush=True)
+            raise
+        time.sleep(min(2 ** attempts, 15))
 
 
 def _webview2_available() -> bool:
@@ -256,15 +269,28 @@ def main() -> None:
     cfg = load_config(cfg_path)
     host, port = cfg.server.host, cfg.server.port
     url = f"http://{host}:{port}{DASH_PATH}"
+    # remembered for _shutdown_generator (worker stop on window close)
+    global _last_gateway_origin
+    _last_gateway_origin = f"http://{host}:{port}"
 
     threading.Thread(target=_run_server, daemon=True, name="gateway").start()
+    browser_fallback = False
     if not _wait_for(url):
-        webbrowser.open(url)   # fall back to the browser rather than a dead window
-        return
-
-    if not _webview2_available():
+        browser_fallback = True   # serve in the browser; keep the process (and the gateway thread) alive
+    elif not _webview2_available():
         # native window impossible on this machine: install prompt + browser
-        _offer_webview2_or_browser(url)
+        browser_fallback = _offer_webview2_or_browser(url)
+
+    if browser_fallback:
+        # The gateway runs in a DAEMON thread — returning from main() kills
+        # it and the browser would load a dead URL. Park the main thread
+        # until the process is killed or the user closes the terminal.
+        webbrowser.open(url)
+        _notify("The dashboard is running in your browser.\n\n"
+                "Keep this process (this window / terminal) open — closing "
+                "it stops the gateway.")
+        while True:
+            time.sleep(3600)
         return
 
     webview.create_window(
@@ -272,11 +298,37 @@ def main() -> None:
         width=1280, height=800, min_size=(980, 620),
         background_color="#0f1115", text_select=True)
     webview.start(gui="edgechromium")
+
     # The window closed. edgechromium/pythonnet leave non-daemon threads that
     # keep the interpreter — and with it the port and the single-instance
     # mutex — alive forever, so the next launch hits the "already running"
     # alert. Hard-exit: window close must mean the tool actually quit.
+    # Before the hard exit, stop the generator's workers — os._exit skips
+    # atexit and the FastAPI lifespan, and spawned Chromium children would
+    # otherwise be orphaned on the machine.
+    _shutdown_generator()
     os._exit(0)
+
+
+def _shutdown_generator() -> None:
+    """Best-effort: stop generator workers (kills their Chromium children)
+    before the hard exit. Runs from the MAIN thread after the window closed —
+    use the HTTP surface, not the gateway's event loop."""
+    try:
+        # same origin the window was served from (config host:port), not a
+        # hardcoded 8788 — custom-port installs used to leak browsers on exit
+        base = _last_gateway_origin or "http://127.0.0.1:8788"
+        import urllib.request as _ur
+        # the internal sentinel authenticates from loopback only; this is our
+        # own process talking to itself
+        req = _ur.Request(base + "/admin/dash/generator/stopall",
+                          data=b"{}", method="POST",
+                          headers={"Authorization": "Bearer gateway-internal",
+                                   "Content-Type": "application/json"})
+        with _ur.urlopen(req, timeout=5) as _:
+            pass
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

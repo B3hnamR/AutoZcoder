@@ -105,7 +105,12 @@ def test_deploy_cloudflare_mock(monkeypatch):
         resp.ok = True
         resp.status_code = 200
         if "subdomain" in url and method == "get":
+            # account-level subdomain read
             resp.json.return_value = {"success": True, "result": {"subdomain": "my-sub"}}
+        elif "subdomain" in url and method == "post":
+            # per-script enable: must report enabled=true (checked since a
+            # failed enable used to yield a stored-but-dead relay URL)
+            resp.json.return_value = {"success": True, "result": {"enabled": True}}
         else:
             resp.json.return_value = {"success": True}
         return resp
@@ -118,6 +123,29 @@ def test_deploy_cloudflare_mock(monkeypatch):
     assert res["ok"] is True
     assert res["type"] == "cloudflare"
     assert res["url"] == "https://my-cf.my-sub.workers.dev"
+
+
+def test_deploy_cloudflare_fails_when_workers_dev_enable_fails(monkeypatch):
+    import requests
+
+    def mock_request(method, url, **kwargs):
+        resp = MagicMock()
+        resp.ok = True
+        resp.status_code = 200
+        if "subdomain" in url and method == "get":
+            resp.json.return_value = {"success": True, "result": {"subdomain": "my-sub"}}
+        elif "subdomain" in url and method == "post":
+            resp.json.return_value = {"success": True, "result": {"enabled": False}}
+        else:
+            resp.json.return_value = {"success": True}
+        return resp
+
+    monkeypatch.setattr(requests, "put", lambda url, **kwargs: mock_request("put", url, **kwargs))
+    monkeypatch.setattr(requests, "post", lambda url, **kwargs: mock_request("post", url, **kwargs))
+    monkeypatch.setattr(requests, "get", lambda url, **kwargs: mock_request("get", url, **kwargs))
+
+    with pytest.raises(RuntimeError, match="workers.dev route failed"):
+        deploy_cloudflare("acc123", "token_xyz", "my-cf")
 
 
 @pytest.mark.asyncio

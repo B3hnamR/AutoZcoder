@@ -27,12 +27,13 @@ export default {
       // 13-digit zero-padded ts: lexicographic order == chronological order
       const key = 'msg:' + String(rec.ts).padStart(13, '0') + ':' + rand(6);
       await env.MAIL.put(key, JSON.stringify(rec), { expirationTtl: 3600 });
-      // Per-recipient pointer slot. Overwrite only when this mail actually
-      // carries a verify link — z.ai sends a welcome mail first, and a blind
-      // overwrite used to destroy the stored verification link before the
-      // signup flow ever polled it.
+      // Per-recipient pointers. The verify link gets its OWN key, written
+      // only when a link is present — the old single 'to:' slot was a
+      // GET-then-PUT race: a linkless welcome mail landing between the
+      // verify mail's get and put clobbered the stored link with null.
       if (to) {
         if (rec.link) {
+          await env.MAIL.put('link:' + to, JSON.stringify(rec), { expirationTtl: 3600 });
           await env.MAIL.put('to:' + to, JSON.stringify(rec), { expirationTtl: 3600 });
         } else {
           const existing = await env.MAIL.get('to:' + to);
@@ -50,7 +51,10 @@ export default {
     const url = new URL(req.url);
     if (url.pathname === '/health') return json({ ok: true });
 
-    if (url.pathname !== '/inbox') return new Response('ok');
+    // every other path (including '/', '/inbox/', '/inboxx') is NOT the
+    // inbox — answering 200 'ok' here made paste-the-wrong-URL health
+    // checks pass while the real inbox poll failed on non-JSON
+    if (url.pathname !== '/inbox') return new Response('not found', { status: 404 });
 
     // The inbox serves verification links: it must NEVER be public. If the
     // secret is not configured, reject everything (fail closed).
@@ -73,7 +77,8 @@ export default {
 
     const to = (url.searchParams.get('to') || '').toLowerCase();
     if (to) {
-      const v = await env.MAIL.get('to:' + to);
+      // prefer the dedicated link pointer; fall back to the generic slot
+      const v = (await env.MAIL.get('link:' + to)) || (await env.MAIL.get('to:' + to));
       return json(v ? JSON.parse(v) : { error: 'none' });
     }
 

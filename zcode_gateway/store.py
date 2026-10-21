@@ -143,6 +143,80 @@ class Store:
             out.append(b)
         return out
 
+    # ------------------------------------------------------------------ #
+    # analytics (pro dashboard)
+    # ------------------------------------------------------------------ #
+
+    def hourly_series(self, hours: int = 24) -> list[dict]:
+        """Per-hour requests/tokens/errors for the analytics chart."""
+        import datetime as _dt
+        since = time.time() - hours * 3600
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT ts, status, total_tokens, prompt_tokens, completion_tokens
+                   FROM usage WHERE ts >= ? ORDER BY ts""", (since,)).fetchall()
+        buckets: dict[str, dict] = {}
+        for ts, status, tokens, pt, ct in rows:
+            hr = _dt.datetime.fromtimestamp(ts).strftime("%m-%d %H:00")
+            b = buckets.setdefault(hr, {"hour": hr, "requests": 0, "ok": 0,
+                                        "errors": 0, "tokens": 0})
+            b["requests"] += 1
+            if status == 200:
+                b["ok"] += 1
+            else:
+                b["errors"] += 1
+            b["tokens"] += tokens or 0
+        out = []
+        now = _dt.datetime.now()
+        for i in range(hours - 1, -1, -1):
+            hr = (now - _dt.timedelta(hours=i)).strftime("%m-%d %H:00")
+            out.append(buckets.get(hr, {"hour": hr, "requests": 0, "ok": 0,
+                                        "errors": 0, "tokens": 0}))
+        return out
+
+    def latency_percentiles(self, since_seconds: int = 86400) -> dict:
+        """p50/p90/p99 duration of successful requests."""
+        since = time.time() - since_seconds
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT duration_ms FROM usage
+                   WHERE status = 200 AND duration_ms IS NOT NULL AND ts >= ?
+                   ORDER BY duration_ms""", (since,)).fetchall()
+        vals = [r[0] for r in rows if r[0] is not None]
+        if not vals:
+            return {"p50": 0, "p90": 0, "p99": 0, "samples": 0}
+        def pct(p):
+            return round(vals[min(int(len(vals) * p), len(vals) - 1)], 1)
+        return {"p50": pct(0.50), "p90": pct(0.90), "p99": pct(0.99),
+                "samples": len(vals)}
+
+    def error_breakdown(self, since_seconds: int = 86400) -> list[dict]:
+        """Top error codes with counts + last seen."""
+        since = time.time() - since_seconds
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT status, error_code, COUNT(*), MAX(ts) FROM usage
+                   WHERE status != 200 AND ts >= ?
+                   GROUP BY status, error_code ORDER BY COUNT(*) DESC
+                   LIMIT 12""", (since,)).fetchall()
+        return [{"status": s, "code": c or "", "count": n, "last_ts": t}
+                for s, c, n, t in rows]
+
+    def by_client_key(self, since_seconds: int = 86400 * 30) -> list[dict]:
+        """Per-API-key usage (analytics + key manager stats)."""
+        since = time.time() - since_seconds
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT client_key, COUNT(*), SUM(total_tokens),
+                          SUM(CASE WHEN status = 200 THEN 1 ELSE 0 END),
+                          MAX(ts)
+                   FROM usage WHERE ts >= ? AND client_key IS NOT NULL
+                   GROUP BY client_key ORDER BY COUNT(*) DESC""",
+                (since,)).fetchall()
+        return [{"client_key": k, "requests": n, "tokens": t or 0,
+                 "ok": ok or 0, "last_ts": mx}
+                for k, n, t, ok, mx in rows]
+
 
 class JsonlCapture:
     """Writes every upstream exchange in the same shape as the Phase-1 capture."""

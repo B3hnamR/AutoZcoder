@@ -56,11 +56,15 @@ CAPTCHA_HOOK = r"""
   function capture(txt) {
     try {
       if (!txt || txt.indexOf('securityToken') === -1) return;
-      var r = (JSON.parse(txt) || {}).Result;
+      var j = JSON.parse(txt);
+      var r = (j || {}).Result;
       if (r && r.securityToken && (r.VerifyResult === true || r.VerifyCode === 'T001')) {
         window.__verifyParam = b64(JSON.stringify({
           certifyId: r.certifyId, sceneId: SCENE, isSign: true, securityToken: r.securityToken
         }));
+        // region travels with the verdict; must be sent as
+        // x-aliyun-captcha-verify-region or the API answers 405/3012
+        try { window.__captchaRegion = (j.Region || j.region || ''); } catch (e2) {}
       }
     } catch (e) {}
   }
@@ -194,6 +198,20 @@ def _oauth_bridge(page, chat_token, log=print):
     return ok
 
 
+def _summary_progress(s):
+    """`current`, null-safe. referral_summary copies the API's explicit
+    nulls into the dict, and dict.get(k, default) does NOT substitute the
+    default for an existing None — `None < 3` raised TypeError AFTER the
+    claim already succeeded, reporting success as failure."""
+    v = s.get('current')
+    return v if isinstance(v, (int, float)) else 0
+
+
+def _summary_target(s):
+    v = s.get('target')
+    return v if isinstance(v, (int, float)) else 3
+
+
 def referral_summary(zcode_jwt, log=print):
     import requests
     from plan_check import build_headers
@@ -215,33 +233,12 @@ def referral_summary(zcode_jwt, log=print):
 _LAST_CAPTCHA_REGION = None
 
 
-def _captcha_param(log=print):
-    """Pull a traceless-captcha param from the local Go captcha service
-    (POST /api/captcha/solve {return:'param'}, auth: admin/admin). Optional —
-    the in-page send is the primary path; this is a fallback for headless runs.
-
-    Returns the param STRING, or None. The matching region is kept in
-    ``_LAST_CAPTCHA_REGION`` and must be sent as X-Aliyun-Captcha-Verify-Region;
-    without it the API answers 405/3012 even with a fresh param.
-    """
-    global _LAST_CAPTCHA_REGION
-    import requests
-    base = os.environ.get('ZAI_CAPTCHA_URL') or 'http://127.0.0.1:8687'
-    try:
-        s = requests.Session()
-        r = s.post(f'{base}/api/login',
-                   json={'username': 'admin', 'password': 'admin'}, timeout=10)
-        tok = r.json().get('token')
-        h = {'Authorization': 'Bearer ' + tok} if tok else {}
-        r = s.post(f'{base}/api/captcha/solve', json={'return': 'param'},
-                   headers=h, timeout=180)
-        j = r.json()
-        if j.get('success') and j.get('param'):
-            _LAST_CAPTCHA_REGION = j.get('region') or _LAST_CAPTCHA_REGION
-            return str(j['param'])
-        log(f'  invite: captcha solve failed: {str(j)[:120]}')
-    except Exception as e:
-        log(f'  invite: captcha service unreachable ({base}): {type(e).__name__}')
+def _deleted_captcha_service_stub():
+    """(removed) The external Go captcha-service fallback was deleted: it was
+    not in this repo, degraded silently, and per the Aliyun A/B report an
+    HTTP-minted token can never pass (F001). _page_captcha_param() replaces
+    it — params are minted inside the same headful browser that earned the
+    captcha score."""
     return None
 
 
@@ -253,15 +250,35 @@ ZCODE_HARNESS = '''You are an interactive ZCode agent that helps users with soft
 - Prefer the dedicated file/search tools over shell commands when one fits.'''
 
 
-def _norm_captcha_param(v):
-    """Coerce whatever we have into an HTTP-header-safe string or None.
-    Guards against the (param, region) tuple an older _captcha_param returned."""
-    if isinstance(v, (tuple, list)):
-        v = v[0] if v else None
-    if v is None:
-        return None
-    s = v if isinstance(v, str) else str(v)
-    return s.strip() or None
+_LAST_CAPTCHA_REGION = None
+
+
+def _page_captcha_param(page, log=print, max_wait=15):
+    """Mint a FRESH traceless-captcha param inside the logged-in page.
+
+    Replaces the old external Go service (not in this repo, silently
+    degrading, and per the Aliyun A/B report a pure HTTP minter can never
+    pass anyway: the judge scores the BROWSER that earned the token). The
+    page's own Aliyun SDK performs InitCaptchaV3 + VerifyCaptchaV3 when the
+    invite page loads; CAPTCHA_HOOK captures the T001 material. Each call
+    clears window.__verifyParam first so a retry can never replay a
+    consumed certifyId (F008 "duplicate" looks exactly like a bad token)."""
+    global _LAST_CAPTCHA_REGION
+    try:
+        page.evaluate("window.__verifyParam = ''")
+        deadline = time.time() + max_wait
+        while time.time() < deadline:
+            vp = page.evaluate("window.__verifyParam || ''")
+            if vp:
+                _LAST_CAPTCHA_REGION = page.evaluate(
+                    "window.__captchaRegion || ''") or _LAST_CAPTCHA_REGION
+                return str(vp)
+            time.sleep(1)
+        log('  invite: no fresh page captcha param within '
+            f'{max_wait}s (scene={INVITE_SCENE})')
+    except Exception as e:
+        log(f'  invite: page captcha mint failed ({type(e).__name__})')
+    return None
 
 
 def send_message_in_page(page, zcode_jwt, log=print, captcha_param=None,
@@ -346,6 +363,9 @@ def _send_confirmed(zcode_jwt, log=print, last=None):
     return False
 
 
+_SEND_PAGE = [None]     # live claim page for in-page captcha retries
+
+
 def send_one_message(zcode_jwt, log=print, retries=2):
     """Complete the send_message task via the ZCode client chat API.
 
@@ -414,6 +434,23 @@ def send_one_message(zcode_jwt, log=print, retries=2):
                 return _send_confirmed(zcode_jwt, log)
             last = f'{r.status_code} {r.text[:150]}'
             log(f'  invite: client chat -> {last}')
+            # 405/3012 = risk control wants the traceless-captcha headers.
+            # Retrying the identical captcha-less request can never succeed
+            # (the regression 86576bd deleted this branch). Send ONE fresh
+            # in-page attempt with a just-minted param: the page's Aliyun SDK
+            # earns the score in the browser risk-control actually judges.
+            if (r.status_code == 405 or '3012' in (r.text or '')) and _SEND_PAGE[0] is not None:
+                try:
+                    page = _SEND_PAGE[0]
+                    cap = _page_captcha_param(page, log=log)
+                    reg = _LAST_CAPTCHA_REGION or ''
+                    if cap and send_message_in_page(page, zcode_jwt, log=log,
+                                                    captcha_param=cap,
+                                                    captcha_region=reg):
+                        return _send_confirmed(zcode_jwt, log)
+                    log('  invite: in-page captcha retry did not land')
+                except Exception as e:
+                    log(f'  invite: in-page captcha retry failed ({type(e).__name__})')
             time.sleep(3 * attempt)
         except Exception as e:
             last = f'{type(e).__name__}: {e}'
@@ -683,9 +720,10 @@ def claim_invite(chat_token: str, invite_code: str = 'MT9GNDQ8', log=print,
     device_login run EARLIER) to skip step 4 — the proven order for fresh
     accounts is login FIRST, then bind, then message.
 
-    captcha_param: an Aliyun traceless-captcha param captured earlier in the
-    flow (e.g. the signup param) — used as the last-resort source for the
-    client message, which otherwise answers 405/3012.
+    captcha_param: ACCEPTED FOR COMPATIBILITY BUT IGNORED. Params are
+    single-use per certifyId (F008 "duplicate"), so a param captured at
+    signup is consumed there and replaying it reads as a bad token. The
+    claim flow mints its own fresh params inside the live page.
 
     force_direct: run the whole claim on the REAL IP — the bind is authenticated
     by the account session, not by IP, so the signup proxy is neither needed nor
@@ -941,6 +979,8 @@ def claim_invite(chat_token: str, invite_code: str = 'MT9GNDQ8', log=print,
         # logged out): don't burn the manual window on a POST that can't happen.
         deadline = (90 if manual_accept else 90) if clicked else 12
         waited = 0
+        bind_retries = 0
+        MAX_BIND_RETRIES = 3
         while waited < deadline and not bind_seen['code']:
             time.sleep(1)
             waited += 1
@@ -956,6 +996,26 @@ def claim_invite(chat_token: str, invite_code: str = 'MT9GNDQ8', log=print,
                     pass
                 time.sleep(3)
                 _click_accept()
+                continue
+            # risk-controlled bind: a NON-200 bind-code response used to end
+            # the wait loop for good — the account was silently left unbound
+            # and nothing but a manual re-run could recover it. Treat only 200
+            # as done; on a failure status, reload for a fresh captcha score
+            # (certifyId is single-use) and click again, bounded.
+            if isinstance(bind_seen['code'], int) and bind_seen['code'] != 200 \
+                    and bind_retries < MAX_BIND_RETRIES:
+                bind_retries += 1
+                log(f"  invite: bind-code -> {bind_seen['code']} — reload + re-click "
+                    f"({bind_retries}/{MAX_BIND_RETRIES}) for a fresh captcha")
+                bind_seen['code'] = 0
+                bind_seen.pop('body', None)
+                try:
+                    page.goto(invite_url, wait_until='domcontentloaded', timeout=60000)
+                    time.sleep(2.5)
+                except Exception:
+                    pass
+                _click_accept()
+                waited = 0        # a fresh attempt earns a fresh window
                 continue
             if (waited in (15, 30, 45)
                     and _on_invite_page() and not bind_seen['code']):
@@ -1038,9 +1098,14 @@ def claim_invite(chat_token: str, invite_code: str = 'MT9GNDQ8', log=print,
         #    signup proxy. No captcha header, no device headers: that exact
         #    shape is what passes risk control (the endpoint may still answer
         #    405/3012 on the wire while crediting the task — the summary is
-        #    the only truth).
+        #    the only truth). A 405/3012 falls back to ONE fresh in-page
+        #    send with a just-minted captcha param (see send_one_message).
         if s and s['tasks'].get('referral_bind_code') and not s['tasks'].get('send_message'):
-            result['message_sent'] = send_one_message(zjwt, log=log)
+            _SEND_PAGE[0] = page          # page still open inside the ctx
+            try:
+                result['message_sent'] = send_one_message(zjwt, log=log)
+            finally:
+                _SEND_PAGE[0] = None
 
         try:
             ctx.close()
@@ -1054,14 +1119,14 @@ def claim_invite(chat_token: str, invite_code: str = 'MT9GNDQ8', log=print,
         s = referral_summary(zjwt, log=log)
         if not s:
             continue
-        if s.get('issued') or s.get('current', 0) < s.get('target', 3):
+        if s.get('issued') or _summary_progress(s) < _summary_target(s):
             break
         # All tasks complete (3/3) but issued is granting asynchronously: poll up to 12s
         log(f"  invite: newcomer tasks 3/3 complete — waiting for plan issuance ({attempt + 1}/6)…")
     result['summary'] = s
     result['bound'] = bool(s and s['tasks'].get('referral_bind_code'))
     if s:
-        log(f"  invite: tasks={s['tasks']} progress={s['current']}/{s['target']} "
+        log(f"  invite: tasks={s['tasks']} progress={_summary_progress(s)}/{_summary_target(s)} "
             f"issued={s['issued']}")
     return result
 

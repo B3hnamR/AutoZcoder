@@ -276,8 +276,9 @@ async def test_download_rejects_a_checksum_for_a_different_file(frozen_download)
 
 def test_apply_update_quotes_paths_via_environment(tmp_path, monkeypatch):
     new_exe = tmp_path / "ZcodeGateway.new.exe"
-    new_exe.write_bytes(b"MZ")
+    new_exe.write_bytes(b"MZ" * 600_000)   # above apply's plausibility floor
     fake_target = tmp_path / "ZcodeGateway.exe"
+    fake_target.write_bytes(b"MZ" * 600_001)  # different hash from new_exe
 
     monkeypatch.setattr(updater_mod.sys, "frozen", True, raising=False)
     monkeypatch.setattr(updater_mod.sys, "executable", str(fake_target))
