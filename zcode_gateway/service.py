@@ -167,7 +167,24 @@ class ChatService:
             # 502 (captured live 2026-10-21: 10x/10min on a plan-less
             # account) — treating it as a generic 5xx only cooled the
             # account 30s and the router picked it again, forever.
+            # Duration depends on what the quota data says:
+            #   remaining <= 0 + resets_at -> genuinely spent bucket: park
+            #     until the reset (correct, could be hours)
+            #   remaining > 0 -> the upstream's answer CONTRADICTS the ledger:
+            #     either in-flight usage drained it since the last 60s poll,
+            #     or (seen live across whole clusters 2026-10-22) the exit IP
+            #     is risk-shaped and z.ai mislabels the rejection. Parking
+            #     until resets_at here would sideline a 105M-token account
+            #     for a day on ONE transient error — short park instead, the
+            #     next balance poll auto-clears it when the ledger is right.
+            #   no bucket data -> strike toward EXHAUSTED (plan-less churner)
             quota = account.notes.get('quotas', {}).get(model, {})
+            remaining = int(quota.get('remaining', 0) or 0)
+            if remaining > 0:
+                await self.pool.cap_model(account, model, 600,
+                                          reason='11113' if code == '11113' else '1005',
+                                          message=message)
+                return
             seconds = max(1, quota.get('resets_at', 0) - time.time()) if quota else 0
             if seconds <= 1:
                 # no bucket data to schedule around: if the account HAS no

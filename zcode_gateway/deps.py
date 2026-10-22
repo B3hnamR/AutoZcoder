@@ -87,3 +87,14 @@ async def admin_key(request: Request) -> str:
     if _is_internal(request, state, supplied) or _compare(state.cfg.server.admin_key, supplied):
         return "admin"
     raise HTTPException(status_code=403, detail="invalid admin key")
+
+
+async def internal_or_admin(request: Request) -> str:
+    """For endpoints spawned generator workers call with the per-run internal
+    token (they don't hold the admin key). Internal token only works from
+    loopback (see _is_internal); the admin key always works."""
+    state = get_state(request)
+    supplied = _bearer(request)
+    if _is_internal(request, state, supplied) or _compare(state.cfg.server.admin_key, supplied):
+        return "internal"
+    raise HTTPException(status_code=403, detail="invalid internal token")

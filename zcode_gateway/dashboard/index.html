@@ -2760,6 +2760,7 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
           <div id="px-progress-row" style="display:${px.running && total ? 'flex' : 'none'};gap:10px;align-items:center;margin-top:12px">
             <div class="progress"><div id="px-progress" style="width:${pct}%"></div></div>
             <span class="mono" id="px-progress-text" style="color:var(--muted);font-size:12px">${probed}/${total}</span>
+            ${ps.prefilter_phase ? `<span style="font-size:11.5px;color:var(--accent-soft,#8ea7ff)">TCP prefilter ${ps.prefilter_phase.done}/${ps.prefilter_phase.total} (${ps.prefilter_phase.open} open)</span>` : ""}
           </div>
           <div style="margin-top:10px;color:var(--muted);font-size:12px" id="px-status-line">
             ${px.running ? "checking… " + esc(px.action||"") + " (" + (px.elapsed||0) + "s)" : (px.state==='exited'?'✓ finished':(px.state==='failed'?'✗ failed':'idle'))}</div>

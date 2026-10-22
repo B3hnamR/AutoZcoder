@@ -1304,12 +1304,27 @@ def _verify_list(proxies, opts, label, quiet=False, limit=None):
             ok, why = probe_endpoint(ep[0], ep[1], ptimeout)
             return ep, ok, why
 
+        # Progress matters here: with a 96k-raw pool the prefilter runs 15+
+        # minutes, and the old ex.map loop emitted NOTHING until every
+        # endpoint was done — the dashboard counter sat at 0/96614 looking
+        # frozen (users stopped a healthy scan).
         with ThreadPoolExecutor(max_workers=max(1, pconc)) as ex:
-            for ep, ok, why in ex.map(_probe_ep, endpoints):
+            futures = {ex.submit(_probe_ep, ep): ep for ep in endpoints}
+            done_ct = 0
+            last_emit = time.time()
+            emit_every = max(2.0, min(30.0, len(endpoints) / max(pconc, 1)))
+            for fut in as_completed(futures):
+                ep, ok, why = fut.result()
+                done_ct += 1
                 if ok:
                     alive_eps.add(ep)
                 else:
                     ep_reason[ep] = why
+                now = time.time()
+                if now - last_emit >= emit_every or done_ct == len(endpoints):
+                    last_emit = now
+                    emit(t='prefilter_progress', done=done_ct,
+                         total=len(endpoints), open=len(alive_eps))
         _dead_mark_many('ep', [f"{ep[0]}:{ep[1]}" for ep in ep_reason])
         filtered = []
         for p in proxies:
@@ -1331,8 +1346,15 @@ def _verify_list(proxies, opts, label, quiet=False, limit=None):
         if done % step == 0:
             n = _record_new(results, saved, max_lat)
             _print_checkpoint(done, len(proxies), len(results), n, reasons, quiet)
+            # structured progress for the dashboard counter: the `reasons`
+            # event only fired at checkpoints on some paths and never during
+            # long stretches, leaving 0/96614 on screen for minutes
+            emit(t='reasons', probed=done, total=len(proxies),
+                 alive=len(results))
         elif done == len(proxies):
             _print_checkpoint(done, len(proxies), len(results), 0, reasons, quiet)
+            emit(t='reasons', probed=done, total=len(proxies),
+                 alive=len(results))
 
     _run_probes(proxies, timeout, concurrency, results, failures, reasons, progress)
 

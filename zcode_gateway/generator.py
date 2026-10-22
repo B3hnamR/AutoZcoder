@@ -880,6 +880,14 @@ class ProxyChecker:
             self.stats.update(prefilter={"endpoints": ev.get("endpoints", 0),
                                          "open": ev.get("open", 0),
                                          "remaining": ev.get("remaining", 0)})
+        elif t == "prefilter_progress":
+            # live movement during the TCP prefilter phase (which alone takes
+            # ~16 min on a 96k pool): update the probed counter so the
+            # dashboard stops showing 0/96614 for the whole phase
+            self.stats["probed"] = ev.get("done", 0)
+            self.stats["prefilter_phase"] = {
+                "done": ev.get("done", 0), "total": ev.get("total", 0),
+                "open": ev.get("open", 0)}
         elif t == "reasons":
             self.stats.update(probed=ev.get("probed", 0), total=ev.get("total", 0),
                               alive=ev.get("alive", 0), reasons=ev.get("reasons") or {})
@@ -1004,6 +1012,23 @@ class ProxyChecker:
             return set()
 
     def _socks(self) -> int:
+        # source of truth is pool.json (types{socks4,socks5}) — the flat
+        # proxies.txt lags behind after record_successes moved to the ledger,
+        # so the KPI used to read 0 while the pool held thousands of socks5
+        pool = self._read_json("pool.json")
+        entries = pool if isinstance(pool, dict) else {}
+        if entries:
+            bad = self._load_bad()
+            used = self._load_used()
+            seen = set()
+            for url, e in entries.items():
+                if not isinstance(e, dict) or url in bad or url in used:
+                    continue
+                proto = str(e.get("proto") or url.split("://", 1)[0]).lower()
+                if proto in ("socks4", "socks5"):
+                    seen.add(url)
+            return len(seen)
+        # fallback: legacy flat file when no ledger exists yet
         bad = self._load_bad()
         used = self._load_used()
         excluded = bad | used

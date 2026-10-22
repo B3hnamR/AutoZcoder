@@ -20,7 +20,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
 import yaml
 
-from .deps import admin_key, get_state
+from .deps import admin_key, get_state, internal_or_admin
 from .logbuffer import LogBuffer
 
 log = logging.getLogger("zcode_gateway.dash")
@@ -530,6 +530,18 @@ async def dash_notifications(request: Request, since: int = 0,
     state = get_state(request)
     return {"events": state.notifications.list(since_id=since),
             "state": state.notifications.unread_state()}
+
+
+@router.post("/admin/dash/notifications/emit")
+async def dash_notifications_emit(request: Request, body: dict = Body(...),
+                                  key: str = Depends(internal_or_admin)) -> dict:
+    """Emit an event from spawned generator workers (they carry the per-run
+    internal token, not the admin key). Loopback-only by token semantics."""
+    category = str(body.get("category") or "generator")[:40]
+    message = str(body.get("message") or "")[:300]
+    level = str(body.get("level") or "info")
+    get_state(request).notifications.emit(category, message, level=level)
+    return {"ok": True}
 
 
 @router.post("/admin/dash/notifications/clear")
