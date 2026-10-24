@@ -60,6 +60,42 @@ _EDITABLE = {
 }
 
 
+# Settings whose value is one of a fixed list: (value, label, description).
+# The dashboard renders these as dropdowns, and PUT rejects anything else (a
+# typo in config.yaml used to surface only at the next boot).
+_CHOICES: dict[str, list[tuple[str, str, str]]] = {
+    "server.host": [
+        ("127.0.0.1", "This computer only", "Safest: only programs on this PC can reach the gateway"),
+        ("localhost", "This computer only (by name)", "Same as above, using the name localhost"),
+        ("0.0.0.0", "Everyone on my network", "Other devices can connect too; keep your client key secret"),
+    ],
+    "accounts.source": [
+        ("accounts_dir", "Account folder", "One snapshot .txt per account in the accounts folder (recommended)"),
+        ("providers_json", "Zcode desktop app", "Use the logins of the installed Zcode app"),
+        ("pool_file", "Pool file", "Use a saved pool.json"),
+    ],
+    "pool.strategy": [
+        ("drain_first", "Drain one account at a time",
+         "Use the account closest to running out first: fewest accounts in play, least likely to be flagged"),
+        ("least_in_flight", "Least busy account", "Send each request to the account running the fewest requests"),
+        ("round_robin", "Take turns", "Rotate through the accounts in order"),
+        ("least_recently_used", "Longest idle first", "Pick the account that has rested the longest"),
+        ("quota_aware", "Most quota left", "Prefer the account with the most remaining quota for that model"),
+    ],
+    "models.default_effort": [
+        ("low", "Low", "Fastest answers, least reasoning"),
+        ("high", "High", "Balanced (recommended)"),
+        ("max", "Max", "Deepest reasoning, slowest"),
+    ],
+    "logging.level": [
+        ("DEBUG", "Debug", "Everything, very noisy"),
+        ("INFO", "Info", "Normal activity (recommended)"),
+        ("WARNING", "Warnings", "Only problems"),
+        ("ERROR", "Errors", "Only failures"),
+    ],
+}
+
+
 def _read_config_raw(path: Path) -> dict:
     try:
         data = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -131,6 +167,14 @@ def dashboard(request: Request) -> HTMLResponse:
     return HTMLResponse(html)
 
 
+def _model_ids(state) -> list[str]:
+    """Model names a default can be set to (the real models first, aliases after)."""
+    try:
+        return [str(m["id"]) for m in state.registry.catalogue() if m.get("id")]
+    except Exception:
+        return []
+
+
 @router.get("/admin/dash/settings")
 async def dash_settings(request: Request, key: str = Depends(admin_key)) -> dict:
     """Current settings + the raw editable values, plus server-side keys."""
@@ -157,10 +201,14 @@ async def dash_settings(request: Request, key: str = Depends(admin_key)) -> dict
             "accounts": cfg.accounts.model_dump(),
             "logging": cfg.logging.model_dump(),
             "models": cfg.models.model_dump(),
+            "update": cfg.update.model_dump(),
         },
         "admin_key": cfg.server.admin_key,
         "client_keys": [k.model_dump() for k in cfg.server.client_keys],
         "accounts_source": cfg.accounts.source,
+        "choices": {path: [{"value": v, "label": lab, "desc": desc} for v, lab, desc in opts]
+                    for path, opts in _CHOICES.items()},
+        "models": _model_ids(state),
     }
 
 
@@ -214,6 +262,16 @@ async def dash_settings_put(request: Request, body: dict = Body(...),
         if dotted == "models.default_effort" and val not in ("low", "high", "max"):
             raise HTTPException(status_code=400,
                                 detail="models.default_effort must be low, high, or max")
+        allowed = _CHOICES.get(dotted)
+        if allowed and dotted != "server.host":     # host may be any name/address
+            probe = val.upper() if dotted == "logging.level" else val
+            if probe not in [c[0] for c in allowed]:
+                raise HTTPException(status_code=400,
+                                    detail=f"{dotted} must be one of: "
+                                           f"{', '.join(c[0] for c in allowed)}")
+            val = probe
+        if dotted in ("models.default", "models.default_anthropic") and not str(val).strip():
+            raise HTTPException(status_code=400, detail=f"{dotted} cannot be empty")
         if dotted == "pool.max_in_flight_per_account" and val < 1:
             raise HTTPException(status_code=400,
                                 detail="pool.max_in_flight_per_account must be >= 1")
@@ -257,27 +315,11 @@ async def dash_import(request: Request, key: str = Depends(admin_key)) -> dict:
     """Snapshot every logged-in Zcode account into the accounts folder."""
     state = get_state(request)
     try:
-        # The two import helpers live in gui.py, but gui.py imports tkinter
-        # at module level (absent on headless servers) and uses it 130+ times.
-        # Rather than executing that module, read just the two needed defs
-        # with ast and exec them against a minimal namespace.
+        # Helpers live in paths.py (tkinter-free) — importing them directly
+        # works from source AND from a packaged exe (gui.py only exists in the
+        # compiled PYZ there, so reading its source off disk always failed).
+        from .paths import _zcode_providers
         from .zcode_accounts import import_credentials
-        import ast as _ast
-        _src = Path(__file__).with_name("gui.py").read_text(encoding="utf-8")
-        _tree = _ast.parse(_src)
-        _wanted = {"app_dir", "base_dir", "find_accounts_dir",
-                   "_zcode_providers"}
-        _ns = {"__name__": "zcode_gateway._gui_helpers",
-               "Path": Path, "os": os, "sys": sys}
-        for _node in _tree.body:
-            if isinstance(_node, _ast.FunctionDef) and _node.name in _wanted:
-                _mod = _ast.Module(body=[_node], type_ignores=[])
-                _code = compile(_mod, "gui.py", "exec")
-                exec(_code, _ns)
-        _missing = _wanted - set(_ns)
-        if _missing:
-            raise RuntimeError(f"helpers not found in gui.py: {_missing}")
-        _zcode_providers = _ns["_zcode_providers"]
     except Exception as exc:  # pragma: no cover - headless build
         raise HTTPException(status_code=500,
                             detail=f"import helper unavailable: {exc}") from exc
@@ -573,33 +615,41 @@ async def dash_proxy_health(request: Request, key: str = Depends(admin_key)) -> 
     pool_file = data_dir / "pool.json"
     proxies: list[dict] = []
     countries: dict[str, int] = {}
-    kpis = {"total": 0, "healthy": 0, "unverified": 0, "bad": 0,
-            "socks": 0, "http": 0}
+    kpis = {"total": 0, "healthy": 0, "working": 0, "failing": 0, "unverified": 0,
+            "used": 0, "bad": 0, "socks": 0, "http": 0}
+
+    def _lines(name: str) -> set:
+        try:
+            return {ln.strip() for ln in (data_dir / name).read_text(
+                encoding="utf-8", errors="ignore").splitlines() if ln.strip()}
+        except OSError:
+            return set()
+
     try:
+        from .generator import classify_proxy_entry
         raw = json.loads(pool_file.read_text(encoding="utf-8"))
         entries = raw if isinstance(raw, dict) else {}
+        bad_set, used_set = _lines("proxies_bad.txt"), _lines("proxies_used.txt")
         for url, e in entries.items():
             if not isinstance(e, dict):
                 continue
-            cc = str(e.get("country") or e.get("cc") or "??").upper()
-            ok = bool(e.get("ok") or e.get("healthy"))
-            bad = bool(e.get("bad") or e.get("dead"))
+            cc = str(e.get("country") or e.get("cc") or "").upper() or "??"
+            status = classify_proxy_entry(e, url, bad_set, used_set)
             scheme = url.split("://")[0].lower() if "://" in url else "http"
             kpis["total"] += 1
             kpis["socks" if scheme.startswith("socks") else "http"] += 1
-            if ok:
-                kpis["healthy"] += 1
-            elif bad:
-                kpis["bad"] += 1
-            else:
-                kpis["unverified"] += 1
+            kpis[{"new": "unverified"}.get(status, status)] += 1
             countries[cc] = countries.get(cc, 0) + 1
             proxies.append({
-                "url": url, "country": cc, "ok": ok, "bad": bad,
-                "latency": e.get("latency") or e.get("last_latency"),
-                "checked_at": e.get("checked_at") or e.get("last_check"),
-                "used": e.get("used_count") or e.get("used"),
+                "url": url, "country": cc, "status": status,
+                "ok": status == "working", "bad": status == "bad",
+                "latency": e.get("latency") or None,
+                "checked_at": e.get("last_check") or None,
+                "checks": int(e.get("checks", 0) or 0),
+                "fails": int(e.get("fails", 0) or 0),
+                "reason": e.get("last_reason") or "",
             })
+        kpis["healthy"] = kpis["working"]          # old key, same meaning now
     except FileNotFoundError:
         return {"available": False, "note": "no proxy pool yet — run the proxy "
                 "checker or import proxies first", "proxies": [], "countries": {},
@@ -609,7 +659,11 @@ async def dash_proxy_health(request: Request, key: str = Depends(admin_key)) -> 
                 "(corrupt?) — the checker's next save rebuilds it from .bak",
                 "proxies": [], "countries": {}, "kpis": kpis,
                 "pool_file": str(pool_file)}
-    proxies.sort(key=lambda p: (not p["ok"], p["country"], p["url"]))
+    # working first (fastest first), then everything else
+    rank = {"working": 0, "failing": 1, "new": 2, "used": 3, "bad": 4}
+    proxies.sort(key=lambda p: (rank.get(p["status"], 9),
+                                p["latency"] if (p["status"] == "working" and p["latency"]) else 9e9,
+                                p["url"]))
     return {"available": True, "kpis": kpis,
             "countries": dict(sorted(countries.items(), key=lambda kv: -kv[1])),
             "proxies": proxies[:500], "total_in_file": len(proxies),
@@ -785,6 +839,17 @@ def _generator(request: Request):
                        + (" …" if len(checked) > 5 else ""))
         main_loop = asyncio.get_running_loop()
 
+        async def _settle_new_account(account_id: str) -> None:
+            """A generator account just joined the pool: pull its plan and quota
+            now, instead of showing an empty row until the next balance poll."""
+            try:
+                pooled = await state.pool.find(account_id)
+                if pooled is not None:
+                    await state.tokens.check_account(pooled)
+            except Exception:
+                log.warning("generator: quota refresh failed for new account %s",
+                            account_id, exc_info=True)
+
         def register_account(info: dict):
             """Worker finished with a new account: mint its zcodeJWT via the
             ZCODEAUTO device flow, write an accounts_dir snapshot and upsert
@@ -823,6 +888,10 @@ def _generator(request: Request):
                     fut = asyncio.run_coroutine_threadsafe(
                         state.pool.upsert(account), main_loop)
                     fut.result(timeout=30)
+                    # quota/plan refresh is network-bound and best-effort: fire and
+                    # forget, so a slow upstream can never fail the registration
+                    asyncio.run_coroutine_threadsafe(
+                        _settle_new_account(account.id), main_loop)
                     try:
                         mgr.mark_registered(email)   # done → never re-register
                     except Exception:
@@ -840,7 +909,7 @@ def _generator(request: Request):
             except Exception:
                 log.exception("generator: pool registration failed for %s", email)
 
-        from .generator import GeneratorManager
+        from .generator import GeneratorManager, claim_result_landed
         gc = state.cfg.generator
         # Portable install: worker output (accounts/plans/proxies) lives beside
         # the exe in ./generator-data; a source checkout uses ZCODEAUTO's output/.
@@ -850,6 +919,47 @@ def _generator(request: Request):
         mgr = GeneratorManager(gen_dir, on_account=register_account,
                                python_exe=getattr(gc, "python_exe", ""),
                                data_dir=data_dir)
+
+        def _claim_settle(job) -> None:
+            """A claim job just finished: if it claimed, revive + re-settle
+            the account so a DEAD entry returns to rotation with the new
+            plan instead of waiting for a manual enable."""
+            if not claim_result_landed(getattr(job, "result", None)):
+                return
+            email = (getattr(job, "email", "") or "").strip().lower()
+            if not email:
+                return
+            try:
+                fut = asyncio.run_coroutine_threadsafe(_revive_by_email(email),
+                                                       main_loop)
+                fut.result(timeout=60)
+            except Exception:
+                log.exception("claim settle failed for %s", email)
+
+        async def _revive_by_email(email: str) -> None:
+            for acc in await state.pool.all():
+                if (acc.email or "").strip().lower() != email:
+                    continue
+                # fresh quota is live: clear hard state and re-settle reality
+                acc.state = type(acc.state).READY if hasattr(acc, "state") else acc.state
+                acc.paid_exhausted = False
+                acc.cooldown_until = 0.0
+                acc.error_count = 0
+                acc.last_error = ""
+                try:
+                    await state.tokens.check_account(acc)
+                except Exception:
+                    pass
+                try:
+                    await state.tokens.fetch_plan(acc)
+                except Exception:
+                    pass
+                log.info("claim settle: %s revived after successful claim", email)
+                return
+            log.info("claim settle: %s not in pool (import/refresh later)", email)
+
+        mgr._claim_settle = _claim_settle
+        mgr._revive_by_email = _revive_by_email
         mgr.internal_token = state.internal_token
         # AI-captcha fallback: children hit the gateway's own /v1 endpoint
         # AND the pool-health guard counts the gateway's real account dir
@@ -861,8 +971,14 @@ def _generator(request: Request):
         except Exception:
             log.warning("could not wire gateway-key for AI captcha", exc_info=True)
         # defaults come from config.yaml; '' invite_code would mean "off", but
-        # the shipped default is the project's referral code (claim stays on)
-        mgr.claim = bool(gc.claim)
+        # the shipped default is the project's referral code. claim500 wins
+        # over claim when both would be on (the dashboard offers one dropdown).
+        # The claim type seeds from config on the FIRST run only: afterwards
+        # the dashboard's saved choice wins (re-seeding every start reverted
+        # it, and set_options() below then persisted the reverted value).
+        if not mgr._has_saved_options:
+            mgr.claim = bool(gc.claim) and not bool(getattr(gc, "claim500", False))
+            mgr.claim500 = bool(getattr(gc, "claim500", True))
         mgr._invite_code = gc.invite_code
         if gc.captcha in ("auto", "manual", "ai", "classic") and not mgr._has_saved_options:
             # First run only (no generator_options.json yet): seed from
@@ -989,7 +1105,7 @@ async def generator_mail_test(request: Request, key: str = Depends(admin_key)) -
 @router.get("/admin/dash/generator/status")
 async def generator_status(request: Request, key: str = Depends(admin_key)) -> dict:
     try:
-        # status() counts pool countries and may read the offline geo DB; that is
+        # status() counts pool countries from the cache files; that is
         # blocking disk work and must not run on the event loop
         return await asyncio.to_thread(_generator(request).status)
     except HTTPException:
@@ -1195,10 +1311,11 @@ async def generator_proxies_maintain(request: Request, body: dict = Body(...),
     return _generator(request).checker.run(action)
 
 
-@router.post("/admin/dash/generator/proxies/geo")
-async def generator_proxies_geo(request: Request, key: str = Depends(admin_key)) -> dict:
-    """Download the offline country/ASN database (one explicit click)."""
-    return _generator(request).checker.run("geo")
+@router.post("/admin/dash/generator/proxies/countries")
+async def generator_proxies_countries(request: Request, key: str = Depends(admin_key)) -> dict:
+    """Look up the country of every pool proxy that has none (online, nothing is
+    downloaded). Runs in the proxy checker so its log and progress show up."""
+    return _generator(request).checker.run("countries")
 
 
 # ---- Edge Relays (Cloudflare, Vercel, Deno, Netlify) ------------------------ #
@@ -1230,7 +1347,11 @@ async def deploy_relay_endpoint(request: Request, body: dict = Body(...),
     try:
         return await asyncio.to_thread(mgr.deploy_and_add, relay_type, body)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        from .neterr import friendly
+        # the readable sentence goes to the dashboard; the raw cause to the log
+        log.warning("relay deploy (%s) failed: %s: %s [%s]", relay_type, type(e).__name__, e,
+                    getattr(e, "detail", ""))
+        raise HTTPException(status_code=400, detail=friendly(e))
 
 
 @router.post("/admin/dash/relays/add")
@@ -1276,6 +1397,19 @@ async def save_relay_settings(request: Request, body: dict = Body(...),
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from None
     return {"ok": True, "settings": st}
+
+
+@router.post("/admin/dash/relays/delete")
+async def delete_relays_endpoint(request: Request, body: dict = Body(...),
+                                 key: str = Depends(admin_key)) -> dict:
+    """Bulk delete: {"ids": [...]} removes those relays, {"all": true} every one."""
+    mgr = _relay_mgr(request)
+    ids = body.get("ids")
+    if body.get("all") is not True and not (isinstance(ids, list) and ids):
+        raise HTTPException(status_code=400, detail="send {\"ids\": [...]} or {\"all\": true}")
+    removed = mgr.delete_relays(ids if isinstance(ids, list) else None,
+                                all_relays=body.get("all") is True)
+    return {"ok": True, "deleted": removed}
 
 
 @router.delete("/admin/dash/relays/{relay_id}")

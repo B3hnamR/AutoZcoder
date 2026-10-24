@@ -53,6 +53,48 @@ delete = _DEPLOY_SESSION.delete
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
+from .neterr import describe_exception, describe_http_error, is_transient, host_of
+
+
+class RelayDeployError(RuntimeError):
+    """A deploy failed for a reason that can be explained to the user; the
+    message is already plain language (see neterr)."""
+
+    def __init__(self, user_message: str, detail: str = "") -> None:
+        super().__init__(user_message)
+        self.user_message = user_message
+        self.detail = detail
+
+
+def _call(method: str, url: str, *, attempts: int = 4, **kw):
+    """requests call that rides out transient network failures (a dropped TLS
+    handshake used to abort a whole deploy). Any transient error is retried
+    for GET/PUT/PATCH/DELETE; a POST is not retried after a read timeout —
+    the server may already have acted on it. A 502/503/504 is retried too."""
+    verb = method.lower()
+    call = getattr(requests, verb)
+    for i in range(attempts):
+        try:
+            res = call(url, **kw)
+        except requests.exceptions.RequestException as exc:
+            can_retry = is_transient(exc) and not (
+                verb == "post" and isinstance(exc, requests.exceptions.ReadTimeout))
+            if can_retry and i + 1 < attempts:
+                time.sleep(1.5 * (i + 1))
+                continue
+            raise RelayDeployError(describe_exception(exc, host_of(exc)),
+                                   detail=f"{type(exc).__name__}: {exc}") from exc
+        if res.status_code in (502, 503, 504) and i + 1 < attempts:
+            time.sleep(1.5 * (i + 1))
+            continue
+        return res
+
+
+def _api_error(provider: str, res, doing: str) -> RelayDeployError:
+    return RelayDeployError(
+        describe_http_error(provider, res.status_code, res.text, doing),
+        detail=f"HTTP {res.status_code}: {res.text[:300]}")
+
 # ---------------------------------------------------------------------------
 # Worker Codes
 # ---------------------------------------------------------------------------
@@ -251,17 +293,15 @@ def deploy_cloudflare(account_id: str, api_token: str, project_name: str = "") -
         "index.js": ("index.js", CLOUDFLARE_WORKER_CODE.encode("utf-8"), "application/javascript+module"),
         "metadata": ("metadata.json", json.dumps(metadata).encode("utf-8"), "application/json"),
     }
-    upload_res = requests.put(script_url, headers=headers, files=files, timeout=45)
+    upload_res = _call("put", script_url, headers=headers, files=files, timeout=45)
     if not upload_res.ok:
-        err = upload_res.json() if "application/json" in upload_res.headers.get("content-type", "") else {}
-        msg = (err.get("errors") or [{}])[0].get("message") or f"Cloudflare upload failed ({upload_res.status_code})"
-        raise RuntimeError(msg)
+        raise _api_error("Cloudflare", upload_res, "upload Workers scripts for this account id")
 
     # 2. Enable workers.dev subdomain — per script. Enabling is per-script,
     # not account-wide: a failed enable used to produce a stored-but-dead
     # URL. Check the response and refuse to return a URL that isn't live.
     subdomain_url = f"{script_url}/subdomain"
-    enable_res = requests.post(subdomain_url, headers=headers, json={"enabled": True}, timeout=30)
+    enable_res = _call("post", subdomain_url, headers=headers, json={"enabled": True}, timeout=30)
     enabled = False
     if enable_res.ok:
         try:
@@ -269,7 +309,7 @@ def deploy_cloudflare(account_id: str, api_token: str, project_name: str = "") -
         except ValueError:
             enabled = False
     if not enabled:
-        raise RuntimeError(
+        raise RelayDeployError(
             "Worker deployed but enabling its workers.dev route failed "
             f"(HTTP {enable_res.status_code}). Enable it in the Cloudflare "
             "dashboard (Workers → your worker → Settings → Domains & Routes)."
@@ -277,14 +317,14 @@ def deploy_cloudflare(account_id: str, api_token: str, project_name: str = "") -
 
     # 3. Retrieve account workers.dev subdomain
     account_subdomain_url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/workers/subdomain"
-    sub_res = requests.get(account_subdomain_url, headers=headers, timeout=30)
+    sub_res = _call("get", account_subdomain_url, headers=headers, timeout=30)
     subdomain = ""
     if sub_res.ok:
         data = sub_res.json().get("result") or {}
         subdomain = data.get("subdomain") or ""
 
     if not subdomain:
-        raise RuntimeError(
+        raise RelayDeployError(
             "Worker deployed but failed to retrieve workers.dev subdomain. "
             "Make sure you have set up a workers.dev subdomain in your Cloudflare Dashboard."
         )
@@ -326,10 +366,9 @@ def deploy_vercel(vercel_token: str, project_name: str = "") -> dict[str, Any]:
         "projectSettings": {"framework": None},
         "target": "production",
     }
-    res = requests.post("https://api.vercel.com/v13/deployments", headers=headers, json=payload, timeout=45)
+    res = _call("post", "https://api.vercel.com/v13/deployments", headers=headers, json=payload, timeout=45)
     if not res.ok:
-        err = res.json() if "application/json" in res.headers.get("content-type", "") else {}
-        raise RuntimeError(err.get("error", {}).get("message") or f"Vercel deployment failed ({res.status_code})")
+        raise _api_error("Vercel", res, "create deployments")
 
     deployment = res.json()
     deployment_id = deployment.get("id") or deployment.get("uid")
@@ -337,15 +376,24 @@ def deploy_vercel(vercel_token: str, project_name: str = "") -> dict[str, Any]:
 
     # 2. Disable SSO/deployment protection so the relay is publicly callable
     try:
-        requests.patch(f"https://api.vercel.com/v9/projects/{project_id}", headers=headers, json={"ssoProtection": None}, timeout=15)
+        _call("patch", f"https://api.vercel.com/v9/projects/{project_id}", headers=headers, json={"ssoProtection": None}, timeout=15, attempts=2)
     except Exception:
         pass
 
     # 3. Poll readiness (up to 120s)
     deadline = time.time() + 120
     ready_url = ""
+    last_net = ""
     while time.time() < deadline:
-        poll = requests.get(f"https://api.vercel.com/v13/deployments/{deployment_id}", headers=headers, timeout=20)
+        try:
+            poll = _call("get", f"https://api.vercel.com/v13/deployments/{deployment_id}",
+                         headers=headers, timeout=20, attempts=2)
+        except RelayDeployError as exc:
+            # the deployment already exists on Vercel: one failed status check
+            # must not abort the whole deploy, keep polling until the deadline
+            last_net = exc.user_message
+            time.sleep(3)
+            continue
         if poll.ok:
             data = poll.json()
             state = data.get("readyState")
@@ -353,11 +401,15 @@ def deploy_vercel(vercel_token: str, project_name: str = "") -> dict[str, Any]:
                 ready_url = data.get("url")
                 break
             if state in ("ERROR", "CANCELED"):
-                raise RuntimeError(f"Vercel deployment failed with state: {state}")
+                why = data.get("errorMessage") or ""
+                raise RelayDeployError(f"Vercel built the deployment but it ended in state {state}"
+                                       + (f": {why}" if why else "") + ".")
         time.sleep(3)
 
     if not ready_url:
-        raise RuntimeError("Vercel deployment timed out waiting for READY status")
+        raise RelayDeployError("Vercel did not report the deployment READY within 2 minutes"
+                               + (f" (last network problem: {last_net})" if last_net else "")
+                               + ". It may still finish - check the Vercel dashboard before retrying.")
 
     deploy_url = f"https://{ready_url}"
     return {
@@ -389,7 +441,7 @@ def deploy_deno(deno_token: str, org_domain: str, app_name: str = "") -> dict[st
     }
 
     # 1. Create app
-    app_res = requests.post("https://api.deno.com/v2/apps", headers=headers, json={
+    app_res = _call("post", "https://api.deno.com/v2/apps", headers=headers, json={
         "slug": app_name,
         "labels": {"custom.kind": "autozcoder-relay"},
         "config": {"install": "deno install", "runtime": {"type": "dynamic", "entrypoint": "main.ts"}},
@@ -397,14 +449,14 @@ def deploy_deno(deno_token: str, org_domain: str, app_name: str = "") -> dict[st
 
     if not app_res.ok:
         if app_res.status_code == 409:
-            raise RuntimeError(f'App "{app_name}" already exists. Choose a different name.')
-        raise RuntimeError(f"Failed to create Deno app ({app_res.status_code}): {app_res.text[:120]}")
+            raise RelayDeployError(f'A Deno app named "{app_name}" already exists. Choose a different name.')
+        raise _api_error("Deno Deploy", app_res, "create apps in this organization")
 
     app_data = app_res.json()
     app_id = app_data.get("id")
 
     # 2. Deploy script asset
-    deploy_res = requests.post(f"https://api.deno.com/v2/apps/{app_id}/deploy", headers=headers, json={
+    deploy_res = _call("post", f"https://api.deno.com/v2/apps/{app_id}/deploy", headers=headers, json={
         "assets": {
             "main.ts": {
                 "kind": "file",
@@ -416,10 +468,10 @@ def deploy_deno(deno_token: str, org_domain: str, app_name: str = "") -> dict[st
 
     if not deploy_res.ok:
         try:
-            requests.delete(f"https://api.deno.com/v2/apps/{app_id}", headers=headers, timeout=10)
+            _call("delete", f"https://api.deno.com/v2/apps/{app_id}", headers=headers, timeout=10, attempts=2)
         except Exception:
             pass
-        raise RuntimeError(f"Deno deployment failed ({deploy_res.status_code}): {deploy_res.text[:120]}")
+        raise _api_error("Deno Deploy", deploy_res, "deploy to this app")
 
     revision = deploy_res.json()
     revision_id = revision.get("id")
@@ -427,8 +479,15 @@ def deploy_deno(deno_token: str, org_domain: str, app_name: str = "") -> dict[st
     # 3. Poll revision status (up to 60s)
     deadline = time.time() + 60
     succeeded = False
+    last_net = ""
     while time.time() < deadline:
-        rev_res = requests.get(f"https://api.deno.com/v2/revisions/{revision_id}", headers=headers, timeout=15)
+        try:
+            rev_res = _call("get", f"https://api.deno.com/v2/revisions/{revision_id}",
+                            headers=headers, timeout=15, attempts=2)
+        except RelayDeployError as exc:
+            last_net = exc.user_message          # keep polling: the revision exists already
+            time.sleep(2)
+            continue
         if rev_res.ok:
             st = rev_res.json().get("status")
             if st == "succeeded":
@@ -440,10 +499,12 @@ def deploy_deno(deno_token: str, org_domain: str, app_name: str = "") -> dict[st
 
     if not succeeded:
         try:
-            requests.delete(f"https://api.deno.com/v2/apps/{app_id}", headers=headers, timeout=10)
+            _call("delete", f"https://api.deno.com/v2/apps/{app_id}", headers=headers, timeout=10, attempts=2)
         except Exception:
             pass
-        raise RuntimeError("Deno deployment timed out or failed to reach succeeded state")
+        raise RelayDeployError("Deno did not finish building the revision within 1 minute"
+                               + (f" (last network problem: {last_net})" if last_net else "")
+                               + ". The half-created app was removed - try again.")
 
     org_slug = org_domain.split(".")[0].strip()
     deploy_url = f"https://{app_name}.{org_slug}.deno.net"
@@ -484,12 +545,11 @@ def deploy_netlify(netlify_token: str, site_name: str = "") -> dict[str, Any]:
     }
 
     # 1. Create site
-    site_res = requests.post("https://api.netlify.com/api/v1/sites", headers=headers, json={"name": site_name}, timeout=30)
+    site_res = _call("post", "https://api.netlify.com/api/v1/sites", headers=headers, json={"name": site_name}, timeout=30)
     if not site_res.ok:
         if site_res.status_code == 422:
-            raise RuntimeError(f'Site name "{site_name}" is taken — choose a different name.')
-        err = site_res.json() if "application/json" in site_res.headers.get("content-type", "") else {}
-        raise RuntimeError(err.get("message") or f"Failed to create Netlify site ({site_res.status_code})")
+            raise RelayDeployError(f'The Netlify site name "{site_name}" is taken - choose a different name.')
+        raise _api_error("Netlify", site_res, "create sites")
 
     site = site_res.json()
     site_id = site.get("id") or site.get("site_id")
@@ -500,13 +560,13 @@ def deploy_netlify(netlify_token: str, site_name: str = "") -> dict[str, Any]:
     index_sha1 = hashlib.sha1(index_bytes).hexdigest()
     zip_bytes, fn_sha256 = _build_netlify_zip()
 
-    deploy_res = requests.post(f"https://api.netlify.com/api/v1/sites/{site_id}/deploys", headers=headers, json={
+    deploy_res = _call("post", f"https://api.netlify.com/api/v1/sites/{site_id}/deploys", headers=headers, json={
         "files": {"/index.html": index_sha1},
         "functions": {"relay": fn_sha256},
     }, timeout=30)
 
     if not deploy_res.ok:
-        raise RuntimeError(f"Failed to create Netlify deploy ({deploy_res.status_code}): {deploy_res.text[:120]}")
+        raise _api_error("Netlify", deploy_res, "create deploys for this site")
 
     deploy_data = deploy_res.json()
     deploy_id = deploy_data.get("id")
@@ -519,23 +579,32 @@ def deploy_netlify(netlify_token: str, site_name: str = "") -> dict[str, Any]:
     # so NOTHING was ever uploaded and every deploy timed out.
     oct_headers = {"Authorization": f"Bearer {netlify_token}", "Content-Type": "application/octet-stream", "User-Agent": UA}
     if "/index.html" in required_files or index_sha1 in required_files:
-        requests.put(f"https://api.netlify.com/api/v1/deploys/{deploy_id}/files/index.html", headers=oct_headers, data=index_bytes, timeout=30)
+        _call("put", f"https://api.netlify.com/api/v1/deploys/{deploy_id}/files/index.html", headers=oct_headers, data=index_bytes, timeout=30)
 
     if "relay" in required_functions or fn_sha256 in required_functions:
-        requests.put(f"https://api.netlify.com/api/v1/deploys/{deploy_id}/functions/relay?runtime=js", headers=oct_headers, data=zip_bytes, timeout=45)
+        _call("put", f"https://api.netlify.com/api/v1/deploys/{deploy_id}/functions/relay?runtime=js", headers=oct_headers, data=zip_bytes, timeout=45)
 
     # 4. Poll until ready (up to 90s)
     deadline = time.time() + 90
     ready = False
+    last_net = ""
     while time.time() < deadline:
-        st_res = requests.get(f"https://api.netlify.com/api/v1/deploys/{deploy_id}", headers=headers, timeout=15)
+        try:
+            st_res = _call("get", f"https://api.netlify.com/api/v1/deploys/{deploy_id}",
+                           headers=headers, timeout=15, attempts=2)
+        except RelayDeployError as exc:
+            last_net = exc.user_message          # the deploy exists: keep polling
+            time.sleep(3)
+            continue
         if st_res.ok and st_res.json().get("state") == "ready":
             ready = True
             break
         time.sleep(3)
 
     if not ready:
-        raise RuntimeError("Netlify deployment timed out waiting for ready state")
+        raise RelayDeployError("Netlify did not report the deploy ready within 90 seconds"
+                               + (f" (last network problem: {last_net})" if last_net else "")
+                               + ". It may still finish - check the Netlify dashboard before retrying.")
 
     deploy_url = f"{site_url.rstrip('/')}/.netlify/functions/relay"
     return {
@@ -566,10 +635,27 @@ def ping_relay(relay_url: str, timeout: float = 12.0) -> dict[str, Any]:
         elapsed_ms = int((time.time() - t0) * 1000)
         if r.status_code == 200:
             return {"ok": True, "status": 200, "elapsed_ms": elapsed_ms}
-        return {"ok": False, "status": r.status_code, "error": f"HTTP {r.status_code} ({r.text[:80]})", "elapsed_ms": elapsed_ms}
+        return {"ok": False, "status": r.status_code, "error": _ping_status_text(r.status_code, r.text),
+                "elapsed_ms": elapsed_ms}
     except Exception as e:
         elapsed_ms = int((time.time() - t0) * 1000)
-        return {"ok": False, "status": 500, "error": f"{type(e).__name__}: {e}", "elapsed_ms": elapsed_ms}
+        return {"ok": False, "status": 500, "error": describe_exception(e, host_of(e) or "the relay"),
+                "elapsed_ms": elapsed_ms}
+
+
+def _ping_status_text(status: int, body: str) -> str:
+    """What a non-200 answer from a RELAY URL means, in plain words."""
+    snippet = (body or "").strip().replace("\n", " ")[:80]
+    if status in (401, 403):
+        return f"The relay refused the request (HTTP {status}) - deployment protection or a wrong URL."
+    if status == 404:
+        return "Nothing is deployed at this relay URL (HTTP 404) - check the address."
+    if status == 429:
+        return "The relay host is rate-limiting requests (HTTP 429) - its free quota may be used up."
+    if status >= 500:
+        return (f"The relay itself is failing (HTTP {status}) - redeploy it, or its host may be down"
+                + (f": {snippet}" if snippet else "") + ".")
+    return f"Unexpected answer from the relay (HTTP {status})" + (f": {snippet}" if snippet else "") + "."
 
 
 # Backward-compatible alias

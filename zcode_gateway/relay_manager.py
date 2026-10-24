@@ -277,6 +277,32 @@ class RelayManager:
             self.save_settings(st)
             return True
 
+    def delete_relays(self, ids=None, *, all_relays: bool = False) -> int:
+        """Remove several relays in ONE read-modify-write (a loop of
+        delete_relay() would re-save the file per relay and race the health
+        loop). `all_relays=True` empties the list. Returns how many went."""
+        with self._lock:
+            st = self.get_settings()
+            before = st["relays"]
+            wanted = {str(i) for i in (ids or [])}
+            st["relays"] = [] if all_relays else [r for r in before if r.get("id") not in wanted]
+            removed = len(before) - len(st["relays"])
+            if not removed:
+                return 0
+            if not any(r.get("id") == st.get("active_id") for r in st["relays"]):
+                if st["relays"]:
+                    st["active_id"] = st["relays"][0]["id"]
+                    st["active_url"] = st["relays"][0]["url"]
+                else:
+                    st["active_id"] = ""
+                    st["active_url"] = ""
+            keep = {r.get("id") for r in st["relays"]} | {r.get("url") for r in st["relays"]}
+            for key in list(self._failed):          # cooldown keys are ids AND urls
+                if key not in keep:
+                    self._failed.pop(key, None)
+            self.save_settings(st)
+            return removed
+
     def set_active(self, relay_id: str) -> bool:
         st = self.get_settings()
         for r in st["relays"]:

@@ -633,6 +633,9 @@ class GenWorker:
         self.captcha = "manual" if env.get("ZAI_MANUAL") == "1" else "auto"
         self.email: str | None = None
         self.starter: bool | None = None
+        # the 500M giveaway grants its own plan, so the account is poolable
+        # even when the signup never got Starter
+        self.giveaway500 = False
         self.stopped = False
         self.created = time.time()
         # outcomes observed on the output files (set by the watcher);
@@ -691,6 +694,8 @@ class GenWorker:
             if ("100M Global Build active" in line or "issued=1" in line
                     or "progress=3/3" in line or "tasks 3/3 complete" in line):
                 self.global_build = True
+            if "500M giveaway claimed" in line:
+                self.giveaway500 = True
         self.proc.wait()
         code = self.proc.returncode
         if self.stopped:
@@ -707,7 +712,7 @@ class GenWorker:
     def check_new_account(self):
         """A successful run leaves one more row in accounts<SUF>.txt — surface
         the email/password for pool registration only if it received a plan."""
-        if self.starter is False:
+        if self.starter is False and not self.giveaway500:
             return None
         try:
             rows = [ln for ln in self.account_file.read_text(
@@ -751,6 +756,7 @@ class GenWorker:
             "exit_code": self.exit_code,
             "email": self.email,
             "starter": self.starter,
+            "giveaway500": self.giveaway500,
             "global_build": getattr(self, "global_build", False),
             "lines": list(self.lines)[-80:],
         }
@@ -764,7 +770,7 @@ class ProxyChecker:
     fallback for older generator folders.
     """
 
-    ACTIONS = ("fetch", "verify", "recheck", "all", "geo", "stats", "prune",
+    ACTIONS = ("fetch", "verify", "recheck", "all", "countries", "stats", "prune",
                "clear-bad", "clear-used", "clear-dead")
 
     def __init__(self, gen_dir: Path, python_exe: str = "", data_dir: Path | None = None):
@@ -833,8 +839,8 @@ class ProxyChecker:
             self.lines.clear()
             for key in ("probed", "alive", "total", "best", "median", "raw",
                         "pool", "scanned", "ever_good", "reasons", "labels",
-                        "second_chance", "prefilter", "geo_ok", "geo_updated",
-                        "elapsed"):
+                        "second_chance", "prefilter", "prefilter_phase",
+                        "countries_resolved", "countries_missing", "elapsed"):
                 self.stats.pop(key, None)
             self.refresh_stats()
             env = os.environ.copy()
@@ -880,6 +886,8 @@ class ProxyChecker:
             self.stats.update(prefilter={"endpoints": ev.get("endpoints", 0),
                                          "open": ev.get("open", 0),
                                          "remaining": ev.get("remaining", 0)})
+            # phase complete: drop the live-phase chip so it can't linger
+            self.stats.pop("prefilter_phase", None)
         elif t == "prefilter_progress":
             # live movement during the TCP prefilter phase (which alone takes
             # ~16 min on a 96k pool): update the probed counter so the
@@ -911,9 +919,9 @@ class ProxyChecker:
                 self.stats["elapsed"] = ev["elapsed"]
         elif t == "fetch_done":
             self.stats["raw"] = ev.get("raw", 0)
-        elif t == "geo":
-            self.stats.update(geo_ok=bool(ev.get("ok")), geo_updated=ev.get("updated"),
-                              geo_size_mb=ev.get("size_mb"))
+        elif t == "countries":
+            self.stats.update(countries_resolved=ev.get("resolved"),
+                              countries_missing=ev.get("missing"))
         elif t == "stats":
             for key in ("count", "usable", "healthy", "failed", "bad", "used",
                         "avg_latency", "by_proto"):
@@ -1054,7 +1062,8 @@ class ProxyChecker:
         pool = self._read_json("pool.json")
         entries = pool if isinstance(pool, dict) else {}
         if entries:
-            usable = healthy = failed = unverified = 0
+            counts = {"bad": 0, "used": 0, "new": 0, "working": 0, "failing": 0}
+            with_country = 0
             by_proto: dict[str, int] = {}
             lat = 0.0
             bad = self._load_bad()
@@ -1062,37 +1071,22 @@ class ProxyChecker:
             for url, e in entries.items():
                 if not isinstance(e, dict):
                     continue
-                fails = int(e.get("fails", 0) or 0)
-                if fails == 0:
-                    healthy += 1
-                if fails > 0:
-                    failed += 1
-                if e.get("vouched") and not int(e.get("last_ok", 0) or 0):
-                    unverified += 1
-                last_ok = int(e.get("last_ok", 0) or 0)
-                last_check = int(e.get("last_check", 0) or 0)
-                result = e.get("last_result")
-                if result is None:
-                    result = "ok" if last_check <= last_ok else "fail"
-                verified_now = last_ok > 0 and result == "ok"
-                if url not in bad and url not in used and verified_now and fails <= 3:
-                    usable += 1
+                counts[classify_proxy_entry(e, url, bad, used)] += 1
+                if e.get("country"):
+                    with_country += 1
                 proto = str(e.get("proto") or url.split("://", 1)[0]).lower()
                 by_proto[proto] = by_proto.get(proto, 0) + 1
                 try:
                     lat += float(e.get("latency", 0) or 0)
                 except (TypeError, ValueError):
                     pass
-            self.stats.update(pool_json=len(entries), usable=usable, healthy=healthy,
-                              failed=failed, unverified=unverified, types=by_proto,
+            # `healthy`/`unverified` keep their old keys but now mean working /
+            # never-checked, so the tiles add up to the number of known proxies
+            self.stats.update(pool_json=len(entries), usable=counts["working"],
+                              healthy=counts["working"], failing=counts["failing"],
+                              failed=counts["failing"], unverified=counts["new"],
+                              countries_known=with_country, types=by_proto,
                               avg_latency=round(lat / len(entries), 2) if entries else 0)
-        geo = self.data_dir / "geo" / "dbip-country-lite.csv.gz"
-        try:
-            st = geo.stat()
-            self.stats["geo"] = {"available": True, "size_mb": round(st.st_size / 1e6, 1),
-                                 "updated": time.strftime("%Y-%m-%d", time.localtime(st.st_mtime))}
-        except OSError:
-            self.stats["geo"] = {"available": False}
 
     def _read_json(self, name: str):
         try:
@@ -1186,8 +1180,76 @@ class ProxyChecker:
                    if ln.strip() and not ln.strip().startswith('#'))
 
 
+def classify_proxy_entry(entry: dict, url: str, bad: set, used: set, max_fails: int = 3) -> str:
+    """Exactly one state per proxy in the pool ledger (pool.json):
+
+      bad      - flagged as MITM / unusable (proxies_bad.txt)
+      used     - already consumed by a signup or claim (proxies_used.txt)
+      new      - never checked yet (imported or scraped, waiting for a scan)
+      working  - the latest check passed: ready to be handed out
+      failing  - checked, and the latest check failed (or too many failures)
+
+    The checker tiles and the "Proxy pool" card both use this, so their numbers
+    agree (they used to disagree: one counted "never failed" as healthy, the other
+    read fields that do not exist and called everything unverified)."""
+    if url in bad:
+        return "bad"
+    if url in used:
+        return "used"
+    last_ok = int(entry.get("last_ok", 0) or 0)
+    last_check = int(entry.get("last_check", 0) or 0)
+    if last_ok == 0 and last_check == 0:
+        return "new"
+    result = entry.get("last_result")
+    if result is None:
+        result = "ok" if last_check <= last_ok else "fail"
+    if last_ok > 0 and result == "ok" and int(entry.get("fails", 0) or 0) <= max_fails:
+        return "working"
+    return "failing"
+
+
+def _run_capture(args, cwd, timeout, env=None) -> subprocess.CompletedProcess:
+    """subprocess.run(capture_output) that kills the whole process TREE on
+    timeout. `npx` is a .cmd shim in front of node: run()'s own kill only hits
+    the shim, orphaning node — which then keeps wrangler's OAuth port bound and
+    makes the next login attempt fail with "address in use"."""
+    proc = subprocess.Popen(
+        args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, encoding="utf-8", errors="replace", shell=False, env=env,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                               capture_output=True, timeout=10, **_child_kwargs())
+            proc.kill()
+        except Exception:
+            pass
+        try:
+            out, err = proc.communicate(timeout=5)
+        except Exception:
+            out = err = ""
+        raise subprocess.TimeoutExpired(args, timeout, output=out, stderr=err)
+    return subprocess.CompletedProcess(args, proc.returncode, out, err)
+
+
+def claim_result_landed(res) -> bool:
+    """Did a finished claim job's CLAIM_RESULT actually grant the plan?
+
+    The two claim scripts report differently: claim500.py sets a top-level
+    `claimed`, claim100.py nests the verdict as `summary.issued`."""
+    if not isinstance(res, dict):
+        return False
+    if res.get("claimed") or res.get("issued"):
+        return True
+    summary = res.get("summary")
+    return isinstance(summary, dict) and bool(summary.get("issued"))
+
+
 class ClaimJob:
-    """Standalone 100M claim for one account (generator/claim100.py).
+    """Standalone claim for one account (generator/claim100.py or claim500.py).
 
     Runs with a visible browser and manual accept, like a normal claim; the
     final `CLAIM_RESULT {...}` line carries the referral summary."""
@@ -1195,16 +1257,13 @@ class ClaimJob:
 
     def __init__(self, name: str, email: str, mode: str, proxy: str,
                  gen_dir: Path, python_exe: str, invite_code: str,
-                 data_dir: Path | None = None):
+                 data_dir: Path | None = None, kind: str = "100m"):
         self.name, self.email, self.mode, self.proxy = name, email, mode, proxy
+        self.kind = kind if kind in ("100m", "500m") else "100m"
         self.gen_dir = Path(gen_dir)
         self.data_dir = Path(data_dir) if data_dir else self.gen_dir / "output"
-        argv = [python_exe, "-u", "claim100.py", email]
-        if mode == "direct":
-            argv.append("--direct")
-        elif proxy:
-            argv += ["--proxy", proxy]
-        self.argv = argv
+        self.python_exe = python_exe
+        self.argv = self._build_argv()
         self.invite_code = invite_code
         self.proc: subprocess.Popen | None = None
         self.state = "starting"      # starting|running|exited|failed|killed
@@ -1214,9 +1273,35 @@ class ClaimJob:
         self.lines: deque[str] = deque(maxlen=220)
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
+        self.on_exit = None          # set by the gateway (claim settle hook)
+
+    def _build_argv(self) -> list[str]:
+        script = "claim500.py" if self.kind == "500m" else "claim100.py"
+        argv = [self.python_exe, "-u", script, self.email]
+        if self.kind == "500m":
+            # claim500 has no invite-code dependency: the 500M is a direct
+            # billing/claim against the giveaway plan id.
+            argv += ["--plan", "zcode-v3-start-plan-1024"]
+        if self.mode == "direct":
+            argv.append("--direct")
+        elif self.proxy:
+            argv += ["--proxy", self.proxy]
+        return argv
+
+    def set_route(self, mode: str, proxy: str) -> None:
+        """Fix the route once it has been resolved (the job is queued before)."""
+        self.mode, self.proxy = mode, proxy
+        self.argv = self._build_argv()
+
+    def fail(self, message: str) -> None:
+        self.lines.append(message)
+        self.state = "failed"
 
     def alive(self) -> bool:
-        return bool(self.proc and self.proc.poll() is None)
+        if self.proc is not None:
+            return self.proc.poll() is None
+        # queued: the route is still being resolved in the background
+        return self.state == "starting" and not self.stopped
 
     def start(self):
         env = os.environ.copy()
@@ -1246,6 +1331,7 @@ class ClaimJob:
         if isinstance(res, dict):
             res = {k: v for k, v in res.items() if k != "_claim_jwt"}
         return {"name": self.name, "email": self.email, "mode": self.mode,
+                "kind": self.kind,
                 "proxy": re.sub(r"//[^/]*@", "//", self.proxy) if self.proxy else "", "state": self.state,
                 "elapsed": int(time.time() - self.started) if self.started else 0,
                 "result": res,
@@ -1273,6 +1359,13 @@ class ClaimJob:
             self.lines.append(line)
         self.proc.wait()
         self.state = "exited" if self.proc.returncode == 0 else "failed"
+        # completion hook: let the gateway re-settle the account (a dead
+        # account that just claimed a plan must return to rotation)
+        if self.on_exit:
+            try:
+                self.on_exit(self)
+            except Exception:
+                log.exception("claim on_exit callback failed for %s", self.email)
 
     def stop(self):
         self.stopped = True
@@ -1347,7 +1440,8 @@ class GeneratorManager:
         self.country = "ALL"                # ALL | US | DE | ...
         self.pin_proxy = ""
         self.retries = 5
-        self.claim = True                   # invite Global Build claim on/off
+        self.claim = False                  # invite Global Build (100M) claim on/off
+        self.claim500 = True                # 500M giveaway billing/claim on/off (default)
         self.headless = False               # default: visible window (manual captcha needs it)
         self._invite_code = "MT9GNDQ8"      # referral code ('' = off; overridden by config)
         self.pool_file = self.data_dir / "proxies.txt"
@@ -1460,10 +1554,14 @@ class GeneratorManager:
         out, seen = [], set()
         # v1.0.5 sorted layout puts starter*.txt under results/; older folders
         # (and catch-up scans of legacy data) still have them flat — read both.
+        # accounts500m*.txt holds 500M-giveaway accounts, which are poolable
+        # without a Starter plan (the main accounts*.txt also lists failed
+        # signups, so it is deliberately not scanned wholesale).
         files: list[Path] = []
         for base in (self.data_dir / "results", self.data_dir):
             try:
                 files.extend(sorted(base.glob("starter*.txt")))
+                files.extend(sorted(base.glob("accounts500m*.txt")))
             except OSError:
                 continue
         for f in files:
@@ -1720,28 +1818,42 @@ class GeneratorManager:
             info["wrangler_authed"] = None
             info["node_missing"] = True
             return info
-        # whoami tells us wrangler auth without opening a browser.
-        # A cold npx download on a slow link can exceed the 60s cap; report
-        # "unknown" instead of an error — the files ARE exported and the
-        # Email card must not show a red error before the user did anything.
-        try:
-            r = subprocess.run(
-                [npx, "wrangler", "whoami"], cwd=str(wdir),
-                capture_output=True, text=True, timeout=60,
-                shell=False, encoding="utf-8", errors="replace",
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        except subprocess.TimeoutExpired:
-            info["wrangler_authed"] = None
-            info["whoami_timeout"] = True
-            return info
-        out = _clean_output((r.stdout or "") + (r.stderr or ""))
-        info["wrangler_authed"] = "You are logged in" in out
-        if "@" in out and "logged in" in out:
-            for tok in out.split():
-                if "@" in tok and "." in tok:
-                    info["account"] = tok.strip("👋🔐 ")
-                    break
+        info.update(self._cached_whoami(npx, wdir))
         return info
+
+    def _cached_whoami(self, npx: str, wdir: Path) -> dict:
+        """`wrangler whoami` result, cached. The dashboard asks on every visit
+        to the Generator tab and each ask used to spawn npx (seconds, up to the
+        60s cap on a cold start). A positive answer is good for 10 minutes; an
+        unknown/negative one is re-checked after 20s. A deploy clears it."""
+        if getattr(self, "_whoami_lock", None) is None:
+            self._whoami_lock = threading.Lock()
+        with self._whoami_lock:          # concurrent asks share one npx run
+            cached = getattr(self, "_whoami_cache", None)
+            if cached:
+                ts, fields = cached
+                ttl = 600 if fields.get("wrangler_authed") is True else 20
+                if time.time() - ts < ttl:
+                    return dict(fields)
+            # whoami tells us wrangler auth without opening a browser.
+            # A cold npx download on a slow link can exceed the 60s cap; report
+            # "unknown" instead of an error — the files ARE exported and the
+            # Email card must not show a red error before the user did anything.
+            fields: dict = {}
+            try:
+                r = _run_capture([npx, "wrangler", "whoami"], cwd=str(wdir), timeout=60)
+            except subprocess.TimeoutExpired:
+                fields = {"wrangler_authed": None, "whoami_timeout": True}
+            else:
+                out = _clean_output((r.stdout or "") + (r.stderr or ""))
+                fields["wrangler_authed"] = "You are logged in" in out
+                if "@" in out and "logged in" in out:
+                    for tok in out.split():
+                        if "@" in tok and "." in tok:
+                            fields["account"] = tok.strip("👋🔐 ")
+                            break
+            self._whoami_cache = (time.time(), fields)
+            return dict(fields)
 
     def deploy_worker(self, progress=None) -> dict:
         """One-click deploy: export files, ensure Node (auto-install if
@@ -1758,7 +1870,55 @@ class GeneratorManager:
         try:
             return self._deploy_worker_locked(progress)
         finally:
+            self._whoami_cache = None        # login state may have just changed
             self._deploy_lock.release()
+
+    # `wrangler login` strategies, tried in order. Wrangler's default OAuth
+    # callback listens on `localhost`, which Node resolves to IPv6 ::1 first;
+    # on machines where ::1 is unusable (WSAEACCES) the browser's redirect to
+    # localhost:8976 never reaches it and the login times out. Binding the
+    # callback server to 127.0.0.1 fixes that (browsers fall back from the
+    # dead ::1 to IPv4); the device-code flow needs no local server at all.
+    _LOGIN_ATTEMPTS = (
+        ("browser, IPv4 callback", ("login", "--callback-host", "127.0.0.1"), 180),
+        ("device code", ("login", "--device"), 660),
+    )
+
+    @staticmethod
+    def _last_line(text: str, limit: int = 160) -> str:
+        lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+        return (lines[-1][:limit]) if lines else "no output"
+
+    def _wrangler_login(self, run, npx: str, say) -> tuple[bool, str]:
+        """Log wrangler in; returns (True, whoami output) or (False, error).
+
+        Each strategy is verified with `whoami` (a login can succeed even on a
+        nonzero exit), and a failed one reports wrangler's own last line so the
+        dashboard shows the real reason instead of a generic "try again"."""
+        notes: list[str] = []
+        for label, args, timeout in self._LOGIN_ATTEMPTS:
+            say(f"Cloudflare login — {label}…")
+            try:
+                r = run([npx, "wrangler", *args], timeout=timeout)
+                text = _clean_output((r.stdout or "") + (r.stderr or ""))
+            except subprocess.TimeoutExpired:
+                text = "timed out waiting for the browser"
+            except OSError as exc:
+                text = f"{type(exc).__name__}: {exc}"
+            who = ""
+            try:
+                w = run([npx, "wrangler", "whoami"], timeout=90)
+                who = _clean_output((w.stdout or "") + (w.stderr or ""))
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+            if "You are logged in" in who:
+                return True, who
+            notes.append(f"{label}: {self._last_line(text)}")
+            say(f"login attempt failed — {notes[-1]}")
+        return False, ("Cloudflare login did not complete (" + "; ".join(notes)
+                       + "). If your browser cannot reach localhost:8976, run "
+                       "`npx wrangler login --device` in a terminal (or set "
+                       "CLOUDFLARE_API_TOKEN) and retry.")
 
     def _deploy_worker_locked(self, progress=None) -> dict:
         import re as _re
@@ -1786,11 +1946,7 @@ class GeneratorManager:
             if env_extra:
                 env = dict(os.environ)
                 env.update({k: v for k, v in env_extra.items() if v})
-            return subprocess.run(args, cwd=str(wdir), capture_output=True,
-                                  text=True, timeout=timeout, shell=False,
-                                  encoding="utf-8", errors="replace",
-                                  env=env,
-                                  creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            return _run_capture(args, cwd=str(wdir), timeout=timeout, env=env)
 
         # Multi-account Cloudflare logins: wrangler cannot pick an account in
         # non-interactive mode (our capture_output pipes make it non-TTY) and
@@ -1830,17 +1986,9 @@ class GeneratorManager:
         out = _clean_output((r.stdout or "") + (r.stderr or ""))
         if "You are logged in" not in out:
             say("opening browser for Cloudflare login (one time)…")
-            r = run([npx, "wrangler", "login"], timeout=600)
-            out = _clean_output((r.stdout or "") + (r.stderr or ""))
-            if "You are logged in" not in out:
-                # login may have succeeded even on nonzero exit; recheck
-                r2 = run([npx, "wrangler", "whoami"], timeout=90)
-                out2 = _clean_output((r2.stdout or "") + (r2.stderr or ""))
-                if "You are logged in" not in out2:
-                    return {"ok": False,
-                            "error": "Cloudflare login did not complete — try again"}
-            r = run([npx, "wrangler", "whoami"], timeout=90)
-            out = _clean_output((r.stdout or "") + (r.stderr or ""))
+            logged_in, out = self._wrangler_login(run, npx, say)
+            if not logged_in:
+                return {"ok": False, "error": out}
 
         # pin the account for every subsequent wrangler call when the login
         # has more than one account (non-interactive selection is impossible)
@@ -2060,7 +2208,7 @@ class GeneratorManager:
         return self.data_dir / "generator_options.json"
 
     _OPTION_FIELDS = ("captcha", "ip_source", "country", "proxy_types",
-                      "pin_proxy", "retries", "claim", "headless",
+                      "pin_proxy", "retries", "claim", "claim500", "headless",
                       "invite_code", "captcha_strategy",
                       "custom_ai_url", "custom_ai_key", "custom_ai_model")
 
@@ -2078,6 +2226,7 @@ class GeneratorManager:
             "pin_proxy": self.pin_proxy,
             "retries": self.retries,
             "claim": self.claim,
+            "claim500": self.claim500,
             "headless": self.headless,
             "invite_code": self._invite_code,
         }
@@ -2099,6 +2248,10 @@ class GeneratorManager:
             return
         # reuse the validation in set_options; invite_code maps to the field
         kw = {k: v for k, v in raw.items() if k in self._OPTION_FIELDS}
+        # a file saved before claim500 existed: `claim` was the whole choice
+        # (on = 100M, off = off), so don't let claim500's default turn it on
+        if "claim" in kw and "claim500" not in kw:
+            kw["claim500"] = False
         if kw:
             self.set_options(**kw)
 
@@ -2131,6 +2284,16 @@ class GeneratorManager:
         if "claim" in kw:
             v = kw["claim"]
             self.claim = v if isinstance(v, bool) else (str(v).lower() in ("true", "1", "yes", "on"))
+        if "claim500" in kw:
+            v = kw["claim500"]
+            self.claim500 = v if isinstance(v, bool) else (str(v).lower() in ("true", "1", "yes", "on"))
+        # mutually exclusive by design: the 500M giveaway wins over the 100M
+        # referral claim (a fresh account can hold both, but the pipeline runs
+        # one chain; the dashboard exposes a single "claim type" dropdown).
+        if "claim500" in kw and self.claim500:
+            self.claim = False
+        elif "claim" in kw and self.claim:
+            self.claim500 = False
         if "headless" in kw:
             v = kw["headless"]
             self.headless = v if isinstance(v, bool) else (str(v).lower() in ("true", "1", "yes", "on", "auto"))
@@ -2142,16 +2305,6 @@ class GeneratorManager:
             self._invite_code = str(kw["invite_code"] or "").strip()
         # options changed from the dashboard: persist for the next start
         self.save_options()
-
-    def _geo_db(self):
-        """Offline DB-IP lookup if the generator downloaded it; never network."""
-        try:
-            sys.path.insert(0, str(self.gen_dir))
-            import proxy_geo
-            proxy_geo.set_data_dir(str(self.data_dir))
-            return proxy_geo
-        except Exception:
-            return None
 
     def _country_counts(self) -> dict[str, int]:
         bad = self._load_bad()
@@ -2185,25 +2338,10 @@ class GeneratorManager:
         except (OSError, ValueError):
             pass
 
+        # status() is polled by the dashboard, so it NEVER touches the network:
+        # countries come from the cache and from pool.json, and are filled in by
+        # the "Look up countries" action (online lookup in the proxy checker)
         ip_re = re.compile(r"://(?:[^@/]+@)?([^:/]+)")
-        missing = list(dict.fromkeys(
-            m.group(1) for p in lines
-            for m in [ip_re.search(p)] if m and m.group(1) not in cache))
-        if missing:
-            db = self._geo_db()
-            if db is not None and db.available():
-                added = False
-                for ip in missing[:5000]:
-                    cc = db.lookup(ip).get("country", "")
-                    if cc:
-                        cache[ip] = cc.upper()
-                        added = True
-                if added:
-                    try:
-                        cache_file.write_text(json.dumps(cache, indent=2), encoding="utf-8")
-                    except OSError:
-                        pass
-
         from collections import Counter
         counts = Counter()
         schemes = self._proxy_type_schemes()
@@ -2290,7 +2428,8 @@ class GeneratorManager:
                 "country": getattr(self, "country", "ALL"),
                 "countries_available": self._country_counts(),
                 "pin_proxy": self.pin_proxy, "retries": self.retries,
-                "claim": self.claim, "headless": self.headless,
+                "claim": self.claim, "claim500": self.claim500,
+                "headless": self.headless,
                 "invite_code": self._invite_code,
                 "socks_available": tc["socks"],
                 "mail": self.mail_config(),
@@ -2313,6 +2452,15 @@ class GeneratorManager:
                     if ln.strip()}
         except OSError:
             return set()
+
+    def _proxy_pool(self):
+        """The proxy_pool module, pointed at this manager's data folder.
+
+        The manager called this in several places (claim proxy pick, worker
+        proxy pick, socks-ready badge) but only ProxyChecker defined it, so every
+        one of those calls raised AttributeError, was swallowed by a broad
+        `except`, and quietly meant "no proxy available"."""
+        return self.checker._proxy_pool()
 
     def _pick_proxy(self, socks_only: bool, tries: int = 25) -> str | None:
         """Verify-on-pick from the pool, honouring the configured type filter."""
@@ -2543,6 +2691,9 @@ class GeneratorManager:
             env["ZAI_INVITE_CODE"] = self._invite_code
         else:
             env["ZAI_INVITE_CODE"] = ""   # explicit OFF (main.py treats '' as off)
+        # 500M giveaway claim is mutually exclusive with the 100M referral:
+        # when on, main.py skips the invite chain entirely.
+        env["ZAI_CLAIM500"] = "1" if self.claim500 else "0"
         # email: the user's own domains + worker inbox (public-ready setup)
         m = self.mail_cfg
         if m.get("active"):
@@ -2600,55 +2751,108 @@ class GeneratorManager:
 
     # ---- per-account 100M claims (Accounts tab) ------------------------------ #
 
+    def _launch_claim(self, kind: str, email: str, mode: str,
+                      allow_direct_fallback: bool = True) -> dict:
+        """Queue one claim job and return AT ONCE.
+
+        Picking a verified proxy can take minutes (live probes, a busy checker).
+        Doing that inside the HTTP request left the dashboard on "starting…"
+        with nothing visible, and a second click then queued a duplicate because
+        the first job was not registered yet. The job is registered here, shows
+        up in the claim list immediately, and its route is resolved in the
+        background (see _resolve_claim_route)."""
+        email = (email or "").strip().lower()
+        if not email:
+            return {"error": "account has no email"}
+        if len([j for j in self.claims.values() if j.alive()]) >= 3:
+            return {"error": "too many claims running"}
+        if any(j.alive() and j.email == email for j in self.claims.values()):
+            return {"error": "a claim for this account is already running"}
+        mode = "direct" if mode == "direct" else "proxy"
+        name = f"{'claim500' if kind == '500m' else 'claim'}-{int(time.time())}"
+        while name in self.claims:
+            name += "x"
+        job = ClaimJob(name, email, mode, "", self.gen_dir, self.python_exe,
+                       self._invite_code, data_dir=self.data_dir, kind=kind)
+        job._internal_token = self.internal_token
+        job.on_exit = getattr(self, "_claim_settle", None)
+        job.lines.append("looking for a verified proxy…" if mode == "proxy"
+                         else "starting on the direct IP…")
+        job.started = time.time()          # elapsed counts from the click, not from process start
+        self.claims[name] = job
+        threading.Thread(target=self._resolve_claim_route, args=(job, allow_direct_fallback),
+                         daemon=True, name=f"{name}-route").start()
+        return {"started": name, "proxy": "", "mode": mode}
+
+    def _resolve_claim_route(self, job: "ClaimJob", allow_direct_fallback: bool) -> None:
+        """Background half of _launch_claim: pick the route, then launch."""
+        try:
+            mode, proxy = job.mode, ""
+            if mode == "proxy":
+                progress = job.lines.append
+                proxy = self._proxy_for_claim(job.kind, progress)
+                if not proxy and not job.stopped:
+                    # nothing passed a live test: refresh the pool, then pick again
+                    # (a scan that is already running is simply waited for)
+                    already = self.checker.alive()
+                    job.lines.append("no proxy passed a live test — "
+                                     + ("waiting for the running proxy scan…" if already
+                                        else "running a quick recheck of the pool…"))
+                    try:
+                        if not already:
+                            self.checker.run("recheck")
+                        for sec in range(90):
+                            if job.stopped or not self.checker.alive():
+                                break
+                            if sec and sec % 15 == 0:
+                                job.lines.append(
+                                    f"  …scan still running ({sec}s, "
+                                    f"{self.checker.stats.get('alive') or 0} alive so far)")
+                            time.sleep(1)
+                        if not job.stopped:
+                            proxy = self._proxy_for_claim(job.kind, progress)
+                    except Exception:
+                        log.exception("claim: auto-recheck failed")
+                if not proxy:
+                    if not allow_direct_fallback:
+                        job.fail("no usable proxy in the pool (run a proxy scan first)")
+                        return
+                    job.lines.append("no verified proxy available — falling back to the DIRECT IP")
+                    mode = "direct"
+                else:
+                    job.lines.append("verified proxy found — starting")
+            if job.stopped:
+                return
+            # only the 100M referral claim drives a browser; the 500M claim is plain HTTP
+            if job.kind == "100m" and not self._ensure_playwright():
+                job.fail("playwright setup failed — check the log")
+                return
+            if job.stopped:
+                return
+            job.set_route(mode, proxy)
+            job.start()
+        except Exception as exc:
+            log.exception("claim %s could not start", job.name)
+            from .neterr import friendly
+            job.fail(f"could not start: {friendly(exc)}")
+
     def start_claim(self, email: str, mode: str = "proxy", allow_direct_fallback: bool = True) -> dict:
         """Claim 100M for one account, separately from the generator flow.
 
         mode: 'proxy' — a pool proxy (pinned proxy first), 'direct' — no proxy.
         The claim browser is visible and waits for a manual Accept like a
-        generator claim. When the pool pick fails in proxy mode, a quick
-        re-verify runs once and the pick retries; if it still fails, the claim
-        falls back to direct (the bind is session-authenticated, not
-        IP-bound) instead of dead-ending."""
-        email = (email or "").strip().lower()
-        if not email:
-            return {"error": "account has no email"}
-        alive = [j for j in self.claims.values() if j.alive()]
-        if len(alive) >= 3:
-            return {"error": "too many claims running"}
-        if any(j.alive() and j.email == email for j in self.claims.values()):
-            return {"error": "a claim for this account is already running"}
-        if mode == "proxy":
-            proxy = self._proxy_for_claim()
-            if not proxy:
-                # one quick background recheck of the usable pool, then retry
-                log.info("claim: pool pick empty — running a quick recheck")
-                try:
-                    self.checker.run("recheck")
-                    # wait briefly for the recheck to finish (bounded)
-                    for _ in range(120):
-                        if not self.checker.alive():
-                            break
-                        time.sleep(1)
-                    proxy = self._proxy_for_claim()
-                except Exception:
-                    log.exception("claim: auto-recheck failed")
-            if not proxy:
-                if not allow_direct_fallback:
-                    return {"error": "no usable proxy in the pool (run a proxy scan first)"}
-                log.info("claim: pool still empty — falling back to DIRECT")
-                mode = "direct"
-        else:
-            proxy = ""
-        if not self._ensure_playwright():
-            return {"error": "playwright setup failed — check the log"}
-        name = f"claim-{int(time.time())}"
-        job = ClaimJob(name, email, mode, proxy, self.gen_dir,
-                       self.python_exe, self._invite_code,
-                       data_dir=self.data_dir)
-        job._internal_token = self.internal_token
-        job.start()
-        self.claims[name] = job
-        return {"started": name, "proxy": job.proxy, "mode": mode}
+        generator claim. If no verified proxy can be found the claim falls back
+        to direct (the bind is session-authenticated, not IP-bound)."""
+        return self._launch_claim("100m", email, mode, allow_direct_fallback)
+
+    def start_claim500(self, email: str, mode: str = "proxy",
+                       allow_direct_fallback: bool = True) -> dict:
+        """Claim the 500M giveaway (1024 Dev Day) for one account.
+
+        Runs generator/claim500.py (device_login -> marketing_touch ->
+        billing/claim -> billing/balance verification). Pure HTTP: no browser,
+        so unlike the 100M claim it never needs Playwright."""
+        return self._launch_claim("500m", email, mode, allow_direct_fallback)
 
     def socks_ready_count(self) -> int:
         """Live socks count for the claim health badge (cheap heuristic:
@@ -2686,17 +2890,35 @@ class GeneratorManager:
                 errors.append(f"{email}: {res.get('error', '?')}")
         return {"started": started, "skipped": skipped, "errors": errors}
 
-    def _proxy_for_claim(self) -> str:
+    def _proxy_for_claim(self, kind: str = "100m", progress=None) -> str:
+        """A live proxy for a claim: the pinned one, else one picked from the
+        pool and VERIFIED right now (pick_verified probes before it hands one
+        out). "Usable" only means "passed its last check", which can be days old,
+        so several waves are tried — freshest first — before giving up. The
+        500M claim is plain HTTP and also accepts non-socks proxies; the 100M
+        browser flow stays socks-only."""
         o = self.options()
         pinned = str(o.get("pinned") or "").strip()
         if pinned:
             return pinned
         try:
             pool = self._proxy_pool()
-            return pool.pick_verified(tries=8, socks=True) or ""
         except Exception as e:
             log.warning("claim pool pick failed: %s", e)
             return ""
+        waves = [(True, 25), (True, 40)] + ([(False, 40)] if kind == "500m" else [])
+        for n, (socks, tries) in enumerate(waves, 1):
+            if progress:
+                progress(f"testing proxies live ({'socks' if socks else 'any type'}, "
+                         f"round {n}/{len(waves)})…")
+            try:
+                picked = pool.pick_verified(tries=tries, socks=socks)
+            except Exception as e:
+                log.warning("claim pool pick failed: %s", e)
+                picked = None
+            if picked:
+                return picked
+        return ""
 
     def claims_public(self) -> list[dict]:
         return [j.to_public() for j in self.claims.values()]

@@ -255,7 +255,8 @@ select.sel option{background:var(--card); color:var(--fg)}
 .dd-btn:hover, .dd.open .dd-btn{background:var(--elev); color:var(--fg)}
 .dd-menu{position:absolute; right:0; top:calc(100% + 5px); z-index:40; min-width:190px;
   background:var(--card); border:1px solid var(--border); border-radius:10px;
-  padding:5px; box-shadow:0 12px 34px rgba(0,0,0,.5); display:none; text-align:left}
+  padding:5px; box-shadow:0 12px 34px rgba(0,0,0,.5); display:none; text-align:left;
+  max-height:calc(100vh - 16px); overflow-y:auto}
 .dd.open .dd-menu{display:block}
 .dd-item{display:flex; align-items:center; gap:9px; width:100%; background:none; border:0;
   color:var(--fg); font:13px "Segoe UI",sans-serif; padding:8px 10px; border-radius:7px;
@@ -265,6 +266,78 @@ select.sel option{background:var(--card); color:var(--fg)}
 .dd-item.danger{color:var(--err)}
 .dd-item.danger:hover{background:rgba(255,107,122,.1)}
 .dd-sep{height:1px; background:var(--border); margin:5px 4px}
+
+/* ---------- themed select: replaces the OS dropdown list everywhere ---------- */
+.sel-dd{position:relative; display:inline-block; max-width:100%; vertical-align:middle}
+.sel-btn{display:flex; align-items:center; justify-content:space-between; gap:8px; width:100%;
+  background:var(--field); color:var(--fg); border:1px solid var(--border); border-radius:8px;
+  padding:8px 11px; font:13px "Segoe UI",sans-serif; cursor:pointer; text-align:left; min-height:32px}
+.sel-btn:hover{border-color:var(--accent-dim)}
+.sel-btn:focus-visible,.sel-dd.open .sel-btn{outline:none; border-color:var(--accent)}
+.sel-btn:disabled{opacity:.55; cursor:not-allowed}
+.sel-label{flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.sel-caret{flex:none; width:7px; height:7px; border-right:2px solid var(--muted); border-bottom:2px solid var(--muted);
+  transform:rotate(45deg) translateY(-2px); transition:transform .15s}
+.sel-dd.open .sel-caret{transform:rotate(-135deg) translate(-2px,-1px)}
+.sel-menu{min-width:100%; max-width:min(420px, calc(100vw - 16px)); padding:5px}
+.sel-menu .dd-item{align-items:flex-start; gap:8px; text-align:left}
+.sel-menu .dd-item .tick{width:14px; flex:none; color:var(--accent-soft); text-align:center}
+.sel-menu .dd-item .txt{display:block; min-width:0; flex:1; text-align:left}
+.sel-menu .dd-item small{display:block; color:var(--faint); font-size:11px; white-space:normal; margin-top:2px; line-height:1.35}
+.sel-menu .dd-item.on{color:var(--fg); background:rgba(139,124,247,.12)}
+.sel-menu .dd-item.active{background:var(--elev)}
+.sel-menu .dd-group{padding:7px 10px 3px; color:var(--faint); font:600 10.5px "Segoe UI Semibold",sans-serif;
+  text-transform:uppercase; letter-spacing:.06em}
+
+/* ---------- settings page ---------- */
+.set-top{display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:14px}
+.set-top input[type=search]{max-width:280px}
+.set-wrap{display:grid; grid-template-columns:190px minmax(0,1fr); gap:22px; align-items:start}
+.set-toc{position:sticky; top:0; display:flex; flex-direction:column; gap:2px}
+.set-toc button{background:none; border:0; color:var(--muted); font:13px "Segoe UI",sans-serif; text-align:left;
+  padding:7px 11px; border-radius:8px; cursor:pointer}
+.set-toc button:hover{background:var(--elev); color:var(--fg)}
+.set-card{margin-bottom:16px; scroll-margin-top:8px}
+.set-card h2{margin-bottom:2px}
+.set-desc{color:var(--muted); font-size:12.5px; margin:0 0 6px}
+.set-row{display:grid; grid-template-columns:minmax(0,1fr) minmax(210px,330px); gap:4px 26px; padding:13px 0;
+  border-top:1px solid var(--border); align-items:center}
+.set-row:first-of-type{border-top:0}
+.set-meta label{display:block; font-weight:600; font-size:13px; color:var(--fg); margin:0 0 2px}
+.set-meta .help{color:var(--muted); font-size:12px; line-height:1.45; margin:0}
+.set-ctl{display:flex; align-items:center; gap:9px; justify-content:flex-end; min-width:0}
+.set-ctl .sel-dd{width:100%}
+.set-ctl input[type=number]{width:130px; text-align:right}
+.set-ctl input[type=text]{width:100%}
+.set-ctl .unit{color:var(--faint); font-size:12px; min-width:18px}
+.set-note{grid-column:1 / -1; color:var(--faint); font-size:11.5px; margin:-2px 0 0; text-align:right}
+.set-row.changed .set-meta label::after{content:"  edited"; color:var(--accent-soft); font:600 10.5px "Segoe UI",sans-serif;
+  text-transform:uppercase; letter-spacing:.05em; margin-left:6px}
+.set-row.hidden,.set-card.hidden{display:none}
+.set-adv-tag{display:inline-block; margin-left:6px; padding:0 6px; border-radius:99px; background:var(--elev);
+  color:var(--faint); font:600 10px "Segoe UI",sans-serif; text-transform:uppercase; letter-spacing:.05em}
+.switch{position:relative; width:42px; height:24px; flex:none; display:inline-block}
+.switch input{opacity:0; width:0; height:0; position:absolute}
+.switch .slider{position:absolute; inset:0; background:var(--elev); border:1px solid var(--border); border-radius:99px;
+  cursor:pointer; transition:background .15s,border-color .15s}
+.switch .slider::before{content:""; position:absolute; width:16px; height:16px; left:3px; top:3px; border-radius:50%;
+  background:var(--muted); transition:transform .15s,background .15s}
+.switch input:checked + .slider{background:var(--accent-dim); border-color:var(--accent)}
+.switch input:checked + .slider::before{transform:translateX(18px); background:var(--accent-soft)}
+.switch input:focus-visible + .slider{box-shadow:0 0 0 2px var(--accent)}
+.sw-state{min-width:26px; text-align:left; color:var(--muted); font-size:12.5px}
+.set-bar{position:sticky; bottom:0; display:flex; align-items:center; gap:12px; flex-wrap:wrap;
+  margin-top:14px; padding:11px 16px; background:var(--card); border:1px solid var(--border); border-radius:var(--r);
+  box-shadow:0 -8px 24px rgba(0,0,0,.35); z-index:5}
+.set-bar .dirty{color:var(--accent-soft); font-weight:600; font-size:13px}
+.set-empty{padding:26px; text-align:center; color:var(--muted)}
+@media (max-width:860px){
+  .set-wrap{grid-template-columns:1fr}
+  .set-toc{position:static; flex-direction:row; flex-wrap:wrap}
+  .set-row{grid-template-columns:1fr}
+  .set-ctl{justify-content:flex-start}
+  .set-note{text-align:left}
+}
 
 /* ---------- misc polish ---------- */
 .lbl{color:var(--muted); font-size:12px; display:inline-block; margin-bottom:4px}
@@ -766,6 +839,10 @@ const App = (() => {
     const [accs, pool] = await Promise.all([
       api("/admin/accounts"), api("/admin/pool/state")]);
     if (curTab !== "accounts") return;
+    // The 4s poll rebuilds the whole table, which wiped an open actions menu a
+    // few seconds after it opened (and could swallow a click mid-swap). Leave
+    // the DOM alone while a menu is open; the next tick after it closes catches up.
+    if (document.querySelector(".dd.open")) return;
     const previous = $("#acct-q");
     const focused = previous && document.activeElement === previous;
     const selection = focused ? [previous.selectionStart, previous.selectionEnd] : null;
@@ -805,9 +882,11 @@ const App = (() => {
       for (const a of shown) {
         const caps = capCell(a);
         const hasGlobal = (a.plans || []).some(p => /global|referral/i.test(p.name || p.plan_id || ''));
-        const claimItems = !hasGlobal ? `
+        const claimItems = `
                 <button class="dd-item" data-act="acct-claim-proxy" data-id="${esc(a.id)}"><span class="ic">⚡</span>Claim 100M · proxy</button>
-                <button class="dd-item" data-act="acct-claim-direct" data-id="${esc(a.id)}"><span class="ic">⚡</span>Claim 100M · direct</button>` : '';
+                <button class="dd-item" data-act="acct-claim-direct" data-id="${esc(a.id)}"><span class="ic">⚡</span>Claim 100M · direct</button>
+                <button class="dd-item" data-act="acct-claim500-proxy" data-id="${esc(a.id)}"><span class="ic">⚡</span>Claim 500M · proxy</button>
+                <button class="dd-item" data-act="acct-claim500-direct" data-id="${esc(a.id)}"><span class="ic">⚡</span>Claim 500M · direct</button>`;
         // autopsy: last errors as a sparkline + hover detail for dead/cooling accounts
         const errs = (a.error_history || []).slice(-12);
         const errCell = errs.length ? `<span class="mono" title="${esc(errs.map(e => `${e.ago_s||'?'}s ago ${e.status||''} ${e.code||''}`).join('\n'))}" style="cursor:help;color:${a.state==='dead'?'var(--err)':'var(--warn)'}">${errs.length}err</span>` : '<span style="color:var(--faint)">—</span>';
@@ -855,6 +934,8 @@ const App = (() => {
         else if (act === "acct-remove") acctRemove(id);
         else if (act === "acct-claim-proxy") acctClaim(id, "proxy");
         else if (act === "acct-claim-direct") acctClaim(id, "direct");
+        else if (act === "acct-claim500-proxy") acctClaim500(id, "proxy");
+        else if (act === "acct-claim500-direct") acctClaim500(id, "direct");
       });
     });
     const q = document.getElementById("acct-q");
@@ -912,6 +993,18 @@ const App = (() => {
       else toast(`claim started (${r.started || mode}${r.mode && r.mode !== mode ? " → " + r.mode : ""})`, "ok");
     } catch(e) {
       toast("claim failed: " + e.message, "err");
+    }
+  }
+  async function acctClaim500(id, mode){
+    toast(`starting 500M claim (${mode})…`, "info");    try {
+      const r = await api(`/admin/accounts/${encodeURIComponent(id)}/claim500m`, {
+        method: "POST",
+        body: JSON.stringify({mode: mode})
+      });
+      if (r.error) toast(r.error, "err");
+      else toast(`500M claim queued (${mode}) — watch it in the Generator tab`, "ok");
+    } catch(e) {
+      toast("claim500 failed: " + e.message, "err");
     }
   }
 
@@ -1024,6 +1117,216 @@ const App = (() => {
   });
 
   /* ---------- dropdown menus ---------- */
+  // The table wrapper has overflow:auto, so an absolutely positioned menu was
+  // clipped to it (a one-row table showed a sliver of the menu). Pin the open
+  // menu to the viewport instead, under its button — or above it when there is
+  // no room below — so it always opens outside the box.
+  function placeMenu(btn, menu){
+    if (!menu) return;
+    menu.style.position = "fixed";
+    menu.style.right = "auto";
+    menu.style.left = "0px";
+    menu.style.top = "0px";                     // measure at a known origin (menu is displayed now)
+    const b = btn.getBoundingClientRect();
+    const mw = menu.offsetWidth, mh = menu.offsetHeight;
+    const vw = window.innerWidth, vh = window.innerHeight, gap = 5, pad = 8;
+    const left = Math.min(Math.max(pad, b.right - mw), Math.max(pad, vw - mw - pad));
+    let top = b.bottom + gap;
+    if (top + mh > vh - pad) {
+      const above = b.top - gap - mh;
+      top = above >= pad ? above : Math.max(pad, vh - mh - pad);
+    }
+    menu.style.left = left + "px";
+    menu.style.top = top + "px";
+  }
+  // fixed to the viewport, so a scroll or resize would strand it: close instead
+  window.addEventListener("scroll", e => {
+    if (e.target instanceof Element && e.target.closest(".dd-menu")) return;
+    closeDropdowns();
+  }, true);
+  window.addEventListener("resize", () => closeDropdowns());
+
+  /* ---------- themed <select>: every native select gets the app's own dropdown ----------
+     The native <select> stays in the DOM (hidden): existing code keeps reading
+     .value, setting .disabled/.value, and listening to change events. */
+  function enhanceSelect(sel){
+    if (sel.dataset.enh || sel.multiple || sel.size > 1 || sel.hasAttribute("data-native")) return;
+    sel.dataset.enh = "1";
+    const cs = getComputedStyle(sel);
+    const wrap = document.createElement("div");
+    wrap.className = "sel-dd dd";
+    const pw = sel.parentElement ? sel.parentElement.clientWidth : 0;
+    const w = sel.getBoundingClientRect().width;
+    if (sel.style.width) wrap.style.width = sel.style.width;
+    else if (pw && w >= pw - 8) wrap.style.width = "100%";
+    else if (w) wrap.style.width = Math.round(w) + "px";
+    for (const p of ["maxWidth", "minWidth", "flex", "margin", "alignSelf", "gridColumn"]) {
+      if (sel.style[p]) wrap.style[p] = sel.style[p];
+    }
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "sel-btn";
+    btn.setAttribute("aria-haspopup", "listbox");
+    btn.setAttribute("aria-expanded", "false");
+    // compact variants (small inline selects) keep their size
+    btn.style.fontSize = cs.fontSize;
+    btn.style.padding = `${cs.paddingTop} ${cs.paddingLeft} ${cs.paddingBottom} ${cs.paddingLeft}`;
+    btn.style.borderRadius = cs.borderRadius;
+    const label = document.createElement("span");
+    label.className = "sel-label";
+    const caret = document.createElement("span");
+    caret.className = "sel-caret";
+    btn.append(label, caret);
+    const menu = document.createElement("div");
+    menu.className = "dd-menu sel-menu";
+    menu.setAttribute("role", "listbox");
+    wrap.append(btn, menu);
+    sel.style.display = "none";
+    sel.insertAdjacentElement("afterend", wrap);
+
+    let items = [];          // {el, idx} for every selectable option, in order
+    let active = -1;         // position in `items` highlighted by the keyboard
+    let typed = "", typedAt = 0;
+
+    const ariaLabel = () => {
+      const own = sel.getAttribute("aria-label");
+      if (own) return own;
+      const lab = sel.id ? document.querySelector(`label[for="${sel.id}"]`) : null;
+      return lab ? lab.textContent.trim() : "";
+    };
+    const sync = () => {
+      const o = sel.options[sel.selectedIndex];
+      label.textContent = o ? o.textContent : "";
+      items.forEach(it => {
+        const on = it.idx === sel.selectedIndex;
+        it.el.classList.toggle("on", on);
+        it.el.setAttribute("aria-selected", on ? "true" : "false");
+        it.el.firstChild.textContent = on ? "✓" : "";
+      });
+      btn.disabled = sel.disabled;
+      if (sel.title) btn.title = sel.title; else btn.removeAttribute("title");
+      const al = ariaLabel(); if (al) btn.setAttribute("aria-label", al);
+    };
+    const choose = idx => {
+      if (idx < 0 || idx >= sel.options.length || sel.options[idx].disabled) return;
+      const changed = idx !== sel.selectedIndex;
+      protoSet.selectedIndex.call(sel, idx);
+      sync();
+      if (changed) {
+        sel.dispatchEvent(new Event("input", {bubbles: true}));
+        sel.dispatchEvent(new Event("change", {bubbles: true}));
+      }
+    };
+    const build = () => {
+      menu.innerHTML = "";
+      items = [];
+      const addOpt = (o, idx) => {
+        const it = document.createElement("button");
+        it.type = "button";
+        it.className = "dd-item";
+        it.setAttribute("role", "option");
+        it.disabled = o.disabled;
+        const tick = document.createElement("span"); tick.className = "tick";
+        const txt = document.createElement("span"); txt.className = "txt";
+        txt.textContent = o.textContent;
+        if (o.dataset.desc) { const sm = document.createElement("small"); sm.textContent = o.dataset.desc; txt.appendChild(sm); }
+        it.append(tick, txt);
+        it.addEventListener("click", e => { e.stopPropagation(); choose(idx); close(true); });
+        it.addEventListener("mousemove", () => setActive(items.findIndex(x => x.idx === idx), false));
+        menu.appendChild(it);
+        items.push({el: it, idx});
+      };
+      let idx = 0;
+      for (const child of sel.children) {
+        if (child.tagName === "OPTGROUP") {
+          const g = document.createElement("div"); g.className = "dd-group"; g.textContent = child.label;
+          menu.appendChild(g);
+          for (const o of child.children) addOpt(o, idx++);
+        } else if (child.tagName === "OPTION") addOpt(child, idx++);
+      }
+      sync();
+    };
+    const setActive = (pos, scroll = true) => {
+      items.forEach((it, i) => it.el.classList.toggle("active", i === pos));
+      active = pos;
+      if (scroll && items[pos]) items[pos].el.scrollIntoView({block: "nearest"});
+    };
+    const openMenu = () => {
+      if (sel.disabled) return;
+      closeDropdowns(wrap);
+      wrap.classList.add("open");
+      menu.style.minWidth = btn.offsetWidth + "px";
+      placeMenu(btn, menu);
+      setActive(Math.max(0, items.findIndex(it => it.idx === sel.selectedIndex)));
+    };
+    const close = refocus => {
+      wrap.classList.remove("open");
+      if (refocus) btn.focus();
+    };
+    const move = delta => {
+      const enabled = items.map((it, i) => (it.el.disabled ? -1 : i)).filter(i => i >= 0);
+      if (!enabled.length) return;
+      const at = enabled.indexOf(active);
+      setActive(enabled[Math.min(enabled.length - 1, Math.max(0, (at < 0 ? 0 : at) + delta))]);
+    };
+    btn.addEventListener("click", e => {
+      e.stopPropagation();
+      if (wrap.classList.contains("open")) close(); else openMenu();
+    });
+    btn.addEventListener("keydown", e => {
+      const isOpen = wrap.classList.contains("open");
+      if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+        e.preventDefault();
+        if (!isOpen) openMenu(); else move(e.key === "ArrowDown" ? 1 : -1);
+      } else if (e.key === "Home" || e.key === "End") {
+        if (isOpen) { e.preventDefault(); setActive(e.key === "Home" ? 0 : items.length - 1); }
+      } else if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        if (!isOpen) openMenu();
+        else { if (items[active]) choose(items[active].idx); close(true); }
+      } else if (e.key === "Escape") {
+        if (isOpen) { e.preventDefault(); e.stopPropagation(); close(true); }
+      } else if (e.key === "Tab") {
+        close();
+      } else if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        const now = Date.now();
+        typed = (now - typedAt > 700 ? "" : typed) + e.key.toLowerCase();
+        typedAt = now;
+        const hit = items.findIndex(it => !it.el.disabled && it.el.textContent.replace(/^✓/, "").trim().toLowerCase().startsWith(typed));
+        if (hit >= 0) { if (!isOpen) openMenu(); setActive(hit); }
+      }
+    });
+    new MutationObserver(() =>
+      btn.setAttribute("aria-expanded", wrap.classList.contains("open") ? "true" : "false"))
+      .observe(wrap, {attributes: true, attributeFilter: ["class"]});
+    // options rewritten by app code, or select disabled/enabled
+    new MutationObserver(build).observe(sel, {childList: true, subtree: true, characterData: true});
+    new MutationObserver(sync).observe(sel, {attributes: true, attributeFilter: ["disabled", "title"]});
+    // programmatic `select.value = x` / `selectedIndex = n` must refresh the label too
+    for (const prop of ["value", "selectedIndex"]) {
+      Object.defineProperty(sel, prop, {
+        configurable: true,
+        get(){ return protoGet[prop].call(this); },
+        set(v){ protoSet[prop].call(this, v); sync(); },
+      });
+    }
+    build();
+  }
+  const protoGet = {}, protoSet = {};
+  for (const prop of ["value", "selectedIndex"]) {
+    const d = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, prop);
+    protoGet[prop] = d.get; protoSet[prop] = d.set;
+  }
+  function enhanceSelects(root){
+    if (!root || root.nodeType !== 1) return;
+    if (root.tagName === "SELECT") enhanceSelect(root);
+    root.querySelectorAll && root.querySelectorAll("select:not([data-enh])").forEach(enhanceSelect);
+  }
+  enhanceSelects(document.body);
+  // microtask-timed, so a freshly rendered native select is replaced before it is ever painted
+  new MutationObserver(muts => {
+    for (const m of muts) m.addedNodes.forEach(enhanceSelects);
+  }).observe(document.body, {childList: true, subtree: true});
   function closeDropdowns(except){
     document.querySelectorAll(".dd.open").forEach(dd => {
       if (dd !== except) dd.classList.remove("open");
@@ -1036,6 +1339,7 @@ const App = (() => {
       const wasOpen = dd.classList.contains("open");
       closeDropdowns(dd);
       dd.classList.toggle("open", !wasOpen);
+      if (!wasOpen) placeMenu(btn, dd.querySelector(".dd-menu"));
       e.stopPropagation();
       return;
     }
@@ -1187,80 +1491,193 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
   }
 
   /* ------------ tab: settings ------------ */
+  /* ------------ tab: settings ------------ */
+  // [path, kind, label, help, options]   kind: bool | enum | model | int | float | text
+  const SETTING_SECTIONS = [
+    {id: "server", title: "Server", desc: "Where the gateway listens, and who can reach it.", rows: [
+      ["server.host", "enum", "Who can connect", "“This computer only” is safest. Choose “Everyone on my network” only if other devices should use the gateway; they still need a client key."],
+      ["server.port", "int", "Port", "The port the gateway and this dashboard listen on. Clients connect to http://host:port.", {min: 1, max: 65535}]]},
+    {id: "accounts", title: "Accounts", desc: "Where the gateway finds the Zcode accounts it uses.", rows: [
+      ["accounts.source", "enum", "Where accounts come from", "Normally the account folder, which the Accounts tab and the generator fill in."],
+      ["accounts.dir", "text", "Accounts folder", "Folder holding one snapshot .txt file per account (used when the source is the account folder)."],
+      ["accounts.pool_file", "text", "Pool file", "Only used when the source is “Pool file”.", {adv: true}]]},
+    {id: "pool", title: "Account rotation", desc: "How requests are spread across your accounts, and how failures are handled.", rows: [
+      ["pool.strategy", "enum", "How to pick an account", "Decides which account serves the next request."],
+      ["pool.max_in_flight_per_account", "int", "Simultaneous requests per account", "How many requests one account may run at the same time. Higher is faster but looks busier to the provider.", {min: 1}],
+      ["pool.acquire_wait_seconds", "float", "Wait for a free account", "When every account is busy, how long a request waits for a slot before failing. 0 fails immediately.", {unit: "s", min: 0}],
+      ["pool.cooldown_seconds", "int", "Rest after an error", "How long an account rests after a connection or server error. Overloaded models are retried separately.", {unit: "s", min: 0}],
+      ["pool.blocked_model_cooldown_seconds", "int", "Rest after “unusual activity”", "When the provider blocks one model on an account (405/3012), only that model is paused on that account for this long.", {unit: "s", min: 0}],
+      ["pool.refresh_lead_seconds", "int", "Renew logins early", "Refresh an account's token this long before it expires.", {unit: "s", min: 0}],
+      ["pool.balance_poll_seconds", "int", "Check quotas every", "How often each account's remaining quota is read. The minimum is 10 seconds.", {unit: "s", min: 10}],
+      ["pool.min_balance_micro", "int", "Legacy balance threshold", "Old credit-based setting. Zcode now uses per-model token quotas, so leave it at 0.", {min: 0, adv: true}]]},
+    {id: "upstream", title: "Connection to Zcode", desc: "Timeouts and retries for requests sent to the provider.", rows: [
+      ["upstream.timeout_connect", "float", "Connection timeout", "How long to wait to reach the provider.", {unit: "s", min: 0}],
+      ["upstream.timeout_read", "float", "Response timeout", "How long to wait for data while an answer streams. Keep it high for long answers.", {unit: "s", min: 0}],
+      ["upstream.max_attempts", "int", "Accounts to try per request", "If an account fails (quota, login or other errors) the request moves to another one, up to this many tries.", {min: 1}],
+      ["upstream.overload_max_attempts", "int", "Tries when a model is overloaded", "Counts the first try. The official app uses 11.", {min: 1}],
+      ["upstream.overload_base_delay_seconds", "float", "First retry delay", "Retries back off exponentially (with jitter) starting from this delay.", {unit: "s", min: 0}],
+      ["upstream.overload_max_delay_seconds", "float", "Longest retry delay", "The official app uses 60.", {unit: "s", min: 0}],
+      ["upstream.anthropic_cache_control", "bool", "Prompt caching", "Send Anthropic cache hints, as the official app does. Turn off only to test."]]},
+    {id: "models", title: "Models", desc: "Defaults used when a client does not choose.", rows: [
+      ["models.default", "model", "Default model (OpenAI-style requests)", "Used when a request to /v1/chat/completions names no model."],
+      ["models.default_anthropic", "model", "Default model (Anthropic-style requests)", "Used when a request to /v1/messages names no model."],
+      ["models.default_effort", "enum", "Reasoning effort", "Used when the client does not ask for one. High is nearly as good as Max for coding and much faster."],
+      ["models.auto_free_fallback.enabled", "bool", "Fall back to another model", "When a model is blocked or out of quota, serve the request with the next model in the fallback chain (the chain itself is set in config.yaml)."],
+      ["models.pacing.enabled", "bool", "Space out requests", "Adds a small random pause between requests so the provider's CDN does not flag your IP."],
+      ["models.pacing.min_gap_ms", "int", "Shortest pause", "Together with the longest pause this sets the random window.", {unit: "ms", min: 0}],
+      ["models.pacing.max_gap_ms", "int", "Longest pause", "", {unit: "ms", min: 0}]]},
+    {id: "logging", title: "Logging", desc: "What the gateway writes down.", rows: [
+      ["logging.level", "enum", "Detail level", "Shown in the Logs tab. Info is right for everyday use."],
+      ["logging.capture", "bool", "Record every exchange", "Writes each upstream request and response to a JSONL file. Handy for debugging, but it stores your prompts on disk."]]},
+    {id: "updates", title: "Updates", desc: "Release notifications.", rows: [
+      ["update.enabled", "bool", "Check for updates", "Look for new releases on GitHub and show a badge in the sidebar."],
+      ["update.interval_hours", "float", "Check every", "Hours between checks.", {unit: "h", min: 0}]]},
+  ];
+
   async function renderSettings(v){
     const s = await api("/admin/dash/settings");
-    const values = s.values;
-    const inp = (path, kind) => {
-      const val = values[path] ?? path.split('.').reduce((obj, part) => obj?.[part], s.effective);
-      if (kind === "bool") {
-        return `<select class="sel" data-set="${path}"><option value="true" ${val ? "selected":""}>true</option>
-          <option value="false" ${!val ? "selected":""}>false</option></select>`;
+    const values = s.values || {};
+    const choices = s.choices || {};
+    const lookup = path => values[path] ?? path.split(".").reduce((o, p) => o?.[p], s.effective);
+
+    const optionsFor = (path, kind, cur) => {
+      let opts;
+      if (kind === "model") {
+        opts = (s.models || []).map(m => ({value: m, label: m, desc: ""}));
+      } else {
+        opts = (choices[path] || []).map(c => ({value: c.value, label: c.label, desc: c.desc}));
       }
-      const t = (kind === "int" || kind === "float") ? "number" : "text";
-      return `<input type="${t}" data-set="${path}" value="${esc(val ?? "")}"
-        ${kind==="float" ? 'step="any"' : ""}>`;
+      if (cur != null && cur !== "" && !opts.some(o => String(o.value).toLowerCase() === String(cur).toLowerCase())) {
+        opts.unshift({value: cur, label: `${cur} (current)`, desc: "Set in config.yaml"});
+      }
+      return opts;
     };
-    const grp = (title, rows) => `<fieldset><legend>${title}</legend>
-      ${rows.map(([path, kind, label, help]) => `
-        <div class="field"><label>${label}</label>${inp(path, kind)}
-        ${help ? `<div class="help">${help}</div>` : ""}</div>`).join("")}</fieldset>`;
-    v.innerHTML = `<form onsubmit="return false" class="dense">
-    <div class="dense-grid">
-    ${grp("Server", [
-      ["server.host","text","Host","loopback only is safest"],
-      ["server.port","int","Port","a restart is required"]])}
-    ${grp("Accounts", [
-      ["accounts.source","text","Source","accounts_dir · providers_json · pool_file"],
-      ["accounts.dir","text","Accounts folder","snapshot .txt files live here"],
-      ["accounts.pool_file","text","Pool file","for pool_file source"]])}
-    ${grp("Pool", [
-      ["pool.strategy","text","Strategy","least_in_flight · drain_first · round_robin · least_recently_used · quota_aware"],
-      ["pool.min_balance_micro","int","Legacy balance threshold","Zcode uses per-model token quotas"],
-      ["pool.refresh_lead_seconds","int","Refresh lead (s)","refresh tokens this long before expiry"],
-      ["pool.cooldown_seconds","int","Cooldown (s)","transport and server errors; model overload retries separately"],
-      ["pool.blocked_model_cooldown_seconds","int","Blocked-model cooldown (s)","405/3012 \"unusual activity\" parks just that model on that account"],
-      ["pool.max_in_flight_per_account","int","Max in-flight/acct","concurrent runs per account"],
-      ["pool.acquire_wait_seconds","float","Acquire wait (s)","how long to wait for a free slot"],
-      ["pool.balance_poll_seconds","int","Quota poll (s)","0 disables"]])}
-    ${grp("Upstream", [
-      ["upstream.timeout_connect","float","Connect timeout (s)",""],
-      ["upstream.timeout_read","float","Read timeout (s)","long streams"],
-      ["upstream.max_attempts","int","Account attempts","quota, authentication and other errors"],
-      ["upstream.overload_max_attempts","int","Overload attempts","native ZCode default: 11; includes first attempt"],
-      ["upstream.overload_base_delay_seconds","float","Overload initial delay (s)","exponential backoff with jitter"],
-      ["upstream.overload_max_delay_seconds","float","Overload maximum delay (s)","native ZCode default: 60"],
-      ["upstream.anthropic_cache_control","bool","Anthropic cache_control","captured as always-on; test at false"]])}
-    ${grp("Models", [
-      ["models.default","text","Default model",""],
-      ["models.default_anthropic","text","Default Anthropic",""],
-      ["models.default_effort","text","Default reasoning effort","used when the client doesn't specify: low | high | max"],
-      ["models.auto_free_fallback.enabled","bool","Fallback to another model","off by default; when on, a blocked/capped model is served by the next in models.auto_free_fallback.chain (set the chain in the desktop Settings or config.yaml)"],
-      ["models.pacing.enabled","bool","Pacing gate","randomized gap between upstream sends — prevents CDN/WAF IP blocks"],
-      ["models.pacing.min_gap_ms","int","Pacing min gap (ms)","with max gap, defines the randomized window"],
-      ["models.pacing.max_gap_ms","int","Pacing max gap (ms)",""]])}
-    ${grp("Logging", [
-      ["logging.level","text","Level","INFO · DEBUG · WARNING"],
-      ["logging.capture","bool","Capture exchanges","JSONL of every upstream call"]])}
-    ${grp("Updates", [
-      ["update.enabled","bool","Auto-check","check GitHub for new releases"],
-      ["update.interval_hours","float","Interval (h)","hours between checks"]])}
+
+    const control = (path, kind, o) => {
+      const cur = lookup(path);
+      const attrsFor = init => `data-set="${esc(path)}" data-init="${esc(String(init))}"`;
+      if (kind === "bool") {
+        const attrs = attrsFor(!!cur);
+        return `<label class="switch"><input type="checkbox" ${attrs} ${cur ? "checked" : ""}>
+          <span class="slider"></span></label><span class="sw-state">${cur ? "On" : "Off"}</span>`;
+      }
+      if (kind === "enum" || kind === "model") {
+        const opts = optionsFor(path, kind, cur);
+        const picked = opts.find(x => String(x.value).toLowerCase() === String(cur ?? "").toLowerCase());
+        const attrs = attrsFor(picked ? picked.value : (cur ?? ""));
+        return `<select class="sel" ${attrs} aria-label="${esc(o.label)}">${opts.map(x =>
+          `<option value="${esc(x.value)}" data-desc="${esc(x.desc || "")}" ${x === picked ? "selected" : ""}>${esc(x.label)}</option>`).join("")}</select>`;
+      }
+      const attrs = attrsFor(cur ?? "");
+      const num = kind === "int" || kind === "float";
+      const lim = num ? `${o.min != null ? `min="${o.min}"` : ""} ${o.max != null ? `max="${o.max}"` : ""} ${kind === "float" ? 'step="any"' : 'step="1"'}` : "";
+      return `<input type="${num ? "number" : "text"}" ${attrs} value="${esc(cur ?? "")}" ${lim}
+        ${num ? "" : 'class="mono" spellcheck="false"'} aria-label="${esc(o.label)}">` +
+        (o.unit ? `<span class="unit">${esc(o.unit)}</span>` : "");
+    };
+
+    const row = ([path, kind, label, help, opt]) => {
+      const o = Object.assign({label}, opt || {});
+      return `<div class="set-row" data-path="${esc(path)}" data-text="${esc((label + " " + help + " " + path).toLowerCase())}">
+        <div class="set-meta"><label>${esc(label)}${o.adv ? '<span class="set-adv-tag">advanced</span>' : ""}</label>
+          ${help ? `<p class="help">${esc(help)}</p>` : ""}</div>
+        <div class="set-ctl">${control(path, kind, o)}</div>
+      </div>`;
+    };
+
+    v.innerHTML = `
+    <div class="set-top">
+      <input type="search" id="set-q" placeholder="Filter settings…" aria-label="Filter settings" oninput="App.settingsFilter(this.value)">
+      <span class="help" style="margin:0">Saved to <span class="mono">${esc(s.config_path || "config.yaml")}</span>. Changes apply after the gateway restarts.</span>
     </div>
-    <div class="toolbar" style="margin-top:14px">
-      <button class="btn btn-pri" onclick="App.saveSettings()">Save</button>
-      <span style="color:var(--faint); font-size:12px">writes config.yaml — restart applies</span>
+    <div class="set-wrap">
+      <nav class="set-toc" aria-label="Settings sections">
+        ${SETTING_SECTIONS.map(g => `<button type="button" data-act="setJump" data-id="set-${g.id}">${esc(g.title)}</button>`).join("")}
+        <button type="button" data-act="setJump" data-id="set-danger">Keys</button>
+      </nav>
+      <div class="set-main">
+        ${SETTING_SECTIONS.map(g => `<section class="card set-card" id="set-${g.id}">
+          <h2>${esc(g.title)}</h2><p class="set-desc">${esc(g.desc)}</p>${g.rows.map(row).join("")}</section>`).join("")}
+        <section class="card set-card" id="set-danger">
+          <h2>Keys</h2><p class="set-desc">The admin key and client keys protect this dashboard and the /v1 endpoints.</p>
+          <div class="set-row"><div class="set-meta"><label>Regenerate keys</label>
+            <p class="help">Replaces the admin key and the first client key. Programs using the old keys stop working until you update them. Needs a restart.</p></div>
+            <div class="set-ctl"><button class="btn btn-ghost btn-danger" onclick="App.regenKeys()">Regenerate keys…</button></div></div>
+        </section>
+        <div class="set-empty" id="set-nomatch" style="display:none">No settings match that filter.</div>
+      </div>
+    </div>
+    <div class="set-bar">
+      <span id="set-state" style="color:var(--faint);font-size:13px">No changes</span>
       <div class="grow"></div>
-      <button class="btn btn-ghost btn-danger" onclick="App.regenKeys()">Regenerate keys</button>
-    </div></form>`;
+      <button class="btn btn-ghost" id="set-reset" onclick="App.settingsReset()" disabled>Discard changes</button>
+      <button class="btn btn-pri" id="set-save" onclick="App.saveSettings()" disabled>Save changes</button>
+    </div>`;
+
+    // dirty tracking: only what the user touched is sent on save
+    const current = el => (el.type === "checkbox" ? String(el.checked) : el.value);
+    const refresh = () => {
+      let n = 0;
+      v.querySelectorAll("[data-set]").forEach(el => {
+        const dirty = current(el) !== el.dataset.init;
+        el.closest(".set-row").classList.toggle("changed", dirty);
+        if (dirty) n++;
+        if (el.type === "checkbox") {
+          const st = el.closest(".set-ctl").querySelector(".sw-state");
+          if (st) st.textContent = el.checked ? "On" : "Off";
+        }
+      });
+      const state = $("#set-state");
+      state.textContent = n ? `${n} unsaved change${n === 1 ? "" : "s"}` : "No changes";
+      state.className = n ? "dirty" : "";
+      $("#set-save").disabled = !n;
+      $("#set-reset").disabled = !n;
+    };
+    const root = v.querySelector(".set-wrap");     // replaced with the page, so listeners never pile up
+    root.addEventListener("input", refresh);
+    root.addEventListener("change", refresh);
+    refresh();
+  }
+
+  function settingsFilter(q){
+    q = String(q || "").trim().toLowerCase();
+    let shown = 0;
+    document.querySelectorAll(".set-card").forEach(card => {
+      const rows = card.querySelectorAll(".set-row");
+      let any = 0;
+      rows.forEach(r => {
+        const hit = !q || (r.dataset.text || r.textContent.toLowerCase()).includes(q);
+        r.classList.toggle("hidden", !hit);
+        if (hit) any++;
+      });
+      card.classList.toggle("hidden", !any);
+      shown += any;
+    });
+    const nm = $("#set-nomatch"); if (nm) nm.style.display = shown ? "none" : "block";
+  }
+  function settingsReset(){ renderSettings($("#view")); }
+  function settingsJump(id){
+    const el = document.getElementById(id);
+    if (el) el.scrollIntoView({behavior: "smooth", block: "start"});
   }
 
   async function saveSettings(){
     const values = {};
-    document.querySelectorAll("[data-set]").forEach(el => { values[el.dataset.set] = el.value; });
+    document.querySelectorAll("#view [data-set]").forEach(el => {
+      const cur = el.type === "checkbox" ? String(el.checked) : el.value;
+      if (cur !== el.dataset.init) values[el.dataset.set] = cur;
+    });
+    if (!Object.keys(values).length) { toast("no changes", "info"); return; }
+    const btn = $("#set-save");
+    if (btn) btn.disabled = true;
     try {
-      const r = await api("/admin/dash/settings", {method:"PUT", body:{values}});
-      toast(r.changed.length ? `saved ${r.changed.length} setting(s) — restart applies`
-                             : "no changes", "ok");
-    } catch (e) { toast("save: " + e.message, "err"); }
+      const r = await api("/admin/dash/settings", {method: "PUT", body: {values}});
+      toast(r.changed.length ? `saved ${r.changed.length} setting(s) — restart applies` : "no changes", "ok");
+      renderSettings($("#view"));              // reload so "edited" markers reset to what is on disk
+    } catch (e) {
+      toast("save: " + e.message, "err");
+      if (btn) btn.disabled = false;
+    }
   }
   async function regenKeys(){
     if (!(await confirmDlg("Regenerate keys?",
@@ -1489,8 +1906,12 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
       const stateCol = {running:'var(--ok)', starting:'var(--accent-soft)', exited:'var(--ok)',
                         failed:'var(--err)', killed:'var(--err)'}[w.state] || 'var(--muted)';
       const res = w.email ? ` · ${esc(w.email)}` : '';
-      const plan = w.global_build ? ' · <b style="color:var(--warn)">⚡ 100M GLOBAL BUILD</b>'
-        : (w.starter === true ? ' · <b style="color:var(--ok)">✅ STARTER</b>' : (w.starter === false ? ' · <span style="color:var(--muted)">no plan</span>' : ''));
+      const badges = [];
+      if (w.giveaway500) badges.push('<b style="color:var(--warn)">⚡ 500M · 1024 DEV DAY CLAIMED</b>');
+      if (w.global_build) badges.push('<b style="color:var(--warn)">⚡ 100M GLOBAL BUILD</b>');
+      else if (w.starter === true) badges.push('<b style="color:var(--ok)">✅ STARTER</b>');
+      if (!badges.length && w.starter === false) badges.push('<span style="color:var(--muted)">no plan</span>');
+      const plan = badges.length ? ' · ' + badges.join(' · ') : '';
       const lines = (w.lines || []).slice(-6).map(l =>
         `<div class="mono" style="color:var(--faint);font-size:11px">${esc(l)}</div>`).join('');
       return `<div class="card" style="padding:8px 12px; margin-bottom:8px">
@@ -1511,14 +1932,15 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
       const icon = {running:'⚡', starting:'◌', exited:'✓', failed:'✗', killed:'✗'}[c.state] || '◌';
       const stateCol = {running:'var(--warn)', starting:'var(--accent-soft)', exited:'var(--ok)',
                         failed:'var(--err)', killed:'var(--err)'}[c.state] || 'var(--muted)';
+      const kindLabel = c.kind === '500m' ? '500M' : '100M';
       const lines = (c.lines || []).slice(-10).map(l =>
         `<div class="mono" style="color:var(--faint);font-size:11px">${esc(l)}</div>`).join('');
       const issued = c.result && c.result.summary && c.result.summary.issued
-        ? ' · <b style="color:var(--warn)">⚡ 100M GLOBAL BUILD ISSUED</b>'
+        ? ` · <b style="color:var(--warn)">⚡ 100M GLOBAL BUILD ISSUED</b>`
         : (c.state === 'exited' ? ' · <span style="color:var(--ok)">finished</span>' : '');
       return `<div class="card" style="padding:8px 12px; margin-bottom:8px; border-left:3px solid var(--warn)">
         <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-          <b><span style="color:${stateCol}">${icon}</span> 100M Claim: ${esc(c.email || c.name)}</b>
+          <b><span style="color:${stateCol}">${icon}</span> ${kindLabel} Claim: ${esc(c.email || c.name)}</b>
           <span class="badge" style="background:var(--elev); color:${stateCol}">${esc(c.state)}</span>
           <span class="mono" style="color:var(--muted)">${esc(c.mode || 'proxy')}</span>
           ${c.proxy ? `<span class="mono" title="${esc(c.proxy)}" style="color:var(--muted)">⇄ ${esc(String(c.proxy).length > 34 ? String(c.proxy).slice(0,34)+'…' : c.proxy)}</span>` : ''}
@@ -1533,13 +1955,15 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
     };
     const claimsHtml = (st.claims || []).map(claimCard).join('');
     // claim-finished toasts: transition running -> terminal state
-    (st.claims || []).forEach(c => {
+      (st.claims || []).forEach(c => {
       const prev = claimStates[c.name];
       const terminal = c.state === 'exited' || c.state === 'failed' || c.state === 'killed';
       if (prev && prev === 'running' && terminal) {
+        const kindLabel = c.kind === '500m' ? '500M' : '100M';
         const issued = c.result && c.result.summary && c.result.summary.issued;
         if (issued) toast(`⚡ 100M issued: ${c.email}`, "ok");
-        else toast(`claim finished (not issued): ${c.email}`, "err");
+        else if (c.state === 'exited') toast(`${kindLabel} claim finished: ${c.email}`, "ok");
+        else toast(`${kindLabel} claim finished (not issued): ${c.email}`, "err");
       }
       claimStates[c.name] = c.state;
     });
@@ -1601,10 +2025,11 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
               <div id="gen-headless-hint" class="help" style="margin-top:3px"></div></div>
             <div><label class="lbl">retries</label>
               <input type="number" id="gen-retries" value="${o.retries||5}" min="0" max="10" style="width:100%" oninput="App.genAutoSave()"></div>
-            <div><label class="lbl">claim 100M</label>
+            <div><label class="lbl">claim type</label>
               <select id="gen-claim" class="sel" style="width:100%" onchange="App.genAutoSave()">
-                <option value="on" ${o.claim!==false?'selected':''}>on</option>
-                <option value="off" ${o.claim===false?'selected':''}>off</option>
+                <option value="off" ${o.claim===false && (o.claim500||false)!==true?'selected':''}>off</option>
+                <option value="on" ${o.claim!==false && (o.claim500||false)!==true?'selected':''}>100M (referral)</option>
+                <option value="500m" ${(o.claim500||false)===true?'selected':''}>500M (giveaway)</option>
               </select></div>
             <div><label class="lbl">invite code</label>
               <input type="text" id="gen-invite" value="${esc(o.invite_code||'')}" placeholder="referral code (empty = off)" style="width:100%" oninput="App.genAutoSave()"></div>
@@ -1654,8 +2079,9 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
         <div id="gen-workers">${workersHtml}</div>
         <div class="card" style="margin-top:10px"><h2>Pipeline</h2>
           <p style="color:var(--muted);font-size:12px">
-          signup → Starter check → device login (+telemetry) → invite bind → client message
-          → successful accounts join the pool automatically.</p>
+          ${((o.claim500||false)===true)
+            ? "signup → device login → campaign touch → 500M giveaway claim (billing/claim, no browser) → the account joins the pool automatically."
+            : "signup → Starter check → device login (+telemetry) → invite bind → client message → successful accounts join the pool automatically."}</p>
         </div>`;
       genMounted = true;
       genLoadSources();
@@ -1725,6 +2151,7 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
       pin_proxy: val("gen-pin"),
       retries: val("gen-retries"),
       claim: val("gen-claim") === "on",
+      claim500: val("gen-claim") === "500m",
       headless: val("gen-headless") === "true",
       invite_code: val("gen-invite"),
     };
@@ -1770,15 +2197,15 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
       refresh();
     } catch (e) { if (msg) msg.textContent = action + " failed: " + e.message; }
   }
-  async function proxyGeo(){
-    const msg = $("#px-geo-msg");
-    if (msg) msg.textContent = "downloading…";
+  async function proxyCountries(){
+    const msg = $("#px-countries-msg");
+    if (msg) msg.textContent = "looking up…";
     try {
-      const r = await api("/admin/dash/generator/proxies/geo", {method:"POST", body:"{}"});
+      const r = await api("/admin/dash/generator/proxies/countries", {method:"POST", body:"{}"});
       if (r && r.error) throw new Error(r.error);
-      if (msg) msg.textContent = "✓ download started — watch the log";
+      if (msg) msg.textContent = "✓ started — watch the log below";
       refresh();
-    } catch (e) { if (msg) msg.textContent = "download failed: " + e.message; }
+    } catch (e) { if (msg) msg.textContent = "failed: " + e.message; }
   }
   async function proxyYield(){
     const box = $("#px-yield");
@@ -1923,33 +2350,48 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
   let mailSel = null;
   let mailDeploying = false;
 
+  // Last fetched mail config + deploy status and the HTML built from them. Every
+  // Generator-tab visit re-mounts the card; painting from this cache first makes
+  // tab switches instant instead of flashing "loading email setup…".
+  const mailCache = {m: null, st: null, html: ""};
+
   async function mailRenderWizard(){
+    const box = $("#mail-steps");
+    if (!box) return;
+    if (!box.children.length) {
+      if (mailCache.m) mailPaintWizard(mailCache.m, mailCache.st || {});
+      else box.innerHTML = `<div class="empty" style="padding:12px;color:var(--muted);font-size:12.5px">loading email setup…</div>`;
+    }
+    // deploy-status shells out to `npx wrangler whoami` (seconds, up to a minute
+    // on a cold start) and only feeds an info note, so the card never waits on it
+    const statusP = api("/admin/dash/generator/mail/deploy-status").catch(() => null);
+    let m;
+    try { m = await api("/admin/dash/generator/mail"); } catch (e) { return; }
+    mailCache.m = m || {};
+    mailPaintWizard(mailCache.m, mailCache.st || {});
+    const st = await statusP;
+    if (st) {
+      mailCache.st = st;
+      mailPaintWizard(mailCache.m, st);
+    }
+  }
+
+  function mailPaintWizard(m, st){
     // Step-by-step card. Each step shows its state; only the current step is
     // actionable. Step 1 domains, Step 2 one-click worker deploy,
     // Step 3 verify — done.
     const box = $("#mail-steps");
     if (!box) return;
-    // instant placeholder so the card never looks missing while loading
-    // (first Generator-tab visit previously showed an empty Email card for
-    // the duration of two sequential API round-trips)
-    if (!box.children.length) {
-      box.innerHTML = `<div class="empty" style="padding:12px;color:var(--muted);font-size:12.5px">loading email setup…</div>`;
-    }
-    // parallel fetch: mail config and deploy status don't depend on each other
-    const [mR, stR] = await Promise.allSettled([
-      api("/admin/dash/generator/mail"),
-      api("/admin/dash/generator/mail/deploy-status"),
-    ]);
-    if (mR.status === "rejected") { return; }
-    const m = mR.value || {};
-    const st = stR.status === "fulfilled" ? (stR.value || {}) : {};
 
     const doms = m.domains || [];
     mailSel = mailSel && doms.includes(mailSel) ? mailSel : (m.active || doms[0] || null);
     const hasUrl = !!(m.inbox_url || st.has_url);
-    // `undefined !== false` is true, so an ERRORED deploy-status call used to
-    // tick step 2 — require a non-error status explicitly.
-    const deployed = hasUrl && st.wrangler_authed === true;
+    // Deployed = the worker URL and secret are saved. This used to also demand
+    // a live `wrangler whoami` success, which flips to "not connected" whenever
+    // the check is slow, offline or errors (every relaunch) and un-ticked a
+    // finished step 2 until a later check happened to pass. Whoami only matters
+    // for the NEXT deploy, so it stays an info note (authNote below).
+    const deployed = hasUrl && (m.inbox_secret_set === true || st.has_secret === true);
     // step 3 = the MANUAL Cloudflare routing. There is no API to verify it, so
     // it completes only on an explicit per-domain confirmation — never from the
     // inbox test (which just proves the worker itself answers).
@@ -2091,7 +2533,7 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
     ];
     const allDone = curStep === -1;
     const startAt = allDone ? -1 : curStep;
-    box.innerHTML = steps.map((s, i) => {
+    const html = steps.map((s, i) => {
       const done = stepDone[i];
       const active = i === startAt && !done;
       // steps 1 (domains) and 3 (routing) stay on screen so they remain
@@ -2105,6 +2547,18 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
              ✓ Email setup complete — signups will rotate across your domains and
              read verification mail from your worker.</p>`
         : '');
+    // identical to what is on screen: leave the DOM (and anything being typed) alone
+    if (html !== mailCache.html || !box.children.length) {
+      const typed = $("#mail-new-domain");
+      const typedVal = typed ? typed.value : "";
+      const hadFocus = !!typed && document.activeElement === typed;
+      box.innerHTML = html;
+      mailCache.html = html;
+      if (typedVal) {
+        const t = $("#mail-new-domain");
+        if (t) { t.value = typedVal; if (hadFocus) t.focus(); }
+      }
+    }
 
     // keep the manual url/secret inputs in sync (below the wizard)
     const u = $("#mail-inbox-url"); if (u && document.activeElement !== u) u.value = m.inbox_url || "";
@@ -2253,6 +2707,7 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
   /* ------------ tab: proxy (edge relays) ------------ */
   let relayData = { enabled: true, active_url: "", active_id: "", models: ["GLM-5.3"], relays: [] };
   let relayLoading = false;
+  let relaySel = new Set();       // ids ticked for bulk delete
 
   async function loadRelays(){
     if (relayLoading) return;
@@ -2296,9 +2751,24 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
       custom: `<span style="color:var(--muted)">🔗 Custom</span>`,
     };
 
-    list.innerHTML = `<table style="width:100%;border-collapse:collapse;font-size:12.5px">
+    // drop ticks for relays that no longer exist
+    const known = new Set(relays.map(r => r.id));
+    relaySel = new Set([...relaySel].filter(id => known.has(id)));
+    const nSel = relaySel.size;
+    const bulkBar = `<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 8px">
+      <span style="color:var(--muted);font-size:12px">${relays.length} relay${relays.length === 1 ? '' : 's'}${nSel ? ` · <b style="color:var(--fg)">${nSel} selected</b>` : ''}</span>
+      <div class="grow"></div>
+      <button class="btn btn-ghost btn-sm" data-act="relayDeleteSel" ${nSel ? '' : 'disabled'}
+        style="${nSel ? 'color:var(--err)' : ''}" title="remove the ticked relays from the list">✕ Delete selected${nSel ? ` (${nSel})` : ''}</button>
+      <button class="btn btn-ghost btn-sm" data-act="relayDeleteAll" style="color:var(--err)"
+        title="remove every relay from the list">✕ Delete all (${relays.length})</button>
+    </div>`;
+
+    list.innerHTML = bulkBar + `<table style="width:100%;border-collapse:collapse;font-size:12.5px">
       <thead>
         <tr style="color:var(--muted);text-align:left;border-bottom:1px solid var(--border)">
+          <th style="padding:6px 8px;width:30px"><input type="checkbox" id="relay-sel-all" data-act="relaySelAll"
+            title="select all" ${nSel === relays.length ? 'checked' : ''}></th>
           <th style="padding:6px 8px;width:50px">Active</th>
           <th style="padding:6px 8px">Name</th>
           <th style="padding:6px 8px">Provider</th>
@@ -2314,8 +2784,10 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
           const statusBadge = r.last_status === 200
             ? `<span class="badge" style="background:rgba(34,197,94,0.12);color:var(--ok)">✓ 200 OK (${r.last_latency_ms || 0}ms)</span>`
             : (r.last_status ? `<span class="badge" style="background:rgba(239,68,68,0.12);color:var(--err)">✗ ${r.last_status}</span>` : `<span style="color:var(--faint)">untested</span>`)
-              + (ageMin !== null ? `<div style="font-size:10px;color:var(--faint);margin-top:2px">checked ${ageMin}m ago${r.last_error ? ' · ' + esc(String(r.last_error).slice(0,40)) : ''}</div>` : '');
-          return `<tr style="border-top:1px solid var(--border); ${isActive ? 'background:rgba(255,255,255,0.02)' : ''}">
+              + (ageMin !== null ? `<div style="font-size:10px;color:var(--faint);margin-top:2px">checked ${ageMin}m ago${r.last_error ? ' · <span title="' + esc(String(r.last_error)) + '" style="color:var(--muted)">' + esc(String(r.last_error).slice(0,110)) + '</span>' : ''}</div>` : '');
+          const picked = relaySel.has(r.id);
+          return `<tr style="border-top:1px solid var(--border); ${picked ? 'background:rgba(124,92,255,0.10)' : (isActive ? 'background:rgba(255,255,255,0.02)' : '')}">
+            <td style="padding:8px"><input type="checkbox" data-act="relaySel" data-id="${esc(r.id)}" ${picked ? 'checked' : ''}></td>
             <td style="padding:8px">
               <input type="radio" name="active-relay" ${isActive ? 'checked' : ''} data-act="relaySetActive" data-id="${esc(r.id)}">
             </td>
@@ -2331,6 +2803,43 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
         }).join('')}
       </tbody>
     </table>`;
+    const all = $("#relay-sel-all");
+    if (all) all.indeterminate = nSel > 0 && nSel < relays.length;
+  }
+
+  function relayToggle(id, on){
+    if (on) relaySel.add(id); else relaySel.delete(id);
+    renderRelaysUI();
+  }
+  function relayToggleAll(on){
+    relaySel = on ? new Set((relayData.relays || []).map(r => r.id)) : new Set();
+    renderRelaysUI();
+  }
+  async function deleteRelays(all){
+    const relays = relayData.relays || [];
+    const picked = all ? relays : relays.filter(r => relaySel.has(r.id));
+    if (!picked.length) return;
+    const hitsActive = picked.some(r => r.id === relayData.active_id);
+    const names = picked.slice(0, 6).map(r => r.name || r.id).join(", ")
+      + (picked.length > 6 ? ` … +${picked.length - 6} more` : "");
+    const msg = (all
+        ? `All ${picked.length} relays will be removed from the list.`
+        : `${picked.length} selected relay${picked.length === 1 ? '' : 's'} will be removed from the list: ${names}.`)
+      + " The deployments themselves stay on their provider."
+      + (hitsActive ? (all ? " Requests will go direct until you add a relay." : " The active relay is among them — another one (or none) becomes active.") : "");
+    if (!(await confirmDlg(all ? "Delete ALL relays?" : `Delete ${picked.length} relay${picked.length === 1 ? '' : 's'}?`,
+                           msg, "Delete", true))) return;
+    try {
+      const r = await api("/admin/dash/relays/delete", {
+        method: "POST",
+        body: JSON.stringify(all ? {all: true} : {ids: picked.map(x => x.id)})
+      });
+      relaySel = new Set();
+      toast(`${r.deleted} relay${r.deleted === 1 ? '' : 's'} deleted`, "ok");
+      loadRelays();
+    } catch(e) {
+      toast("Failed to delete relays: " + e.message, "err");
+    }
   }
 
   async function saveRelayOptions(){
@@ -2681,8 +3190,8 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
     pxAutoRefresh();
     const ps = px.stats || {};
     pxCache = ps;
-    const kpi = (id, label, val, color) =>
-      `<span class="px-kpi" title="${esc(label)}"><span class="v" id="${id}" style="color:${color||'var(--fg)'}">${val}</span>
+    const kpi = (id, label, val, color, hint) =>
+      `<span class="px-kpi" title="${esc(hint || label)}"><span class="v" id="${id}" style="color:${color||'var(--fg)'}">${val}</span>
        <span class="k">${label}</span></span>`;
     const probed = ps.probed ?? 0, total = ps.total ?? 0;
     const pct = total > 0 ? Math.round(probed / total * 100) : 0;
@@ -2694,16 +3203,17 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
         <div class="card">
           <h2>Proxy checker</h2>
           <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px">
-            ${kpi("px-raw", "raw", ps.raw || 0)}
-            ${kpi("px-alive", "alive this scan", ps.alive ?? 0, "var(--ok)")}
-            ${kpi("px-pool", "usable pool", ps.pool_file || 0, "var(--ok)")}
-            ${kpi("px-known", "known", ps.pool_json || ps.pool_file || 0)}
-            ${kpi("px-healthy", "healthy", ps.healthy || 0, "var(--ok)")}
-            ${kpi("px-unverified", "unverified", ps.unverified || 0, "var(--warn)")}
-            ${kpi("px-evergood", "ever-good", ps.ever_good_file || 0)}
-            ${kpi("px-socks", "socks", ps.socks || 0, "var(--accent-soft)")}
-            ${kpi("px-used", "used", ps.used || 0, "var(--warn)")}
-            ${kpi("px-bad", "bad / MITM", ps.bad || 0, "var(--err)")}
+            ${kpi("px-raw", "raw list", ps.raw || 0, null, "Scraped candidates waiting to be checked (proxies_raw.txt)")}
+            ${kpi("px-alive", "alive this scan", ps.alive ?? 0, "var(--ok)", "Proxies that passed the check during the current / last scan")}
+            ${kpi("px-pool", "usable now", ps.pool_file || 0, "var(--ok)", "Verified proxies ready to be handed out right now (proxies.txt)")}
+            ${kpi("px-known", "in pool", ps.pool_json || ps.pool_file || 0, null, "Every proxy remembered in the pool ledger, whatever its state. working + failing + never checked + used + bad = this number")}
+            ${kpi("px-healthy", "working", ps.healthy || 0, "var(--ok)", "The latest check passed: ready to use (and not used up yet)")}
+            ${kpi("px-failing", "failing", ps.failing || 0, "var(--err)", "Checked, and the latest check failed. 'Recheck pool' gives them another chance")}
+            ${kpi("px-unverified", "never checked", ps.unverified || 0, "var(--warn)", "Imported or scraped but not checked yet: run 'Verify raw' or 'Recheck pool'")}
+            ${kpi("px-evergood", "ever-good", ps.ever_good_file || 0, null, "Passed at least once in the past (proxies_evergood.txt), even if failing now")}
+            ${kpi("px-socks", "socks", ps.socks || 0, "var(--accent-soft)", "SOCKS proxies in the usable list - the type claims and signups prefer")}
+            ${kpi("px-used", "used up", ps.used || 0, "var(--warn)", "Already consumed by a signup or claim. Each proxy is used once")}
+            ${kpi("px-bad", "bad / MITM", ps.bad || 0, "var(--err)", "Flagged as intercepting HTTPS (man-in-the-middle) or otherwise unusable")}
             ${ps.best ? `<span class="px-kpi"><span class="v">${ps.best}s</span><span class="k">best</span></span>` : ""}
             ${ps.median ? `<span class="px-kpi"><span class="v">${ps.median}s</span><span class="k">median</span></span>` : ""}
           </div>
@@ -2792,16 +3302,15 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
             imports sit as pending until a real check proves them.</div>
           <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:12px;padding-top:12px;border-top:1px solid var(--border)">
             <div>
-              <div class="lbl">location data</div>
-              <div class="help" id="px-geo-line" style="margin:0">
-                ${(ps.geo||{}).available ? `offline country/ASN ready (${esc(String((ps.geo||{}).updated||''))})` : "not downloaded — country filters use the local cache only"}
+              <div class="lbl">countries</div>
+              <div class="help" id="px-countries-line" style="margin:0">
+                ${ps.countries_known ?? 0} of ${ps.pool_json || 0} proxies have a country
               </div>
             </div>
-            <button class="btn btn-ghost btn-sm" onclick="App.proxyGeo()" ${px.running ? "disabled" : ""}
-              title="download DB-IP Lite (~7 MB, no account): offline country + ASN, no API calls">⤓ Download databases</button>
-            <span class="help" style="margin:0;font-size:11px">by
-              <a href="https://db-ip.com" target="_blank" rel="noopener">DB-IP</a> (CC BY 4.0)</span>
-            <span id="px-geo-msg" style="color:var(--muted);font-size:12px"></span>
+            <button class="btn btn-ghost btn-sm" onclick="App.proxyCountries()" ${px.running ? "disabled" : ""}
+              title="asks free public lookup sites (ip-api.com, geojs.io) for the country of each proxy IP; nothing is downloaded">🌍 Look up countries</button>
+            <span class="help" style="margin:0;font-size:11px">online, nothing to download; new working proxies are looked up automatically</span>
+            <span id="px-countries-msg" style="color:var(--muted);font-size:12px"></span>
           </div>
         </div>
         <div class="card" id="relay-card">
@@ -2921,6 +3430,7 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
     setT("#px-pool", ps.pool_file || 0);
     setT("#px-known", ps.pool_json || ps.pool_file || 0);
     setT("#px-healthy", ps.healthy || 0);
+    setT("#px-failing", ps.failing || 0);
     setT("#px-unverified", ps.unverified || 0);
     setT("#px-evergood", ps.ever_good_file || 0);
     setT("#px-socks", ps.socks || 0);
@@ -2928,10 +3438,8 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
     setT("#px-bad", ps.bad || 0);
     const rx = $("#px-reasons");
     if (rx) rx.innerHTML = pxReasonsHtml(ps);
-    const gl = $("#px-geo-line");
-    if (gl) gl.textContent = (ps.geo||{}).available
-      ? `offline country/ASN ready (${(ps.geo||{}).updated || ''})`
-      : "not downloaded — country filters use the local cache only";
+    const cl = $("#px-countries-line");
+    if (cl) cl.textContent = `${ps.countries_known ?? 0} of ${ps.pool_json || 0} proxies have a country`;
     const row = $("#px-progress-row");
     if (row) {
       row.style.display = px.running && total ? "flex" : "none";
@@ -2952,7 +3460,10 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
       pxBox.innerHTML = pxLinesHtml;
       if (atBottom) pxBox.scrollTop = pxBox.scrollHeight;
     }
-    if (pxWasRunning && !px.running) proxyYield();   // scan just finished: refresh yield
+    if (pxWasRunning && !px.running) {               // scan just finished: refresh yield + pool card
+      proxyYield();
+      const ph = $("#px-health"); if (ph) renderProxyHealth(ph);
+    }
     pxWasRunning = !!px.running;
   }
   function pxClearLog(){
@@ -3256,51 +3767,77 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
   let logSearchTimer = null;
 
   /* ------------ proxy health card (inside Proxy tab) ------------ */
+  function pxHealthRefresh(){
+    const ph = $("#px-health");
+    if (ph) renderProxyHealth(ph);
+  }
   async function renderProxyHealth(container){
     try {
       const h = await api("/admin/dash/proxies/health");
       const k = h.kpis || {};
-      const countryRows = Object.entries(h.countries||{}).slice(0,12).map(([c,n])=>{
-        const total = k.total||1;
-        const pct = Math.round(n/total*100);
-        return `<div style="display:flex;align-items:center;gap:8px;margin:3px 0">
-          <span class="mono" style="width:26px">${esc(c)}</span>
-          <div style="flex:1;height:10px;background:var(--border);border-radius:5px;overflow:hidden">
-            <div style="width:${pct}%;height:100%;background:var(--accent-soft,#4f8cff)"></div></div>
-          <span style="width:36px;text-align:right;color:var(--muted);font-size:12px">${n}</span></div>`;
-      }).join("") || '<div style="color:var(--faint);font-size:12px">no country data</div>';
-      const rows = (h.proxies||[]).slice(0,100).map(p=>{
-        const st = p.ok ? '<span style="color:var(--ok)">●</span>' : p.bad ? '<span style="color:var(--err)">●</span>' : '<span style="color:var(--faint)">●</span>';
-        return `<tr><td>${st}</td><td class="mono" style="max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(p.url)}">${esc(p.url)}</td>
+      const total = k.total || 0;
+      const STATES = [
+        ["working",  k.working ?? k.healthy ?? 0, "var(--ok)",   "the latest check passed - ready to use"],
+        ["failing",  k.failing || 0,              "var(--err)",  "checked, and the latest check failed"],
+        ["never checked", k.unverified || 0,      "var(--warn)", "imported or scraped, not checked yet"],
+        ["used up",  k.used || 0,                 "var(--accent-soft)", "already consumed by a signup or claim"],
+        ["bad / MITM", k.bad || 0,                "#8b5cf6",     "flagged as intercepting HTTPS"],
+      ];
+      const stateBar = total ? `<div style="display:flex;height:10px;border-radius:5px;overflow:hidden;background:var(--border);margin:8px 0 6px">
+          ${STATES.filter(s => s[1]).map(s => `<div title="${esc(s[0])}: ${s[1]} - ${esc(s[3])}" style="width:${(s[1]/total*100).toFixed(2)}%;background:${s[2]}"></div>`).join("")}</div>` : "";
+      const legend = STATES.map(s => `<span title="${esc(s[3])}" style="display:inline-flex;align-items:center;gap:6px;cursor:help">
+          <i style="width:9px;height:9px;border-radius:50%;background:${s[2]};display:inline-block"></i><b>${s[1]}</b> <span style="color:var(--muted)">${esc(s[0])}</span></span>`).join("");
+      const dot = {working:"var(--ok)", failing:"var(--err)", new:"var(--warn)", used:"var(--accent-soft)", bad:"#8b5cf6"};
+      const label = {working:"working", failing:"failing", new:"never checked", used:"used up", bad:"bad / MITM"};
+      const cEntries = Object.entries(h.countries||{});
+      const allUnknown = cEntries.length > 0 && cEntries.every(([c]) => c === "??");
+      const countryRows = allUnknown
+        ? `<div class="help" style="margin:4px 0">No country known yet.
+            <button class="btn btn-ghost btn-sm" onclick="App.proxyCountries()" style="margin-left:6px">🌍 Look up countries</button>
+            <span style="color:var(--faint)">online, takes about a minute</span></div>`
+        : (cEntries.slice(0,10).map(([c,n]) => {
+            const pct = Math.max(1, Math.round(n/(total||1)*100));
+            return `<div style="display:flex;align-items:center;gap:8px;margin:3px 0">
+              <span class="mono" style="width:26px">${esc(c)}</span>
+              <div style="flex:1;height:8px;background:var(--border);border-radius:5px;overflow:hidden">
+                <div style="width:${pct}%;height:100%;background:var(--accent-soft,#4f8cff)"></div></div>
+              <span style="width:44px;text-align:right;color:var(--muted);font-size:12px">${n}</span></div>`;
+          }).join("") || '<div style="color:var(--faint);font-size:12px">no country data</div>');
+      const rows = (h.proxies||[]).slice(0,100).map(p => {
+        const st = p.status || (p.ok ? "working" : "new");
+        const why = p.status === "failing" && p.reason ? ` - ${p.reason}` : "";
+        return `<tr><td title="${esc(label[st] || st)}${esc(why)}"><span style="color:${dot[st] || "var(--faint)"}">●</span></td>
+          <td class="mono" style="max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(p.url)}">${esc(p.url)}</td>
           <td class="mono">${esc(p.country)}</td>
-          <td style="text-align:right">${p.latency!=null?p.latency+"s":"—"}</td>
-          <td style="text-align:right;color:var(--faint)">${p.checked_at?timeAgo(p.checked_at):"—"}</td>
-          <td style="text-align:right">${p.used!=null?p.used:"—"}</td></tr>`;
+          <td style="text-align:right">${p.latency ? p.latency + "s" : "-"}</td>
+          <td style="text-align:right;color:var(--muted)" title="checks run / failures">${p.checks || 0}<span style="color:var(--faint)"> / </span>${p.fails || 0}</td>
+          <td style="text-align:right;color:var(--faint)">${p.checked_at ? timeAgo(p.checked_at) : "never"}</td></tr>`;
       }).join("");
       container.innerHTML = `
         <div class="card">
-          <h2>Proxy pool health</h2>
-          ${!h.available ? `<p style="color:var(--faint);font-size:12.5px">${esc(h.note||"pool unavailable")}</p>` : `
-          <div style="display:flex;gap:14px;flex-wrap:wrap;margin-bottom:12px;font-size:13px">
-            <span><b>${k.total||0}</b> <span style="color:var(--muted)">total</span></span>
-            <span style="color:var(--ok)"><b>${k.healthy||0}</b> healthy</span>
-            <span style="color:var(--warn)"><b>${k.unverified||0}</b> unverified</span>
-            <span style="color:var(--err)"><b>${k.bad||0}</b> bad</span>
-            <span><b>${k.socks||0}</b> socks</span>
-            <span><b>${k.http||0}</b> http</span>
+          <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:4px">
+            <h2 style="margin:0">Proxy pool</h2>
+            <span class="help" style="display:inline">your saved proxies and how good they are right now. Claims and signups pick from the <b>working</b> ones.</span>
+            <div class="grow"></div>
+            <button class="btn btn-quiet btn-sm" data-act="pxHealthRefresh" title="re-read the pool file">↻ Refresh</button>
           </div>
+          ${!h.available ? `<p style="color:var(--faint);font-size:12.5px">${esc(h.note||"pool unavailable")}</p>` : `
+          <div style="font-size:13px"><b>${total}</b> <span style="color:var(--muted)">proxies known</span>
+            <span style="color:var(--faint)"> · ${k.socks||0} socks · ${k.http||0} http</span></div>
+          ${stateBar}
+          <div style="display:flex;gap:16px;flex-wrap:wrap;font-size:12.5px;margin-bottom:12px">${legend}</div>
           <div class="grid2">
-            <div><h3 style="font-size:12px;color:var(--muted);margin:6px 0">BY COUNTRY</h3>${countryRows}</div>
-            <div><h3 style="font-size:12px;color:var(--muted);margin:6px 0">TOP PROXIES (first 100)</h3>
+            <div><h3 style="font-size:12px;color:var(--muted);margin:6px 0">WHERE THEY EXIT (BY COUNTRY)</h3>${countryRows}</div>
+            <div><h3 style="font-size:12px;color:var(--muted);margin:6px 0">BEST PROXIES <span style="color:var(--faint);font-weight:400">· working first, fastest first · showing ${Math.min(100, (h.proxies||[]).length)} of ${h.total_in_file ?? total}</span></h3>
               <div class="scroll" style="max-height:230px"><table style="font-size:11.5px">
-                <thead><tr><th></th><th style="text-align:left">Proxy</th><th>CC</th><th style="text-align:right">Latency</th><th style="text-align:right">Checked</th><th style="text-align:right">Used</th></tr></thead>
+                <thead><tr><th></th><th style="text-align:left">Proxy</th><th>Country</th><th style="text-align:right">Latency</th><th style="text-align:right" title="checks run / failures">Checks</th><th style="text-align:right">Last check</th></tr></thead>
                 <tbody>${rows || '<tr><td colspan="6" style="color:var(--faint);padding:8px">empty pool</td></tr>'}</tbody>
               </table></div>
             </div>
           </div>`}
         </div>`;
     } catch (e) {
-      container.innerHTML = `<div class="card"><h2>Proxy pool health</h2>
+      container.innerHTML = `<div class="card"><h2>Proxy pool</h2>
         <p style="color:var(--faint);font-size:12.5px">${esc(e.message)}</p></div>`;
     }
   }
@@ -3377,11 +3914,12 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
           showUpdate, hideUpdate, skipUpdate, doUpdate,
           loginStart, loginCancel, genStart, genStop, genStopAll, genSaveOptions, genAutoSave, genIpChanged,
           proxyRun, proxyStop, genProxyImport, genProxyFile, genLoadSources, genSaveSources,
-          proxyMaintain, proxyGeo, proxyYield, pxPresetChanged, pxAutoVerify,
-          genClearWorkers, genRemove, claimStop, claimRemove, acctClaim, claimAllPending, purgeDrained,
+          proxyMaintain, proxyCountries, proxyYield, pxPresetChanged, pxAutoVerify,
+          genClearWorkers, genRemove, claimStop, claimRemove, acctClaim, acctClaim500, claimAllPending, purgeDrained,
           setupOpen, setupClose, setupInstall,
           openRelayModal, closeRelayModal, relayDeploy, relayAddCustom, loadRelays,
-          saveRelayOptions, setActiveRelay, testRelay, deleteRelay};
+          saveRelayOptions, setActiveRelay, testRelay, deleteRelay, deleteRelays, relayToggle, relayToggleAll, pxHealthRefresh,
+          settingsFilter, settingsReset, settingsJump};
 })();
 
 // Global delegated listener: names/ids/domains must never be interpolated into
@@ -3400,10 +3938,16 @@ window.addEventListener("click", e => {
   else if (act === "relaySetActive") App.setActiveRelay(id);
   else if (act === "relayTest") App.testRelay(id);
   else if (act === "relayDelete") App.deleteRelay(id);
+  else if (act === "relayDeleteSel") App.deleteRelays(false);
+  else if (act === "relayDeleteAll") App.deleteRelays(true);
+  else if (act === "pxHealthRefresh") App.pxHealthRefresh();
+  else if (act === "setJump") App.settingsJump(id);
 });
 window.addEventListener("change", e => {
   const el = e.target;
   if (el && el.dataset && el.dataset.act === "mailSelDomain") App.mailSelDomain(el.dataset.id);
+  else if (el && el.dataset && el.dataset.act === "relaySel") App.relayToggle(el.dataset.id, el.checked);
+  else if (el && el.dataset && el.dataset.act === "relaySelAll") App.relayToggleAll(el.checked);
 });
 window.addEventListener("DOMContentLoaded", App.start);
 </script>

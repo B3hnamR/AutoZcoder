@@ -37,6 +37,30 @@ try:
 except Exception:
     _VERIFY = False
 
+# A stale REQUESTS_CA_BUNDLE (e.g. a leftover mitmproxy cert) silently breaks
+# verify=_VERIFY too, since requests prefers the env var over the verify arg.
+# Neutralize it unless the user deliberately points it at a valid bundle.
+import ssl as _ssl
+
+
+def _ca_path_ok(path: str) -> bool:
+    if not path:
+        return True
+    if os.path.isdir(path):      # requests accepts a CA directory too
+        return True
+    try:
+        ctx = _ssl.create_default_context(cafile=path)
+        return bool(ctx.get_ca_certs())
+    except Exception:
+        return False
+
+
+# only the variable that is actually broken is dropped — a valid corporate
+# SSL_CERT_FILE must survive a stale REQUESTS_CA_BUNDLE
+for _var in ('REQUESTS_CA_BUNDLE', 'SSL_CERT_FILE'):
+    if not _ca_path_ok(os.environ.get(_var, '')):
+        os.environ.pop(_var, None)
+
 import urllib3
 urllib3.disable_warnings()
 
@@ -635,14 +659,32 @@ def device_login(chat_token, log=print, force_direct: bool = False):
     poll_token = secrets.token_hex(32)
     h = dict(APP_HEADERS)
     h['authorization'] = 'Bearer ' + poll_token
-    r = requests.post(INIT, headers=h, json={'provider': 'zai'},
-                      timeout=30, verify=_VERIFY, proxies=_proxies())
-    d = (r.json().get('data') or {})
+    # zcode.z.ai answers 502 in bursts; init is idempotent (it just opens a
+    # new flow), so a few quick retries beat aborting the whole login
+    r = None
+    for _try in range(3):
+        try:
+            r = requests.post(INIT, headers=h, json={'provider': 'zai'},
+                              timeout=30, verify=_VERIFY, proxies=_proxies())
+        except requests.RequestException as e:
+            log(f'  invite: device init error ({type(e).__name__})')
+            r = None
+        if r is not None and r.status_code < 500:
+            break
+        if r is not None:
+            log(f'  invite: device init {r.status_code} — retrying')
+        time.sleep(2)
+    if r is None:
+        return None, False
+    try:
+        d = (r.json().get('data') or {})
+    except Exception:
+        d = {}
     flow_id, poll_token = d.get('flow_id'), d.get('poll_token') or poll_token
     m = _re.search(r'state=([^&]+)', d.get('authorize_url', ''))
     state = m.group(1) if m else ''
     if not flow_id:
-        log('  invite: device init failed')
+        log(f'  invite: device init failed {r.status_code} {r.text[:120]}')
         return None, False
 
     r = requests.post(AUTHORIZE, headers={
@@ -654,20 +696,46 @@ def device_login(chat_token, log=print, force_direct: bool = False):
              'redirect_uri': CALLBACK,
              'state': state, 'response_type': 'code',
              'action': 'approve'}, timeout=30, verify=_VERIFY, proxies=_proxies())
-    m = _re.search(r'code=(code-[0-9a-fA-F]+)', r.json().get('redirect_url', ''))
+    try:
+        rj = r.json()
+    except Exception:
+        rj = {}
+    m = _re.search(r'code=(code-[0-9a-fA-F]+)', str(rj.get('redirect_url', '')))
     if not m:
-        log(f'  invite: device authorize failed {r.status_code}')
+        log(f'  invite: device authorize failed {r.status_code} {r.text[:120]}')
         return None, False
     cb = dict(h)
     cb['x-request-id'] = str(_uuid.uuid4())
-    requests.get(CALLBACK + f'?code={m.group(1)}&state={state}',
-                 headers=cb, timeout=30, verify=_VERIFY, proxies=_proxies())
+    # The callback is what makes the flow "ready". A 502 here used to be
+    # ignored, and the poll loop then waited minutes on a flow that could never
+    # complete — so retry it, and poll only briefly if it still never landed.
+    cb_ok = False
+    for _try in range(3):
+        try:
+            cr = requests.get(CALLBACK + f'?code={m.group(1)}&state={state}',
+                              headers=cb, timeout=30, verify=_VERIFY, proxies=_proxies())
+            cb_ok = cr.status_code < 500
+        except requests.RequestException as e:
+            log(f'  invite: device callback error ({type(e).__name__})')
+        if cb_ok:
+            break
+        log('  invite: device callback not accepted — retrying')
+        time.sleep(2)
 
     zjwt = zai_tok = user_id = None
-    for _ in range(30):
-        r = requests.get(POLL + flow_id, headers=h,
-                         timeout=30, verify=_VERIFY, proxies=_proxies())
-        data = (r.json().get('data') or {})
+    for _ in range(30 if cb_ok else 5):
+        try:
+            r = requests.get(POLL + flow_id, headers=h,
+                             timeout=30, verify=_VERIFY, proxies=_proxies())
+        except requests.RequestException as e:
+            # one slow/failed poll must not discard a flow that is still alive
+            log(f'  invite: device poll error ({type(e).__name__})')
+            time.sleep(2)
+            continue
+        try:
+            data = (r.json().get('data') or {})
+        except Exception:
+            data = {}
         if data.get('status') == 'ready':
             zjwt = data.get('token')
             user_info = data.get('user') or {}
@@ -684,7 +752,13 @@ def device_login(chat_token, log=print, force_direct: bool = False):
 
     ok = False
     if zai_tok:
-        ok = zai_login(zai_tok, log=log)
+        # best-effort: the zcodeJWT is already minted, and a flaky api.z.ai
+        # lookup/connect here used to raise out of device_login and throw the
+        # whole login (and the claim built on it) away
+        try:
+            ok = zai_login(zai_tok, log=log)
+        except Exception as e:
+            log(f'  invite: zai login skipped ({type(e).__name__}) — continuing with the zcodeJWT')
     return zjwt, ok
 
 

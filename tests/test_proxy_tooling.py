@@ -331,35 +331,132 @@ def test_pick_verified_claims_and_filters(pool_dir, monkeypatch):
     assert second == "socks5://2.2.2.2:1080"
 
 
-# --------------------------------------------------------------------------- geo
+# --------------------------------------------------------------------------- countries (online lookup)
 
-def test_geo_index_lookup():
-    rows = [(167772160, 167772415, "US|United States"),
-            (167772416, 167772671, "DE|Germany")]
-    idx = geo._Index.from_rows(rows)
-    assert idx.lookup(geo.ip_to_int("10.0.0.5")) == "US|United States"
-    assert idx.lookup(geo.ip_to_int("10.0.0.200")) == "US|United States"
-    assert idx.lookup(geo.ip_to_int("10.0.1.5")) == "DE|Germany"
-    assert idx.lookup(geo.ip_to_int("10.0.9.5")) == ""
-    assert geo.ip_to_int("not-an-ip") is None
+def _fake_net(monkeypatch, ipapi=None, geojs=None, ipwho=None, ipinfo=None):
+    """Replace the four lookup sites; each is {ip: 'CC'} or an Exception to raise."""
+    calls = {"ipapi": [], "geojs": [], "ipwho": [], "ipinfo": []}
+
+    def mk(name, table, batch):
+        def fn(arg, timeout):
+            calls[name].append(list(arg) if batch else arg)
+            if isinstance(table, Exception):
+                raise table
+            if batch:
+                return {ip: table[ip] for ip in arg if table and ip in table}
+            return (table or {}).get(arg, "")
+        return fn
+
+    monkeypatch.setattr(geo, "_BATCH_PROVIDERS", (("ip-api", mk("ipapi", ipapi, True)),
+                                                  ("geojs", mk("geojs", geojs, True))))
+    monkeypatch.setattr(geo, "_SINGLE_PROVIDERS", (("ipwho", mk("ipwho", ipwho, False)),
+                                                   ("ipinfo", mk("ipinfo", ipinfo, False))))
+    geo._down.clear()
+    geo._memo.clear()
+    return calls
 
 
-def test_country_csv_format(tmp_path):
-    """DB-IP Lite ships dotted ranges and (currently) three columns."""
-    import gzip
-    path = tmp_path / "country.csv.gz"
-    with gzip.open(path, "wt", encoding="utf-8") as f:
-        f.write("1.0.0.0,1.0.0.255,AU\n1.0.1.0,1.0.3.255,CN\n")
-    idx = geo._load_country(str(path))
-    assert idx.lookup(geo.ip_to_int("1.0.0.5")) == "AU|"
-    assert idx.lookup(geo.ip_to_int("1.0.2.5")) == "CN|"
-    assert idx.lookup(geo.ip_to_int("9.9.9.9")) == ""
+def test_valid_ip_only_accepts_public_addresses():
+    assert geo.valid_ip("8.8.8.8") and geo.valid_ip("2001:4860:4860::8888")
+    assert not geo.valid_ip("10.0.0.1") and not geo.valid_ip("192.168.1.5")
+    assert not geo.valid_ip("127.0.0.1") and not geo.valid_ip("proxy.example.com")
 
 
-def test_asn_csv_format(tmp_path):
-    import gzip
-    path = tmp_path / "asn.csv.gz"
-    with gzip.open(path, "wt", encoding="utf-8") as f:
-        f.write('1.0.0.0,1.0.0.255,13335,"Cloudflare, Inc."\n')
-    idx = geo._load_asn(str(path))
-    assert idx.lookup(geo.ip_to_int("1.0.0.1")) == "13335 Cloudflare, Inc."
+def test_lookup_many_uses_batches_then_falls_through(monkeypatch):
+    ips = ["8.8.8.8", "51.15.20.32", "45.74.31.42", "9.9.9.9"]
+    calls = _fake_net(monkeypatch,
+                      ipapi={"8.8.8.8": "US", "51.15.20.32": "NL"},        # knows two
+                      geojs={"45.74.31.42": "NL"},                           # knows one more
+                      ipwho={}, ipinfo={"9.9.9.9": "CH"})                    # the last by single lookup
+    out = geo.lookup_many(ips + ["10.0.0.1", "not-an-ip", ""])               # junk is ignored
+    assert out == {"8.8.8.8": "US", "51.15.20.32": "NL", "45.74.31.42": "NL", "9.9.9.9": "CH"}
+    assert calls["ipapi"] == [ips]                                           # ONE request for all four
+    assert calls["geojs"] == [["45.74.31.42", "9.9.9.9"]]                    # only the unresolved ones
+    assert calls["ipwho"] == ["9.9.9.9"] and calls["ipinfo"] == ["9.9.9.9"]
+
+
+def test_lookup_many_batches_of_100(monkeypatch):
+    ips = [f"20.{a}.{b}.1" for a in range(1, 4) for b in range(1, 90)]       # 267 public IPs
+    calls = _fake_net(monkeypatch, ipapi={ip: "DE" for ip in ips})
+    out = geo.lookup_many(ips)
+    assert len(out) == 267 and [len(c) for c in calls["ipapi"]] == [100, 100, 67]
+
+
+def test_a_failing_provider_is_skipped_and_the_next_one_answers(monkeypatch):
+    calls = _fake_net(monkeypatch, ipapi=RuntimeError("rate limited"), geojs={"8.8.8.8": "US"})
+    assert geo.lookup_many(["8.8.8.8"]) == {"8.8.8.8": "US"}
+    # ip-api is now parked: the next call does not even try it
+    assert geo.lookup_many(["8.8.4.4"]) == {}
+    assert len(calls["ipapi"]) == 1
+
+
+def test_everything_down_returns_nothing_instead_of_raising(monkeypatch):
+    boom = RuntimeError("no network")
+    _fake_net(monkeypatch, ipapi=boom, geojs=boom, ipwho=boom, ipinfo=boom)
+    assert geo.lookup_many(["8.8.8.8", "1.2.3.4"]) == {}
+    assert geo.country("8.8.8.8") == "" and geo.lookup("8.8.8.8") == {"country": ""}
+
+
+def test_record_successes_looks_countries_up_online_once(pool_dir, monkeypatch):
+    calls = _fake_net(monkeypatch, ipapi={"51.15.20.32": "NL", "8.8.8.8": "US"})
+    proxy_pool.record_successes([("socks5://51.15.20.32:1080", 0.5, ""),
+                                 ("http://8.8.8.8:80", 0.7, ""),
+                                 ("socks5://20.1.1.1:1080", 0.9, "FR")])     # already has a country
+    pool = proxy_pool._load_pool_map()
+    assert pool["socks5://51.15.20.32:1080"]["country"] == "NL"
+    assert pool["http://8.8.8.8:80"]["country"] == "US"
+    assert pool["socks5://20.1.1.1:1080"]["country"] == "FR"
+    assert len(calls["ipapi"]) == 1 and "20.1.1.1" not in calls["ipapi"][0]  # one batch, only unknown IPs
+    assert proxy_pool.load_country_cache()["51.15.20.32"] == "NL"            # remembered for next time
+    calls["ipapi"].clear()
+    proxy_pool.record_successes([("socks5://51.15.20.32:1081", 0.5, "")])   # same IP, other port
+    assert calls["ipapi"] == []                                              # served from the cache
+
+
+def test_cmd_countries_fills_the_pool_working_first(pool_dir, monkeypatch, capsys):
+    _fake_net(monkeypatch)                                                   # sites unreachable at first
+    proxy_pool.add_success("socks5://51.15.20.32:1080", 0.5)                 # working, country unknown
+    pool = proxy_pool._load_pool_map()
+    pool["http://8.8.8.8:80"] = proxy_pool._new_entry("http://8.8.8.8:80")  # never checked
+    pool["http://9.9.9.9:80"] = proxy_pool._new_entry("http://9.9.9.9:80", country="CH")   # has one
+    proxy_pool._save_pool_map(pool)
+    calls = _fake_net(monkeypatch, ipapi={"51.15.20.32": "NL", "8.8.8.8": "US"})
+    assert proxy_pool.cmd_countries() == 0
+    after = proxy_pool._load_pool_map()
+    assert after["socks5://51.15.20.32:1080"]["country"] == "NL"
+    assert after["http://8.8.8.8:80"]["country"] == "US"
+    assert calls["ipapi"] == [["51.15.20.32", "8.8.8.8"]]                    # working proxy first, CH skipped
+    assert proxy_pool.pool_stats()["countries_known"] == 3
+    assert "0 still unknown" in capsys.readouterr().out
+
+
+def test_country_filter_resolves_unknown_candidates_before_filtering(pool_dir, monkeypatch):
+    proxy_pool.add_success("socks5://51.15.20.32:1080", 0.5)
+    proxy_pool.add_success("socks5://8.8.8.8:1080", 0.4)
+    _fake_net(monkeypatch, ipapi={"51.15.20.32": "NL", "8.8.8.8": "US"})
+    monkeypatch.setattr(proxy_pool, "probe_detailed", lambda url, timeout=10: (0.3, "ok"))
+    assert proxy_pool.pick_verified(tries=5, timeout=1, country="NL") == "socks5://51.15.20.32:1080"
+
+
+def test_pick_verified_tests_the_freshest_proxies_first(pool_dir, monkeypatch):
+    """"Usable" only means "passed its LAST check", which can be days old. Live
+    probes used to land on a random mix and mostly hit the stale half."""
+    now = int(time.time())
+    fresh = [f"socks5://10.0.0.{i}:1080" for i in range(1, 31)]
+    stale = [f"socks5://10.0.1.{i}:1080" for i in range(1, 31)]
+    for u in fresh + stale:
+        proxy_pool.add_success(u, 3.0 if u in fresh else 0.2)       # stale ones are FASTER
+    pool = proxy_pool._load_pool_map()
+    for u in stale:
+        pool[u]["last_ok"] = pool[u]["last_check"] = now - 5 * 86400
+    proxy_pool._save_pool_map(pool)
+
+    probed = []
+
+    def dead(url, timeout=10):
+        probed.append(url)
+        return (None, "timeout")
+
+    monkeypatch.setattr(proxy_pool, "probe_detailed", dead)
+    assert proxy_pool.pick_verified(tries=25, timeout=1, socks=True) is None
+    assert len(probed) == 25 and set(probed) <= set(fresh)          # no stale proxy wasted a probe

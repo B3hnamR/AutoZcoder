@@ -217,6 +217,7 @@ def notify_gateway(category: str, message: str, level: str = 'info') -> None:
     Workers are subprocesses; the only channel back is HTTP with the per-run
     internal token. Never raises, never blocks the signup flow for long."""
     try:
+        import requests
         base = os.environ.get('ZAI_GATEWAY_URL') or 'http://127.0.0.1:8788'
         internal = os.environ.get('ZAI_GATEWAY_INTERNAL_TOKEN') or 'gateway-internal'
         requests.post(f'{base}/admin/dash/notifications/emit',
@@ -1284,11 +1285,8 @@ def main():
                 if CURRENT_PROXY and not pinned_mode:
                     pass              # pool route: the normal rotation below handles it
                 elif _pool_has_live_proxy():
-                    newp = pick_verified_proxy()
-                    if not newp:
-                        logger.error("  IP rate-limited, no live pool proxy — stopping")
-                        break
-                    set_proxy(newp)
+                    # let the single rotation below do the pick+set (picking
+                    # here too verified a proxy and then threw it away)
                     rotate = True
                     logger.info("  IP rate-limited on direct — switching to a "
                                 "pool proxy for the next attempt")
@@ -1385,12 +1383,27 @@ def main():
                 # needs a plan, and the bind is a one-shot per account.
                 # ZAI_INVITE_CODE set to empty string = explicitly OFF; absent
                 # or non-empty = use it (fall back to CONFIG).
+                # 500M giveaway claim (claim500): pure HTTP billing/claim, no
+                # browser, works with or without Starter. Mutually exclusive
+                # with the 100M referral claim — claim500 wins when on.
+                claim500_on = os.environ.get('ZAI_CLAIM500', '').strip().lower() in ('1', 'true', 'yes', 'on')
                 if 'ZAI_INVITE_CODE' in os.environ:
                     invite_code = os.environ.get('ZAI_INVITE_CODE', '')
                 else:
                     invite_code = CONFIG.get('invite_code')
                 global_build = False
-                if invite_code and starter and isinstance(result, str):
+                giveaway500 = False
+                if claim500_on and isinstance(result, str):
+                    try:
+                        from claim500 import claim500 as run_claim500
+                        r500 = run_claim500(token, 'zcode-v3-start-plan-1024',
+                                            log=logger.info, force_direct=False)
+                        giveaway500 = bool(r500.get('claimed'))
+                        if giveaway500:
+                            logger.info(f"500M giveaway claimed for {email}")
+                    except Exception as e:
+                        logger.warning(f"500M claim failed: {e}")
+                elif invite_code and starter and isinstance(result, str):
                     try:
                         from invite_claim import device_login, claim_invite
                         zjwt, _ = device_login(token, log=logger.info,
@@ -1417,16 +1430,21 @@ def main():
                         'email': email, 'starter': starter,
                         'plans': plan.get('plans') if plan else None,
                         'global_build': global_build,
+                        'giveaway500': giveaway500,
                         'ts': int(time.time()),
                     }) + "\n")
                 if starter:
                     starter_count += 1
-                    with open(STARTER_FILE, 'a') as f:
+                    with open(STARTER_FILE, 'a', encoding='utf-8') as f:
                         f.write(f"{email}:{password}:{token}\n")
                 if global_build:
                     with open(os.path.join(OUTPUT_DIR, 'starter100m.txt'), 'a', encoding='utf-8') as f:
                         f.write(f"{email}:{password}:{token}\n")
                     logger.info(f"Account {i+1} 100M Global Build active -> {STARTER_FILE}100m")
+                if giveaway500:
+                    with open(os.path.join(OUTPUT_DIR, 'accounts500m.txt'), 'a', encoding='utf-8') as f:
+                        f.write(f"{email}:{password}:{token}\n")
+                    logger.info(f"Account {i+1} 500M giveaway claimed -> accounts500m.txt")
 
                 logger.info(f"Account {i+1} created with token: {token_display}")
 

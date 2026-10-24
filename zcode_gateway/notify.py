@@ -31,9 +31,11 @@ _DEDUPE_S = {
     "relay_cooled": 300,
     "token_expiring": 3600,
     "account_dead": 0,
-    "generator": 0,
+    # worker events repeat across the fleet in the same minute (8 workers x
+    # the same IP lockout); bump count instead of flooding the bell
+    "generator": 300,
     "update": 0,
-    "quota": 0,
+    "quota": 60,
     "default": 60,
 }
 

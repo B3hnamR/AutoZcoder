@@ -91,13 +91,12 @@ def _proxy_host(proxy_url: str) -> str:
 def exit_ip_country(proxy_url=None, timeout=6):
     """2-letter country of the exit IP (through the proxy when given).
 
-    Order: live ip-api lookup when the proxy scheme allows it (http/https),
-    then the OFFLINE geo DB (proxy_geo) by the proxy's host IP. The offline
-    path is what makes SOCKS work at all: a socks5:// URL fed to urllib's
-    HTTP ProxyHandler is a plain HTTP request to the SOCKS port — it always
-    failed and every SOCKS-sourced account fell back to US/New_York, exactly
-    the mismatch fraud systems look for. The pool already resolves proxy
-    countries offline; reuse it."""
+    Order: live ip-api lookup through the proxy when its scheme allows it
+    (http/https), then an online lookup of the proxy's own host IP
+    (proxy_geo). The second path is what makes SOCKS work at all: a socks5://
+    URL fed to urllib's HTTP ProxyHandler is a plain HTTP request to the SOCKS
+    port — it always failed and every SOCKS-sourced account fell back to
+    US/New_York, exactly the mismatch fraud systems look for."""
     key = proxy_url or '__direct__'
     if key in _COUNTRY_CACHE:
         return _COUNTRY_CACHE[key]

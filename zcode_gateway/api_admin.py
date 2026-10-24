@@ -385,6 +385,25 @@ async def claim_100m(request: Request, account_id: str, body: dict = Body(defaul
     return await asyncio.to_thread(mgr.start_claim, email, mode)
 
 
+@router.post("/accounts/{account_id}/claim500m")
+async def claim_500m(request: Request, account_id: str, body: dict = Body(default={}),
+                     key: str = Depends(admin_key)) -> dict:
+    """Claim the 500M giveaway plan (1024 Dev Day) for one account."""
+    state = get_state(request)
+    account = await state.pool.find(account_id)
+    if account is None:
+        raise HTTPException(status_code=404, detail="account not found")
+    email = (account.email or "").strip().lower()
+    if not email:
+        raise HTTPException(status_code=400, detail="account has no email on file")
+    mode = "direct" if str(body.get("mode") or "").lower() == "direct" else "proxy"
+    from .api_dash import _generator
+    mgr = _generator(request)
+    if mgr is None:
+        raise HTTPException(status_code=400, detail="generator manager unavailable")
+    return await asyncio.to_thread(mgr.start_claim500, email, mode)
+
+
 @router.post("/claims/stop")
 async def claim_stop(request: Request, body: dict = Body(...),
                      key: str = Depends(admin_key)) -> dict:

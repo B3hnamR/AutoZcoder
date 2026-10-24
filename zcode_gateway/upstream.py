@@ -294,6 +294,7 @@ class UpstreamResponse:
     status_code: int
     headers: dict[str, str]
     _resp: httpx.Response
+    relay_url: str = ""        # which relay carried it ('' = direct); for failure logs
 
     async def aread(self) -> bytes:
         return await self._resp.aread()
@@ -433,7 +434,7 @@ class UpstreamClient:
                                            headers=dict(resp.headers))
                 return UpstreamResponse(status_code=405,
                                         headers={k.lower(): v for k, v in resp.headers.items()},
-                                        _resp=synthetic)
+                                        _resp=synthetic, relay_url=relay_url or "")
 
             if relay_url and self.relay_manager:
                 self.relay_manager.mark_relay_ok(relay_url)
@@ -441,6 +442,7 @@ class UpstreamClient:
                 status_code=resp.status_code,
                 headers={k.lower(): v for k, v in resp.headers.items()},
                 _resp=resp,
+                relay_url=relay_url or "",
             )
 
         if last_exc is not None:

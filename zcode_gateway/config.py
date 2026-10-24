@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from .zcode_device import default_device_mid
 
 
@@ -160,7 +160,8 @@ class GeneratorConfig(BaseModel):
     # A visible browser is mandatory then (headless is forced off).
     captcha: str = "manual"            # manual | auto
     headless: bool = False             # only applies when captcha == 'auto'
-    claim: bool = True                 # claim the invite Global Build after signup
+    claim: bool = False                # claim the invite Global Build (100M) after signup
+    claim500: bool = True              # claim the 500M giveaway after signup (wins over claim)
     invite_code: str = "MT9GNDQ8"      # referral code to claim ('' = off)
     # Which proxy schemes the generator may pick from the pool:
     #   all | socks | socks5 | socks4 | http  (or a comma list: "socks5,http")
@@ -169,6 +170,16 @@ class GeneratorConfig(BaseModel):
     # Legacy bool kept for old config.yaml files; only read when proxy_types
     # is left at its default.
     socks_only: bool = True
+
+    @model_validator(mode="after")
+    def _explicit_claim_stays_exclusive(self) -> "GeneratorConfig":
+        # claim500 defaults to True, so a config.yaml written for the old
+        # schema (`claim: true`, no claim500) would silently flip to the 500M
+        # giveaway. An explicit `claim` without an explicit `claim500` keeps
+        # meaning exactly what it said.
+        if "claim" in self.model_fields_set and "claim500" not in self.model_fields_set:
+            self.claim500 = False
+        return self
 
 
 class Config(BaseModel):

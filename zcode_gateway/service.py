@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import time
+import urllib.parse
 from collections import deque
 from dataclasses import dataclass
 
@@ -46,6 +47,9 @@ class StreamHandle:
     events: object = None
     first: dict | None = None
     closed: bool = False
+    # re-opens the same request on a fresh upstream stream (set by open_stream);
+    # used to retry a stream that died before any content reached the client
+    reopen: object = None
 
 @dataclass
 class CallResult:
@@ -54,6 +58,15 @@ class CallResult:
     raw: bytes
     duration_ms: float
     upstream_headers: dict
+
+
+def _snapshot_payload(payload):
+    """Copy of a request payload that survives open_stream mutating it (the
+    account pin is popped out of payload['_anthropic'] on each attempt)."""
+    snap = dict(payload)
+    if isinstance(snap.get('_anthropic'), dict):
+        snap['_anthropic'] = dict(snap['_anthropic'])
+    return snap
 
 
 def _split_sse_frames(pending):
@@ -223,7 +236,92 @@ class ChatService:
         elif status >= 500:
             await self.pool.cool(account, reason='upstream_error')
 
+    # A stream that dies BEFORE any content reached the client (only
+    # message_start/ping so far) is re-opened this many times, transparently:
+    # the client cannot tell, and nothing is ever replayed to it.
+    STREAM_RETRIES = 2
+
+    def _relay_label(self, resp) -> str:
+        url = getattr(resp, 'relay_url', '') or ''
+        if not url:
+            return 'direct'
+        name = ''
+        try:
+            rm = getattr(self.client, 'relay_manager', None)
+            if rm is not None:
+                for r in rm.get_settings().get('relays') or []:
+                    if str(r.get('url', '')).rstrip('/') == url.rstrip('/'):
+                        name = str(r.get('name') or '')
+                        break
+        except Exception:
+            pass
+        host = urllib.parse.urlparse(url).netloc or url
+        return f'{name} ({host})' if name else host
+
+    @staticmethod
+    def _describe_failure(exc) -> str:
+        if isinstance(exc, UpstreamFailure):
+            if exc.code == 'truncated_stream':
+                return 'connection closed cleanly before message_stop'
+            return f'{exc.code}: {exc.message}'
+        text = f'{type(exc).__name__}: {exc}'.rstrip(': ')
+        inner = exc.__cause__ or exc.__context__
+        if inner is not None and inner is not exc:
+            text += f' (caused by {type(inner).__name__}: {inner})'.replace(': )', ')')
+        return text
+
+    @staticmethod
+    def _retryable(exc) -> bool:
+        # transport-level only: a dead/cut connection, or a clean EOF with no
+        # message_stop. Upstream error events and parse errors are not retried.
+        return isinstance(exc, httpx.HTTPError) or (
+            isinstance(exc, UpstreamFailure) and exc.code == 'truncated_stream')
+
+    def _log_stream_failure(self, handle, exc, *, committed, events, retry):
+        acct = handle.account
+        who = str(acct.id)[:12] + (f' <{acct.email}>' if getattr(acct, 'email', '') else '')
+        log.warning('ZCode stream failed mid-flight: model=%s account=%s relay=%s after %.1fs, '
+                    '%d event(s), content_sent=%s - %s%s',
+                    handle.body.get('model'), who, self._relay_label(handle.resp),
+                    time.time() - handle.started, events, committed,
+                    self._describe_failure(exc),
+                    ' - retrying transparently' if retry else '')
+
+    async def _after_stream_failure(self, handle, exc, *, committed, events, retries_left):
+        """Log a mid-stream failure; return a freshly opened handle when the
+        failure is retryable and nothing has been sent to the client."""
+        will_retry = (not committed) and retries_left > 0 and self._retryable(exc)
+        self._log_stream_failure(handle, exc, committed=committed, events=events, retry=will_retry)
+        if not will_retry:
+            return None
+        reopen = getattr(handle, 'reopen', None)
+        if reopen is None:
+            return None
+        # free this attempt's in-flight slot BEFORE re-opening: with a low
+        # per-account cap the retry would otherwise wait on the slot we hold
+        await self._close(handle)
+        await asyncio.sleep(0.15)
+        try:
+            return await reopen()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc2:
+            log.warning('ZCode stream retry could not open a new upstream stream (%s) - '
+                        'reporting the original failure', self._describe_failure(exc2))
+            return None
+
     async def open_stream(self, payload, *, model, variant='anthropic', dialect='openai', client_key='anonymous', is_disconnected=None):
+        snapshot = _snapshot_payload(payload)
+        handle = await self._open_stream(payload, model=model, variant=variant, dialect=dialect,
+                                         client_key=client_key, is_disconnected=is_disconnected)
+
+        async def reopen():
+            return await self.open_stream(_snapshot_payload(snapshot), model=model, variant=variant,
+                                          dialect=dialect, client_key=client_key)
+        handle.reopen = reopen
+        return handle
+
+    async def _open_stream(self, payload, *, model, variant='anthropic', dialect='openai', client_key='anonymous', is_disconnected=None):
         fallback = self.cfg.models.auto_free_fallback
         chain = list(dict.fromkeys(self.registry.resolve(m, dialect) for m in fallback.chain))
         candidates = chain[chain.index(model):] if fallback.enabled and model in chain else [model]
@@ -452,42 +550,79 @@ class ChatService:
         usage, stopped, status = {}, False, 200
         captured = deque()
         capture_size = 0
+        committed = False       # has anything beyond the prelude been handed to the client?
+        prelude = []            # message_start/ping held back until real content shows up,
+                                # so an early failure can be retried without the client noticing
+        seen = 0
+        retries_left = self.STREAM_RETRIES
+
+        def emit(event):
+            kind = event.get('type')
+            if kind == 'message_start': usage.update(event['message'].get('usage') or {})
+            if kind == 'message_delta': usage.update(event.get('usage') or {})
+            if anthropic: return [_sse_event(kind, event)]
+            return [sse_frame(chunk) for chunk in translator.feed(event)]
+
         async def events():
             yield handle.first
             async for event in handle.events: yield event
         try:
-            async for event in events():
-                kind = event.get('type')
-                if self.capture.enabled and capture_size < 200000:
-                    text = json.dumps(event, ensure_ascii=False)
-                    captured.append(text)
-                    capture_size += len(text)
-                # OpenAI-shaped mid-stream error frame: {"error":{...}} with
-                # no "type" key (captured 2026-09-16). Without this branch it
-                # fell through to the Anthropic passthrough as `event: None`
-                # — not in the Anthropic SSE vocabulary — and the account was
-                # never parked for the failure.
-                if kind == 'error' or (kind is None and 'error' in event):
-                    info = event.get('error') or event
-                    code, message = str(info.get('code') or info.get('type') or 'api_error'), info.get('message', 'ZCode stream failed')
-                    status = 529 if is_model_overload(502, code) else (429 if code in ('11113', 'rate_limit_error') else 502)
-                    await self._apply_error(handle.account, model, status, code, message)
-                    yield _sse_event('error', event) if anthropic else sse_frame(openai_error(status, code, message))
-                    if not anthropic: yield b'data: [DONE]\n\n'
-                    return
-                if kind == 'message_start': usage.update(event['message'].get('usage') or {})
-                if kind == 'message_delta': usage.update(event.get('usage') or {})
-                if anthropic:
-                    yield _sse_event(kind, event)
-                else:
-                    for chunk in translator.feed(event): yield sse_frame(chunk)
-                if kind == 'message_stop':
-                    stopped = True
-                    if not anthropic: yield b'data: [DONE]\n\n'
-                    await self.pool.on_success(handle.account)
+            while True:                     # one pass per upstream attempt
+                try:
+                    async for event in events():
+                        kind = event.get('type')
+                        seen += 1
+                        if self.capture.enabled and capture_size < 200000:
+                            text = json.dumps(event, ensure_ascii=False)
+                            captured.append(text)
+                            capture_size += len(text)
+                        if not committed:
+                            if kind in ('message_start', 'ping'):
+                                prelude.append(event)
+                                continue
+                            committed = True
+                            for held in prelude:
+                                for out in emit(held): yield out
+                            prelude.clear()
+                        # OpenAI-shaped mid-stream error frame: {"error":{...}} with
+                        # no "type" key (captured 2026-09-16). Without this branch it
+                        # fell through to the Anthropic passthrough as `event: None`
+                        # — not in the Anthropic SSE vocabulary — and the account was
+                        # never parked for the failure.
+                        if kind == 'error' or (kind is None and 'error' in event):
+                            info = event.get('error') or event
+                            code, message = str(info.get('code') or info.get('type') or 'api_error'), info.get('message', 'ZCode stream failed')
+                            status = 529 if is_model_overload(502, code) else (429 if code in ('11113', 'rate_limit_error') else 502)
+                            await self._apply_error(handle.account, model, status, code, message)
+                            self._log_stream_failure(handle, UpstreamFailure(status, code, message),
+                                                     committed=committed, events=seen, retry=False)
+                            yield _sse_event('error', event) if anthropic else sse_frame(openai_error(status, code, message))
+                            if not anthropic: yield b'data: [DONE]\n\n'
+                            return
+                        for out in emit(event): yield out
+                        if kind == 'message_stop':
+                            stopped = True
+                            if not anthropic: yield b'data: [DONE]\n\n'
+                            await self.pool.on_success(handle.account)
+                            break
+                    if not stopped:
+                        raise UpstreamFailure(502, 'truncated_stream', 'ZCode stream ended before message_stop')
                     break
-            if not stopped:
-                raise UpstreamFailure(502, 'truncated_stream', 'ZCode stream ended before message_stop')
+                except (httpx.HTTPError, ValueError, KeyError, UpstreamFailure) as exc:
+                    fresh = await self._after_stream_failure(
+                        handle, exc, committed=committed, events=seen, retries_left=retries_left)
+                    if fresh is None:
+                        raise               # reported to the client below, as before
+                    retries_left -= 1
+                    # the aborted attempt still counts as an upstream failure
+                    self._record(handle.account, handle.headers, handle.body, 502, handle.resp.headers,
+                                 '\n'.join(captured), (time.time() - handle.started) * 1000,
+                                 client_key, dialect, model, usage)
+                    old, handle = handle, fresh
+                    await self._close(old)
+                    model = handle.body['model']
+                    translator = OpenAITranslator(model)
+                    usage, captured, capture_size, prelude, seen = {}, deque(), 0, [], 0
         except asyncio.CancelledError:
             status = 499
             raise
@@ -507,44 +642,60 @@ class ChatService:
     async def complete(self, payload, *, model, variant='anthropic', dialect='openai', client_key='anonymous', is_disconnected=None):
         handle = await self.open_stream(payload, model=model, variant=variant, dialect=dialect, client_key=client_key,
                                         is_disconnected=is_disconnected)
-        model = handle.body['model']
-        accumulator, translator, chunks = MessageAccumulator(), OpenAITranslator(model), []
-        status = 200
-        try:
-            accumulator.feed(handle.first)
-            if dialect != 'anthropic': chunks.extend(sse_frame(c) for c in translator.feed(handle.first))
-            async for event in handle.events:
-                if event.get('type') == 'error':
-                    info = event.get('error') or event
-                    code = str(info.get('code') or info.get('type') or 'api_error')
-                    status = 529 if is_model_overload(502, code) else (429 if code in ('11113', 'rate_limit_error') else (405 if is_block_code(code) else 502))
-                    message = info.get('message', 'ZCode stream failed')
-                    await self._apply_error(handle.account, model, status, code, message)
-                    raise UpstreamFailure(status, code, message)
-                accumulator.feed(event)
-                if dialect != 'anthropic': chunks.extend(sse_frame(c) for c in translator.feed(event))
-                if event.get('type') == 'message_stop': break
-            if not accumulator.stopped:
-                raise UpstreamFailure(502, 'truncated_stream', 'ZCode stream ended before message_stop')
-            message = accumulator.finish()
-            raw = json.dumps(message, ensure_ascii=False).encode() if dialect == 'anthropic' else b''.join(chunks)
-            await self.pool.on_success(handle.account)
-            self._record(handle.account, handle.headers, handle.body, 200, handle.resp.headers,
-                         json.dumps(message, ensure_ascii=False), (time.time() - handle.started) * 1000,
-                         client_key, dialect, model, message['usage'])
-            return CallResult(handle.account, 200, raw, (time.time()-handle.started)*1000, handle.resp.headers)
-        except UpstreamFailure as exc:
-            self._record(handle.account, handle.headers, handle.body, exc.status, handle.resp.headers,
-                         json.dumps({'error': exc.message}), (time.time() - handle.started)*1000,
-                         client_key, dialect, model, accumulator.message.get('usage') or {})
-            raise
-        except (httpx.HTTPError, ValueError, KeyError) as exc:
-            self._record(handle.account, handle.headers, handle.body, 502, handle.resp.headers,
-                         '{"error":"malformed stream"}', (time.time() - handle.started)*1000,
-                         client_key, dialect, model, accumulator.message.get('usage') or {})
-            raise UpstreamFailure(502, 'invalid_stream', 'ZCode returned an incomplete or malformed response') from exc
-        finally:
-            await self._close(handle)
+        retries_left = self.STREAM_RETRIES
+        fresh = None
+        while True:
+            if fresh is not None:
+                handle, fresh = fresh, None
+            model = handle.body['model']
+            accumulator, translator, chunks = MessageAccumulator(), OpenAITranslator(model), []
+            status, seen = 200, 0
+            try:
+                accumulator.feed(handle.first)
+                if dialect != 'anthropic': chunks.extend(sse_frame(c) for c in translator.feed(handle.first))
+                async for event in handle.events:
+                    seen += 1
+                    if event.get('type') == 'error':
+                        info = event.get('error') or event
+                        code = str(info.get('code') or info.get('type') or 'api_error')
+                        status = 529 if is_model_overload(502, code) else (429 if code in ('11113', 'rate_limit_error') else (405 if is_block_code(code) else 502))
+                        message = info.get('message', 'ZCode stream failed')
+                        await self._apply_error(handle.account, model, status, code, message)
+                        raise UpstreamFailure(status, code, message)
+                    accumulator.feed(event)
+                    if dialect != 'anthropic': chunks.extend(sse_frame(c) for c in translator.feed(event))
+                    if event.get('type') == 'message_stop': break
+                if not accumulator.stopped:
+                    raise UpstreamFailure(502, 'truncated_stream', 'ZCode stream ended before message_stop')
+                message = accumulator.finish()
+                raw = json.dumps(message, ensure_ascii=False).encode() if dialect == 'anthropic' else b''.join(chunks)
+                await self.pool.on_success(handle.account)
+                self._record(handle.account, handle.headers, handle.body, 200, handle.resp.headers,
+                             json.dumps(message, ensure_ascii=False), (time.time() - handle.started) * 1000,
+                             client_key, dialect, model, message['usage'])
+                return CallResult(handle.account, 200, raw, (time.time()-handle.started)*1000, handle.resp.headers)
+            except UpstreamFailure as exc:
+                self._record(handle.account, handle.headers, handle.body, exc.status, handle.resp.headers,
+                             json.dumps({'error': exc.message}), (time.time() - handle.started)*1000,
+                             client_key, dialect, model, accumulator.message.get('usage') or {})
+                # non-streaming: nothing has reached the client, so a cut or
+                # truncated stream is retried whatever it had produced so far
+                fresh = await self._after_stream_failure(
+                    handle, exc, committed=False, events=seen, retries_left=retries_left)
+                if fresh is None:
+                    raise
+                retries_left -= 1
+            except (httpx.HTTPError, ValueError, KeyError) as exc:
+                self._record(handle.account, handle.headers, handle.body, 502, handle.resp.headers,
+                             '{"error":"malformed stream"}', (time.time() - handle.started)*1000,
+                             client_key, dialect, model, accumulator.message.get('usage') or {})
+                fresh = await self._after_stream_failure(
+                    handle, exc, committed=False, events=seen, retries_left=retries_left)
+                if fresh is None:
+                    raise UpstreamFailure(502, 'invalid_stream', 'ZCode returned an incomplete or malformed response') from exc
+                retries_left -= 1
+            finally:
+                await self._close(handle)
 
     def _record(self, account, headers, body, status, response_headers, response, duration, key, dialect, model, usage):
         converted = usage_openai(usage)

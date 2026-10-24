@@ -1,257 +1,160 @@
-"""Offline country / ASN lookup for proxy hosts (DB-IP Lite, CC BY 4.0).
+"""Online country lookup for proxy hosts.
 
-Nothing is downloaded until ``download()`` is called. After that every lookup is
-offline — no per-proxy API calls, no rate limits. If no database is present the
-lookup simply returns empty values and the caller falls back to its own cache.
-
-Files live in ``<output dir>/geo/`` so a portable install keeps them beside the
-exe. Country database ~ 2 MB gz, ASN ~ 5 MB gz.
+Nothing is downloaded or installed. The 2-letter country of a proxy's IP is asked
+of free public lookup sites — ip-api.com and geojs.io in batches of up to 100,
+ipwho.is and ipinfo.io one IP at a time as a last resort — and the callers keep the
+answers in ``ip_country.json``. A lookup that fails simply returns less: callers
+carry on with whatever their cache already holds, and a provider that errors or
+rate-limits is skipped for a few minutes.
 """
 from __future__ import annotations
 
-import bisect
-import csv
-import gzip
-import io
 import ipaddress
-import os
 import re
+import threading
 import time
-from array import array
 
-COUNTRY_FILE = "dbip-country-lite.csv.gz"
-ASN_FILE = "dbip-asn-lite.csv.gz"
-DOWNLOAD_BASE = "https://download.db-ip.com/free/"
+import requests
+
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36"
+BATCH = 100                 # IPs per request for the batch providers
+SINGLE_LIMIT = 40           # most single lookups per provider per call
+DOWN_SECONDS = 300          # how long a failing/rate-limited provider is skipped
 
-_data_dir = None
-_country = None          # _Index
-_asn = None              # _Index
-_loaded_for = None
-
-_COUNTRY_NAME = re.compile(r"[^A-Za-z0-9 .,'&()/-]")
-
-
-class _Index:
-    """Sorted IP ranges with a value per range (a 2-letter code or an ASN label)."""
-
-    __slots__ = ("starts", "ends", "values")
-
-    def __init__(self, starts: array, ends: array, values: list):
-        self.starts, self.ends, self.values = starts, ends, values
-
-    def __len__(self) -> int:
-        return len(self.starts)
-
-    @classmethod
-    def from_rows(cls, rows) -> "_Index":
-        starts, ends, values = array("I"), array("I"), []
-        for start, end, value in rows:
-            if not value:
-                continue
-            starts.append(start)
-            ends.append(end)
-            values.append(value)
-        return cls(starts, ends, values)
-
-    def lookup(self, ip_int: int) -> str:
-        i = bisect.bisect_right(self.starts, ip_int) - 1
-        if i >= 0 and ip_int <= self.ends[i]:
-            return self.values[i]
-        return ""
+_lock = threading.Lock()
+_down: dict = {}            # provider name -> unix time it may be tried again
+_memo: dict = {}            # ip -> country, for repeated single lookups in one process
+_CC = re.compile(r"^[A-Za-z]{2}$")
 
 
-def set_data_dir(path) -> None:
-    """Point the database folder at the pool's data directory."""
-    global _data_dir, _country, _asn, _loaded_for
-    new = str(path)
-    if _data_dir == new and _loaded_for is not None:
-        return                      # same folder: keep the parsed index
-    _data_dir = new
-    _country = _asn = None
-    _loaded_for = None
-
-
-def _dir() -> str:
-    return os.path.join(_data_dir or os.path.join(os.path.dirname(os.path.abspath(__file__)), "output"), "geo")
-
-
-def paths() -> dict:
-    d = _dir()
-    return {"dir": d, "country": os.path.join(d, COUNTRY_FILE), "asn": os.path.join(d, ASN_FILE)}
-
-
-def available() -> bool:
-    return os.path.exists(paths()["country"])
-
-
-def status() -> dict:
-    p = paths()
-    out = {"available": os.path.exists(p["country"]), "dir": p["dir"],
-           "country_db": os.path.exists(p["country"]), "asn_db": os.path.exists(p["asn"])}
+def valid_ip(host) -> bool:
+    """A public IP literal (hostnames, private and reserved ranges can't be looked up)."""
     try:
-        st = os.stat(p["country"])
-        out["size_mb"] = round(st.st_size / 1e6, 1)
-        out["updated"] = time.strftime("%Y-%m-%d", time.localtime(st.st_mtime))
-    except OSError:
-        pass
-    try:
-        if _country is not None:
-            out["ranges"] = len(_country)
-    except Exception:
-        pass
-    return out
-
-
-def ip_to_int(ip: str) -> int | None:
-    try:
-        addr = ipaddress.ip_address(ip)
+        return ipaddress.ip_address(str(host).strip().strip("[]")).is_global
     except ValueError:
-        return None
-    if addr.version != 4:
-        return None
-    return int(addr)
+        return False
 
 
-def _iter_csv(path: str):
-    opener = gzip.open if path.endswith(".gz") else open
-    with opener(path, "rt", encoding="utf-8", errors="ignore", newline="") as f:
-        yield from csv.reader(f)
+def _is_down(name: str) -> bool:
+    with _lock:
+        return _down.get(name, 0) > time.time()
 
 
-def _load_country(path: str) -> _Index:
-    def rows():
-        for row in _iter_csv(path):
-            if len(row) < 3:
-                continue
-            start, end = ip_to_int(row[0]), ip_to_int(row[1])
-            if start is None or end is None:
-                continue
-            if len(row) == 3:
-                # current Lite CSV: ip_start, ip_end, country_code
-                code, name = row[2], ""
-            elif len(row) >= 6:
-                # full/older layout: start, end, continent_code, continent_name,
-                # country_code, eu_member, country_name
-                code = row[4]
-                name = row[6] if len(row) > 6 else ""
-            else:
-                code, name = row[2], (row[3] if len(row) > 3 else "")
-            code = (code or "").strip().upper()
-            name = _COUNTRY_NAME.sub("", name or "")[:48]
-            yield start, end, (code + "|" + name) if code else ""
-    return _Index.from_rows(rows())
+def _mark_down(name: str, seconds: int = DOWN_SECONDS) -> None:
+    with _lock:
+        _down[name] = time.time() + seconds
 
 
-def _load_asn(path: str) -> _Index:
-    def rows():
-        for row in _iter_csv(path):
-            if len(row) < 4:
-                continue
-            start, end = ip_to_int(row[0]), ip_to_int(row[1])
-            if start is None or end is None:
-                continue
-            org = (row[3] or "").strip()[:64]
-            asn = (row[2] or "").strip()[:16]
-            if org or asn:
-                yield start, end, (asn + " " + org).strip()
-    return _Index.from_rows(rows())
+def _headers() -> dict:
+    return {"User-Agent": UA}
 
 
-def _ensure_loaded() -> None:
-    global _country, _asn, _loaded_for
-    p = paths()
-    key = (p["country"], p["asn"])
-    if _loaded_for == key:
-        return
-    _country = _load_country(p["country"]) if os.path.exists(p["country"]) else None
-    _asn = _load_asn(p["asn"]) if os.path.exists(p["asn"]) else None
-    _loaded_for = key
+# ----------------------------------------------------------------------------- providers
+
+def _ipapi_batch(ips, timeout) -> dict:
+    r = requests.post("http://ip-api.com/batch?fields=status,query,countryCode",
+                      json=list(ips), headers=_headers(), timeout=timeout)
+    if r.status_code == 429:
+        raise RuntimeError("rate limited")
+    r.raise_for_status()
+    return {row["query"]: row["countryCode"].upper() for row in r.json()
+            if row.get("status") == "success" and _CC.match(row.get("countryCode") or "")}
 
 
-def lookup(ip: str) -> dict:
-    """{"country": "US", "country_name": "...", "asn": "...", "org": "..."} (empty when unknown)."""
-    out = {"country": "", "country_name": "", "asn": "", "org": ""}
-    n = ip_to_int(ip or "")
-    if n is None:
-        return out
-    _ensure_loaded()
-    if _country is not None:
-        val = _country.lookup(n)
-        if val:
-            cc, _, name = val.partition("|")
-            out["country"], out["country_name"] = cc, name
-    if _asn is not None:
-        val = _asn.lookup(n)
-        if val:
-            asn, _, org = val.partition(" ")
-            out["asn"], out["org"] = asn, org
+def _geojs_batch(ips, timeout) -> dict:
+    r = requests.get("https://get.geojs.io/v1/ip/country.json", params={"ip": ",".join(ips)},
+                     headers=_headers(), timeout=timeout)
+    if r.status_code == 429:
+        raise RuntimeError("rate limited")
+    r.raise_for_status()
+    data = r.json()
+    rows = data if isinstance(data, list) else [data]
+    return {row["ip"]: row["country"].upper() for row in rows
+            if row.get("ip") and _CC.match(row.get("country") or "")}
+
+
+def _ipwho_single(ip, timeout) -> str:
+    r = requests.get(f"https://ipwho.is/{ip}", params={"fields": "success,country_code"},
+                     headers=_headers(), timeout=timeout)
+    if r.status_code == 429:
+        raise RuntimeError("rate limited")
+    data = r.json()
+    code = data.get("country_code") or ""
+    return code.upper() if data.get("success") and _CC.match(code) else ""
+
+
+def _ipinfo_single(ip, timeout) -> str:
+    r = requests.get(f"https://ipinfo.io/{ip}/country", headers=_headers(), timeout=timeout)
+    if r.status_code == 429:
+        raise RuntimeError("rate limited")
+    text = (r.text or "").strip()
+    return text.upper() if r.ok and _CC.match(text) else ""
+
+
+_BATCH_PROVIDERS = (("ip-api", _ipapi_batch), ("geojs", _geojs_batch))
+_SINGLE_PROVIDERS = (("ipwho", _ipwho_single), ("ipinfo", _ipinfo_single))
+
+
+# ----------------------------------------------------------------------------- public API
+
+def lookup_many(ips, budget_s: float = 20.0, progress=None) -> dict:
+    """{ip: 'DE'} for every IP that could be resolved within ``budget_s`` seconds.
+
+    Batch providers go first (a thousand IPs take about ten requests), then the
+    single-IP ones for whatever is left. Unresolvable IPs are simply absent."""
+    todo = list(dict.fromkeys(ip for ip in (str(i).strip() for i in ips if i) if valid_ip(ip)))
+    out: dict = {}
+    deadline = time.time() + max(1.0, float(budget_s))
+
+    def remaining() -> float:
+        return deadline - time.time()
+
+    for name, fn in _BATCH_PROVIDERS:
+        if not todo or remaining() <= 0:
+            break
+        if _is_down(name):
+            continue
+        for i in range(0, len(todo), BATCH):
+            if remaining() <= 0:
+                break
+            try:
+                out.update(fn(todo[i:i + BATCH], timeout=min(10.0, max(2.0, remaining()))))
+            except Exception:
+                _mark_down(name)
+                break
+            if progress:
+                progress(len(out), len(todo))
+        todo = [ip for ip in todo if ip not in out]
+    for name, fn in _SINGLE_PROVIDERS:
+        if not todo or remaining() <= 0:
+            break
+        if _is_down(name):
+            continue
+        for ip in todo[:SINGLE_LIMIT]:
+            if remaining() <= 0:
+                break
+            try:
+                cc = fn(ip, timeout=min(8.0, max(2.0, remaining())))
+            except Exception:
+                _mark_down(name)
+                break
+            if cc:
+                out[ip] = cc
+        todo = [ip for ip in todo if ip not in out]
     return out
 
 
-def country(ip: str) -> str:
-    return lookup(ip)["country"]
+def country(host) -> str:
+    """2-letter country of one IP ('' when unknown). Remembered for this process."""
+    host = str(host or "").strip().strip("[]")
+    if host in _memo:
+        return _memo[host]
+    cc = lookup_many([host], budget_s=6.0).get(host, "")
+    if cc:
+        _memo[host] = cc
+    return cc
 
 
-def _download_one(kind: str, progress=None) -> dict:
-    import urllib.request
-
-    name = COUNTRY_FILE if kind == "country" else ASN_FILE
-    os.makedirs(_dir(), exist_ok=True)
-    target = os.path.join(_dir(), name)
-    now = time.gmtime()
-    candidates = []
-    y, m = now.tm_year, now.tm_mon
-    for _ in range(8):
-        candidates.append(f"{DOWNLOAD_BASE}dbip-{kind}-lite-{y}-{m:02d}.csv.gz")
-        m -= 1
-        if m == 0:
-            y, m = y - 1, 12
-    last = ""
-    for url in candidates:
-        if progress:
-            progress(f"trying {url.rsplit('/', 1)[-1]}")
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": UA})
-            with urllib.request.urlopen(req, timeout=90) as resp:
-                data = resp.read()
-            if len(data) < 10_000:
-                raise ValueError("file too small — not a database")
-            with gzip.GzipFile(fileobj=io.BytesIO(data)) as gz:
-                head = gz.read(200).decode("utf-8", "ignore")
-            if "," not in head:
-                raise ValueError("not a CSV database")
-            tmp = target + ".tmp"
-            with open(tmp, "wb") as f:
-                f.write(data)
-            os.replace(tmp, target)
-            if progress:
-                progress(f"saved {name} ({len(data)/1e6:.1f} MB)")
-            return {"ok": True, "file": target, "bytes": len(data)}
-        except Exception as e:  # noqa: BLE001
-            last = f"{type(e).__name__}: {e}"
-    return {"ok": False, "error": last or "no database found"}
-
-
-def download(progress=None, asn: bool = True) -> dict:
-    """Fetch the current (or most recent) DB-IP Lite databases."""
-    res = {"country": _download_one("country", progress)}
-    if res["country"].get("ok") and asn:
-        res["asn"] = _download_one("asn", progress)
-    global _loaded_for
-    _loaded_for = None
-    res["status"] = status()
-    res["ok"] = bool(res["country"].get("ok"))
-    return res
-
-
-def clear() -> None:
-    global _country, _asn, _loaded_for
-    for p in paths().values():
-        if isinstance(p, str) and p.endswith((".gz",)) and os.path.exists(p):
-            try:
-                os.remove(p)
-            except OSError:
-                pass
-    _country = _asn = None
-    _loaded_for = None
+def lookup(host) -> dict:
+    """{'country': 'DE'} (empty when unknown)."""
+    return {"country": country(host)}

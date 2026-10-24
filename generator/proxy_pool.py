@@ -18,7 +18,7 @@ Usage:
     python proxy_pool.py verify     # test raw list against chat.z.ai
     python proxy_pool.py recheck    # strictly re-test the live pool
     python proxy_pool.py pick       # print one claimed proxy URL
-    python proxy_pool.py geo        # download the offline country/ASN database
+    python proxy_pool.py countries  # look up the country of pool proxies (online)
     python proxy_pool.py stats      # pool health summary
     python proxy_pool.py            # fetch + verify
 
@@ -72,10 +72,6 @@ def _resolve_paths():
     HISTORY_FILE = os.path.join(OUTPUT_DIR, 'proxy_history.json')
     SOURCE_STATS_FILE = os.path.join(OUTPUT_DIR, 'proxy_sources_stats.json')
     LOCK_FILE = os.path.join(OUTPUT_DIR, '.proxy.lock')
-    try:
-        geo.set_data_dir(OUTPUT_DIR)
-    except Exception:
-        pass
 
 
 def set_output_dir(path: str):
@@ -364,27 +360,27 @@ def extract_ip(purl):
     return m.group(1) if m else None
 
 
-def resolve_proxy_countries(proxies, max_lookup=300):
-    """purl -> 2-letter country. Offline DB first, then the local cache.
-
-    No network calls: the old ip-api batching got rate-limited halfway through
-    long scans and left country filters half-empty.
-    """
+def resolve_proxy_countries(proxies, max_lookup=300, budget_s=15.0):
+    """purl -> 2-letter country: the local cache first, then ONE batched online
+    lookup (proxy_geo) for the IPs the cache does not know. A failed or
+    rate-limited lookup just leaves those empty."""
     cache = load_country_cache()
-    changed = False
-    result = {}
+    result, missing = {}, []
     for p in proxies:
         ip = extract_ip(p)
-        cc = cache.get(ip, '') if ip else ''
-        if not cc and ip:
-            info = geo.lookup(ip)
-            cc = info.get('country', '')
-            if cc:
-                cache[ip] = cc
-                changed = True
-        result[p] = cc
-    if changed:
-        save_country_cache(cache)
+        result[p] = cache.get(ip, '') if ip else ''
+        if ip and not result[p]:
+            missing.append(ip)
+    missing = list(dict.fromkeys(missing))[:max_lookup]
+    if missing:
+        found = geo.lookup_many(missing, budget_s=budget_s)
+        if found:
+            cache.update(found)
+            save_country_cache(cache)
+            for p in proxies:
+                ip = extract_ip(p)
+                if not result[p] and ip in found:
+                    result[p] = found[ip]
     return result
 
 
@@ -843,20 +839,23 @@ def record_successes(items) -> int:
     items = clean
     if not items:
         return 0
-    # country lookups (and the one-time geo DB parse) happen outside the lock so
-    # other workers' claims are not held up behind a disk-backed lookup
+    # country lookups happen outside the lock so other workers' claims are not
+    # held up behind the network: cache first, then one batched online lookup
     cache = load_country_cache()
     changed_cache = False
+    missing = list(dict.fromkeys(
+        ip for url, _, country in items if not country
+        for ip in [extract_ip(url)] if ip and not cache.get(ip)))
+    if missing:
+        found = geo.lookup_many(missing, budget_s=6.0)
+        if found:
+            cache.update(found)
+            changed_cache = True
     resolved = []
     for url, latency, country in items:
         if not country:
             ip = extract_ip(url)
             country = cache.get(ip, '') if ip else ''
-            if not country and ip:
-                country = geo.lookup(ip).get('country', '')
-                if country:
-                    cache[ip] = country
-                    changed_cache = True
         resolved.append((url, latency, country))
     with _lock():
         pool = _load_pool_map()
@@ -1046,7 +1045,8 @@ def pool_stats() -> dict:
             'by_proto': dict(by_proto), 'avg_latency': round(total_latency / len(pool), 2) if pool else 0,
             'failed': sum(1 for e in pool.values() if int(e.get('fails', 0)) > 0),
             'bad': len(bad), 'used': len(used),
-            'geo': geo.status(), 'max_fails': MAX_FAILS}
+            'countries_known': sum(1 for e in pool.values() if e.get('country')),
+            'max_fails': MAX_FAILS}
 
 
 # ----------------------------------------------------------------------------- pool ledger writes
@@ -1131,8 +1131,6 @@ def _country_of(entry: dict, cache: dict) -> str:
         return cc
     ip = entry.get('host') or extract_ip(entry.get('url', ''))
     cc = cache.get(ip, '') if ip else ''
-    if not cc and ip:
-        cc = geo.lookup(ip).get('country', '')
     return cc.upper()
 
 
@@ -1155,6 +1153,16 @@ def pick_verified(tries=30, timeout=8, socks=False, country=None, types=None):
         cache = load_country_cache()
         keep = []
         by_url = {e['url']: e for e in good}
+        # one batched online lookup for candidates whose country nobody knows yet
+        unknown = list(dict.fromkeys(
+            ip for u in urls
+            for ip in [by_url.get(u, {}).get('host') or extract_ip(u)]
+            if ip and not by_url.get(u, {}).get('country') and not cache.get(ip)))
+        if unknown:
+            found = geo.lookup_many(unknown[:300], budget_s=8.0)
+            if found:
+                cache.update(found)
+                save_country_cache(cache)
         for u in urls:
             if _country_of(by_url.get(u, {}), cache) == target_country:
                 keep.append(u)
@@ -1162,11 +1170,37 @@ def pick_verified(tries=30, timeout=8, socks=False, country=None, types=None):
     if not urls:
         return None
     ranked = {e['url']: e for e in good}
-    urls.sort(key=lambda u: (int(ranked.get(u, {}).get('fails', 0)),
-                             float(ranked.get(u, {}).get('latency', 0))))
+    now = time.time()
+
+    def _freshness(u: str) -> int:
+        """How long ago the proxy last PASSED a check. A proxy verified a few
+        hours ago is far likelier to still be alive than one verified last
+        week, and picking blindly among 'usable' ones meant most live probes
+        hit the stale half and failed."""
+        age = now - int(ranked.get(u, {}).get('last_ok', 0) or 0)
+        return 0 if age < 7200 else 1 if age < 43200 else 2 if age < 172800 else 3
+
+    def _rank(u: str):
+        return (int(ranked.get(u, {}).get('fails', 0)), _freshness(u),
+                float(ranked.get(u, {}).get('latency', 0)))
+
+    urls.sort(key=_rank)
     head = urls[:min(120, len(urls))]
-    if len(head) > 10:               # large pool: spread load between workers
-        random.shuffle(head)
+    if len(head) > 10:
+        # large pool: spread load between workers, but only among proxies that
+        # are equally healthy AND equally fresh — never mix fresh with stale
+        mixed, group, key = [], [], None
+        for u in head:
+            k = _rank(u)[:2]
+            if k != key and group:
+                random.shuffle(group)
+                mixed.extend(group)
+                group = []
+            key = k
+            group.append(u)
+        random.shuffle(group)
+        mixed.extend(group)
+        head = mixed
     candidates = head[:min(len(head), max(int(tries), 25))]
 
     failures: list[tuple[str, str]] = []
@@ -1467,17 +1501,46 @@ def cmd_pick():
     return None
 
 
-def cmd_geo():
-    print("downloading DB-IP Lite (country + ASN)…")
-    emit(t='start', action='geo')
-    res = geo.download(progress=lambda m: print("  " + m), asn=True)
-    st = res.get('status') or {}
-    if res.get('ok'):
-        print(f"geo database ready: {st.get('size_mb', '?')} MB, updated {st.get('updated', '?')}")
-    else:
-        print(f"geo download failed: {res.get('country', {}).get('error', 'unknown error')}")
-    emit(t='geo', ok=bool(res.get('ok')), **{k: v for k, v in st.items() if k in ('available', 'updated', 'size_mb')})
-    return 1 if res.get('ok') else 0
+def cmd_countries(limit=None, budget_s=120.0):
+    """Fill in the country of pool proxies that have none, using online lookup
+    sites (nothing is downloaded). Working proxies are done first so a short
+    budget still covers the ones that matter."""
+    emit(t='start', action='countries')
+    pool = _load_pool_map()
+    bad, used = _bad_set(), _used_set()
+    entries = sorted(pool.values(), key=lambda e: 0 if _is_usable(e, bad, used, MAX_FAILS) else 1)
+    cache = load_country_cache()
+
+    def host_of(e):
+        return e.get('host') or extract_ip(e.get('url', ''))
+
+    todo = [e for e in entries if not e.get('country')]
+    ips = list(dict.fromkeys(h for e in todo for h in [host_of(e)] if h and not cache.get(h)))
+    if limit:
+        ips = ips[:int(limit)]
+    print(f"{len(todo)} of {len(pool)} proxies have no country; looking up {len(ips)} IPs online…")
+    found = {}
+    if ips:
+        found = geo.lookup_many(
+            ips, budget_s=budget_s,
+            progress=lambda done, total: print(f"  resolved {done}/{total}", flush=True))
+        cache.update(found)
+        save_country_cache(cache)
+    resolved = 0
+    with _lock():
+        pool = _load_pool_map()
+        for e in pool.values():
+            cc = cache.get(host_of(e) or '', '')
+            if cc and not e.get('country'):
+                e['country'] = cc.upper()
+                resolved += 1
+        if resolved:
+            _save_pool_map(pool)
+    missing = sum(1 for e in pool.values() if not e.get('country'))
+    print(f"countries: {resolved} proxies updated, {missing} still unknown"
+          + ("" if found or not ips else " (the lookup sites did not answer — try again later)"))
+    emit(t='countries', ok=bool(found) or not ips, resolved=resolved, missing=missing, total=len(pool))
+    return 0
 
 
 def cmd_stats():
@@ -1487,8 +1550,7 @@ def cmd_stats():
     print(f"ledgers: bad={st['bad']} used={st['used']}  avg latency={st['avg_latency']}s")
     if st['by_proto']:
         print("types: " + ", ".join(f"{k}={v}" for k, v in sorted(st['by_proto'].items())))
-    g = st.get('geo') or {}
-    print(f"geo: {'ready (' + str(g.get('updated')) + ')' if g.get('available') else 'not downloaded'}")
+    print(f"countries known: {st['countries_known']}/{st['count']}")
     emit(t='stats', **st)
     return st
 
@@ -1505,8 +1567,8 @@ def main(argv=None):
         cmd_recheck()
     if cmd == 'pick':
         cmd_pick()
-    if cmd == 'geo':
-        cmd_geo()
+    if cmd == 'countries':
+        cmd_countries()
     if cmd == 'stats':
         cmd_stats()
     if cmd == 'prune':

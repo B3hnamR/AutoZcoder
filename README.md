@@ -149,10 +149,11 @@ captcha host must be reachable. Around that gate:
 - **Cross-process claims**: eight workers are eight processes; the claim lock
   is a file lock, so two workers can never get the same exit IP.
 - **Per-source yield** and scan presets (`balanced` / `thorough` / `fast`).
-- **Offline geo** — optional DB-IP Lite download for country/ASN, replacing
-  rate-limited API lookups. Data by [DB-IP](https://db-ip.com) (CC BY 4.0).
+- **Countries** — the country of each proxy is looked up online (ip-api.com and
+  geojs.io in batches, with ipwho.is / ipinfo.io as fallbacks) and cached in
+  `ip_country.json`. Nothing is downloaded.
 
-CLI: `python generator/proxy_pool.py{ fetch | verify | recheck | pick | geo | stats | prune | clear-bad | clear-used | clear-dead }`.
+CLI: `python generator/proxy_pool.py{ fetch | verify | recheck | pick | countries | stats | prune | clear-bad | clear-used | clear-dead }`.
 
 ## Security notes
 
