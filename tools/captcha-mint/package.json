@@ -1,0 +1,11 @@
+{
+  "name": "zcode-captcha-mint",
+  "private": true,
+  "type": "module",
+  "version": "1.0.0",
+  "description": "Mint one Aliyun traceless-captcha verify param for the ZCode billing claim",
+  "dependencies": {
+    "happy-dom": "^20.11.6",
+    "undici": "^8.10.0"
+  }
+}

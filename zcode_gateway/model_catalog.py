@@ -4,6 +4,6 @@ class ModelCatalog:
     @property
     def status(self):
         return {'source': 'capture', 'updated_at': None, 'last_attempt_at': None,
-                'error': None, 'app_version': '3.14.4'}
+                'error': None, 'app_version': '3.16.3'}
     async def refresh_if_due(self, *, force=False): return self.status
     async def aclose(self): pass

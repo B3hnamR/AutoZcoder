@@ -206,3 +206,54 @@ async def test_retry_keeps_the_anthropic_account_pin(cfg, service):
     h = await service.open_stream(payload, model='GLM-5.3', dialect='anthropic', variant='anthropic')
     out = b''.join([x async for x in service.stream_from(h, model='GLM-5.3', dialect='anthropic', anthropic=True)])
     assert len(service.client.calls) == 2 and b'hello' in out
+
+
+# --------------------------------------------------------------------------- #
+# a relay whose exit IP z.ai flagged (405/3012) must be a clean error, not a crash
+# --------------------------------------------------------------------------- #
+
+class _BlockedRelayClient:
+    """The upstream client when every relay's exit IP is flagged by z.ai."""
+    calls = 0
+
+    async def send(self, headers, body, stream):
+        from zcode_gateway.upstream import UpstreamBlockThroughRelay
+        type(self).calls += 1
+        raise UpstreamBlockThroughRelay("relay https://relay.example.dev exit IP flagged (405/3012)")
+
+
+@pytest.mark.asyncio
+async def test_flagged_relay_ip_is_a_clean_405_not_an_unhandled_crash(service):
+    service.client = _BlockedRelayClient()
+    with pytest.raises(UpstreamFailure) as err:
+        await service.open_stream(dict(REQ), model='GLM-5.3')
+    assert err.value.status == 405 and err.value.code == '3012'
+    assert 'relay exit IP' in err.value.message and 'retry shortly' in err.value.message
+    assert await idle(service)                       # the account slot was released
+    # the ACCOUNT is not blamed for the relay's flagged IP
+    assert (await service.pool.all())[0].state.value == 'ready'
+
+
+def test_flagged_relay_ip_reaches_api_clients_as_405_json(tmp_path):
+    from fastapi.testclient import TestClient
+    from zcode_gateway.app import create_app
+    from zcode_gateway.config import Config
+
+    cfg = Config(server={"host": "127.0.0.1", "port": 8788, "admin_key": "adm-test",
+                         "client_keys": [{"key": "cli-test", "name": "local"}]},
+                 accounts={"source": "accounts_dir", "dir": str(tmp_path / "accounts")},
+                 store={"sqlite_path": str(tmp_path / "gw.db")},
+                 update={"enabled": False}, logging={"capture": False})
+    cfg.pool.balance_poll_seconds = 0
+    app = create_app(cfg)
+    with TestClient(app, raise_server_exceptions=True) as c:
+        from zcode_gateway.pool import Account
+        import asyncio
+        state = app.state.app_state
+        c.portal.call(state.pool.upsert, Account(id='one', access_token='tok', expires_at=4102444800000))
+        state.service.client = _BlockedRelayClient()
+        for stream in (False, True):
+            r = c.post("/v1/chat/completions", headers={"Authorization": "Bearer cli-test"},
+                       json={"model": "GLM-5.3", "stream": stream, "messages": [{"role": "user", "content": "hi"}]})
+            assert r.status_code == 405, (stream, r.status_code, r.text)
+            assert "internal error" not in r.text and "3012" in r.text

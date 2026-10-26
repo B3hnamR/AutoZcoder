@@ -202,6 +202,17 @@ def plan_in_balance(data: dict, plan_id: str) -> bool:
 FALLBACK_PROXIES = 2          # how many verified pool proxies to try after the first route fails
 
 
+def _is_route_problem(code, msg) -> bool:
+    """Could a different IP / connection change this answer? Only a block
+    (3012 / 405 "unusual activity") or a failed/garbled request can; a definitive
+    business answer such as 1005 "exceed quota limit" cannot, so retrying it
+    through pool proxies only burns single-use proxies."""
+    if code is None or code in (3012, 405, -1):
+        return True
+    text = str(msg or '').lower()
+    return any(k in text for k in ('unusual activity', 'blocked', 'request failed', 'non-json'))
+
+
 def _redact(proxy: str) -> str:
     return re.sub(r'//[^/@]*@', '//', proxy or '')
 
@@ -227,7 +238,7 @@ def _run_chain(token: str, plan_id: str, log, force_direct: bool, zjwt=None,
                claim_attempts: int = 3):
     """One pass of the whole chain on the CURRENT route. Returns (result, zjwt)."""
     res = {'plan_id': plan_id, 'zjwt': False, 'claimed': False,
-           'already_claimed': False, 'balance': None}
+           'already_claimed': False, 'balance': None, 'route_problem': True}
     for attempt in (1, 2):      # the device flow crosses 4 hosts: one blip must not end the run
         if zjwt:
             break
@@ -271,14 +282,22 @@ def _run_chain(token: str, plan_id: str, log, force_direct: bool, zjwt=None,
     marketing_touch(zjwt, cid or CAMPAIGN_ID, log=log)
 
     last_msg = ''
+    last_code = None
     fresh = False
+    unavailable = False
     for attempt in range(1, claim_attempts + 1):
         j = billing_claim(zjwt, plan_id, log=log)
         code, msg = j.get('code'), j.get('msg', '')
+        last_code = code
         last_msg = f'{code} {msg}'
         log(f'  claim500: claim attempt {attempt} -> {last_msg}')
         if code == 0:
             fresh = True
+            break
+        if code == 1005:
+            # "exceed quota limit": the giveaway's own limit. A definitive answer,
+            # not a route problem: asking again or from another IP changes nothing.
+            unavailable = True
             break
         if code == 1003 or 'already' in str(msg).lower():
             # looks like "the claim landed earlier" — but the balance below is
@@ -301,6 +320,17 @@ def _run_chain(token: str, plan_id: str, log, force_direct: bool, zjwt=None,
         res['balance']['buckets'] = buckets
     if not res['claimed']:
         res['error'] = last_msg or 'claim did not land'
+        res['code'] = last_code
+        res['route_problem'] = _is_route_problem(last_code, last_msg)
+        if unavailable:
+            offered = bool(cid or feed_pid)
+            res['unavailable'] = True
+            res['route_problem'] = False
+            res['error'] = ('The 500M giveaway is not available right now: the server answered '
+                            '1005 "exceed quota limit"'
+                            + ('' if offered else ' and is not offering any campaign')
+                            + '. It has probably ended or run out.')
+            log('  claim500: ' + res['error'])
     return res, zjwt
 
 
@@ -317,6 +347,13 @@ def claim500(token: str, plan_id: str, log=print, force_direct: bool = False,
     res, zjwt = _run_chain(token, plan_id, log, force_direct)
     if res['claimed'] or not proxy_fallback:
         return res
+    if res.get('unavailable'):
+        log('  claim500: not retrying through proxies - another route cannot change that answer')
+        return res
+    if not res.get('route_problem', True):
+        log(f"  claim500: the refusal ({res.get('error')}) is not an IP block or a network "
+            'problem - not retrying through proxies')
+        return res
     saved = os.environ.get('ZAI_PROXY')
     try:
         for n in range(1, FALLBACK_PROXIES + 1):
@@ -332,6 +369,8 @@ def claim500(token: str, plan_id: str, log=print, force_direct: bool = False,
             if res2['claimed']:
                 res2['via_proxy'] = _redact(proxy)
                 return res2
+            if res2.get('unavailable') or not res2.get('route_problem', True):
+                return res2              # a clean route got a definitive answer: stop here
             res = res2 if res2.get('zjwt') or not res.get('zjwt') else res
     finally:
         if saved is None:

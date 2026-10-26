@@ -89,7 +89,7 @@ def test_zcode_headers():
     assert headers['x-device-mid']=='test-device'
     assert headers['http-referer']=='https://zcode.z.ai'
     assert 'x-device-mid' not in build_headers('fake-token',Fingerprint(device_mid='test-device'),include_device_mid=False)
-    assert headers['x-zcode-app-version']=='3.14.4'
+    assert headers['x-zcode-app-version']=='3.16.3'
     assert 'x-core-version' not in headers
 
 def test_multiline_sse():

@@ -54,3 +54,12 @@ def _no_real_country_lookups(monkeypatch):
         monkeypatch.setattr(geo, "_BATCH_PROVIDERS", ())
         monkeypatch.setattr(geo, "_SINGLE_PROVIDERS", ())
     yield
+
+
+@pytest.fixture(autouse=True)
+def _no_real_captcha_mint(monkeypatch):
+    """The claim path auto-discovers tools/captcha-mint/captcha-mint.exe (a
+    live Aliyun solve). Tests must never spawn it; opt in explicitly."""
+    monkeypatch.setenv("ZAI_CAPTCHA_MINT", "0")
+    monkeypatch.delenv("ZAI_CAPTCHA_CMD", raising=False)
+    monkeypatch.delenv("ZAI_CAPTCHA_PARAM", raising=False)

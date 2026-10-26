@@ -385,10 +385,30 @@ async def claim_100m(request: Request, account_id: str, body: dict = Body(defaul
     return await asyncio.to_thread(mgr.start_claim, email, mode)
 
 
+@router.post("/accounts/{account_id}/claim_start")
+async def claim_start_plan(request: Request, account_id: str,
+                           body: dict = Body(default={}),
+                           key: str = Depends(admin_key)) -> dict:
+    """Claim the Start Plan from the billing preview for one account."""
+    state = get_state(request)
+    account = await state.pool.find(account_id)
+    if account is None:
+        raise HTTPException(status_code=404, detail="account not found")
+    email = (account.email or "").strip().lower()
+    if not email:
+        raise HTTPException(status_code=400, detail="account has no email on file")
+    mode = "direct" if str(body.get("mode") or "").lower() == "direct" else "proxy"
+    from .api_dash import _generator
+    mgr = _generator(request)
+    if mgr is None:
+        raise HTTPException(status_code=400, detail="generator manager unavailable")
+    return await asyncio.to_thread(mgr.start_claim_start, email, mode)
+
+
 @router.post("/accounts/{account_id}/claim500m")
 async def claim_500m(request: Request, account_id: str, body: dict = Body(default={}),
                      key: str = Depends(admin_key)) -> dict:
-    """Claim the 500M giveaway plan (1024 Dev Day) for one account."""
+    """Legacy 500M giveaway plan (1024 Dev Day) claim for one account."""
     state = get_state(request)
     account = await state.pool.find(account_id)
     if account is None:
@@ -436,8 +456,8 @@ async def claim_clear(request: Request, key: str = Depends(admin_key)) -> dict:
 @router.post("/claims/claim_all_pending")
 async def claim_all_pending(request: Request, body: dict = Body(default={}),
                             key: str = Depends(admin_key)) -> dict:
-    """Sequentially claim 100M for every starter account that hasn't yet.
-    Runs in the background: returns immediately with a queue id."""
+    """Sequentially claim the Start Plan for every pending account.
+    Runs in the background: returns immediately."""
     mode = "direct" if str(body.get("mode") or "").lower() == "direct" else "proxy"
     from .api_dash import _generator
     mgr = _generator(request)

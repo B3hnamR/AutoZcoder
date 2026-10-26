@@ -163,13 +163,14 @@ def test_manual_captcha_forces_visible_browser():
 
     with tempfile.TemporaryDirectory() as tmpdir:
         mgr = GeneratorManager(Path(tmpdir), data_dir=Path(tmpdir))
-        # defaults: you solve it, in a visible window; 500M giveaway claim
-        # is on, the 100M referral claim is off
+        # defaults: you solve it, in a visible window; the Start Plan claim is
+        # on, both legacy campaigns (100M invite / 500M giveaway) are off
         opt = mgr.options()
         assert opt["captcha"] == "manual"
         assert opt["headless"] is False
         assert opt["claim"] is False
-        assert opt["claim500"] is True
+        assert opt["claim500"] is False
+        assert opt["claim_start"] is True
         assert opt["invite_code"] == "MT9GNDQ8"
 
         # asking for headless while manual must not stick

@@ -25,6 +25,7 @@ sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
 from utils import BROWSER_ARGS
+from plan_check import APP_VERSION
 
 # NOTE: playwright is imported lazily inside claim_invite(). The referral
 # helpers below (referral_summary / send_one_message) are imported by the
@@ -341,7 +342,7 @@ def send_message_in_page(page, zcode_jwt, log=print, captcha_param=None,
                    'authorization': 'Bearer ' + a.jwt,
                    'x-api-key': a.jwt,
                    'x-zcode-agent': 'glm',
-                   'x-zcode-app-version': '3.15.3',
+                   'x-zcode-app-version': APP_VERSION,
                    'x-zcode-session-type': 'main',
                    'x-client-language': 'en-US',
                    'x-os-category': 'windows',
@@ -537,7 +538,7 @@ def per_account_device_mid(token: str) -> str:
 APP_HEADERS = {  # exact cli/init header set captured from the desktop app
     'content-type': 'application/json',
     'http-referer': 'https://zcode.z.ai',
-    'user-agent': 'ZCode/3.15.3',
+    'user-agent': 'ZCode/' + APP_VERSION,
     'x-client-language': 'en-US',
     'x-client-timezone': 'Asia/Tehran',
     'x-device-mid': '58aca3b3-3239-4cb7-9c70-df3e5488fb99',
@@ -546,7 +547,7 @@ APP_HEADERS = {  # exact cli/init header set captured from the desktop app
     'x-platform': 'win32-x64',
     'x-release-channel': 'production',
     'x-title': 'Z Code@electron',
-    'x-zcode-app-version': '3.15.3',
+    'x-zcode-app-version': APP_VERSION,
     'accept': '*/*',
 }
 
@@ -593,7 +594,7 @@ def report_login_device(zjwt: str, user_id: str = None, device_mid: str = None, 
         },
         'user_id': user_id,
         'screen_resolution': '1849x1041',
-        'app_version': '3.15.3',
+        'app_version': APP_VERSION,
         'device_os_category': 'Windows',
         'device_os_version': '10.0.26200',
         'device_mid': mid,
@@ -619,7 +620,7 @@ def report_login_device(zjwt: str, user_id: str = None, device_mid: str = None, 
         },
         'user_id': user_id,
         'screen_resolution': '1849x1041',
-        'app_version': '3.15.3',
+        'app_version': APP_VERSION,
         'device_os_category': 'Windows',
         'device_os_version': '10.0.26200',
         'device_mid': mid,

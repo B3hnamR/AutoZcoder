@@ -228,3 +228,106 @@ def test_verified_pool_proxy_asks_the_pool_to_verify_first(monkeypatch, tmp_path
     monkeypatch.setenv("ZAI_OUTPUT_DIR", str(tmp_path))
     assert c._verified_pool_proxy(lambda m: None) == "http://5.5.5.5:80"
     assert ("dir", str(tmp_path)) in asked and asked[1:] == [("pick", True), ("pick", False)]
+
+
+# --------------------------------------------------------------------------- #
+# 1005 / no campaign = "giveaway unavailable": stop at once, never burn pool proxies
+# --------------------------------------------------------------------------- #
+
+def _offer(c, monkeypatch, campaign):
+    monkeypatch.setattr(c, "discover_campaign",
+                        lambda *a, **k: (("cid-1", PLAN) if campaign else ("", "")))
+
+
+def test_1005_stops_at_once_and_never_touches_the_proxy_pool(monkeypatch):
+    c = _c500()
+    if c is None:
+        return
+    monkeypatch.setenv("ZAI_CLAIM500_PROXY_FALLBACK", "1")
+    seen, picks, logs = [], [], []
+    _stub_chain(c, monkeypatch, lambda n: {"code": 1005, "msg": "exceed quota limit"}, seen)
+    _offer(c, monkeypatch, campaign=False)
+    monkeypatch.setattr(c, "billing_balance", lambda *a, **k: EMPTY)
+    monkeypatch.setattr(c, "_verified_pool_proxy", lambda log: picks.append(1) or "socks5://1.1.1.1:1")
+    res = c.claim500("tok", PLAN, log=logs.append)
+    assert res["claimed"] is False and res["unavailable"] is True
+    assert len(seen) == 1 and picks == []                    # ONE attempt, no pool proxy used up
+    assert "not available right now" in res["error"] and "not offering any campaign" in res["error"]
+    assert any("not available right now" in m for m in logs)
+    assert any("not retrying through proxies" in m for m in logs)
+
+
+def test_the_message_differs_when_a_campaign_is_still_listed(monkeypatch):
+    c = _c500()
+    if c is None:
+        return
+    seen = []
+    _stub_chain(c, monkeypatch, lambda n: {"code": 1005, "msg": "exceed quota limit"}, seen)
+    _offer(c, monkeypatch, campaign=True)
+    monkeypatch.setattr(c, "billing_balance", lambda *a, **k: EMPTY)
+    res = c.claim500("tok", PLAN, log=lambda m: None)
+    assert res["unavailable"] is True and "not offering" not in res["error"]
+
+
+def test_other_business_answers_are_not_retried_through_proxies_either(monkeypatch):
+    c = _c500()
+    if c is None:
+        return
+    monkeypatch.setenv("ZAI_CLAIM500_PROXY_FALLBACK", "1")
+    picks, logs = [], []
+    _stub_chain(c, monkeypatch, lambda n: {"code": 7777, "msg": "something definitive"}, [])
+    monkeypatch.setattr(c, "billing_balance", lambda *a, **k: EMPTY)
+    monkeypatch.setattr(c, "_verified_pool_proxy", lambda log: picks.append(1) or "socks5://1.1.1.1:1")
+    res = c.claim500("tok", PLAN, log=logs.append)
+    assert res["claimed"] is False and not res.get("unavailable") and picks == []
+    assert any("not an IP block or a network problem" in m for m in logs)
+
+
+def test_a_network_failure_is_still_retried_through_a_proxy(monkeypatch):
+    c = _c500()
+    if c is None:
+        return
+    monkeypatch.setenv("ZAI_CLAIM500_PROXY_FALLBACK", "1")
+    seen, state = [], {"claimed": False}
+
+    def claim(n):
+        if n <= 3:
+            return {"code": -1, "msg": "request failed: ConnectionError"}
+        state["claimed"] = True
+        return {"code": 0, "msg": "ok"}
+
+    _stub_chain(c, monkeypatch, claim, seen)
+    monkeypatch.setattr(c, "billing_balance", lambda *a, **k: ACTIVE if state["claimed"] else EMPTY)
+    monkeypatch.setattr(c, "_verified_pool_proxy", lambda log: "socks5://2.2.2.2:1")
+    assert c.claim500("tok", PLAN, log=lambda m: None)["claimed"] is True
+
+
+def test_a_proxy_that_gets_1005_ends_the_retries(monkeypatch):
+    c = _c500()
+    if c is None:
+        return
+    monkeypatch.setenv("ZAI_CLAIM500_PROXY_FALLBACK", "1")
+    seen, picks = [], []
+
+    def claim(n):
+        return ({"code": 3012, "msg": "blocked due to unusual activity"} if n <= 3
+                else {"code": 1005, "msg": "exceed quota limit"})
+
+    _stub_chain(c, monkeypatch, claim, seen)
+    monkeypatch.setattr(c, "billing_balance", lambda *a, **k: EMPTY)
+    monkeypatch.setattr(c, "_verified_pool_proxy", lambda log: picks.append(1) or f"socks5://3.3.3.{len(picks)}:1")
+    res = c.claim500("tok", PLAN, log=lambda m: None)
+    assert res["unavailable"] is True
+    assert len(picks) == 1                                   # the second pool proxy was never used up
+
+
+def test_worker_flags_an_unavailable_giveaway_for_the_dashboard(tmp_path):
+    import io
+    from zcode_gateway.generator import GenWorker
+    w = GenWorker("w1", ["x"], {"ZAI_OUTPUT_DIR": str(tmp_path)}, tmp_path)
+    w.proc = types.SimpleNamespace(
+        stdout=io.StringIO("[WARNING] 500M giveaway unavailable right now - The 500M giveaway is not available\n"),
+        wait=lambda: None, returncode=0)
+    w._pump()
+    assert w.giveaway500_unavailable is True and w.giveaway500 is False
+    assert w.to_public()["giveaway500_unavailable"] is True

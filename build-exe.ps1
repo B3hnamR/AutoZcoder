@@ -69,6 +69,39 @@ foreach ($f in @("README.md", "requirements.txt")) {
 }
 Write-Host "  generator sources staged: $((Get-ChildItem $genStage -File).Count) files"
 
+# captcha-mint sidecar: the Start Plan claim needs an Aliyun verify param, and
+# the happy-dom solver is JS. Compile it to a standalone exe and ship it inside
+# the bundle; claim_start.py looks for it under <_MEIPASS>/captcha-mint/.
+$mintDir = Join-Path $Here "tools\captcha-mint"
+$mintExe = Join-Path $mintDir "captcha-mint.exe"
+$mintData = @()
+if (Test-Path (Join-Path $mintDir "mint.ts")) {
+    $bun = Get-Command bun -ErrorAction SilentlyContinue
+    if ($bun) {
+        if (-not (Test-Path (Join-Path $mintDir "node_modules"))) {
+            Write-Host "  installing captcha-mint deps (bun)..." -ForegroundColor Yellow
+            Push-Location $mintDir
+            & bun install
+            Pop-Location
+            if ($LASTEXITCODE -ne 0) { throw "bun install failed in $mintDir" }
+        }
+        Write-Host "  compiling captcha-mint sidecar (bun)..." -ForegroundColor Yellow
+        Push-Location $mintDir
+        & bun build --compile --outfile captcha-mint.exe mint.ts
+        $mintRc = $LASTEXITCODE
+        Pop-Location
+        if ($mintRc -ne 0) { throw "captcha-mint build failed (exit $mintRc)" }
+    } else {
+        Write-Host "  bun not found - reusing existing captcha-mint.exe" -ForegroundColor Yellow
+    }
+}
+if (Test-Path $mintExe) {
+    $mintData = @("--add-data", "$mintExe;captcha-mint")
+    Write-Host ("  captcha-mint: {0:N1} MB (bundled)" -f ((Get-Item $mintExe).Length / 1MB))
+} else {
+    Write-Host "  WARN: captcha-mint.exe missing - headless Start Plan claims will answer 3007" -ForegroundColor Yellow
+}
+
 # icon: official Zcode logo, extracted to assets/ by tools/make_icon.py
 $icon = Join-Path $Here "assets\zcode.ico"
 $iconArg = @()
@@ -124,7 +157,8 @@ $buildArgs = @(
     "--add-data", "assets;assets",
     "--add-data", "zcode_gateway/dashboard;zcode_gateway/dashboard",
     "--add-data", "mail-worker;mail-worker",
-    "--add-data", "$genStage;generator",
+    "--add-data", "$genStage;generator"
+) + $mintData + @(
     "--paths", $Here,
     "--specpath", $Here
 ) + $iconArg + $versionArg + @("gui_main.py")

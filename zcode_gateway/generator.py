@@ -636,6 +636,10 @@ class GenWorker:
         # the 500M giveaway grants its own plan, so the account is poolable
         # even when the signup never got Starter
         self.giveaway500 = False
+        self.giveaway500_unavailable = False      # the server says the giveaway is over / out of stock
+        # the signup trial was removed; the plan now arrives from the billing
+        # preview claim (see claim_start.py) and is poolable on its own
+        self.start_plan = False
         self.stopped = False
         self.created = time.time()
         # outcomes observed on the output files (set by the watcher);
@@ -696,6 +700,10 @@ class GenWorker:
                 self.global_build = True
             if "500M giveaway claimed" in line:
                 self.giveaway500 = True
+            if "500M giveaway unavailable" in line:
+                self.giveaway500_unavailable = True
+            if "Start Plan claimed" in line:
+                self.start_plan = True
         self.proc.wait()
         code = self.proc.returncode
         if self.stopped:
@@ -712,7 +720,7 @@ class GenWorker:
     def check_new_account(self):
         """A successful run leaves one more row in accounts<SUF>.txt — surface
         the email/password for pool registration only if it received a plan."""
-        if self.starter is False and not self.giveaway500:
+        if self.starter is False and not self.giveaway500 and not self.start_plan:
             return None
         try:
             rows = [ln for ln in self.account_file.read_text(
@@ -757,6 +765,8 @@ class GenWorker:
             "email": self.email,
             "starter": self.starter,
             "giveaway500": self.giveaway500,
+            "giveaway500_unavailable": self.giveaway500_unavailable,
+            "start_plan": self.start_plan,
             "global_build": getattr(self, "global_build", False),
             "lines": list(self.lines)[-80:],
         }
@@ -1257,9 +1267,9 @@ class ClaimJob:
 
     def __init__(self, name: str, email: str, mode: str, proxy: str,
                  gen_dir: Path, python_exe: str, invite_code: str,
-                 data_dir: Path | None = None, kind: str = "100m"):
+                 data_dir: Path | None = None, kind: str = "start"):
         self.name, self.email, self.mode, self.proxy = name, email, mode, proxy
-        self.kind = kind if kind in ("100m", "500m") else "100m"
+        self.kind = kind if kind in ("100m", "500m", "start") else "start"
         self.gen_dir = Path(gen_dir)
         self.data_dir = Path(data_dir) if data_dir else self.gen_dir / "output"
         self.python_exe = python_exe
@@ -1276,12 +1286,14 @@ class ClaimJob:
         self.on_exit = None          # set by the gateway (claim settle hook)
 
     def _build_argv(self) -> list[str]:
-        script = "claim500.py" if self.kind == "500m" else "claim100.py"
+        script = {"500m": "claim500.py", "100m": "claim100.py"}.get(
+            self.kind, "claim_start.py")
         argv = [self.python_exe, "-u", script, self.email]
         if self.kind == "500m":
-            # claim500 has no invite-code dependency: the 500M is a direct
-            # billing/claim against the giveaway plan id.
+            # legacy giveaway: a direct billing/claim against its plan id
             argv += ["--plan", "zcode-v3-start-plan-1024"]
+        elif self.kind == "start" and os.environ.get("ZAI_START_PLAN_ID"):
+            argv += ["--plan", os.environ["ZAI_START_PLAN_ID"]]
         if self.mode == "direct":
             argv.append("--direct")
         elif self.proxy:
@@ -1440,8 +1452,9 @@ class GeneratorManager:
         self.country = "ALL"                # ALL | US | DE | ...
         self.pin_proxy = ""
         self.retries = 5
-        self.claim = False                  # invite Global Build (100M) claim on/off
-        self.claim500 = True                # 500M giveaway billing/claim on/off (default)
+        self.claim = False                  # legacy invite Global Build (100M) claim on/off
+        self.claim500 = False               # legacy 500M giveaway claim (withdrawn 2026-10-26)
+        self.claim_start = True             # Start Plan preview -> billing/claim (default)
         self.headless = False               # default: visible window (manual captcha needs it)
         self._invite_code = "MT9GNDQ8"      # referral code ('' = off; overridden by config)
         self.pool_file = self.data_dir / "proxies.txt"
@@ -1560,6 +1573,7 @@ class GeneratorManager:
         files: list[Path] = []
         for base in (self.data_dir / "results", self.data_dir):
             try:
+                files.extend(sorted(base.glob("startplan*.txt")))
                 files.extend(sorted(base.glob("starter*.txt")))
                 files.extend(sorted(base.glob("accounts500m*.txt")))
             except OSError:
@@ -2208,7 +2222,7 @@ class GeneratorManager:
         return self.data_dir / "generator_options.json"
 
     _OPTION_FIELDS = ("captcha", "ip_source", "country", "proxy_types",
-                      "pin_proxy", "retries", "claim", "claim500", "headless",
+                      "pin_proxy", "retries", "claim", "claim500", "claim_start", "headless",
                       "invite_code", "captcha_strategy",
                       "custom_ai_url", "custom_ai_key", "custom_ai_model")
 
@@ -2284,6 +2298,9 @@ class GeneratorManager:
         if "claim" in kw:
             v = kw["claim"]
             self.claim = v if isinstance(v, bool) else (str(v).lower() in ("true", "1", "yes", "on"))
+        if "claim_start" in kw:
+            v = kw["claim_start"]
+            self.claim_start = v if isinstance(v, bool) else (str(v).lower() in ("true", "1", "yes", "on"))
         if "claim500" in kw:
             v = kw["claim500"]
             self.claim500 = v if isinstance(v, bool) else (str(v).lower() in ("true", "1", "yes", "on"))
@@ -2429,6 +2446,7 @@ class GeneratorManager:
                 "countries_available": self._country_counts(),
                 "pin_proxy": self.pin_proxy, "retries": self.retries,
                 "claim": self.claim, "claim500": self.claim500,
+                "claim_start": self.claim_start,
                 "headless": self.headless,
                 "invite_code": self._invite_code,
                 "socks_available": tc["socks"],
@@ -2691,8 +2709,27 @@ class GeneratorManager:
             env["ZAI_INVITE_CODE"] = self._invite_code
         else:
             env["ZAI_INVITE_CODE"] = ""   # explicit OFF (main.py treats '' as off)
-        # 500M giveaway claim is mutually exclusive with the 100M referral:
-        # when on, main.py skips the invite chain entirely.
+        # Start Plan claim (billing preview -> billing/claim) is the default
+        # path now: the plan is no longer granted by the signup itself.
+        env["ZAI_CLAIM_START"] = "1" if self.claim_start else "0"
+        # Captcha mint sidecar. In a frozen build it lives inside the onefile
+        # extraction (_MEIPASS), but the generator scripts may run under an
+        # external Python where _MEIPASS is unset — resolve it here and hand
+        # the path down, otherwise claim_start can't find it and a plan that
+        # demands a captcha answers 3007.
+        if not env.get("ZAI_CAPTCHA_CMD"):
+            _mint_cands = [
+                Path(getattr(sys, "_MEIPASS", "")) / "captcha-mint" / "captcha-mint.exe",
+                Path(sys.executable).resolve().parent / "captcha-mint" / "captcha-mint.exe",
+            ]
+            for _cand in _mint_cands:
+                try:
+                    if _cand.is_file():
+                        env["ZAI_CAPTCHA_CMD"] = f'"{_cand}"'
+                        break
+                except OSError:
+                    pass
+        # Legacy campaigns (100M invite / 1024 500M) are off by default.
         env["ZAI_CLAIM500"] = "1" if self.claim500 else "0"
         # email: the user's own domains + worker inbox (public-ready setup)
         m = self.mail_cfg
@@ -2769,7 +2806,8 @@ class GeneratorManager:
         if any(j.alive() and j.email == email for j in self.claims.values()):
             return {"error": "a claim for this account is already running"}
         mode = "direct" if mode == "direct" else "proxy"
-        name = f"{'claim500' if kind == '500m' else 'claim'}-{int(time.time())}"
+        prefix = {"500m": "claim500", "start": "startplan"}.get(kind, "claim")
+        name = f"{prefix}-{int(time.time())}"
         while name in self.claims:
             name += "x"
         job = ClaimJob(name, email, mode, "", self.gen_dir, self.python_exe,
@@ -2847,12 +2885,17 @@ class GeneratorManager:
 
     def start_claim500(self, email: str, mode: str = "proxy",
                        allow_direct_fallback: bool = True) -> dict:
-        """Claim the 500M giveaway (1024 Dev Day) for one account.
-
-        Runs generator/claim500.py (device_login -> marketing_touch ->
-        billing/claim -> billing/balance verification). Pure HTTP: no browser,
-        so unlike the 100M claim it never needs Playwright."""
+        """Legacy 500M giveaway claim (withdrawn 2026-10-26) for one account."""
         return self._launch_claim("500m", email, mode, allow_direct_fallback)
+
+    def start_claim_start(self, email: str, mode: str = "proxy",
+                          allow_direct_fallback: bool = True) -> dict:
+        """Claim the Start Plan from the billing preview for one account.
+
+        Runs generator/claim_start.py (device_login -> app activity ->
+        billing/preview -> billing/claim -> billing/balance). Pure HTTP: no
+        browser and no Playwright, unlike the 100M invite claim."""
+        return self._launch_claim("start", email, mode, allow_direct_fallback)
 
     def socks_ready_count(self) -> int:
         """Live socks count for the claim health badge (cheap heuristic:
@@ -2879,7 +2922,7 @@ class GeneratorManager:
             if any(j.email == email for j in self.claims.values()):
                 skipped.append(email)
                 continue
-            res = self.start_claim(email, mode=mode)
+            res = self.start_claim_start(email, mode=mode)
             if res.get("started"):
                 started.append(email)
                 # throttle: wait for the job to finish before the next one
@@ -2906,7 +2949,7 @@ class GeneratorManager:
         except Exception as e:
             log.warning("claim pool pick failed: %s", e)
             return ""
-        waves = [(True, 25), (True, 40)] + ([(False, 40)] if kind == "500m" else [])
+        waves = [(True, 25), (True, 40)] + ([(False, 40)] if kind in ("500m", "start") else [])
         for n, (socks, tries) in enumerate(waves, 1):
             if progress:
                 progress(f"testing proxies live ({'socks' if socks else 'any type'}, "

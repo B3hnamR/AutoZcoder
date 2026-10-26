@@ -19,7 +19,7 @@ import os
 import re
 import sys
 
-from plan_check import get_zcode_jwt, get_plan, DEVICE_MID
+from plan_check import get_zcode_jwt, get_plan, is_start_plan, DEVICE_MID
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 GATEWAY_ACCOUNTS = r'C:\Users\Behnam\Documents\GitHub\ZcodeGate\dist\accounts'
@@ -110,11 +110,8 @@ def main():
         payload = jwt_payload(zjwt)
         ident = payload.get('user_id') or payload.get('sub') or email
         plans_list = plan.get('plans') or []
-        chosen_plan = ''
-        if 'zcode-v3-start-plan-referral' in plans_list:
-            chosen_plan = 'zcode-v3-start-plan-referral'
-        elif plans_list:
-            chosen_plan = plans_list[0]
+        chosen_plan = next((p for p in plans_list if is_start_plan(p)),
+                           plans_list[0] if plans_list else '')
         fields = {
             'captured_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
             'source': 'ZCODEAUTO chat.z.ai signup (OAuth CLI)',

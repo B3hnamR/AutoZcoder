@@ -36,9 +36,13 @@ class ServerConfig(BaseModel):
 
 class Fingerprint(BaseModel):
     user_agent: str = (
-        "ZCode/3.14.4 ai-sdk/provider-utils/4.0.27 runtime/node.js/24"
+        "ZCode/3.16.3 ai-sdk/provider-utils/4.0.27 runtime/node.js/24"
     )
-    client_version: str = "3.14.4"
+    # The billing preview gift list (and the plan shown on /billing/balance)
+    # is version-gated: 3.14.3..3.16.0 answer [], 3.16.1+ name the plan. A
+    # 3.14.x fingerprint therefore reads as "this account has no plan" even
+    # when the Start Plan is active. 3.16.3 is the build this repo tracks.
+    client_version: str = "3.16.3"
     core_version: str = "0.0.83"
     platform: str = "win32-x64"
     device_mid: str = Field(default_factory=default_device_mid)
@@ -160,8 +164,11 @@ class GeneratorConfig(BaseModel):
     # A visible browser is mandatory then (headless is forced off).
     captcha: str = "manual"            # manual | auto
     headless: bool = False             # only applies when captcha == 'auto'
-    claim: bool = False                # claim the invite Global Build (100M) after signup
-    claim500: bool = True              # claim the 500M giveaway after signup (wins over claim)
+    claim: bool = False                # legacy: invite Global Build (100M) claim after signup
+    claim500: bool = False             # legacy: 1024 Dev Day 500M giveaway (withdrawn)
+    # Start Plan: the signup grant was removed, so the plan is claimed from the
+    # billing preview after signup. This is the default path now.
+    claim_start: bool = True
     invite_code: str = "MT9GNDQ8"      # referral code to claim ('' = off)
     # Which proxy schemes the generator may pick from the pool:
     #   all | socks | socks5 | socks4 | http  (or a comma list: "socks5,http")

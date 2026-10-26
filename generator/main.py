@@ -1377,15 +1377,17 @@ def main():
                 with open(ACC_FILE, 'a') as f:
                     f.write(f"{email}:{password}:{token}\n")
 
-                # Invite-referral Global Build (100M GLM-5.3-Flash):
-                # device login FIRST, then bind, then message (proven order).
-                # Only claim accounts that actually got Starter — client chat
-                # needs a plan, and the bind is a one-shot per account.
-                # ZAI_INVITE_CODE set to empty string = explicitly OFF; absent
-                # or non-empty = use it (fall back to CONFIG).
-                # 500M giveaway claim (claim500): pure HTTP billing/claim, no
-                # browser, works with or without Starter. Mutually exclusive
-                # with the 100M referral claim — claim500 wins when on.
+                # Start Plan claim (billing preview -> billing/claim).
+                # The signup grant was removed: a fresh account is NOT given a
+                # plan, it is only *offered* one, and the offer is invisible to
+                # clients older than app_version 3.16.1. This runs for EVERY
+                # created account — gating it on `starter` (the old behaviour)
+                # made it unreachable once the signup grant disappeared.
+                # ZAI_CLAIM_START=0 disables it.
+                claim_start_on = os.environ.get('ZAI_CLAIM_START', '1').strip().lower() \
+                    not in ('0', 'false', 'no', 'off')
+                # Legacy campaigns (withdrawn 2026-10): 100M invite Global Build
+                # and the 1024 500M giveaway. Off unless explicitly requested.
                 claim500_on = os.environ.get('ZAI_CLAIM500', '').strip().lower() in ('1', 'true', 'yes', 'on')
                 if 'ZAI_INVITE_CODE' in os.environ:
                     invite_code = os.environ.get('ZAI_INVITE_CODE', '')
@@ -1393,7 +1395,27 @@ def main():
                     invite_code = CONFIG.get('invite_code')
                 global_build = False
                 giveaway500 = False
-                if claim500_on and isinstance(result, str):
+                start_plan = False
+                start_plan_id = ''
+                if claim_start_on and isinstance(result, str):
+                    try:
+                        from claim_start import claim_start as run_claim_start
+                        rc = run_claim_start(token, log=logger.info,
+                                             force_direct=False)
+                        start_plan = bool(rc.get('claimed'))
+                        start_plan_id = rc.get('plan_id') or ''
+                        if start_plan:
+                            logger.info(f"Start Plan claimed for {email} "
+                                        f"({start_plan_id or 'best offer'})")
+                        elif rc.get('needs_captcha'):
+                            logger.warning(f"Start Plan for {email} needs the "
+                                           f"Aliyun captcha (3007) — not claimed")
+                        else:
+                            logger.info(f"Start Plan not granted for {email}: "
+                                        f"{rc.get('error') or 'nothing claimable'}")
+                    except Exception as e:
+                        logger.warning(f"Start Plan claim failed: {e}")
+                elif claim500_on and isinstance(result, str):
                     try:
                         from claim500 import claim500 as run_claim500
                         r500 = run_claim500(token, 'zcode-v3-start-plan-1024',
@@ -1401,6 +1423,8 @@ def main():
                         giveaway500 = bool(r500.get('claimed'))
                         if giveaway500:
                             logger.info(f"500M giveaway claimed for {email}")
+                        elif r500.get('unavailable'):
+                            logger.warning(f"500M giveaway unavailable right now - {r500.get('error')}")
                     except Exception as e:
                         logger.warning(f"500M claim failed: {e}")
                 elif invite_code and starter and isinstance(result, str):
@@ -1425,9 +1449,14 @@ def main():
                     except Exception as e:
                         logger.warning(f"invite claim failed: {e}")
 
+                # a claimed Start Plan makes the account poolable exactly like
+                # the old signup-granted Starter did
+                starter = starter or start_plan
+
                 with open(PLANS_FILE, 'a') as f:
                     f.write(json.dumps({
                         'email': email, 'starter': starter,
+                        'start_plan': start_plan, 'start_plan_id': start_plan_id,
                         'plans': plan.get('plans') if plan else None,
                         'global_build': global_build,
                         'giveaway500': giveaway500,
@@ -1437,6 +1466,12 @@ def main():
                     starter_count += 1
                     with open(STARTER_FILE, 'a', encoding='utf-8') as f:
                         f.write(f"{email}:{password}:{token}\n")
+                    if start_plan:
+                        with open(os.path.join(RESULTS_DIR, f'startplan{OUT_SUFFIX}.txt'),
+                                  'a', encoding='utf-8') as f:
+                            f.write(f"{email}:{password}:{token}\n")
+                        logger.info(f"Account {i+1} Start Plan claimed -> "
+                                    f"startplan{OUT_SUFFIX}.txt")
                 if global_build:
                     with open(os.path.join(OUTPUT_DIR, 'starter100m.txt'), 'a', encoding='utf-8') as f:
                         f.write(f"{email}:{password}:{token}\n")

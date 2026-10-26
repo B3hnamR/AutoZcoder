@@ -17,7 +17,8 @@ ADMIN = {"Authorization": "Bearer adm-test"}
 
 def test_generator_config_explicit_claim_beats_claim500_default():
     fresh = GeneratorConfig()
-    assert fresh.claim500 is True and fresh.claim is False
+    assert fresh.claim_start is True and fresh.claim is False
+    assert fresh.claim500 is False       # legacy giveaway is off by default
 
     # a config.yaml written before claim500 existed keeps its meaning
     assert GeneratorConfig(claim=True).claim500 is False
@@ -73,7 +74,8 @@ def test_first_run_seeds_claim_type_from_config(tmp_path):
     with TestClient(app) as c:
         c.get("/admin/dash/generator/mail", headers=ADMIN)
         mgr = app.state.app_state.generator
-        assert (mgr.claim, mgr.claim500) == (False, True)       # shipped default
+        # shipped default: Start Plan claim on, both legacy campaigns off
+        assert (mgr.claim, mgr.claim500, mgr.claim_start) == (False, False, True)
 
     app, _ = _generator_app(tmp_path / "legacy", claim=True)    # old config.yaml
     with TestClient(app) as c:
@@ -228,3 +230,51 @@ def test_new_generator_account_gets_its_quota_refreshed_immediately(tmp_path, mo
             time.sleep(0.05)
         assert checked == ["acct-new"]                            # refreshed right away
         assert "new@x.me" in state.generator.registered_emails()  # and still registered
+
+
+# --- Start Plan round (signup grant removed) -------------------------------
+
+def test_genworker_start_plan_is_poolable_without_a_signup_starter(tmp_path):
+    (tmp_path / "results").mkdir()
+    w = GenWorker("w1", ["x"], {"ZAI_OUTPUT_DIR": str(tmp_path)}, tmp_path)
+    (tmp_path / "results" / "accounts.txt").write_text(
+        "s@x.me:pw:eyJabc.token\n", encoding="utf-8")
+
+    w.starter = False
+    assert w.check_new_account() is None       # nothing worth pooling yet
+
+    w.start_plan = True                        # billing preview claim landed
+    assert w.check_new_account()["email"] == "s@x.me"
+
+
+def test_genworker_parses_the_start_plan_log_line(tmp_path):
+    (tmp_path / "results").mkdir()
+    w = GenWorker("w1", ["x"], {"ZAI_OUTPUT_DIR": str(tmp_path)}, tmp_path)
+    # the pump only needs a proc-like iterator
+    class _Proc:
+        stdout = iter(["Start Plan claimed for s@x.me (zcode-v3-start-plan-referral)\n"])
+        returncode = 0
+        def wait(self):
+            return 0
+        def poll(self):
+            return 0
+    w.proc = _Proc()
+    w._pump()
+    assert w.start_plan is True
+    assert w.to_public()["start_plan"] is True
+
+
+def test_claim_job_defaults_to_the_start_plan_script(tmp_path):
+    from zcode_gateway.generator import ClaimJob
+    job = ClaimJob("j1", "a@x.me", "direct", "", tmp_path, "py", "", data_dir=tmp_path)
+    assert job.kind == "start"
+    assert job._build_argv()[2] == "claim_start.py"
+
+
+def test_pending_accounts_reads_startplan_ledgers(tmp_path):
+    (tmp_path / "results").mkdir()
+    (tmp_path / "results" / "startplan.txt").write_text(
+        "p@x.me:pw:eyJabc.token\n", encoding="utf-8")
+    mgr = GeneratorManager(tmp_path, data_dir=tmp_path)
+    emails = [a["email"] for a in mgr.pending_accounts()]
+    assert "p@x.me" in emails

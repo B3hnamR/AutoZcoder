@@ -54,3 +54,7 @@ Desktop.ini
 .DS_Store
 .idea/
 .vscode/
+
+# captcha mint sidecar (built, not committed)
+tools/captcha-mint/node_modules/
+tools/captcha-mint/captcha-mint.exe

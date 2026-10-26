@@ -454,7 +454,7 @@ class TransportError(Exception):
     """Network-level failure — safe to retry on another account."""
 
 
-class UpstreamBlockThroughRelay(Exception):
+class UpstreamBlockThroughRelay(TransportError):
     """405/3012 'unusual activity' arrived THROUGH a relay: the relay's exit
     IP is flagged, not the account. The client layer must rotate the RELAY
     (already done in UpstreamClient.send) rather than park the account."""

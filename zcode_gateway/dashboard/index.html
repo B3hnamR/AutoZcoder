@@ -883,10 +883,8 @@ const App = (() => {
         const caps = capCell(a);
         const hasGlobal = (a.plans || []).some(p => /global|referral/i.test(p.name || p.plan_id || ''));
         const claimItems = `
-                <button class="dd-item" data-act="acct-claim-proxy" data-id="${esc(a.id)}"><span class="ic">⚡</span>Claim 100M · proxy</button>
-                <button class="dd-item" data-act="acct-claim-direct" data-id="${esc(a.id)}"><span class="ic">⚡</span>Claim 100M · direct</button>
-                <button class="dd-item" data-act="acct-claim500-proxy" data-id="${esc(a.id)}"><span class="ic">⚡</span>Claim 500M · proxy</button>
-                <button class="dd-item" data-act="acct-claim500-direct" data-id="${esc(a.id)}"><span class="ic">⚡</span>Claim 500M · direct</button>`;
+                <button class="dd-item" data-act="acct-claimstart-proxy" data-id="${esc(a.id)}"><span class="ic">⚡</span>Claim Start Plan · proxy</button>
+                <button class="dd-item" data-act="acct-claimstart-direct" data-id="${esc(a.id)}"><span class="ic">⚡</span>Claim Start Plan · direct</button>`;
         // autopsy: last errors as a sparkline + hover detail for dead/cooling accounts
         const errs = (a.error_history || []).slice(-12);
         const errCell = errs.length ? `<span class="mono" title="${esc(errs.map(e => `${e.ago_s||'?'}s ago ${e.status||''} ${e.code||''}`).join('\n'))}" style="cursor:help;color:${a.state==='dead'?'var(--err)':'var(--warn)'}">${errs.length}err</span>` : '<span style="color:var(--faint)">—</span>';
@@ -932,10 +930,8 @@ const App = (() => {
         else if (act === "acct-balance") acct("balance", id);
         else if (act === "acct-enable") acct("enable", id);
         else if (act === "acct-remove") acctRemove(id);
-        else if (act === "acct-claim-proxy") acctClaim(id, "proxy");
-        else if (act === "acct-claim-direct") acctClaim(id, "direct");
-        else if (act === "acct-claim500-proxy") acctClaim500(id, "proxy");
-        else if (act === "acct-claim500-direct") acctClaim500(id, "direct");
+        else if (act === "acct-claimstart-proxy") acctClaimStart(id, "proxy");
+        else if (act === "acct-claimstart-direct") acctClaimStart(id, "direct");
       });
     });
     const q = document.getElementById("acct-q");
@@ -993,6 +989,19 @@ const App = (() => {
       else toast(`claim started (${r.started || mode}${r.mode && r.mode !== mode ? " → " + r.mode : ""})`, "ok");
     } catch(e) {
       toast("claim failed: " + e.message, "err");
+    }
+  }
+  async function acctClaimStart(id, mode){
+    toast(`starting Start Plan claim (${mode})…`, "info");
+    try {
+      const r = await api(`/admin/accounts/${encodeURIComponent(id)}/claim_start`, {
+        method: "POST",
+        body: JSON.stringify({mode: mode})
+      });
+      if (r.error) toast(r.error, "err");
+      else toast(`Start Plan claim queued (${mode}) — watch it in the Generator tab`, "ok");
+    } catch(e) {
+      toast("claim_start failed: " + e.message, "err");
     }
   }
   async function acctClaim500(id, mode){
@@ -1908,9 +1917,10 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
       const res = w.email ? ` · ${esc(w.email)}` : '';
       const badges = [];
       if (w.giveaway500) badges.push('<b style="color:var(--warn)">⚡ 500M · 1024 DEV DAY CLAIMED</b>');
+      else if (w.giveaway500_unavailable) badges.push('<span style="color:var(--warn)" title="the server says the 500M giveaway is over or out of stock; nothing was claimed">⚠ 500M giveaway unavailable</span>');
       if (w.global_build) badges.push('<b style="color:var(--warn)">⚡ 100M GLOBAL BUILD</b>');
       else if (w.starter === true) badges.push('<b style="color:var(--ok)">✅ STARTER</b>');
-      if (!badges.length && w.starter === false) badges.push('<span style="color:var(--muted)">no plan</span>');
+      if (w.starter === false && !w.giveaway500 && !w.global_build) badges.push('<span style="color:var(--muted)">no plan</span>');
       const plan = badges.length ? ' · ' + badges.join(' · ') : '';
       const lines = (w.lines || []).slice(-6).map(l =>
         `<div class="mono" style="color:var(--faint);font-size:11px">${esc(l)}</div>`).join('');
@@ -1932,12 +1942,16 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
       const icon = {running:'⚡', starting:'◌', exited:'✓', failed:'✗', killed:'✗'}[c.state] || '◌';
       const stateCol = {running:'var(--warn)', starting:'var(--accent-soft)', exited:'var(--ok)',
                         failed:'var(--err)', killed:'var(--err)'}[c.state] || 'var(--muted)';
-      const kindLabel = c.kind === '500m' ? '500M' : '100M';
+      const kindLabel = c.kind === '500m' ? '500M' : (c.kind === 'start' ? 'Start Plan' : '100M');
       const lines = (c.lines || []).slice(-10).map(l =>
         `<div class="mono" style="color:var(--faint);font-size:11px">${esc(l)}</div>`).join('');
       const issued = c.result && c.result.summary && c.result.summary.issued
         ? ` · <b style="color:var(--warn)">⚡ 100M GLOBAL BUILD ISSUED</b>`
-        : (c.state === 'exited' ? ' · <span style="color:var(--ok)">finished</span>' : '');
+        : (c.result && c.result.unavailable ? ' · <b style="color:var(--warn)">⚠ giveaway unavailable</b>'
+          : (c.state === 'exited' ? ' · <span style="color:var(--ok)">finished</span>' : ''));
+      const unavailableNote = c.result && c.result.unavailable
+        ? `<div style="margin-top:6px;color:var(--warn);font-size:12px">⚠ ${esc(c.result.error || "The 500M giveaway is not available right now.")}
+             Nothing was claimed, and retrying through other IPs would not help — try again only when it is offered again.</div>` : '';
       return `<div class="card" style="padding:8px 12px; margin-bottom:8px; border-left:3px solid var(--warn)">
         <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
           <b><span style="color:${stateCol}">${icon}</span> ${kindLabel} Claim: ${esc(c.email || c.name)}</b>
@@ -1950,7 +1964,7 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
           ${c.state === 'running' || c.state === 'starting'
             ? `<button class="btn btn-ghost btn-sm btn-danger" data-act="claimStop" data-id="${esc(c.name)}">Kill</button>`
             : `<button class="btn btn-quiet btn-sm" title="remove from list" data-act="claimRemove" data-id="${esc(c.name)}">✕</button>`}
-        </div>${lines ? `<div style="margin-top:6px;max-height:180px;overflow:auto;background:var(--field);border-radius:6px;padding:6px">${lines}</div>` : ''}
+        </div>${unavailableNote}${lines ? `<div style="margin-top:6px;max-height:180px;overflow:auto;background:var(--field);border-radius:6px;padding:6px">${lines}</div>` : ''}
       </div>`;
     };
     const claimsHtml = (st.claims || []).map(claimCard).join('');
@@ -1959,9 +1973,10 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
       const prev = claimStates[c.name];
       const terminal = c.state === 'exited' || c.state === 'failed' || c.state === 'killed';
       if (prev && prev === 'running' && terminal) {
-        const kindLabel = c.kind === '500m' ? '500M' : '100M';
+        const kindLabel = c.kind === '500m' ? '500M' : (c.kind === 'start' ? 'Start Plan' : '100M');
         const issued = c.result && c.result.summary && c.result.summary.issued;
         if (issued) toast(`⚡ 100M issued: ${c.email}`, "ok");
+        else if (c.result && c.result.unavailable) toast(`${kindLabel} giveaway unavailable right now — nothing claimed for ${c.email}`, "warn");
         else if (c.state === 'exited') toast(`${kindLabel} claim finished: ${c.email}`, "ok");
         else toast(`${kindLabel} claim finished (not issued): ${c.email}`, "err");
       }
@@ -2027,12 +2042,10 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
               <input type="number" id="gen-retries" value="${o.retries||5}" min="0" max="10" style="width:100%" oninput="App.genAutoSave()"></div>
             <div><label class="lbl">claim type</label>
               <select id="gen-claim" class="sel" style="width:100%" onchange="App.genAutoSave()">
-                <option value="off" ${o.claim===false && (o.claim500||false)!==true?'selected':''}>off</option>
-                <option value="on" ${o.claim!==false && (o.claim500||false)!==true?'selected':''}>100M (referral)</option>
-                <option value="500m" ${(o.claim500||false)===true?'selected':''}>500M (giveaway)</option>
+                <option value="start" selected>Start Plan (claim from preview)</option>
               </select></div>
-            <div><label class="lbl">invite code</label>
-              <input type="text" id="gen-invite" value="${esc(o.invite_code||'')}" placeholder="referral code (empty = off)" style="width:100%" oninput="App.genAutoSave()"></div>
+            <div><label class="lbl">invite code <span style="color:var(--faint)">(legacy 100M — unused)</span></label>
+              <input type="text" id="gen-invite" value="${esc(o.invite_code||'')}" placeholder="not used by Start Plan" style="width:100%" disabled></div>
             <div style="display:flex;align-items:center;gap:6px">
               <button class="btn btn-ghost btn-sm" onclick="App.genSaveOptions()">Save options</button>
               <span id="gen-save-indicator" style="color:var(--success,#3fb950);font-size:12px;display:none">✓ Saved</span>
@@ -2079,9 +2092,7 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
         <div id="gen-workers">${workersHtml}</div>
         <div class="card" style="margin-top:10px"><h2>Pipeline</h2>
           <p style="color:var(--muted);font-size:12px">
-          ${((o.claim500||false)===true)
-            ? "signup → device login → campaign touch → 500M giveaway claim (billing/claim, no browser) → the account joins the pool automatically."
-            : "signup → Starter check → device login (+telemetry) → invite bind → client message → successful accounts join the pool automatically."}</p>
+          signup → device login → app activity → billing preview (app_version 3.16.3) → Aliyun captcha → billing claim → the account joins the pool automatically. No browser.</p>
         </div>`;
       genMounted = true;
       genLoadSources();
@@ -2150,8 +2161,9 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
       country: val("gen-country") || "ALL",
       pin_proxy: val("gen-pin"),
       retries: val("gen-retries"),
-      claim: val("gen-claim") === "on",
-      claim500: val("gen-claim") === "500m",
+      claim: false,
+      claim500: false,
+      claim_start: true,
       headless: val("gen-headless") === "true",
       invite_code: val("gen-invite"),
     };
@@ -3915,7 +3927,7 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
           loginStart, loginCancel, genStart, genStop, genStopAll, genSaveOptions, genAutoSave, genIpChanged,
           proxyRun, proxyStop, genProxyImport, genProxyFile, genLoadSources, genSaveSources,
           proxyMaintain, proxyCountries, proxyYield, pxPresetChanged, pxAutoVerify,
-          genClearWorkers, genRemove, claimStop, claimRemove, acctClaim, acctClaim500, claimAllPending, purgeDrained,
+          genClearWorkers, genRemove, claimStop, claimRemove, acctClaim, acctClaimStart, acctClaim500, claimAllPending, purgeDrained,
           setupOpen, setupClose, setupInstall,
           openRelayModal, closeRelayModal, relayDeploy, relayAddCustom, loadRelays,
           saveRelayOptions, setActiveRelay, testRelay, deleteRelay, deleteRelays, relayToggle, relayToggleAll, pxHealthRefresh,

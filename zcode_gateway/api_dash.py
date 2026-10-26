@@ -865,20 +865,41 @@ def _generator(request: Request):
                 sys.path.insert(0, str(gen_dir))
                 from plan_check import get_zcode_jwt, get_plan
                 from .accounts_dir_bridge import mint_and_register
-                zjwt = get_zcode_jwt(chat_token, log=lambda *a: None)
+                # Both steps hit the same flaky edge as the worker (a bare 502
+                # with an empty body). A single failure used to drop the
+                # account silently: no snapshot, no registered marker. Retry,
+                # and on a plan that hasn't propagated yet leave it UNMARKED so
+                # the start-up catch-up scan can pick it up later.
+                import time as _time
+                zjwt = None
+                for attempt in range(1, 4):
+                    zjwt = get_zcode_jwt(chat_token, log=lambda *a: None)
+                    if zjwt:
+                        break
+                    log.warning("generator: no zcodeJWT for %s (attempt %d/3)",
+                                email, attempt)
+                    if attempt < 3:
+                        _time.sleep(3)
                 if not zjwt:
-                    log.warning("generator: no zcodeJWT for %s", email)
+                    log.warning("generator: %s left unregistered — retried, will "
+                                "be picked up by the catch-up scan", email)
                     return
-                plan_info = get_plan(zjwt) or {}
-                plans = plan_info.get("plans") or []
+                plans = []
+                for attempt in range(1, 4):
+                    plan_info = get_plan(zjwt) or {}
+                    plans = plan_info.get("plans") or []
+                    if plans:
+                        break
+                    if attempt < 3:
+                        _time.sleep(3)
                 if not plans:
-                    log.info("generator: %s has no plan — skipping pool registration", email)
-                    try:
-                        mgr.mark_registered(email)
-                    except Exception:
-                        pass
+                    log.info("generator: %s has no plan after retries — leaving "
+                             "it for the catch-up scan", email)
                     return
-                chosen_plan = "zcode-v3-start-plan-referral" if "zcode-v3-start-plan-referral" in plans else (plans[0] if plans else "")
+                chosen_plan = next((p for p in plans
+                                    if str(p).startswith("zcode-v3-start-plan-")
+                                    and p != "zcode-v3-start-plan-1024"),
+                                   plans[0] if plans else "")
                 account = mint_and_register(
                     state.cfg.accounts.dir, email, zjwt,
                     state.cfg.upstream.fingerprint.device_mid,
@@ -978,7 +999,8 @@ def _generator(request: Request):
         # it, and set_options() below then persisted the reverted value).
         if not mgr._has_saved_options:
             mgr.claim = bool(gc.claim) and not bool(getattr(gc, "claim500", False))
-            mgr.claim500 = bool(getattr(gc, "claim500", True))
+            mgr.claim500 = bool(getattr(gc, "claim500", False))
+            mgr.claim_start = bool(getattr(gc, "claim_start", True))
         mgr._invite_code = gc.invite_code
         if gc.captcha in ("auto", "manual", "ai", "classic") and not mgr._has_saved_options:
             # First run only (no generator_options.json yet): seed from
