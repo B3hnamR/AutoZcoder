@@ -873,7 +873,16 @@ def _generator(request: Request):
                 import time as _time
                 zjwt = None
                 for attempt in range(1, 4):
-                    zjwt = get_zcode_jwt(chat_token, log=lambda *a: None)
+                    try:
+                        zjwt = get_zcode_jwt(chat_token, log=lambda *a: None)
+                    except Exception as exc:
+                        # transient network failure: cost ONE attempt, not all
+                        # three (an escaping exception used to jump straight
+                        # to the outer handler and drop the account).
+                        log.warning("generator: zcodeJWT mint error for %s "
+                                    "(attempt %d/3): %s", email, attempt,
+                                    type(exc).__name__)
+                        zjwt = None
                     if zjwt:
                         break
                     log.warning("generator: no zcodeJWT for %s (attempt %d/3)",
@@ -886,7 +895,13 @@ def _generator(request: Request):
                     return
                 plans = []
                 for attempt in range(1, 4):
-                    plan_info = get_plan(zjwt) or {}
+                    try:
+                        plan_info = get_plan(zjwt) or {}
+                    except Exception as exc:
+                        log.warning("generator: plan read error for %s "
+                                    "(attempt %d/3): %s", email, attempt,
+                                    type(exc).__name__)
+                        plan_info = {}
                     plans = plan_info.get("plans") or []
                     if plans:
                         break
