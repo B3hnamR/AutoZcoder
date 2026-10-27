@@ -1404,7 +1404,10 @@ def main():
                                              force_direct=False)
                         start_plan = bool(rc.get('claimed'))
                         start_plan_id = rc.get('plan_id') or ''
-                        if start_plan:
+                        if start_plan and rc.get('already_claimed'):
+                            logger.info(f"Start Plan already active for {email} "
+                                        f"({start_plan_id or 'start plan'})")
+                        elif start_plan:
                             logger.info(f"Start Plan claimed for {email} "
                                         f"({start_plan_id or 'best offer'})")
                         elif rc.get('needs_captcha'):
@@ -1453,6 +1456,20 @@ def main():
                 # the old signup-granted Starter did
                 starter = starter or start_plan
 
+                # Cohort forensics: which Start Plan variant a signup gets
+                # (0817 vs nt-1026) does not follow a simple country rule, so
+                # record the signup exit country/zone next to the result and
+                # correlate later. exit_ip_geo caches per proxy host, so this
+                # normally costs nothing.
+                signup_cc, signup_tz = '', ''
+                try:
+                    from fingerprint import exit_ip_geo
+                    _cc, _tz = exit_ip_geo(
+                        CURRENT_PROXY if CURRENT_PROXY and CURRENT_PROXY != '0' else None)
+                    signup_cc, signup_tz = _cc or '', _tz or ''
+                except Exception:
+                    pass
+
                 with open(PLANS_FILE, 'a') as f:
                     f.write(json.dumps({
                         'email': email, 'starter': starter,
@@ -1460,6 +1477,7 @@ def main():
                         'plans': plan.get('plans') if plan else None,
                         'global_build': global_build,
                         'giveaway500': giveaway500,
+                        'signup_cc': signup_cc, 'signup_tz': signup_tz,
                         'ts': int(time.time()),
                     }) + "\n")
                 if starter:
