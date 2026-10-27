@@ -84,6 +84,47 @@ def _proxies():
     return {'http': raw, 'https': raw}
 
 
+# One shared session: pool keep-alive across the init/authorize/callback/poll
+# chain, and trust_env=False so a 'direct' connection is actually direct.
+# On Windows requests otherwise silently inherits the IE/registry proxy
+# (127.0.0.1:vhost-port of whatever VPN client is running), and every
+# registration request rides a flaky tunnel that drops TLS at random —
+# the exact SSLEOFError/ProxyError trail that killed account registration.
+_session = requests.Session()
+_session.trust_env = False
+
+
+def _request(method, url, *, tries=3, backoff=2.0, log=print, **kw):
+    """requests call with per-request retries on transient network errors.
+
+    The device-flow endpoints sit behind an edge that intermittently answers
+    502-with-empty-body or resets the connection. Without this, a single
+    SSLError escapes get_zcode_jwt and the caller burns ALL of its outer
+    retry attempts at once (the exception jumps straight past the loop).
+
+    Dispatch stays patchable: tests monkeypatch ``requests.get``/``post``
+    at module level, so honour them when they've been replaced.
+    """
+    short = url.split('?')[0].split('/')[-1]
+    meth = method.upper()
+    # test shims monkeypatch plan_check.requests.get/post in place; honour
+    # whichever function was swapped so canned envelopes keep working
+    shim = {"GET": requests.get, "POST": requests.post}.get(meth)
+    if shim is not None and shim is not requests.api.get and shim is not requests.api.post:
+        return shim(url, proxies=_proxies(), **kw)
+    last = None
+    for i in range(1, tries + 1):
+        try:
+            return _session.request(method, url, proxies=_proxies(), **kw)
+        except requests.RequestException as e:
+            last = e
+            if i < tries:
+                log(f"  plan: {method.lower()} {short} failed "
+                    f"({type(e).__name__}), retry {i}/{tries - 1}")
+                time.sleep(min(backoff * i, 6))
+    raise last
+
+
 # --- plan ids ---------------------------------------------------------------
 # Every Start Plan variant shares the prefix; the id suffix changes with each
 # campaign (`-0817`, `-referral`, ...). The 1024 Dev Day giveaway is a
@@ -169,7 +210,8 @@ def get_zcode_jwt(chat_token, log=print):
 
     # init/poll carry the self-chosen poll token; x-api-key is dropped there.
     h_init = build_headers(poll_token, include_api_key=False)
-    r = requests.post(INIT, headers=h_init, json={"provider": "zai"}, timeout=30, verify=_VERIFY, proxies=_proxies())
+    r = _request("POST", INIT, headers=h_init, json={"provider": "zai"},
+                 timeout=30, verify=_VERIFY, log=log)
     try:
         env = r.json()
     except Exception:
@@ -190,7 +232,7 @@ def get_zcode_jwt(chat_token, log=print):
     interval = int(d.get("poll_interval_sec") or 2)
 
     # consent with the ACCOUNT's chat.z.ai bearer token
-    r = requests.post(AUTHORIZE, headers={
+    r = _request("POST", AUTHORIZE, headers={
         "authorization": "Bearer " + chat_token,
         "content-type": "application/x-www-form-urlencoded",
         "x-region": "overseas",
@@ -202,7 +244,7 @@ def get_zcode_jwt(chat_token, log=print):
         "state": state,
         "response_type": "code",
         "action": "approve",
-    }, timeout=30, verify=_VERIFY, proxies=_proxies())
+    }, timeout=30, verify=_VERIFY, log=log)
     code = None
     try:
         code = re.search(r"code=(code-[0-9a-fA-F]+)", r.json().get("redirect_url", ""))
@@ -213,11 +255,12 @@ def get_zcode_jwt(chat_token, log=print):
         log(f"  plan: authorize failed {r.status_code} {r.text[:180]}")
         return None
 
-    requests.get(CALLBACK + f"?code={code}&state={state}", headers=h_init, timeout=30, verify=_VERIFY, proxies=_proxies())
+    _request("GET", CALLBACK + f"?code={code}&state={state}", headers=h_init,
+             timeout=30, verify=_VERIFY, log=log)
 
     for _ in range(15):
-        r = requests.get(POLL + flow_id, headers=build_headers(poll_token, include_api_key=False),
-                         timeout=30, verify=_VERIFY, proxies=_proxies())
+        r = _request("GET", POLL + flow_id, headers=build_headers(poll_token, include_api_key=False),
+                     timeout=30, verify=_VERIFY, log=log)
         try:
             data = r.json().get("data") or {}
         except Exception:
@@ -237,7 +280,12 @@ def _active_ids(data: dict) -> list:
 def get_plan(zcode_jwt, log=print):
     """Read balance + entitlements. <=63M-token plans may appear only in
     `plans[].entitlements[]` (with `effective_at`) until they go live."""
-    r = requests.get(BALANCE, headers=build_headers(zcode_jwt), timeout=30, verify=_VERIFY, proxies=_proxies())
+    try:
+        r = _request("GET", BALANCE, headers=build_headers(zcode_jwt), timeout=30,
+                     verify=_VERIFY, log=log)
+    except requests.RequestException as e:
+        log(f"  plan: balance failed ({type(e).__name__})")
+        return None
     try:
         j = r.json()
     except Exception:
@@ -270,8 +318,8 @@ def get_plan(zcode_jwt, log=print):
 def get_current(zcode_jwt, log=print):
     """Raw `/billing/current` data (plan list with entitlements/expiry)."""
     try:
-        r = requests.get(CURRENT, headers=build_headers(zcode_jwt), timeout=30,
-                         verify=_VERIFY, proxies=_proxies())
+        r = _request("GET", CURRENT, headers=build_headers(zcode_jwt), timeout=30,
+                     verify=_VERIFY, log=log)
         return (r.json() or {}).get("data") or {}
     except Exception as e:
         log(f"  plan: current failed ({type(e).__name__})")
@@ -343,8 +391,8 @@ def report_app_activity(zcode_jwt, log=print) -> bool:
     ok = False
     for body in _plan_events(zcode_jwt):
         try:
-            r = requests.post(EVENT, headers=h, json=body, timeout=30,
-                              verify=_VERIFY, proxies=_proxies())
+            r = _request("POST", EVENT, headers=h, json=body, timeout=30,
+                         verify=_VERIFY, log=log)
             try:
                 j = r.json()
             except Exception:
@@ -381,8 +429,8 @@ def _walk_plan_ids(node, out):
 def preview_plans(zcode_jwt, log=print) -> list:
     """Plans the account is currently eligible to claim (possibly empty)."""
     try:
-        r = requests.get(PREVIEW, headers=build_headers(zcode_jwt), timeout=30,
-                         verify=_VERIFY, proxies=_proxies())
+        r = _request("GET", PREVIEW, headers=build_headers(zcode_jwt), timeout=30,
+                     verify=_VERIFY, log=log, tries=2)
     except Exception as e:
         log(f"  plan: preview failed ({type(e).__name__})")
         return []
@@ -422,9 +470,9 @@ def claim_plan(zcode_jwt, plan_id, verify_param="", region="", log=print) -> dic
         if region:
             h["x-aliyun-captcha-verify-region"] = region
     try:
-        r = requests.post(CLAIM, headers=h,
-                          json={"plan_id": plan_id}, timeout=30,
-                          verify=_VERIFY, proxies=_proxies())
+        r = _request("POST", CLAIM, headers=h,
+                     json={"plan_id": plan_id}, timeout=30,
+                     verify=_VERIFY, log=log)
     except requests.RequestException as e:
         return {"code": -1, "msg": f"request failed: {type(e).__name__}"}
     try:
