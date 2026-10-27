@@ -88,19 +88,26 @@ def _proxy_host(proxy_url: str) -> str:
         return ""
 
 
-def exit_ip_country(proxy_url=None, timeout=6):
-    """2-letter country of the exit IP (through the proxy when given).
+def exit_ip_geo(proxy_url=None, timeout=6):
+    """(country, timezone) of the exit IP, through the proxy when given.
+
+    The TIMEZONE matters as much as the country: an IP in Finland paired with
+    `America/New_York` is exactly the mismatch fraud scoring looks for. ip-api
+    reports the real zone for the IP, so use it instead of guessing from a
+    country table (which only covered ~40 countries and silently fell back to
+    US timezones for everything else — that is how `cc=FI · tz=America/New_York`
+    happened).
 
     Order: live ip-api lookup through the proxy when its scheme allows it
     (http/https), then an online lookup of the proxy's own host IP
     (proxy_geo). The second path is what makes SOCKS work at all: a socks5://
     URL fed to urllib's HTTP ProxyHandler is a plain HTTP request to the SOCKS
     port — it always failed and every SOCKS-sourced account fell back to
-    US/New_York, exactly the mismatch fraud systems look for."""
+    US/New_York."""
     key = proxy_url or '__direct__'
     if key in _COUNTRY_CACHE:
         return _COUNTRY_CACHE[key]
-    cc = None
+    cc, tz = None, None
     socks = bool(proxy_url) and proxy_url != '0' and \
         str(proxy_url).lower().startswith(('socks4://', 'socks5://', 'socks://'))
     if not socks:
@@ -108,13 +115,16 @@ def exit_ip_country(proxy_url=None, timeout=6):
             proxies = ({'http': proxy_url, 'https': proxy_url}
                        if proxy_url and proxy_url != '0' else None)
             req = urllib.request.Request(
-                'http://ip-api.com/json/?fields=countryCode', headers={'User-Agent': 'Mozilla/5.0'})
+                'http://ip-api.com/json/?fields=countryCode,timezone',
+                headers={'User-Agent': 'Mozilla/5.0'})
             opener = urllib.request.build_opener(
                 urllib.request.ProxyHandler(proxies) if proxies else urllib.request.ProxyHandler({}))
             with opener.open(req, timeout=timeout) as resp:
-                cc = (json.loads(resp.read().decode()).get('countryCode') or None)
+                payload = json.loads(resp.read().decode())
+                cc = payload.get('countryCode') or None
+                tz = payload.get('timezone') or None
         except Exception:
-            cc = None
+            cc, tz = None, None
     if cc is None and proxy_url and proxy_url != '0':
         host = _proxy_host(str(proxy_url))
         if host:
@@ -123,8 +133,13 @@ def exit_ip_country(proxy_url=None, timeout=6):
                 cc = proxy_geo.country(host) or None
             except Exception:
                 cc = None
-    _COUNTRY_CACHE[key] = cc
-    return cc
+    _COUNTRY_CACHE[key] = (cc, tz)
+    return cc, tz
+
+
+def exit_ip_country(proxy_url=None, timeout=6):
+    """2-letter country of the exit IP (kept for callers that only need cc)."""
+    return exit_ip_geo(proxy_url, timeout)[0]
 
 
 def random_user_agent(rng=None):
@@ -141,9 +156,11 @@ def make_identity(proxy_url=None, seed=None):
     browser launch kwargs and the anti-detection script."""
     rng = random.Random(seed) if seed is not None else random.Random()
 
-    cc = exit_ip_country(proxy_url)
+    cc, ip_tz = exit_ip_geo(proxy_url)
     locale, tzs = LOCALE_TZ.get(cc, DEFAULT_LOCALE_TZ)
-    tz = rng.choice(tzs)
+    # the IP's own zone wins: a country table miss must never produce a
+    # continent-away timezone (cc=FI · America/New_York)
+    tz = ip_tz or rng.choice(tzs)
 
     w, h = rng.choice(VIEWPORTS)
     cores = rng.choice([4, 6, 8, 8, 12, 16])

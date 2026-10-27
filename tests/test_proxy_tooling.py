@@ -460,3 +460,24 @@ def test_pick_verified_tests_the_freshest_proxies_first(pool_dir, monkeypatch):
     monkeypatch.setattr(proxy_pool, "probe_detailed", dead)
     assert proxy_pool.pick_verified(tries=25, timeout=1, socks=True) is None
     assert len(probed) == 25 and set(probed) <= set(fresh)          # no stale proxy wasted a probe
+
+
+def test_unmapped_country_uses_the_ips_own_timezone(monkeypatch):
+    """cc=FI used to fall back to a US timezone: a continent-away mismatch
+    between the exit IP and the browser clock."""
+    import fingerprint
+
+    monkeypatch.setattr(fingerprint, "exit_ip_geo",
+                        lambda *a, **k: ("FI", "Europe/Helsinki"))
+    ident = fingerprint.make_identity()
+    assert ident["country"] == "FI"
+    assert ident["timezone_id"] == "Europe/Helsinki"
+
+
+def test_known_country_without_ip_timezone_still_matches(monkeypatch):
+    import fingerprint
+
+    monkeypatch.setattr(fingerprint, "exit_ip_geo", lambda *a, **k: ("US", None))
+    ident = fingerprint.make_identity()
+    assert ident["locale"] == "en-US"
+    assert ident["timezone_id"].startswith("America/")
