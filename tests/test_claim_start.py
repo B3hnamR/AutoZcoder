@@ -274,3 +274,35 @@ def test_claim_omits_captcha_headers_without_a_token(monkeypatch):
     monkeypatch.setattr(plan_check.requests, "post", fake_post)
     assert plan_check.claim_plan("jwt", "p")["code"] == 3007
     assert "x-aliyun-captcha-verify-param" not in seen["headers"]
+
+
+def test_claim_does_not_retry_a_spent_captcha_token(monkeypatch):
+    # verify_param is single-use: a transport error may still have delivered
+    # the claim, so a blind retry burns 3007. The caller mints a fresh token
+    # on code -1; the claim itself must fire exactly once.
+    calls = []
+
+    def fake_post(url, **kw):
+        calls.append(kw)
+        raise plan_check.requests.ConnectionError("edge reset")
+
+    monkeypatch.setattr(plan_check.requests, "post", fake_post)
+    j = plan_check.claim_plan("jwt", "p", verify_param="V" * 40, region="sgp")
+    assert j["code"] == -1
+    assert len(calls) == 1
+
+
+def test_sessions_are_per_thread():
+    import threading
+
+    main = plan_check._session()
+    assert plan_check._session() is main          # reused within a thread
+
+    seen = []
+    t = threading.Thread(target=lambda: seen.append(plan_check._session()))
+    t.start()
+    t.join()
+
+    assert seen and seen[0] is not main           # no cookie jar shared
+    assert seen[0].trust_env is False
+    assert main.trust_env is False

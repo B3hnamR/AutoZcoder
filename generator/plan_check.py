@@ -30,6 +30,7 @@ import os
 import re
 import secrets
 import sys
+import threading
 import time
 import uuid
 
@@ -84,14 +85,26 @@ def _proxies():
     return {'http': raw, 'https': raw}
 
 
-# One shared session: pool keep-alive across the init/authorize/callback/poll
-# chain, and trust_env=False so a 'direct' connection is actually direct.
+# One session per thread: pool keep-alive across the init/authorize/callback/
+# poll chain, and trust_env=False so a 'direct' connection is actually direct.
 # On Windows requests otherwise silently inherits the IE/registry proxy
 # (127.0.0.1:vhost-port of whatever VPN client is running), and every
 # registration request rides a flaky tunnel that drops TLS at random —
 # the exact SSLEOFError/ProxyError trail that killed account registration.
-_session = requests.Session()
-_session.trust_env = False
+#
+# Thread-local rather than module-global: register_account runs one thread per
+# account, and a shared Session is neither thread-safe nor a place to share a
+# cookie jar — one account's cf_clearance would ride the next account's flow.
+_tls = threading.local()
+
+
+def _session():
+    s = getattr(_tls, 'session', None)
+    if s is None:
+        s = requests.Session()
+        s.trust_env = False
+        _tls.session = s
+    return s
 
 
 def _request(method, url, *, tries=3, backoff=2.0, log=print, **kw):
@@ -115,7 +128,7 @@ def _request(method, url, *, tries=3, backoff=2.0, log=print, **kw):
     last = None
     for i in range(1, tries + 1):
         try:
-            return _session.request(method, url, proxies=_proxies(), **kw)
+            return _session().request(method, url, proxies=_proxies(), **kw)
         except requests.RequestException as e:
             last = e
             if i < tries:
@@ -462,6 +475,10 @@ def claim_plan(zcode_jwt, plan_id, verify_param="", region="", log=print) -> dic
     Codes: 0 claimed · 1003 already claimed (treat as success) ·
     3007 captcha demanded · 1001 plan gone · 1005 quota/limit.
     """
+    # No retry here: `verify_param` is single-use, so a transport error may
+    # mean the request was delivered and the token is spent. Retrying would
+    # cost 3007 (captcha) with a dead token; the caller mints a fresh one and
+    # re-enters on code -1, which is the retry that actually works.
     h = build_headers(zcode_jwt)
     h["x-platform"] = PLATFORM
     h["accept"] = "*/*"
@@ -472,7 +489,7 @@ def claim_plan(zcode_jwt, plan_id, verify_param="", region="", log=print) -> dic
     try:
         r = _request("POST", CLAIM, headers=h,
                      json={"plan_id": plan_id}, timeout=30,
-                     verify=_VERIFY, log=log)
+                     verify=_VERIFY, log=log, tries=1)
     except requests.RequestException as e:
         return {"code": -1, "msg": f"request failed: {type(e).__name__}"}
     try:
