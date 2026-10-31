@@ -2,13 +2,63 @@
 
 from __future__ import annotations
 
+import json
 import os
+import ssl
+import sys
+from urllib.parse import urlsplit
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar, get_origin
 
 import yaml
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, ValidationError, model_validator
 from .zcode_device import default_device_mid
+
+
+_CERT_HOSTS_CACHE: dict[tuple[str, int, int], tuple[str, ...]] = {}
+
+
+def _read_certificate_hosts(path: str) -> tuple[str, ...]:
+    """DNS/IP subjectAltNames of the first certificate in a PEM file."""
+    try:
+        from cryptography import x509
+        with open(path, "rb") as fh:
+            cert = x509.load_pem_x509_certificate(fh.read())
+        san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+        names = [str(n) for n in san.get_values_for_type(x509.DNSName)]
+        names += [str(n) for n in san.get_values_for_type(x509.IPAddress)]
+        return tuple(n.lower() for n in names if "*" not in n)
+    except ImportError:
+        pass                       # Windows build ships without cryptography
+    except Exception:
+        return ()
+    # stdlib fallback: undocumented helper, so tolerate its absence entirely
+    decode = getattr(getattr(ssl, "_ssl", None), "_test_decode_cert", None)
+    if decode is None:
+        return ()
+    try:
+        cert = decode(path)
+    except Exception:
+        return ()
+    return tuple(str(value).lower() for kind, value in cert.get("subjectAltName", ())
+                 if kind in ("DNS", "IP Address") and "*" not in str(value))
+
+
+def _certificate_hosts_cached(path: str) -> tuple[str, ...]:
+    if not path:
+        return ()
+    try:
+        st = os.stat(path)
+    except OSError:
+        return ()
+    key = (path, st.st_mtime_ns, st.st_size)
+    hit = _CERT_HOSTS_CACHE.get(key)
+    if hit is None:
+        # a renewed certificate (new mtime) replaces the stale entry
+        for old in [k for k in _CERT_HOSTS_CACHE if k[0] == path]:
+            _CERT_HOSTS_CACHE.pop(old, None)
+        hit = _CERT_HOSTS_CACHE[key] = _read_certificate_hosts(path)
+    return hit
 
 
 def _expand(p: str) -> str:
@@ -31,7 +81,96 @@ class ServerConfig(BaseModel):
     port: int = 8788
     client_keys: list[ClientKey] = Field(default_factory=list)
     require_client_key: bool = True
-    admin_key: str = "gw-admin-change-me"
+    # Placeholder keys that have shipped in config templates. The public-bind
+    # boot guard (app.py) rejects ALL of these, not just the exact default:
+    # an example value like "gw-admin-change-me-bytes" must not sail past a
+    # character-prefix comparison and boot a VPS with a repo-published key.
+    PLACEHOLDER_ADMIN_KEYS: ClassVar[frozenset[str]] = frozenset({
+        "gw-admin-change-me",
+        "gw-admin-change-me-bytes",
+        "gw-admin-local",
+    })
+    PLACEHOLDER_CLIENT_KEYS: ClassVar[frozenset[str]] = frozenset({
+        "gw-client-change-me",
+        "gw-local-1",
+    })
+    # The admin key is local root-equivalent (it can point the generator at
+    # arbitrary code, swap the binary, rewrite config). Minimum length keeps
+    # an empty/one-char key from ever authenticating (fail closed).
+    admin_key: str = Field(default="gw-admin-change-me", min_length=8)
+    # VPS / remote bind hardening. When host is non-loopback:
+    #   - /admin/* and /dash key injection additionally require these flags
+    #     (loopback peers always pass), and the ops endpoints (/health,
+    #     /ready, /metrics) answer 404 unless expose_ops is set.
+    #   - a missing client key requirement refuses to start (see app.py):
+    #     a proxy with no auth on a public interface is an open relay.
+    allow_remote_admin: bool = False
+    expose_ops: bool = False
+    # Built-in HTTPS: when both are set the gateway terminates TLS itself, so a
+    # VPS needs no reverse proxy (nginx/Caddy) in front of it.
+    tls_cert: str = ""
+    tls_key: str = ""
+    allowed_hosts: list[str] = Field(default_factory=lambda: ["127.0.0.1", "localhost", "::1"])
+    child_origin: str = ""
+
+    def _certificate_hosts(self) -> list[str]:
+        # the request-path middleware asks on every dashboard call: parse the
+        # file once per (path, mtime), not once per request
+        return list(_certificate_hosts_cached(self.tls_cert))
+
+    def trusted_hosts(self) -> set[str]:
+        hosts = {h.strip().lower().strip("[]") for h in self.allowed_hosts if h.strip() and "*" not in h}
+        hosts.update(self._certificate_hosts())
+        if self.host not in ("0.0.0.0", "::"):
+            hosts.add(self.host.lower().strip("[]"))
+        if self.child_origin:
+            hosts.add((urlsplit(self.child_origin).hostname or "").lower())
+        return hosts
+
+    def child_connection(self) -> tuple[str, str]:
+        """Verified child callback origin; certificate SANs supply TLS names."""
+        tls = bool(self.tls_cert and self.tls_key)
+        if self.child_origin:
+            parsed = urlsplit(self.child_origin)
+            if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password \
+                    or parsed.path not in ("", "/") or parsed.query or parsed.fragment:
+                raise ValueError("server.child_origin must be an absolute HTTP(S) origin without credentials or path")
+            if tls and parsed.scheme != "https":
+                raise ValueError("server.child_origin must use HTTPS with the TLS listener")
+            return self.child_origin.rstrip("/"), self.tls_cert if parsed.scheme == "https" else ""
+        host = self.host if self.host not in ("0.0.0.0", "::") else "127.0.0.1"
+        if tls:
+            names = self._certificate_hosts()
+            if host not in names:
+                if self.is_loopback_bind():
+                    raise ValueError("TLS callback certificate does not cover the loopback bind; set a reachable server.child_origin")
+                if not names:
+                    raise ValueError("TLS certificate has no usable SAN; set server.child_origin")
+                host = names[0]
+        authority = f"[{host}]" if ":" in host else host
+        return f"{'https' if tls else 'http'}://{authority}:{self.port}", self.tls_cert if tls else ""
+
+    def ssl_kwargs(self) -> dict:
+        """uvicorn TLS arguments; empty when TLS is not configured."""
+        cert, key = (self.tls_cert or "").strip(), (self.tls_key or "").strip()
+        if not cert and not key:
+            return {}
+        if not (cert and key):
+            raise RuntimeError("server.tls_cert and server.tls_key must be set together")
+        for path in (cert, key):
+            if not os.path.isfile(path):
+                raise RuntimeError(f"TLS file not found: {path}")
+        return {"ssl_certfile": cert, "ssl_keyfile": key}
+
+    def is_loopback_bind(self) -> bool:
+        return self.host in ("127.0.0.1", "::1", "localhost")
+
+    def admin_key_is_placeholder(self) -> bool:
+        return self.admin_key in self.PLACEHOLDER_ADMIN_KEYS
+
+    def has_placeholder_client_key(self) -> bool:
+        return any(k.key in self.PLACEHOLDER_CLIENT_KEYS
+                   for k in self.client_keys)
 
 
 class Fingerprint(BaseModel):
@@ -47,7 +186,11 @@ class Fingerprint(BaseModel):
     platform: str = "win32-x64"
     device_mid: str = Field(default_factory=default_device_mid)
     language: str = "en-US"
-    timezone: str = "Asia/Tehran"
+    # Neutral default: a fixed owner-personal zone shipped to every install
+    # was a correlation signal (all traffic claiming one geography regardless
+    # of the account/relay exit). New installs get UTC; existing configs keep
+    # whatever they set explicitly.
+    timezone: str = "UTC"
     os_category: str = "windows"
     os_version: str = "10.0.26200"
 
@@ -66,6 +209,12 @@ class UpstreamConfig(BaseModel):
     # Whether the anthropic body variant carries `cache_control`. The capture
     # always included it; flip to false to test whether it is optional.
     anthropic_cache_control: bool = True
+    # Inject the full captured ZCode harness (policy + tooling paragraphs)
+    # into every request's system block. True = fingerprint-faithful (this is
+    # what fixed the 405/3012 wave) but it also steers the model's behavior
+    # for every client. False = identity line only, no behavior steering —
+    # only flip it off if the upstream still accepts the request shape.
+    bootstrap_harness: bool = True
     fingerprint: Fingerprint = Field(default_factory=Fingerprint)
 
     @property
@@ -162,7 +311,7 @@ class GeneratorConfig(BaseModel):
     python_exe: str = ""               # python that can run ZCODEAUTO scripts ('' = auto-detect)
     # 'manual' = you solve the captcha yourself in a visible browser.
     # A visible browser is mandatory then (headless is forced off).
-    captcha: str = "manual"            # manual | auto
+    captcha: str = Field(default_factory=lambda: "ai" if sys.platform.startswith("linux") else "manual")
     headless: bool = False             # only applies when captcha == 'auto'
     claim: bool = False                # legacy: invite Global Build (100M) claim after signup
     claim500: bool = False             # legacy: 1024 Dev Day 500M giveaway (withdrawn)
@@ -277,29 +426,45 @@ def load_config(path: str | os.PathLike | None = None) -> Config:
             base = config_file.parent
             break
 
-    cfg = Config(**data)
-    cfg._config_file = config_file
-
-    # environment overrides (ZCODE_GATEWAY_<SECTION>__<FIELD>)
-    env = {k: v for k, v in os.environ.items() if k.startswith("ZCODE_GATEWAY_")}
-    for key, val in env.items():
+    # Decode collections explicitly; all overrides then pass through the same
+    # schema validation as YAML rather than unchecked setattr assignments.
+    for key, val in os.environ.items():
+        if not key.startswith("ZCODE_GATEWAY_"):
+            continue
         parts = key[len("ZCODE_GATEWAY_"):].lower().split("__")
         if len(parts) != 2:
             continue
         section, field = parts
-        if hasattr(cfg, section) and hasattr(getattr(cfg, section), field):
-            target = getattr(cfg, section)
-            current = getattr(target, field)
+        section_info = Config.model_fields.get(section)
+        if section_info is None:
+            continue
+        section_type = section_info.annotation
+        field_info = section_type.model_fields.get(field)
+        if field_info is None:
+            continue
+        value: Any = val
+        if get_origin(field_info.annotation) in (list, tuple, dict):
             try:
-                if isinstance(current, bool):
-                    setattr(target, field, val.lower() in ("1", "true", "yes"))
-                elif isinstance(current, int):
-                    setattr(target, field, int(val))
-                elif isinstance(current, float):
-                    setattr(target, field, float(val))
-                else:
-                    setattr(target, field, val)
+                value = json.loads(val)
             except ValueError:
-                pass
+                raise SystemExit(
+                    f"config error: {key} ({section}.{field}) must contain valid JSON") from None
+        section_data = data.get(section, {})
+        data[section] = {**(section_data if isinstance(section_data, dict) else {}), field: value}
+
+    try:
+        cfg = Config(**data)
+    except ValidationError as e:
+        # A previously-accepted config that no longer validates (e.g. a short
+        # admin_key, rejected since the min_length=8 hardening) must not die
+        # with a raw pydantic traceback — point the operator at the field.
+        fields = ", ".join(sorted({
+            ".".join(str(p) for p in err.get("loc", ()))
+            for err in e.errors()}))
+        raise SystemExit(
+            f"config error in {config_file or 'config.yaml'}: "
+            f"invalid value(s) for {fields}: {e.errors()[0].get('msg', '')} "
+            f"— fix the listed field(s) and start again") from e
+    cfg._config_file = config_file
 
     return cfg.resolved(base)

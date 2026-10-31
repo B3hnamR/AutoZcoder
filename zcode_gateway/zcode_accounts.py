@@ -8,7 +8,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .accounts_dir import parse_snapshot, snapshot_filename, write_snapshot
+from .accounts_dir import parse_snapshot, snapshot_filename, snapshot_path, write_snapshot
 from .zcode_detect import jwt_claims
 from .zcode_device import read_device_mid
 
@@ -68,7 +68,6 @@ def read_credentials(path):
 
 def import_credentials(path, output_dir):
     folder = Path(output_dir)
-    folder.mkdir(parents=True, exist_ok=True)
     used = {p.name: parse_snapshot(p).get('account_id') for p in folder.glob('*.txt')}
     known = set(used.values())
     files, new_ids, emails = [], [], []
@@ -76,7 +75,7 @@ def import_credentials(path, output_dir):
         ident = fields['account_id']
         name = snapshot_filename(fields['email'], ident, used)
         used[name] = ident
-        write_snapshot(folder / name, fields)
+        write_snapshot(snapshot_path(folder, name), fields)
         files.append(name)
         if ident not in known:
             new_ids.append(ident)

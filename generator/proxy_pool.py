@@ -37,6 +37,7 @@ import ssl
 import sys
 import threading
 import time
+from urllib.parse import unquote, urlsplit
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -58,7 +59,10 @@ def _resolve_paths():
     global OUTPUT_DIR, RAW_FILE, GOOD_FILE, BAD_FILE, EVERGOOD_FILE, LOCAL_SOURCES
     global USED_FILE, COUNTRY_CACHE_FILE, POOL_FILE, DEAD_FILE, HISTORY_FILE
     global SOURCE_STATS_FILE, LOCK_FILE
-    OUTPUT_DIR = os.environ.get('ZAI_OUTPUT_DIR') or os.path.join(HERE, 'output')
+    checkout = os.path.dirname(HERE)
+    default_output = (os.path.join(checkout, '.local', 'runtime', 'generator-data')
+                      if os.path.isdir(os.path.join(checkout, '.git')) else os.path.join(HERE, 'output'))
+    OUTPUT_DIR = os.environ.get('ZAI_OUTPUT_DIR') or default_output
     RAW_FILE = os.path.join(OUTPUT_DIR, 'proxies_raw.txt')
     GOOD_FILE = os.path.join(OUTPUT_DIR, 'proxies.txt')
     BAD_FILE = os.path.join(OUTPUT_DIR, 'proxies_bad.txt')
@@ -82,7 +86,7 @@ def set_output_dir(path: str):
 
 _resolve_paths()
 
-KICKVIEW_SOURCES = os.environ.get('KICKVIEW_SOURCES', r'D:\JB\kickview\data\sources.txt')
+KICKVIEW_SOURCES = os.environ.get('KICKVIEW_SOURCES', '')
 SOURCES_URL = 'https://raw.githubusercontent.com/B3hnamR/kickview/main/data/sources.txt'
 
 DEFAULT_SOURCES = [
@@ -115,6 +119,9 @@ UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
       '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
 PROBE_MARKER = os.environ.get('ZAI_PROBE_MARKER', 'z.ai')
 MAX_PER_SOURCE = int(os.environ.get('PROXY_MAX_PER_SOURCE', '150000'))
+# cap a proxy-source download at 32 MB: real lists are a few MB; anything
+# bigger is hostile (OOM attempt) or wrong
+MAX_SOURCE_BYTES = int(os.environ.get('PROXY_MAX_SOURCE_BYTES', str(32 << 20)))
 
 SCAN_PRESETS = {
     'thorough': {'timeout': 12, 'concurrency': 300, 'probe_timeout': 4, 'probe_concurrency': 300},
@@ -409,7 +416,7 @@ def write_local_sources(text):
 def read_sources():
     srcs = list(DEFAULT_SOURCES) + read_local_sources()
     try:
-        if os.path.exists(KICKVIEW_SOURCES):
+        if KICKVIEW_SOURCES and os.path.isfile(KICKVIEW_SOURCES):
             srcs.extend(pp.parse_source_lines(_read_text(KICKVIEW_SOURCES)))
     except Exception as e:
         print(f"  (sources file unreadable: {e}; using built-ins)")
@@ -462,8 +469,24 @@ def source_stats() -> list[dict]:
 
 def fetch_source(proto, url):
     try:
-        r = requests.get(url, timeout=30, verify=False, headers={'User-Agent': UA})
-        parsed = pp.parse_proxy_list(r.text, proto)
+        # TLS stays verified: verify=False let any MITM poison the proxy pool
+        # (and every signup session that rides it). stream + a byte cap: a
+        # hostile source must not be able to OOM the process with a gigabyte
+        # body.
+        with requests.get(url, timeout=30, verify=True, stream=True,
+                          headers={'User-Agent': UA}) as r:
+            r.raise_for_status()
+            chunks, total = [], 0
+            for chunk in r.iter_content(chunk_size=1 << 16):
+                total += len(chunk)
+                if total > MAX_SOURCE_BYTES:
+                    print(f"  ! {proto} {url[:60]}… rejected: response over "
+                          f"{MAX_SOURCE_BYTES // (1 << 20)} MB")
+                    _source_stats_add(proto, url, 0, 'response too large')
+                    return []
+                chunks.append(chunk)
+            body = b''.join(chunks).decode('utf-8', 'replace')
+        parsed = pp.parse_proxy_list(body, proto)
         got = [pp.to_url(e['proto'], e['host'], e['port'], e['auth']) for e in parsed]
         if MAX_PER_SOURCE and len(got) > MAX_PER_SOURCE:
             print(f"  ! {proto} {url[:60]}… rejected: {len(got):,} over the per-source limit")
@@ -616,6 +639,42 @@ def probe_endpoint(host, port, timeout=3.0):
             return True, ''
     except Exception as e:  # noqa: BLE001
         return False, tcp_reason(e)
+
+
+def tcp_interception_detected(timeout=1.0):
+    """Reserved TEST-NET hosts must not all accept TCP on the discard port.
+
+    A TUN stack may accept locally before its remote dial succeeds. This is a
+    heuristic for unreliable connect results, not proof of a particular VPN.
+    """
+    return all(probe_endpoint(host, 9, timeout)[0]
+               for host in ("192.0.2.1", "198.51.100.1"))
+
+
+def probe_proxy_protocol(purl, timeout=3.0):
+    """Require an actual CONNECT/SOCKS tunnel, never just a local TCP accept."""
+    import socks
+    proxy = urlsplit(purl)
+    # HTTPS-to-proxy requires a TLS-wrapped CONNECT implementation. Keep these
+    # candidates for the existing full TLS verifier rather than false-rejecting.
+    if proxy.scheme == "https":
+        return True, ""
+    types = {"http": socks.HTTP, "socks4": socks.SOCKS4, "socks4a": socks.SOCKS4,
+             "socks5": socks.SOCKS5, "socks5h": socks.SOCKS5}
+    if proxy.scheme not in types:
+        return False, "proxy_protocol"
+    target = urlsplit(CHECK_PAGE)
+    try:
+        with socks.socksocket() as sock:
+            sock.settimeout(timeout)
+            sock.set_proxy(types[proxy.scheme], proxy.hostname, proxy.port,
+                           rdns=True,
+                           username=unquote(proxy.username) if proxy.username else None,
+                           password=unquote(proxy.password) if proxy.password else None)
+            sock.connect((target.hostname, target.port or 443))
+        return True, ""
+    except Exception as exc:
+        return False, classify_error(exc)
 
 
 # ----------------------------------------------------------------------------- dead cache
@@ -1297,6 +1356,15 @@ def _verify_list(proxies, opts, label, quiet=False, limit=None):
     concurrency = int(opts['concurrency'])
     timeout = float(opts['timeout'])
     max_lat = float(opts['max_latency'])
+    intercepted = bool(proxies) and tcp_interception_detected()
+    if intercepted:
+        concurrency = min(concurrency, 64)
+        message = ("TCP connects are being accepted for reserved test addresses (possible VPN/TUN). "
+                   "Using real proxy handshakes and at most 64 HTTPS checks at once. "
+                   "The tunnel is not bypassed; if handshakes fail, try another exit or routing policy.")
+        print("  network warning: " + message, flush=True)
+        emit(t='network_warning', code='tcp_interception', message=message,
+             concurrency=concurrency, protocol_prefilter=True)
 
     reasons = Counter()
     failures: list[tuple[str, str]] = []
@@ -1319,7 +1387,31 @@ def _verify_list(proxies, opts, label, quiet=False, limit=None):
          concurrency=concurrency, prefilter=bool(opts['prefilter']))
 
     # 1. TCP prefilter: never spend an HTTPS request on a closed port
-    if opts['prefilter'] and proxies:
+    if intercepted and proxies:
+        # Per-URL (not host:port): SOCKS and HTTP on one port are not equivalent.
+        filtered = []
+        with ThreadPoolExecutor(max_workers=max(1, min(64, int(opts['probe_concurrency'])))) as ex:
+            done = 0
+            for offset in range(0, len(proxies), 1000):
+                futures = {ex.submit(probe_proxy_protocol, p, float(opts['probe_timeout'])): p
+                           for p in proxies[offset:offset + 1000]}
+                for future in as_completed(futures):
+                    url = futures[future]
+                    ok, reason = future.result()
+                    done += 1
+                    if ok:
+                        filtered.append(url)
+                    else:
+                        reasons[reason] += 1
+                        failures.append((url, reason))
+                    if done % 200 == 0 or done == len(proxies):
+                        emit(t='prefilter_progress', done=done, total=len(proxies), open=len(filtered))
+                        emit(t='reasons', probed=done, total=len(proxies), alive=0,
+                             reasons=dict(reasons))
+        print(f"  protocol prefilter: {len(filtered)}/{len(proxies)} candidates passed CONNECT/SOCKS", flush=True)
+        emit(t='prefilter', endpoints=len(proxies), open=len(filtered), remaining=len(filtered))
+        proxies = filtered
+    elif opts['prefilter'] and proxies:
         endpoints = set()
         for p in proxies:
             s = pp.split_url(p)

@@ -6,9 +6,10 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import urlparse
 from uuid import uuid4
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -141,6 +142,13 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        generator = getattr(app.state.app_state, "generator", None)
+        if generator is not None:
+            try:
+                await asyncio.to_thread(generator.shutdown)
+            except Exception:
+                log.exception("generator shutdown failed")
+        relay_manager._health_stop.set()
         login = getattr(app.state.app_state, "device_login", None)
         if login is not None and getattr(login, "_task", None) is not None:
             login.cancel()
@@ -158,12 +166,58 @@ async def lifespan(app: FastAPI):
         await client.aclose()
         await catalog.aclose()
         await updater.aclose()
+        await pool.aclose()
         store.close()
+
+
+def _norm_netloc(netloc: str, scheme: str) -> str:
+    """Lower-cased host[:port] with the scheme's default port dropped, so
+    `https://h` and `h:443` compare equal."""
+    netloc = (netloc or "").strip().lower()
+    for sch, port in (("https", ":443"), ("http", ":80")):
+        if (scheme or "").lower() == sch and netloc.endswith(port):
+            return netloc[: -len(port)]
+    return netloc
 
 
 def create_app(cfg: Config | None = None) -> FastAPI:
     cfg = cfg or load_config()
     setup_logging(cfg.logging.level)
+
+    # --- bind security (VPS / remote deployments) --------------------------
+    # The admin key is local root-equivalent: it can point the generator at
+    # arbitrary code, swap the binary, and rewrite config. A non-loopback
+    # bind is only allowed with real credentials in place.
+    if not cfg.server.is_loopback_bind():
+        if not cfg.server.require_client_key:
+            raise RuntimeError(
+                f"server.host={cfg.server.host} is a public bind but "
+                "server.require_client_key is false — an unauthenticated "
+                "proxy on a public interface is an open relay. Set "
+                "require_client_key: true (and configure client_keys).")
+        if not cfg.server.client_keys:
+            raise RuntimeError(
+                "server.host is a public bind but no client_keys are "
+                "configured — nothing would authenticate. Configure "
+                "client_keys.")
+        if cfg.server.has_placeholder_client_key():
+            raise RuntimeError(
+                "server.host is a public bind but a client key is still the "
+                "example placeholder from config.example.yaml — set real "
+                "long random keys (see docs/guides/VPS-DEPLOY.md).")
+        if cfg.server.admin_key_is_placeholder():
+            raise RuntimeError(
+                "server.host is a public bind but server.admin_key is still "
+                "a template placeholder — set a long random admin key first.")
+        if not cfg.server.tls_cert:
+            log.warning("serving PLAIN HTTP on a public bind: set server.tls_cert / "
+                        "tls_key (built-in HTTPS) or put a TLS proxy in front")
+        log.warning(
+            "NON-LOCAL BIND (%s): the admin key is equivalent to code "
+            "execution on this machine — keep it secret, prefer a reverse "
+            "proxy with TLS, and leave allow_remote_admin=false unless the "
+            "admin API must be reachable from non-loopback peers",
+            cfg.server.host)
 
     app = FastAPI(title="Zcode Gateway", version=__version__, lifespan=lifespan)
     app.state.cfg = cfg
@@ -172,6 +226,56 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     # every API client is a non-browser tool. `allow_origins=["*"]` let any
     # visited website read /dash (which embeds the admin key on loopback) and
     # then drive the admin API — a remote origin controlling a local tool.
+    @app.middleware("http")
+    async def cross_origin_mutation_guard(request: Request, call_next):
+        """Block browser-driven cross-origin mutations (CSRF / DNS rebinding).
+
+        Non-browser clients (curl, SDKs) send no Origin/Sec-Fetch headers and
+        pass untouched. Same-origin browser calls pass. A malicious page can
+        only send simple cross-site requests — those carry Origin and/or
+        Sec-Fetch-Site: cross-site and are rejected before auth runs.
+
+        same-site is rejected too (intentionally strict): the gateway has no
+        legitimate cross-subdomain browser deployment. Origin "null"
+        (sandboxed iframe / redirected POST) is treated as hostile, and the
+        comparison includes the port (Origin http://127.0.0.1:9999 must not
+        pass against Host 127.0.0.1:8788).
+        """
+        path = request.url.path
+        privileged = path == "/dash" or path.startswith("/admin/") or path in ("/health", "/ready", "/metrics")
+        if privileged:
+            host = (request.url.hostname or "").lower()
+            allowed_hosts = cfg.server.trusted_hosts()
+            if host not in allowed_hosts:
+                return JSONResponse(status_code=400, content={"detail": "untrusted Host header"})
+        # /v1/* is bearer-authenticated inference (no ambient browser
+        # credentials), so there is nothing for CSRF to ride on: browser-based
+        # chat UIs and editor webviews must keep working there.
+        if request.method in ("POST", "PUT", "PATCH", "DELETE") \
+                and not request.url.path.startswith("/v1/"):
+            site = request.headers.get("sec-fetch-site", "").lower()
+            if site in ("cross-site", "same-site"):
+                return JSONResponse(status_code=403, content={
+                    "detail": "cross-site mutation blocked"})
+            origin = request.headers.get("origin", "")
+            if origin:
+                parsed_origin = urlparse(origin)
+                origin_netloc = _norm_netloc(parsed_origin.netloc,
+                                             parsed_origin.scheme)
+                # a TLS front may forward Host without the public port; the
+                # browser's Origin always carries it, so also accept the
+                # forwarded host the front reports
+                allowed = {
+                    _norm_netloc(request.headers.get(h) or "",
+                                 request.headers.get("x-forwarded-proto")
+                                 or request.url.scheme)
+                    for h in ("host", "x-forwarded-host")
+                } - {""}
+                if not origin_netloc or origin_netloc == "null" \
+                        or origin_netloc not in allowed:
+                    return JSONResponse(status_code=403, content={
+                        "detail": "cross-origin mutation blocked"})
+        return await call_next(request)
 
     # dual-dialect surfaces
     app.include_router(openai_router)        # /v1/chat/completions, /v1/completions, /v1/models
@@ -179,6 +283,15 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     app.include_router(admin_router)         # /admin/*
     app.include_router(dash_router)          # /dash + /admin/dash/*
     app.include_router(health_router)        # /health, /ready, /metrics
+
+    # Dashboard CSS/JS modules. Static assets only — no secrets are served from
+    # here (the admin key is injected into the HTML shell, not the modules), so
+    # these stay unauthenticated like the shell itself.
+    from .api_dash import DASH_DIR
+    _assets = DASH_DIR / "assets"
+    if _assets.is_dir():
+        from fastapi.staticfiles import StaticFiles
+        app.mount("/dash/assets", StaticFiles(directory=str(_assets)), name="dash-assets")
 
     @app.exception_handler(StarletteHTTPException)
     async def http_error(request, exc):

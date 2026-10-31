@@ -1,10 +1,10 @@
-# build-exe.ps1 - package the Zcode Gateway desktop client as a single .exe
+# windows.ps1 - package the Zcode Gateway desktop client as a single .exe
 #
-#   .\build-exe.ps1              build
-#   .\build-exe.ps1 -Clean       wipe build/ dist/ first
-#   .\build-exe.ps1 -Console     keep a console window (useful for debugging)
+#   .\scripts\build\windows.ps1              build
+#   .\scripts\build\windows.ps1 -Clean       wipe .local/build/ .local/dist/ first
+#   .\scripts\build\windows.ps1 -Console     keep a console window (useful for debugging)
 #
-# Output: .\dist\ZcodeGateway.exe   (~single file, no Python needed to run)
+# Output: .\.local\dist\ZcodeGateway.exe   (~single file, no Python needed to run)
 
 [CmdletBinding()]
 param(
@@ -13,14 +13,14 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$Here = Split-Path -Parent $MyInvocation.MyCommand.Path
+$Here = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\.."))
 Set-Location $Here
 
 Write-Host "Zcode Gateway - exe build" -ForegroundColor Cyan
 Write-Host "  workdir: $Here"
 
 if ($Clean) {
-    foreach ($d in @("build", "dist")) {
+    foreach ($d in @(".local\build", ".local\dist")) {
         $buildTarget = [System.IO.Path]::GetFullPath((Join-Path $Here $d))
         $buildRoot = [System.IO.Path]::GetFullPath($Here).TrimEnd('\') + '\'
         if (-not $buildTarget.StartsWith($buildRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
@@ -40,11 +40,11 @@ Write-Host "  python : $py$(if (-not $usingVenv) { '  (no .venv — will NOT pip
 # installing into a shared/system Python mutates the user's machine)
 & $py -c "import PyInstaller" 2>$null
 $needInstaller = $LASTEXITCODE -ne 0
-& $py -c "import yaml, httpx, fastapi, uvicorn" 2>$null
+& $py -c "import yaml, httpx, fastapi, uvicorn, socks, webview, clr" 2>$null
 $needRuntime = $LASTEXITCODE -ne 0
 if (($needInstaller -or $needRuntime) -and -not $usingVenv) {
     throw "build deps missing and no .venv found at $Here\.venv - " +
-          "create it first:  python -m venv .venv; .\.venv\Scripts\python -m pip install -r requirements.txt pyinstaller"
+          "create it first:  python -m venv .venv; .\.venv\Scripts\python -m pip install -r requirements/windows.txt pyinstaller"
 }
 if ($needInstaller) {
     Write-Host "  installing pyinstaller (venv)..." -ForegroundColor Yellow
@@ -52,7 +52,7 @@ if ($needInstaller) {
 }
 if ($needRuntime) {
     Write-Host "  installing runtime deps (venv)..." -ForegroundColor Yellow
-    & $py -m pip install -r (Join-Path $Here "requirements.txt")
+    & $py -m pip install -r (Join-Path $Here "requirements\windows.txt")
 }
 
 $mode = if ($Console) { "--console" } else { "--windowed" }
@@ -68,6 +68,16 @@ foreach ($f in @("README.md", "requirements.txt")) {
     if (Test-Path $src) { Copy-Item -LiteralPath $src -Destination $genStage }
 }
 Write-Host "  generator sources staged: $((Get-ChildItem $genStage -File).Count) files"
+$mailStage = Join-Path ([System.IO.Path]::GetTempPath()) ("zcoder-mail-" + [guid]::NewGuid().ToString("N"))
+try {
+    # Generate pristine deployment config; never bundle the local wrangler.toml.
+    & $py (Join-Path $Here "scripts\packaging\stage_mail_worker.py") (Join-Path $Here "mail-worker") $mailStage
+    if ($LASTEXITCODE -ne 0) { throw "Mail-worker staging failed with exit code $LASTEXITCODE" }
+} catch {
+    Remove-Item -LiteralPath $genStage -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $mailStage -Recurse -Force -ErrorAction SilentlyContinue
+    throw
+}
 
 # captcha-mint sidecar: the Start Plan claim needs an Aliyun verify param, and
 # the happy-dom solver is JS. Compile it to a standalone exe and ship it inside
@@ -108,7 +118,7 @@ $iconArg = @()
 if (Test-Path $icon) { $iconArg = @("--icon", $icon) }
 
 # exe properties (right-click -> Details) with the branding line
-$versionFile = Join-Path $Here "tools\exe_version.txt"
+$versionFile = Join-Path $Here "scripts\packaging\exe_version.txt"
 $versionArg = @()
 if (Test-Path $versionFile) { $versionArg = @("--version-file", $versionFile) }
 
@@ -128,6 +138,7 @@ $buildArgs = @(
     "--hidden-import", "requests",
     "--hidden-import", "urllib3",
     "--hidden-import", "urllib3.contrib.socks",
+    "--hidden-import", "socks",
     "--hidden-import", "certifi",
     "--hidden-import", "uvicorn.loops.auto",
     "--hidden-import", "uvicorn.protocols",
@@ -143,6 +154,7 @@ $buildArgs = @(
     "--hidden-import", "httpcore",
     "--hidden-import", "h11",
     "--hidden-import", "yaml",
+    "--hidden-import", "fastapi.staticfiles",
     # pywebview + its Windows WebView2 backend
     "--collect-submodules", "webview",
     "--hidden-import", "clr",
@@ -153,22 +165,25 @@ $buildArgs = @(
     "--hidden-import", "zcode_gateway.accounts_dir_bridge",
     # ship the example config, the app icon assets, the dashboard page, the
     # Cloudflare mail-worker template, and the bundled generator scripts
-    "--add-data", "config.example.yaml;.",
-    "--add-data", "assets;assets",
-    "--add-data", "zcode_gateway/dashboard;zcode_gateway/dashboard",
-    "--add-data", "mail-worker;mail-worker",
+    "--add-data", "$(Join-Path $Here 'config.example.yaml');.",
+    "--add-data", "$(Join-Path $Here 'assets');assets",
+    "--add-data", "$(Join-Path $Here 'zcode_gateway/dashboard');zcode_gateway/dashboard",
+    "--add-data", "$mailStage;mail-worker",
     "--add-data", "$genStage;generator"
 ) + $mintData + @(
     "--paths", $Here,
-    "--specpath", $Here
-) + $iconArg + $versionArg + @("gui_main.py")
+    "--workpath", (Join-Path $Here ".local\build"),
+    "--distpath", (Join-Path $Here ".local\dist"),
+    "--specpath", (Join-Path $Here ".local\build\specs")
+) + $iconArg + $versionArg + @((Join-Path $Here "gui_main.py"))
 
 Write-Host "`n  building (this takes a minute)...`n" -ForegroundColor Cyan
 & $py @buildArgs
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed with exit code $LASTEXITCODE" }
 Remove-Item -LiteralPath $genStage -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $mailStage -Recurse -Force -ErrorAction SilentlyContinue
 
-$exe = Join-Path $Here "dist\ZcodeGateway.exe"
+$exe = Join-Path $Here ".local\dist\ZcodeGateway.exe"
 if (-not (Test-Path $exe)) { throw "expected output missing: $exe" }
 
 $size = [math]::Round((Get-Item $exe).Length / 1MB, 1)

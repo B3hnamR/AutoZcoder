@@ -1,9 +1,10 @@
 # ---- secrets & runtime data (never commit) ----
+/.local/
 config.yaml
 gateway.db
 gateway.db-*
 pool.json
-accounts/
+/accounts/
 logs/
 output/
 generator-data/
@@ -37,14 +38,19 @@ __pycache__/
 .venv/
 venv/
 .env
+.env.*
+!.env.example
+!.env.sample
+mail-worker/.dev.vars
+mail-worker/.dev.vars.*
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 
 # ---- build artifacts ----
-build/
-dist/
-dist-backup*/
+/build/
+/dist/
+/dist-backup*/
 *.spec
 *.new.exe
 
@@ -58,3 +64,11 @@ Desktop.ini
 # captcha mint sidecar (built, not committed)
 tools/captcha-mint/node_modules/
 tools/captcha-mint/captcha-mint.exe
+tools/captcha-mint/captcha-mint
+
+# updater stages, checksums and rollback executables are private runtime files
+ZcodeGateway.exe.bak
+ZcodeGateway.exe.backup
+ZcodeGateway.new.exe.sha256
+ZcodeGateway.update-next.exe
+ZcodeGateway.next

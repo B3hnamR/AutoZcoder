@@ -79,18 +79,22 @@ def _strip_image_blocks_system(system) -> None:
 
 
 def build_body(payload: dict, default_max_tokens=128000, model_caps=None,
-               default_effort='high') -> dict:
+               default_effort='high', harness=True) -> dict:
     """Native requests preserve blocks, caching, signatures and metadata exactly.
 
     `model_caps` (optional): the registry's per-model capability dict — when
     present, image blocks are stripped for non-vision models (the request
     proceeds text-only instead of a guaranteed upstream 400) and max_tokens is
-    clamped to the model's real output cap."""
+    clamped to the model's real output cap.
+    `harness` (default True): inject the full captured ZCode harness block;
+    False injects the identity line only (upstream.bootstrap_harness: false)."""
     vision = None
     if isinstance(model_caps, dict):
         vision = bool(model_caps.get('vision'))
     if payload.get('_anthropic'):
         body = copy.deepcopy(payload['_anthropic'])
+        body.pop('account', None)
+        body.pop('account_id', None)
         body['model'] = payload['model']
         # capability gate applies to the native path too: an Anthropic client
         # can send image blocks to a text-only model just like an OpenAI one
@@ -150,7 +154,11 @@ def build_body(payload: dict, default_max_tokens=128000, model_caps=None,
                 if body['tool_choice'] is None:
                     body.pop('tool_choice', None)
             elif isinstance(choice, str):
-                body['tool_choice'] = {'type': {'required': 'any'}.get(choice, choice)}
+                if choice == 'none':
+                    # Handled after conversion, including history without definitions.
+                    pass
+                else:
+                    body['tool_choice'] = {'type': {'required': 'any'}.get(choice, choice)}
             elif isinstance(choice, dict):
                 body['tool_choice'] = {'type': 'tool', 'name': choice['function']['name']}
             if payload.get('parallel_tool_calls') is False and body.get('tool_choice') is not None:
@@ -164,6 +172,14 @@ def build_body(payload: dict, default_max_tokens=128000, model_caps=None,
         if payload.get('response_format') is not None:
             raise ValueError('response_format is not supported by the captured ZCode API')
         body.update(reasoning(payload, default_effort))
+    choice = body.get('tool_choice') if payload.get('_anthropic') else payload.get('tool_choice')
+    if choice == 'none' or (isinstance(choice, dict) and choice.get('type') == 'none'):
+        if any(b.get('type') in ('tool_use', 'tool_result')
+               for m in body.get('messages', []) if isinstance(m.get('content'), list)
+               for b in m['content'] if isinstance(b, dict)):
+            raise ValueError('tool_choice none with tool history is not supported by the captured ZCode API')
+        body.pop('tools', None)
+        body.pop('tool_choice', None)
     limit = body.get('max_tokens')
     if limit is None:
         limit = payload.get('max_tokens')
@@ -185,7 +201,7 @@ def build_body(payload: dict, default_max_tokens=128000, model_caps=None,
         body.update(reasoning(body, default_effort))
     if (body.get('thinking') or {}).get('type') == 'disabled':
         raise ValueError('ZCode GLM models always use reasoning. Use reasoning_effort low, high, or max; disabling reasoning is not supported.')
-    body['system'] = bootstrap_system(body.get('system'))
+    body['system'] = bootstrap_system(body.get('system'), harness=harness)
     return body
 
 

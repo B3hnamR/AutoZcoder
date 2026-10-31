@@ -22,5 +22,5 @@ bun install
 bun build --compile --outfile captcha-mint.exe mint.ts
 ```
 
-`build-exe.ps1` does both automatically and bundles the resulting exe at
+`scripts/build/windows.ps1` does both automatically and bundles the resulting exe at
 `captcha-mint/captcha-mint.exe` inside the PyInstaller onefile.

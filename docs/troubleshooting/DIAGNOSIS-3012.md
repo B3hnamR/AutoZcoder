@@ -7,9 +7,9 @@ resolved the rejection for normal chat requests.
 
 ## Controlled comparison
 
-The fresh session at `D:/JB/zcode-mitm/sessions/20261009-062246/flows` contains
-successful official-client `hi` requests for both GLM models. The captured
-credential matches the currently signed-in account and pool entry 3.
+The retained capture session `20261009-062246` contains successful
+official-client `hi` requests for both GLM models. The comparison used the
+same credential as the signed-in account and gateway pool entry at the time.
 
 Using that credential and GLM-5.3-Flash:
 
@@ -54,8 +54,10 @@ The equivalent GLM-5.3 probe encountered model overload, so its backend behavior
 when thinking is disabled was not established. Both models expose only the
 captured low/high/max modes through this adapter.
 
-All 127 offline tests passed. Real HTTP API checks succeeded for normal Flash
-OpenAI chat, GLM-5.3 streaming with content and DONE, Anthropic messages with a
+The offline suite passed during this investigation; run
+`python -m pytest tests -q` to verify the current checkout. Real HTTP API checks
+succeeded for normal Flash OpenAI chat, GLM-5.3 streaming with content and DONE,
+Anthropic messages with a
 caller system instruction, and a caller-supplied weather function. The requested
 function was returned without any injected tool definitions or local execution.
 Temporary GLM-5.3 overloads (529/code 1305) occurred before its successful reply;
@@ -69,9 +71,9 @@ for Start Plan account access. Missing signing was not the cause of this error.
 
 ## Evidence scope
 
-- The user's historical and fresh retained captures.
+- Historical and fresh retained captures from the investigation.
 - Direct model requests and local HTTP API observations.
-- Installed `C:/Program Files/ZCode/resources/glm/zcode.cjs` static inspection.
+- Static inspection of the installed client's `resources/glm/zcode.cjs` bundle.
 - Static REA evidence:
   `ev_7852ff5dab7b60c9b215e3146bcac8ad039c55a192a73e1e72cd8836aa584fa7`,
   covering a read-only copy of that bundle, not the entire Electron application.

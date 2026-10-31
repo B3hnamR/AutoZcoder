@@ -117,6 +117,11 @@ async def count_tokens(
                     text = part.get("text", "")
                     if isinstance(text, str):
                         chars += len(text)
+        for call in msg.get("tool_calls", []) or []:
+            function = call.get("function") or {}
+            chars += len(function.get("name") or "")
+            arguments = function.get("arguments", "")
+            chars += len(arguments if isinstance(arguments, str) else json.dumps(arguments))
     for tool in payload.get("tools", []) or []:
         chars += len(json.dumps(tool))
     return {"input_tokens": max(1, chars // 4)}

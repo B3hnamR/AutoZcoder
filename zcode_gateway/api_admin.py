@@ -4,11 +4,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import json
+import math
+import time
+import uuid
 
 from pathlib import Path
 from typing import Any
 
+import httpx
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
+from fastapi.responses import JSONResponse
 
 from .deps import admin_key, get_state
 from .pool import Account, load_accounts
@@ -117,6 +123,170 @@ async def delete_account(request: Request, account_id: str,
         raise HTTPException(status_code=404, detail="account not found")
     state.tokens.drop_lock(account_id)
     return {"removed": account_id}
+
+
+@router.post("/accounts/import-account")
+@router.post("/accounts/import-jwt", include_in_schema=False)
+async def import_jwt_account(request: Request, body: dict[str, Any] = Body(...),
+                             key: str = Depends(admin_key)) -> JSONResponse:
+    """Validate an account transfer or CLI JWT before persisting it."""
+    from .accounts_dir import parse_snapshot, snapshot_filename, snapshot_path, write_snapshot
+    from .upstream import build_headers
+    from .zcode_detect import jwt_claims
+
+    state = get_state(request)
+    token = body.get("token")
+    if not isinstance(token, str):
+        raise HTTPException(400, "Account export or JWT token is required")
+    token = token.strip()
+    bundle = None
+    if token.startswith("{"):
+        if len(token) > 24576:
+            raise HTTPException(400, "Account export is too large")
+        try:
+            bundle = json.loads(token)
+        except ValueError:
+            raise HTTPException(400, "Account export is not valid JSON") from None
+        if not isinstance(bundle, dict) or bundle.get("format") != "autozcoder-account" or type(bundle.get("version")) is not int or bundle["version"] != 1:
+            raise HTTPException(400, "Unsupported AutoZCoder account export")
+        token = bundle.get("access_token")
+        if not isinstance(token, str):
+            raise HTTPException(400, "Account export contains no access token")
+        token = token.strip()
+    if token.lower().startswith("bearer "):
+        token = token[7:].strip()
+    if not token or len(token) > 16384 or any(c.isspace() for c in token):
+        raise HTTPException(400, "Enter a single JWT token (not the whole snapshot)")
+    claims = jwt_claims(token)
+    if not isinstance(claims, dict):
+        raise HTTPException(400, "JWT payload must be an object")
+    ident = claims.get("user_id") or claims.get("sub")
+    if claims.get("user_id") and claims.get("sub") and claims["user_id"] != claims["sub"]:
+        raise HTTPException(400, "JWT contains conflicting account IDs")
+    try:
+        ident = str(uuid.UUID(ident))
+        exp = claims.get("exp", 0)
+        if isinstance(exp, bool):
+            raise ValueError()
+        expiry = float(exp)
+        if not math.isfinite(expiry) or expiry < 0 or expiry > 253402300799:
+            raise ValueError()
+    except (ValueError, TypeError, AttributeError):
+        raise HTTPException(400, "JWT must contain a valid Zcode account ID and expiry") from None
+    if expiry and expiry <= time.time():
+        raise HTTPException(400, "JWT has expired; obtain a current token")
+    if bundle and bundle.get("account_id") != ident:
+        raise HTTPException(400, "Account export ID does not match its token")
+    email = body.get("email") or (bundle.get("email", "") if bundle else "")
+    if not isinstance(email, str) or len(email) > 254 or any(ord(c) < 32 or ord(c) == 127 for c in email):
+        raise HTTPException(400, "Invalid email label")
+    email = email.strip()
+    if email and (email.count("@") != 1 or any(c.isspace() for c in email)):
+        raise HTTPException(400, "Invalid email label")
+    name = bundle.get("name", "") if bundle else ""
+    device = bundle.get("device_mid", "") if bundle else ""
+    if any(not isinstance(v, str) or len(v) > 254 or any(ord(c) < 32 or ord(c) == 127 for c in v)
+           for v in (name, device)):
+        raise HTTPException(400, "Invalid account export metadata")
+    if state.cfg.accounts.source not in ("accounts_dir", "pool_file"):
+        raise HTTPException(409, "Account import requires Accounts source: Accounts folder or Pool file")
+    # Decoding a JWT is not signature validation. Require the configured Zcode
+    # billing service to authenticate this exact credential; never use the chat
+    # profile endpoint (CLI JWTs can be silently treated as guest sessions there).
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(20, connect=10),
+                                     follow_redirects=False, trust_env=False) as client:
+            response = await client.get(
+                state.cfg.upstream.base_url.rstrip("/") + "/zcode-plan/billing/balance",
+                params={"app_version": state.cfg.upstream.fingerprint.client_version},
+                headers=build_headers(token, state.cfg.upstream.fingerprint, device_mid=device or None))
+        if response.status_code in (401, 403):
+            raise HTTPException(400, "Zcode rejected this token")
+        response.raise_for_status()
+        envelope = response.json()
+        if not isinstance(envelope, dict) or envelope.get("code") != 0 or not isinstance(envelope.get("data"), dict):
+            raise HTTPException(400, "Zcode did not accept this token as a billing account")
+        from .quota import parse_balance
+        plans, quotas = parse_balance(envelope["data"], time.time())
+    except (httpx.HTTPError, ValueError, TypeError, KeyError, AttributeError):
+        # Exceptions can embed upstream content/headers. Return no raw values.
+        raise HTTPException(502, "Could not validate token with Zcode; nothing imported. Retry later.") from None
+
+    if not hasattr(state, "jwt_import_lock"):
+        state.jwt_import_lock = asyncio.Lock()
+    # Serialize filename allocation and pool-file writes, and use the existing
+    # per-account refresh lock so importing cannot race credential adoption.
+    async with state.jwt_import_lock, state.tokens._lock_for(ident):
+        existing = await state.pool.find(ident)
+        email = email or (existing.email if existing else "")
+        account = Account(id=ident, email=email, access_token=token,
+                          refresh_token=existing.refresh_token if existing else "", expires_at=int(expiry * 1000),
+                          source="jwt-import", notes={"name": name or (existing.notes.get("name", "") if existing else ""),
+                                                       "imported_jwt": True})
+        if device:
+            account.notes["device_mid"] = device
+        account.notes.update(plans=plans, quotas=quotas, quota_check_attempted_at=time.time())
+        account.balance_checked_at = time.time()
+        account.plan_checked_at = account.balance_checked_at
+        account.has_plan = account.plan_active()
+        try:
+            if state.cfg.accounts.source == "accounts_dir":
+                folder = Path(state.cfg.accounts.dir)
+                used = {p.name: parse_snapshot(p).get("account_id") for p in folder.glob("*.txt")}
+                filename = next((name for name, owner in used.items() if owner == ident),
+                                snapshot_filename(email, ident, used))
+                previous = parse_snapshot(snapshot_path(folder, filename))
+                previous.update(account_id=ident, email=email, name=account.notes["name"],
+                                access_token=token, expires_at_ms=str(account.expires_at),
+                                source="Manual JWT import", imported_jwt="true")
+                if device:
+                    previous["device_mid"] = device
+                await asyncio.to_thread(write_snapshot, snapshot_path(folder, filename), previous)
+                account.notes["file"] = filename
+            else:
+                accounts = [a for a in await state.pool.all() if a.id != ident] + [account]
+                await asyncio.to_thread(persist_pool_snapshot, state.cfg, accounts)
+        except (OSError, ValueError):
+            raise HTTPException(500, "Could not save account snapshot; nothing added to pool") from None
+        await state.pool.upsert(account)
+        current = await state.pool.find(ident)
+        current.balance_checked_at = account.balance_checked_at
+        current.plan_checked_at = account.plan_checked_at
+        current.has_plan = account.has_plan
+        current.notes.pop("quota_check_error", None)
+        state.tokens._scan_at = 0
+    return JSONResponse({"account": current.to_public(), "updated": existing is not None},
+                        headers={"Cache-Control": "no-store"})
+
+
+@router.get("/accounts/{account_id}/token")
+async def current_account_token(request: Request, account_id: str,
+                                 key: str = Depends(admin_key)) -> JSONResponse:
+    """Explicit admin-only disclosure; never include bearer tokens in list APIs."""
+    state = get_state(request)
+    account = await state.pool.find(account_id)
+    if account is None:
+        raise HTTPException(404, "account not found")
+    async with state.tokens._lock_for(account_id):
+        return JSONResponse({"access_token": account.access_token, "expires_at": account.expires_at},
+                            headers={"Cache-Control": "no-store, private", "Pragma": "no-cache"})
+
+
+@router.get("/accounts/{account_id}/export")
+async def export_account(request: Request, account_id: str,
+                         key: str = Depends(admin_key)) -> JSONResponse:
+    """A credential transfer, not a new account or a token-renewal grant."""
+    state = get_state(request)
+    account = await state.pool.find(account_id)
+    if account is None:
+        raise HTTPException(404, "account not found")
+    async with state.tokens._lock_for(account_id):
+        bundle = {"format": "autozcoder-account", "version": 1,
+                  "account_id": account.id, "email": account.email,
+                  "name": account.notes.get("name", ""),
+                  "device_mid": account.notes.get("device_mid", ""),
+                  "access_token": account.access_token, "expires_at_ms": account.expires_at}
+        return JSONResponse(bundle, headers={"Cache-Control": "no-store, private", "Pragma": "no-cache"})
 
 
 @router.post("/accounts/purge_drained")
@@ -242,6 +412,8 @@ async def check_balance(request: Request, account_id: str,
     await state.tokens.check_account(account)
     me = await state.tokens.fetch_me(account)
     return {"account_id": account_id, "balance_micro": account.balance_micro,
+            "balance_checked_at": account.balance_checked_at,
+            "quota_check_error": account.notes.get("quota_check_error", ""),
             "paid_exhausted": account.paid_exhausted, "has_plan": account.has_plan,
             "me": me, "quotas": account.notes.get("quotas", {}),
             "plans": account.notes.get("plans", [])}
@@ -429,7 +601,10 @@ async def claim_stop(request: Request, body: dict = Body(...),
                      key: str = Depends(admin_key)) -> dict:
     name = str(body.get("name") or "")
     from .api_dash import _generator
-    ok = _generator(request).stop_claim(name)
+    mgr = _generator(request)
+    if mgr is None:
+        raise HTTPException(status_code=404, detail="generator manager unavailable")
+    ok = mgr.stop_claim(name)
     if not ok:
         raise HTTPException(status_code=404, detail="no such claim")
     return {"stopped": name}
@@ -440,7 +615,10 @@ async def claim_remove(request: Request, body: dict = Body(...),
                        key: str = Depends(admin_key)) -> dict:
     name = str(body.get("name") or "")
     from .api_dash import _generator
-    ok = _generator(request).remove_claim(name)
+    mgr = _generator(request)
+    if mgr is None:
+        raise HTTPException(status_code=404, detail="generator manager unavailable")
+    ok = mgr.remove_claim(name)
     if not ok:
         raise HTTPException(status_code=404, detail="no such claim")
     return {"removed": name}
@@ -449,7 +627,10 @@ async def claim_remove(request: Request, body: dict = Body(...),
 @router.post("/claims/clear")
 async def claim_clear(request: Request, key: str = Depends(admin_key)) -> dict:
     from .api_dash import _generator
-    n = _generator(request).clear_finished_claims()
+    mgr = _generator(request)
+    if mgr is None:
+        raise HTTPException(status_code=404, detail="generator manager unavailable")
+    n = mgr.clear_finished_claims()
     return {"cleared": n}
 
 
@@ -458,30 +639,23 @@ async def claim_all_pending(request: Request, body: dict = Body(default={}),
                             key: str = Depends(admin_key)) -> dict:
     """Sequentially claim the Start Plan for every pending account.
     Runs in the background: returns immediately."""
-    mode = "direct" if str(body.get("mode") or "").lower() == "direct" else "proxy"
+    mode = "proxy" if str(body.get("mode") or "").lower() == "proxy" else "direct"
     from .api_dash import _generator
     mgr = _generator(request)
-    if getattr(mgr, "_claim_all_running", False):
-        return {"error": "claim-all already running"}
-    mgr._claim_all_running = True
-
-    def _run():
-        try:
-            mgr.claim_all_pending(mode=mode)
-        finally:
-            mgr._claim_all_running = False
-
-    import threading
-    threading.Thread(target=_run, daemon=True).start()
-    return {"started": True, "mode": mode}
+    return mgr.start_claim_all(mode=mode)
 
 
 @router.get("/claims/claim_all_status")
 async def claim_all_status(request: Request, key: str = Depends(admin_key)) -> dict:
     from .api_dash import _generator
     mgr = _generator(request)
-    return {"running": bool(getattr(mgr, "_claim_all_running", False)),
-            "claims": mgr.claims_public()}
+    return {**mgr.claim_all_status(), "claims": mgr.claims_public()}
+
+
+@router.post("/claims/claim_all_stop")
+async def claim_all_stop(request: Request, key: str = Depends(admin_key)) -> dict:
+    mgr = getattr(get_state(request), "generator", None)
+    return await asyncio.to_thread(mgr.stop_claim_all) if mgr else {"state": "idle", "running": False}
 
 
 @router.get("/dash/proxy/socks_ready")

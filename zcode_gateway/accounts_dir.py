@@ -15,9 +15,11 @@ independently of whatever Zcode is currently logged into.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
+import tempfile
 from pathlib import Path
 
 from .pool import Account
@@ -30,7 +32,10 @@ LINE = re.compile(r"^([a-z_]+):\s*(.*)$")
 def safe_name(email: str, fallback: str) -> str:
     """Filesystem-safe snapshot filename base from an email (or fallback)."""
     label = email or fallback or "account"
-    label = re.sub(r"[^A-Za-z0-9._@-]+", "_", label).strip("._")
+    label = re.sub(r"[^A-Za-z0-9._@-]+", "_", label).strip("._")[:160] or "account"
+    if re.fullmatch(r"CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9]",
+                    label.split(".")[0], re.IGNORECASE):
+        label = "account_" + label
     return f"{label}.txt"
 
 
@@ -43,16 +48,28 @@ def snapshot_filename(email: str, account_id: str,
     on a collision the account id becomes part of the name instead.
     """
     name = safe_name(email, account_id)
-    owner = used.get(name)
-    if owner is not None and owner != account_id:
+    owners = {key.casefold(): value for key, value in used.items()}
+    if name.casefold() in owners and owners[name.casefold()] != account_id:
         stem = name[:-len(".txt")]
-        suffix = (account_id or "x").replace("/", "_")[:16]
+        suffix = hashlib.sha256((account_id or "x").encode("utf-8")).hexdigest()[:16]
         name = f"{stem}.{suffix}.txt"
         n = 2
-        while name in used and used[name] != account_id:
+        while name.casefold() in owners and owners[name.casefold()] != account_id:
             name = f"{stem}.{suffix}.{n}.txt"
             n += 1
     return name
+
+
+def snapshot_path(directory: str | Path, name: str) -> Path:
+    """Validate an untrusted filename before joining it to the snapshot root."""
+    if (not name or name in (".", "..") or re.search(r'[\\/:\x00-\x1f]', name)
+            or name.rstrip(" .") != name or Path(name).name != name):
+        raise ValueError("snapshot filename must be a basename")
+    folder = Path(directory)
+    path = folder / name
+    if path.resolve().parent != folder.resolve() or path.is_symlink():
+        raise ValueError("snapshot path escapes the accounts directory")
+    return path
 
 
 def parse_snapshot(path: Path) -> dict[str, str]:
@@ -60,7 +77,7 @@ def parse_snapshot(path: Path) -> dict[str, str]:
     fields: dict[str, str] = {}
     try:
         text = path.read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, UnicodeError):
         return fields
 
     for raw in text.splitlines():
@@ -110,6 +127,7 @@ def _to_account(fields: dict[str, str], path: Path) -> Account | None:
         "workos_user_id": fields.get("workos_user_id", ""),
         "file": path.name,
         "device_mid": fields.get("device_mid", ""),
+        "imported_jwt": fields.get("imported_jwt") == "true" or fields.get("source") == "Manual JWT import",
     }
     return account
 
@@ -151,7 +169,7 @@ def write_snapshot(path: Path, fields: dict[str, str]) -> None:
     full disk mid-write cannot truncate an existing credential file.
     """
     order = [
-        "captured_at", "source", "provider_slot", "app_config_active",
+        "captured_at", "source", "imported_jwt", "provider_slot", "app_config_active",
         "", "account_id", "zcode_user_id", "workos_user_id", "session_id",
         "email", "name", "device_mid",
         "", "token_prefix", "expires_at", "expires_at_ms", "token_lifetime_s",
@@ -166,7 +184,14 @@ def write_snapshot(path: Path, fields: dict[str, str]) -> None:
             continue
         if key in fields:
             lines.append(f"{key + ':':<18}{fields[key]}")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
-    os.replace(tmp, path)
+    path = snapshot_path(path.parent, path.name)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    # mkstemp creates an exclusive 0600 inode, including during replacement.
+    fd, tmp_name = tempfile.mkstemp(prefix=".snapshot-", suffix=".tmp", dir=path.parent)
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
+            stream.write("\n".join(lines) + "\n")
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)

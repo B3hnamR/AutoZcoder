@@ -131,9 +131,24 @@ async def completions(
     key: str = Depends(client_key),
 ):
     """Legacy text-completion shim — reuses the chat path."""
+    unsupported = {
+        "n": 1, "best_of": 1, "echo": False, "logprobs": None,
+        "suffix": None, "presence_penalty": 0, "frequency_penalty": 0,
+        "logit_bias": {}, "seed": None, "response_format": None,
+        "stream_options": None,
+    }
+    for option, default in unsupported.items():
+        if option in body and body[option] != default:
+            return _error_response(400, "invalid_request_error",
+                                   f"{option} is not supported by legacy completions")
     prompt = body.get("prompt")
     if isinstance(prompt, list):
-        prompt = "\n".join(str(p) for p in prompt)
+        if len(prompt) != 1 or not isinstance(prompt[0], str):
+            return _error_response(400, "invalid_request_error",
+                                   "batched or tokenized prompts are not supported")
+        prompt = prompt[0]
+    if prompt is not None and not isinstance(prompt, str):
+        return _error_response(400, "invalid_request_error", "prompt must be a string")
 
     chat_body = {
         "model": body.get("model"),
@@ -141,6 +156,9 @@ async def completions(
         "stream": bool(body.get("stream", False)),
         "max_tokens": body.get("max_tokens"),
     }
+    for option in ("stop", "temperature", "top_p", "top_k"):
+        if option in body:
+            chat_body[option] = body[option]
     response = await chat_completions(request, chat_body, key)
 
     if isinstance(response, StreamingResponse):
@@ -149,7 +167,8 @@ async def completions(
         return StreamingResponse(
             _legacy_completion_stream(response.body_iterator,
                                       body.get("model") or ""),
-            media_type="text/event-stream", headers=SSE_HEADERS)
+            media_type="text/event-stream", headers=SSE_HEADERS,
+            background=response.background)
 
     # reshape chat.completion -> text_completion
     payload = json.loads(response.body.decode("utf-8"))
@@ -192,6 +211,8 @@ async def _legacy_completion_stream(source: Any, model: str) -> Any:
             return None
         if not isinstance(chunk, dict):
             return None
+        if "error" in chunk:
+            return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode("utf-8")
         legacy: dict[str, Any] = {
             "id": chunk.get("id") or f"cmpl-{uuid.uuid4().hex[:24]}",
             "object": "text_completion",

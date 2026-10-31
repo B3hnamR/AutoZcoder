@@ -25,7 +25,7 @@ sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
 from utils import BROWSER_ARGS
-from plan_check import APP_VERSION
+from plan_check import APP_VERSION, _request, direct_requests
 
 # NOTE: playwright is imported lazily inside claim_invite(). The referral
 # helpers below (referral_summary / send_one_message) are imported by the
@@ -398,10 +398,11 @@ def send_one_message(zcode_jwt, log=print, retries=2):
     electron headers, stream=True) which passes upstream risk control with 200."""
     import requests
     gateway_url = os.environ.get("ZAI_GATEWAY_URL") or "http://127.0.0.1:8788"
-    # Per-run token when spawned by the gateway; legacy static value only
-    # authenticates from loopback (manual CLI runs of this repo's tools).
-    internal = os.environ.get("ZAI_GATEWAY_INTERNAL_TOKEN") or "gateway-internal"
+    # Only gateway-spawned jobs have the unpredictable per-run credential.
+    internal = os.environ.get("ZAI_GATEWAY_INTERNAL_TOKEN", "")
     try:
+        if not internal:
+            raise RuntimeError("no gateway callback credential")
         gr = requests.post(
             f"{gateway_url}/admin/dash/generator/send_claim_message",
             json={"zjwt": zcode_jwt},
@@ -431,8 +432,6 @@ def send_one_message(zcode_jwt, log=print, retries=2):
         h = build_headers(zcode_jwt)
         h.pop('x-device-mid', None)
         h['anthropic-beta'] = 'mid-conversation-system-2026-04-07'
-        session_id = h.get('x-session-id', '')
-        device_mid = h.get('x-device-mid', '')
         body = {
             'model': 'GLM-5.3-Flash',
             'max_tokens': 10,
@@ -602,7 +601,7 @@ def report_login_device(zjwt: str, user_id: str = None, device_mid: str = None, 
         'marketing_params': '{}'
     }
     try:
-        requests.post(endpoint, headers=h, json=body_ck, timeout=30, verify=_VERIFY, proxies=_proxies())
+        _oauth_request('POST', endpoint, headers=h, json=body_ck, timeout=30, verify=_VERIFY)
     except Exception as e:
         log(f'  invite: app_login_ck telemetry notice: {e}')
 
@@ -628,13 +627,20 @@ def report_login_device(zjwt: str, user_id: str = None, device_mid: str = None, 
         'marketing_params': '{}'
     }
     try:
-        r = requests.post(endpoint, headers=h, json=body_success, timeout=30, verify=_VERIFY, proxies=_proxies())
+        r = _oauth_request('POST', endpoint, headers=h, json=body_success, timeout=30, verify=_VERIFY)
         ok = r.status_code == 200 and (r.json().get('code') == 0 or r.json().get('code') == 200)
         log(f'  invite: app_login_success telemetry -> {r.status_code} (login_device signaled)')
         return ok
     except Exception as e:
         log(f'  invite: app_login_success failed: {e}')
         return False
+
+
+def _oauth_request(method, url, **kw):
+    # Reuse the trust_env=False session, while honouring patched get/post shims.
+    # Existing OAuth loops own retries; do not multiply their attempts here.
+    with direct_requests(_FORCE_DIRECT):
+        return _request(method, url, tries=1, **kw)
 
 
 @_direct_proxy_while
@@ -645,8 +651,8 @@ def device_login(chat_token, log=print, force_direct: bool = False):
     Returns (zcodeJWT, ok).
 
     force_direct: the OAuth flow is authenticated by the chat token, not the IP,
-    so the 100M claim runs from the user's own connection instead of the
-    account-generation proxy."""
+    so requests skip configured proxies, including environment/registry proxies.
+    OS-level VPN/TUN routing is unaffected."""
     import requests
     import secrets
     import re as _re
@@ -665,8 +671,8 @@ def device_login(chat_token, log=print, force_direct: bool = False):
     r = None
     for _try in range(3):
         try:
-            r = requests.post(INIT, headers=h, json={'provider': 'zai'},
-                              timeout=30, verify=_VERIFY, proxies=_proxies())
+            r = _oauth_request('POST', INIT, headers=h, json={'provider': 'zai'},
+                              timeout=30, verify=_VERIFY)
         except requests.RequestException as e:
             log(f'  invite: device init error ({type(e).__name__})')
             r = None
@@ -688,7 +694,7 @@ def device_login(chat_token, log=print, force_direct: bool = False):
         log(f'  invite: device init failed {r.status_code} {r.text[:120]}')
         return None, False
 
-    r = requests.post(AUTHORIZE, headers={
+    r = _oauth_request('POST', AUTHORIZE, headers={
         'authorization': 'Bearer ' + chat_token,
         'content-type': 'application/x-www-form-urlencoded',
         'x-region': 'overseas', 'origin': 'https://chat.z.ai',
@@ -696,7 +702,7 @@ def device_login(chat_token, log=print, force_direct: bool = False):
     }, data={'client_id': CLIENT_ID,
              'redirect_uri': CALLBACK,
              'state': state, 'response_type': 'code',
-             'action': 'approve'}, timeout=30, verify=_VERIFY, proxies=_proxies())
+             'action': 'approve'}, timeout=30, verify=_VERIFY)
     try:
         rj = r.json()
     except Exception:
@@ -713,8 +719,8 @@ def device_login(chat_token, log=print, force_direct: bool = False):
     cb_ok = False
     for _try in range(3):
         try:
-            cr = requests.get(CALLBACK + f'?code={m.group(1)}&state={state}',
-                              headers=cb, timeout=30, verify=_VERIFY, proxies=_proxies())
+            cr = _oauth_request('GET', CALLBACK + f'?code={m.group(1)}&state={state}',
+                              headers=cb, timeout=30, verify=_VERIFY)
             cb_ok = cr.status_code < 500
         except requests.RequestException as e:
             log(f'  invite: device callback error ({type(e).__name__})')
@@ -726,8 +732,8 @@ def device_login(chat_token, log=print, force_direct: bool = False):
     zjwt = zai_tok = user_id = None
     for _ in range(30 if cb_ok else 5):
         try:
-            r = requests.get(POLL + flow_id, headers=h,
-                             timeout=30, verify=_VERIFY, proxies=_proxies())
+            r = _oauth_request('GET', POLL + flow_id, headers=h,
+                             timeout=30, verify=_VERIFY)
         except requests.RequestException as e:
             # one slow/failed poll must not discard a flow that is still alive
             log(f'  invite: device poll error ({type(e).__name__})')
@@ -769,13 +775,13 @@ def zai_login(zai_access_token, log=print):
     poll returns ready (captured via MITM 2026-10-15)."""
     import requests
     import uuid as _uuid
-    r = requests.post('https://api.z.ai/api/auth/z/login',
+    r = _oauth_request('POST', 'https://api.z.ai/api/auth/z/login',
                       json={'token': zai_access_token},
                       headers={'content-type': 'application/json',
                                'x-request-id': str(_uuid.uuid4()),
                                'user-agent': 'undici',
                                'accept': '*/*'},
-                      timeout=30, verify=_VERIFY, proxies=_proxies())
+                      timeout=30, verify=_VERIFY)
     try:
         j = r.json()
     except Exception:

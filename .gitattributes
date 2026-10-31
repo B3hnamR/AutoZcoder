@@ -3,6 +3,9 @@
 
 *.py   text eol=lf
 *.js   text eol=lf
+*.ts   text eol=lf
+*.css  text eol=lf
+*.json text eol=lf
 *.html text eol=lf
 *.md   text eol=lf
 *.yaml text eol=lf
@@ -16,3 +19,5 @@
 
 *.ico  binary
 *.png  binary
+
+*.sh   text eol=lf

@@ -7,11 +7,27 @@ import asyncio
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
+from .peer import peer_is_local
+
 router = APIRouter(tags=["ops"])
+
+
+def _ops_exposed(request: Request) -> bool:
+    """Ops endpoints leak pool/usage state; they answer only to local peers
+    (see peer.py: loopback connections AND loopback-bound same-box proxies
+    with a local visitor pass; an internet visitor behind Caddy does not)
+    unless the operator explicitly opts in (server.expose_ops)."""
+    state = request.app.state.app_state
+    cfg = state.cfg.server
+    if cfg.expose_ops:
+        return True
+    return peer_is_local(request)
 
 
 @router.get("/health")
 async def health(request: Request) -> dict:
+    if not _ops_exposed(request):
+        return JSONResponse(status_code=404, content={"detail": "Not Found"})
     state = request.app.state.app_state
     out = {"status": "ok"}
     try:
@@ -27,6 +43,8 @@ async def health(request: Request) -> dict:
 
 @router.get("/ready")
 async def ready(request: Request):
+    if not _ops_exposed(request):
+        return JSONResponse(status_code=404, content={"detail": "Not Found"})
     state = request.app.state.app_state
     ready_count = await state.pool.ready_count()
     if ready_count == 0:
@@ -46,6 +64,8 @@ async def metrics(request: Request, since: int | None = None) -> dict:
     long-lived DB does not turn every scrape into a full-table scan. Pass
     since=0 for all-time.
     """
+    if not _ops_exposed(request):
+        return JSONResponse(status_code=404, content={"detail": "Not Found"})
     state = request.app.state.app_state
     snapshot = await state.pool.snapshot()
     window = 86_400 if since is None else (since or None)

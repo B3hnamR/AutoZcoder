@@ -1,7 +1,9 @@
 import os
 from pathlib import Path
 
-_out = os.environ.get('ZAI_OUTPUT_DIR', 'output')
+_root = Path(__file__).resolve().parent.parent
+_out = os.environ.get('ZAI_OUTPUT_DIR') or (
+    str(_root / '.local' / 'runtime' / 'generator-data') if (_root / '.git').is_dir() else 'output')
 
 CONFIG = {
     'url': 'https://chat.z.ai/auth',
@@ -69,8 +71,13 @@ CONFIG = {
     # as a fallback distance estimator when the CV methods all fail.
     # ZAI_GATEWAY_URL / ZAI_GATEWAY_KEY are set by the gateway when it
     # spawns workers; standalone runs can export them manually.
-    'gateway_url': os.environ.get('ZAI_GATEWAY_URL', 'http://127.0.0.1:8788'),
-    'gateway_key': os.environ.get('ZAI_GATEWAY_KEY', ''),
-    'gateway_ai_model': os.environ.get('ZAI_GATEWAY_AI_MODEL', 'GLM-5.3-Flash'),
+    'custom_ai': os.environ.get('ZAI_CUSTOM_AI', '0') == '1',
+    'gateway_url': (os.environ.get('ZAI_AI_URL', '') if os.environ.get('ZAI_CUSTOM_AI') == '1'
+                    else os.environ.get('ZAI_GATEWAY_URL', 'http://127.0.0.1:8788')),
+    'gateway_key': (os.environ.get('ZAI_AI_KEY', '') if os.environ.get('ZAI_CUSTOM_AI') == '1'
+                    else os.environ.get('ZAI_GATEWAY_KEY', '')),
+    'gateway_ai_model': (os.environ.get('ZAI_AI_MODEL', 'gpt-4o-mini') if os.environ.get('ZAI_CUSTOM_AI') == '1'
+                         else os.environ.get('ZAI_GATEWAY_AI_MODEL', 'GLM-5.3-Flash')),
+    'gateway_ca_file': os.environ.get('ZAI_GATEWAY_CA_FILE', ''),
     'enable_gateway_ai': True,
 }

@@ -4,7 +4,7 @@ import json
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from gui_main import _bootstrap_config
 from zcode_gateway.accounts_dir import parse_snapshot, write_snapshot
 from zcode_gateway.config import load_config

@@ -26,7 +26,7 @@ HUB_LOCK = ZCODE_DIR / "data" / "locks" / "hub" / "production.json"
 
 ZCODE_DOWNLOAD_URL = "https://zcode.z.ai"
 
-PROCESS_NAMES = ("ZCode.exe", "ZCode.exe")
+PROCESS_NAMES = ("ZCode.exe",)
 
 
 def default_exe_candidates() -> list[Path]:

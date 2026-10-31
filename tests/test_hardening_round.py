@@ -248,30 +248,130 @@ def test_model_eligible_ignores_tiny_start_skew():
 
 
 def test_cap_model_skips_duplicate_writes():
-    """Re-parking the same model/window every poll must not rewrite disk."""
-    import json
+    """Re-parking the same model/window every poll must not rewrite disk.
+
+    The skip is cap_model's own short-circuit (same model + reason + window
+    returns before the debounced save is scheduled): the duplicate park must
+    not even mark dirty. Persistence is debounced + flushed off the lock."""
     from zcode_gateway.pool import PoolManager
     from zcode_gateway.config import PoolConfig
     from zcode_gateway.pool import Account, AccountState
     import asyncio
 
     pm = PoolManager(PoolConfig(), accounts=[])
+    pm._CAPS_SAVE_DEBOUNCE_S = 0.01      # keep the test fast
     import tempfile, pathlib
     with tempfile.TemporaryDirectory() as td:
         pm.set_caps_path(pathlib.Path(td) / "caps.json")
         a = Account(id="a", email="a@x", access_token="t", expires_at=0)
         a.state = AccountState.READY
         asyncio.run(pm.upsert(a))
-        asyncio.run(pm.cap_model(a, "GLM-5.3", 900, reason="MODEL_CAPPED",
-                                 message="x"))
+
+        async def park_and_flush():
+            await pm.cap_model(a, "GLM-5.3", 900, reason="MODEL_CAPPED",
+                               message="x")
+            await pm.aclose()
+
+        asyncio.run(park_and_flush())
         first = (pathlib.Path(td) / "caps.json").read_text()
-        # same park again: no rewrite (mtime/content identical check)
+        # same park again: the short-circuit must fire — not even dirty
         import time as _t
         _t.sleep(0.02)
-        asyncio.run(pm.cap_model(a, "GLM-5.3", 900, reason="MODEL_CAPPED",
-                                 message="x"))
+
+        async def park_again_assert_clean():
+            await pm.cap_model(a, "GLM-5.3", 900, reason="MODEL_CAPPED",
+                               message="x")
+            assert pm._caps_dirty is False, \
+                "duplicate park marked the debounced writer dirty"
+            await pm.aclose()
+
+        asyncio.run(park_again_assert_clean())
         second = (pathlib.Path(td) / "caps.json").read_text()
         assert first == second
+
+
+def test_caps_flush_rearms_when_marked_dirty_during_write():
+    """F1 regression: a park landing between the flush's snapshot and the
+    task's end must re-arm the timer, not sit dirty with no timer."""
+    import asyncio
+    import tempfile, pathlib
+    from zcode_gateway.pool import PoolManager
+    from zcode_gateway.config import PoolConfig
+    from zcode_gateway.pool import Account, AccountState
+
+    pm = PoolManager(PoolConfig(), accounts=[])
+    pm._CAPS_SAVE_DEBOUNCE_S = 0.01
+    with tempfile.TemporaryDirectory() as td:
+        pm.set_caps_path(pathlib.Path(td) / "caps.json")
+        a = Account(id="a", email="a@x", access_token="t", expires_at=0)
+        a.state = AccountState.READY
+        b = Account(id="b", email="b@x", access_token="t", expires_at=0)
+        b.state = AccountState.READY
+
+        async def scenario():
+            await pm.upsert(a)
+            await pm.upsert(b)
+            await pm.cap_model(a, "GLM-5.3", 900, reason="MODEL_CAPPED")
+            task = pm._caps_save_task
+            assert task is not None
+            # hook the snapshot: while the writer holds the flushed snapshot
+            # (task still running), a second park lands on another account
+            orig = pm._caps_snapshot
+            def snapshot_and_park():
+                out = orig()
+                if not pm._caps_dirty:   # only on the first flush
+                    asyncio.get_running_loop().create_task(
+                        pm.cap_model(b, "GLM-5.3", 900, reason="MODEL_CAPPED"))
+                return out
+            pm._caps_snapshot = snapshot_and_park
+            # wait long enough for: first flush + park-during-write + the
+            # re-armed second flush the old single-shot version never did
+            await asyncio.sleep(0.2)
+            pm._caps_snapshot = orig
+            await pm.aclose()
+
+        asyncio.run(scenario())
+        data = __import__("json").loads(
+            (pathlib.Path(td) / "caps.json").read_text())
+        assert "a" in data and "b" in data, \
+            f"the park that landed during the write was lost: {sorted(data)}"
+
+
+def test_aclose_flushes_a_park_marked_after_the_timer_fired():
+    """F1 regression (shutdown hole): dirty data with the debounce task
+    already finished must still be flushed by aclose."""
+    import asyncio
+    import tempfile, pathlib
+    from zcode_gateway.pool import PoolManager
+    from zcode_gateway.config import PoolConfig
+    from zcode_gateway.pool import Account, AccountState
+
+    pm = PoolManager(PoolConfig(), accounts=[])
+    pm._CAPS_SAVE_DEBOUNCE_S = 0.01
+    with tempfile.TemporaryDirectory() as td:
+        pm.set_caps_path(pathlib.Path(td) / "caps.json")
+        a = Account(id="a", email="a@x", access_token="t", expires_at=0)
+        a.state = AccountState.READY
+
+        async def scenario():
+            await pm.upsert(a)
+            # park, let the debounce fire and the task finish clean
+            await pm.cap_model(a, "GLM-5.3", 900, reason="MODEL_CAPPED")
+            await asyncio.sleep(0.1)
+            task = pm._caps_save_task
+            assert task is not None and task.done()
+            assert pm._caps_dirty is False
+            # a NEW park marks dirty; _schedule_caps_save sees the finished
+            # task... and must arm a fresh timer; aclose must flush it even
+            # if it did not
+            await pm.cap_model(a, "GLM-4.6", 900, reason="MODEL_CAPPED")
+            await pm.aclose()
+
+        asyncio.run(scenario())
+        data = __import__("json").loads(
+            (pathlib.Path(td) / "caps.json").read_text())
+        assert "GLM-4.6" in data.get("a", {}), \
+            f"dirty park at shutdown was not flushed: {data}"
 
 
 # --------------------------------------------------------------------------- #

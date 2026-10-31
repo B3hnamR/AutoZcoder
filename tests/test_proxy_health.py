@@ -1,6 +1,4 @@
-"""The proxy tiles and the "Proxy pool" card must agree, and must read the
-fields pool.json really has (the card used to read keys that do not exist and
-reported every proxy as unverified)."""
+"""Checker counters still classify verified storage after overview removal."""
 import json
 import time
 
@@ -78,7 +76,7 @@ def test_checker_tiles_add_up_to_the_pool(tmp_path):
     assert s["healthy"] + s["failing"] + s["unverified"] + s["used"] + s["bad"] == s["pool_json"]
 
 
-def test_pool_card_endpoint_reads_the_real_fields(tmp_path):
+def test_removed_pool_overview_endpoint_is_not_exposed(tmp_path):
     cfg = Config(server={"host": "127.0.0.1", "port": 8788, "admin_key": "adm-test",
                          "client_keys": [{"key": "cli-test", "name": "local"}]},
                  accounts={"source": "accounts_dir", "dir": str(tmp_path / "accounts")},
@@ -86,18 +84,5 @@ def test_pool_card_endpoint_reads_the_real_fields(tmp_path):
                  update={"enabled": False}, logging={"capture": False})
     _write_pool(tmp_path / "generator-data")
     with TestClient(create_app(cfg)) as c:
-        body = c.get("/admin/dash/proxies/health", headers=ADMIN).json()
-    k = body["kpis"]
-    assert body["available"] is True and k["total"] == 8
-    assert (k["working"], k["failing"], k["unverified"], k["used"], k["bad"]) == (2, 2, 2, 1, 1)
-    assert k["healthy"] == k["working"] and k["socks"] == 5 and k["http"] == 3
-    assert k["working"] + k["failing"] + k["unverified"] + k["used"] + k["bad"] == k["total"]
-
-    # working first, fastest first; then failing, never checked, used, bad
-    order = [p["status"] for p in body["proxies"]]
-    assert order == ["working", "working", "failing", "failing", "new", "new", "used", "bad"]
-    assert [p["url"] for p in body["proxies"][:2]] == ["http://2.2.2.2:80", "socks5://1.1.1.1:1080"]
-    fail = next(p for p in body["proxies"] if p["url"] == "http://3.3.3.3:80")
-    assert fail["reason"] == "timeout" and fail["fails"] == 1 and fail["checks"] == 6
-    assert fail["checked_at"] == NOW - 10                       # real last_check, not a missing key
-    assert body["countries"]["DE"] == 1 and body["countries"]["??"] == 6 and body["countries"]["US"] == 1
+        assert c.get("/admin/dash/proxies/health", headers=ADMIN).status_code == 404
+        assert "/admin/dash/proxies/health" not in c.get("/openapi.json").json()["paths"]

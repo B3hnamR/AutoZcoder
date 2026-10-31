@@ -133,20 +133,61 @@ async function streamToString(stream) {
 }
 
 function extractVerifyLink(raw) {
-  // Bodies are usually quoted-printable or base64. Undo the common mangling, then
-  // look for the verify URL.
-  let s = raw.replace(/=\r?\n/g, '').replace(/=3D/gi, '=').replace(/&amp;/gi, '&');
-  let m = s.match(/https?:\/\/[^\s"'<>]*verify_email[^\s"'<>]*/i);
-  if (m) return m[0].replace(/[)\].,;"']+$/, '');
-  // base64 body fallback: decode each candidate INDEPENDENTLY — a non-base64
-  // part (headers, mime cruft) must not abort the whole loop
-  const parts = raw.split(/\r?\n\r?\n/);
-  for (const p of parts) {
-    try {
-      const b = atob(p.replace(/\s+/g, ''));
-      const mm = b.match(/https?:\/\/[^\s"'<>]*verify_email[^\s"'<>]*/i);
-      if (mm) return mm[0];
-    } catch (e) { /* not base64 — try the next part */ }
+  // Decode individual MIME bodies, never a body plus the following boundary.
+  // Bound nesting and part count so malformed mail cannot recurse indefinitely.
+  let remaining = 100;
+  function visit(part, depth) {
+    if (depth > 12 || remaining-- <= 0) return null;
+    const split = part.indexOf('\n\n');
+    const headers = Object.create(null);
+    let body = part;
+    if (split >= 0) {
+      const head = part.slice(0, split).replace(/\n[ \t]+/g, ' ');
+      for (const line of head.split('\n')) {
+        const match = line.match(/^([\w-]+):[ \t]*(.*)$/);
+        if (match) headers[match[1].toLowerCase()] = match[2];
+      }
+      if (Object.keys(headers).length) body = part.slice(split + 2);
+    }
+    const type = headers['content-type'] || 'text/plain';
+    if (/^multipart\//i.test(type)) {
+      const match = type.match(/;\s*boundary\s*=\s*(?:"([^"\n]+)"|([^;\s]+))/i);
+      const boundary = match && (match[1] || match[2]);
+      if (!boundary || boundary.length > 200) return null;
+      let lines = null;
+      for (const line of body.split('\n')) {
+        const delimiter = line.trimEnd();
+        if (delimiter === '--' + boundary || delimiter === '--' + boundary + '--') {
+          if (lines !== null) {
+            const link = visit(lines.join('\n'), depth + 1);
+            if (link) return link;
+          }
+          if (delimiter === '--' + boundary + '--') return null;
+          if (remaining <= 0) return null;
+          lines = [];
+        } else if (lines !== null) {
+          lines.push(line);
+        }
+      }
+      return lines === null ? null : visit(lines.join('\n'), depth + 1);
+    }
+    if (!/^text\/(?:plain|html)(?:\s*;|\s*$)/i.test(type)
+        || /^attachment(?:\s*;|\s*$)/i.test(headers['content-disposition'] || '')) return null;
+    const encoding = (headers['content-transfer-encoding'] || '').trim().toLowerCase();
+    if (encoding === 'base64') {
+      try {
+        body = atob(body.replace(/[ \t\n]/g, ''));
+      } catch (e) {
+        return null; // A malformed part must not hide a later valid alternative.
+      }
+    } else if (encoding === 'quoted-printable') {
+      body = body.replace(/=\n/g, '').replace(/=([0-9a-f]{2})/gi,
+        (_, hex) => String.fromCharCode(parseInt(hex, 16)));
+    } else if (encoding && !['7bit', '8bit', 'binary'].includes(encoding)) {
+      return null;
+    }
+    const match = body.replace(/&amp;/gi, '&').match(/https?:\/\/[^\s"'<>]*verify_email[^\s"'<>]*/i);
+    return match ? match[0].replace(/[)\].,;"']+$/, '') : null;
   }
-  return null;
+  return visit(raw.replace(/\r\n/g, '\n'), 0);
 }

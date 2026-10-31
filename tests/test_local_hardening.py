@@ -15,6 +15,9 @@
 from __future__ import annotations
 
 import logging
+import json
+import shutil
+import subprocess
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -157,7 +160,7 @@ def test_dash_does_not_inject_the_admin_key_for_a_foreign_host(tmp_path):
     app = create_app(_cfg(tmp_path))
     with TestClient(app, client=("127.0.0.1", 50000)) as client:
         r = client.get("/dash", headers={"Host": "evil.example:8788"})
-    assert r.status_code == 200
+    assert r.status_code == 400
     assert "adm-test" not in r.text
 
 
@@ -274,11 +277,31 @@ def test_cli_no_longer_accepts_a_host_override():
                for action in parser._actions)
 
 
-def test_dashboard_esc_neutralises_single_quotes():
-    html = (Path(__file__).resolve().parents[1] / "zcode_gateway" / "dashboard"
-            / "index.html").read_text(encoding="utf-8")
-    lines = html.splitlines()
-    esc_line = next(l for l in lines if "const esc" in l)
-    map_line = next(l for l in lines if "&amp;" in l and "&quot;" in l)
-    assert "'" in esc_line          # the regex character class includes it
-    assert "&#39;" in map_line      # ...and it maps to a safe entity
+def test_dashboard_dom_helper_keeps_untrusted_content_as_text():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node is required to exercise the dashboard DOM helper")
+    module = (Path(__file__).resolve().parents[1]
+              / "zcode_gateway/dashboard/assets/js/core/dom.js").as_uri()
+    script = f"""import {{el}} from {json.dumps(module)};
+      import assert from 'node:assert/strict';
+      globalThis.Node = class {{
+        children = [];
+        textContent = '';
+        set innerHTML(value) {{ throw new Error('Untrusted content used innerHTML'); }}
+        append(child) {{ this.children.push(child); }}
+      }};
+      globalThis.document = {{
+        createElement: () => new Node(),
+        createTextNode: value => Object.assign(new Node(), {{textContent: value}}),
+      }};
+      const payload = `<img src=x onerror="alert('x')"> & ' \\"`;
+      const text = el('span', {{text: payload}});
+      assert.equal(text.textContent, payload);
+      assert.equal(text.children.length, 0);
+      const child = el('span', null, payload);
+      assert.equal(child.children.length, 1);
+      assert.equal(child.children[0].textContent, payload);
+    """
+    subprocess.run([node, "--input-type=module", "-e", script],
+                   capture_output=True, text=True, check=True, timeout=15)

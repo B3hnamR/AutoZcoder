@@ -79,6 +79,7 @@ def test_login_failure_reports_wranglers_real_error(tmp_path):
 
 
 def test_deploy_surfaces_the_login_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(gen_mod, "_is_headless", lambda: False)
     mgr = _mgr(tmp_path)
     monkeypatch.setattr(mgr, "_ensure_node", lambda progress=None: {"ok": True, "npx": "npx"})
     monkeypatch.setattr(mgr, "export_worker", lambda: {"ok": True, "path": str(tmp_path)})
@@ -316,5 +317,7 @@ def test_deploy_clears_the_whoami_cache(tmp_path, monkeypatch):
     mgr = _mgr(tmp_path)
     mgr._whoami_cache = (1.0, {"wrangler_authed": True})
     monkeypatch.setattr(mgr, "_deploy_worker_locked", lambda progress=None: {"ok": True})
-    assert mgr.deploy_worker() == {"ok": True}
+    result = mgr.deploy_worker()
+    assert result["ok"] is True
+    assert result["ready"] is False
     assert mgr._whoami_cache is None

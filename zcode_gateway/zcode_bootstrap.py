@@ -15,13 +15,27 @@ IMPORTANT: Assist with authorized security testing, defensive security, CTF chal
 - Reference code as `file_path:line_number` — it's clickable.'''
 
 
-def bootstrap_system(system=None):
+def bootstrap_system(system=None, harness: bool = True):
+    """Prepend the captured ZCode agent context to the caller's system block.
+
+    harness=True injects the full captured harness (identity + the policy and
+    tooling paragraphs) — this is what the upstream fingerprint expects and
+    what fixed the 405/3012 wave (see docs/troubleshooting/DIAGNOSIS-3012.md). It ALSO steers
+    the model's behavior for every request passing through the gateway.
+    harness=False injects the identity line only; use it when the operator
+    explicitly wants no behavior steering (upstream.bootstrap_harness: false).
+    """
     if isinstance(system, str):
         blocks = [{'type': 'text', 'text': system}] if system else []
     else:
         blocks = copy.deepcopy(system or [])
     if not isinstance(blocks, list) or any(not isinstance(b, dict) for b in blocks):
         raise ValueError('system must be text or a list of blocks')
+    identity = {'type': 'text', 'text': ZCODE_IDENTITY}
+    if not harness:
+        if blocks and blocks[0].get('text') == ZCODE_IDENTITY:
+            return blocks
+        return [identity, *blocks]
     if blocks and blocks[0].get('text') == ZCODE_IDENTITY:
         if len(blocks) > 1 and blocks[1].get('text') == ZCODE_HARNESS:
             return blocks

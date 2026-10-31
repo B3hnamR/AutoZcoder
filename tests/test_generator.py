@@ -103,6 +103,21 @@ def test_ansi_output_is_stripped():
     assert "[MAIL]" in _clean_output("created namespace [MAIL] ok")
 
 
+def test_proxy_progress_preserves_last_failure_histogram(tmp_path):
+    from zcode_gateway.generator import ProxyChecker
+
+    checker = ProxyChecker(tmp_path, data_dir=tmp_path)
+    checker._apply_event({"t": "reasons", "probed": 200, "total": 500,
+                          "alive": 0, "reasons": {"timeout": 190, "proxy_rejected": 10}})
+    checker._apply_event({"t": "reasons", "probed": 400, "total": 500, "alive": 0})
+    assert checker.stats["probed"] == 400
+    assert checker.stats["reasons"] == {"timeout": 190, "proxy_rejected": 10}
+    checker._apply_event({"t": "reasons", "reasons": {}})
+    assert checker.stats["reasons"] == {}
+    checker._apply_event({"t": "network_warning", "message": "TUN detected"})
+    assert checker.stats["network_warning"] == "TUN detected"
+
+
 def test_inbox_verification_flag_persists():
     import tempfile
     from zcode_gateway.generator import GeneratorManager
@@ -157,7 +172,8 @@ def test_routing_confirmation_is_manual_and_per_domain():
         assert cfg["routing_all_done"] is False
         assert cfg["routing_pending"] == ["a.com", "c.com"]
 
-def test_manual_captcha_forces_visible_browser():
+def test_manual_captcha_forces_visible_browser(monkeypatch):
+    monkeypatch.setattr("zcode_gateway.generator.sys.platform", "win32")
     import tempfile
     from zcode_gateway.generator import GeneratorManager
 

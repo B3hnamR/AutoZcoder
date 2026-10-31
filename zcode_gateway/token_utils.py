@@ -55,6 +55,9 @@ def persist_pool_snapshot(cfg: Config, accounts: list[Account]) -> None:
                 "refresh_token": a.refresh_token,
                 "expires_at": a.expires_at,
                 "source": a.source,
+                "imported_jwt": bool(a.notes.get("imported_jwt") or a.source == "jwt-import"),
+                "name": a.notes.get("name", ""),
+                "device_mid": a.notes.get("device_mid", ""),
             }
             for a in accounts
         ]

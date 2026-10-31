@@ -738,7 +738,7 @@ class DistanceCalculator:
             # accept it (registry: low/high/max). OpenAI gpt-4o-mini and
             # most third-party endpoints 400 on it. Send it only when the
             # target IS the local gateway (no custom_ai_url override set).
-            is_gateway = not self.config.get('custom_ai_url')
+            is_gateway = not self.config.get('custom_ai', False)
             body = json.dumps({
                 'model': model,
                 # GLM ALWAYS thinks (zcode_protocol forces it) — 512 total
@@ -753,7 +753,10 @@ class DistanceCalculator:
                     {'type': 'image_url', 'image_url': {'url': _b64(plate)}},
                 ]}],
             }).encode()
-            req = _ur.Request(gw_url.rstrip('/') + '/v1/chat/completions', data=body,
+            endpoint = gw_url.rstrip('/')
+            if not endpoint.endswith('/chat/completions'):
+                endpoint += '/chat/completions' if endpoint.endswith('/v1') else '/v1/chat/completions'
+            req = _ur.Request(endpoint, data=body,
                               headers={'Authorization': f'Bearer {gw_key}',
                                        'Content-Type': 'application/json'})
             # Hard wall-clock deadline around the whole call. urlopen's
@@ -763,7 +766,11 @@ class DistanceCalculator:
             # total wait so one judgement can never stall the drag loop.
             timeout = int(self.config.get('gateway_ai_timeout', 45))
             deadline = time.monotonic() + timeout
-            opener = _ur.build_opener(_ur.ProxyHandler({}))  # never route 127.0.0.1 via a system proxy
+            import ssl
+            context = ssl.create_default_context()
+            if is_gateway and self.config.get('gateway_ca_file'):
+                context.load_verify_locations(cafile=self.config['gateway_ca_file'])
+            opener = _ur.build_opener(_ur.ProxyHandler({}), _ur.HTTPSHandler(context=context))
             import threading as _threading
             box = {}
 
@@ -1646,7 +1653,6 @@ class CaptchaSolver:
 
                     si = 0
                     cur_x = end_x
-                    last_px = piece_after
                     for step in range(max_corr * 8):
                         if si >= micro_n:
                             break
@@ -1698,7 +1704,6 @@ class CaptchaSolver:
                             break
                         pieces.append(px)
                         mouses.append(cur_x)
-                        last_px = px
                 # small human-like settle + jitter before releasing
                 try:
                     slider_now = page.locator('#aliyunCaptcha-sliding-slider').bounding_box()

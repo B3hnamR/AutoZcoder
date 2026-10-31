@@ -1,0 +1,166 @@
+/* App shell: sidebar, topbar, scrolling view. Structure only. */
+
+.app {
+  display: grid;
+  grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
+  height: 100%;
+}
+
+/* ---- sidebar ---------------------------------------------------------- */
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--bg-sunken);
+  border-right: 1px solid var(--border);
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: var(--s-4);
+  padding: var(--s-6) var(--s-6) var(--s-5);
+}
+.brand__mark {
+  width: 26px; height: 26px;
+  display: grid; place-items: center;
+  border-radius: var(--r-md);
+  background: linear-gradient(145deg, var(--accent), var(--accent-hover));
+  color: var(--fg-on-accent);
+  font-weight: var(--weight-semibold);
+  font-size: var(--text-sm);
+  flex: none;
+}
+.brand__text { min-width: 0; }
+.brand__name {
+  display: block;
+  font-size: var(--text-base);
+  font-weight: var(--weight-semibold);
+  letter-spacing: -0.01em;
+  white-space: nowrap;
+}
+.brand__sub {
+  display: block;
+  color: var(--fg-faint);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+}
+
+.nav {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--s-2) var(--s-4) var(--s-6);
+}
+.nav__group + .nav__group { margin-top: var(--s-5); }
+.nav__label {
+  padding: 0 var(--s-4) var(--s-2);
+  color: var(--fg-faint);
+  font-size: 10px;
+  font-weight: var(--weight-semibold);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.sidebar__foot {
+  padding: var(--s-4) var(--s-6);
+  border-top: 1px solid var(--border);
+  color: var(--fg-faint);
+  font-size: var(--text-xs);
+  display: flex;
+  align-items: center;
+  gap: var(--s-4);
+}
+
+/* ---- main ------------------------------------------------------------- */
+.main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+.topbar {
+  height: var(--topbar-h);
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--s-4);
+  padding: 0 var(--s-7);
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+}
+.topbar__title {
+  font-size: var(--text-md);
+  font-weight: var(--weight-semibold);
+  letter-spacing: -0.01em;
+  white-space: nowrap;
+}
+.topbar__spacer { flex: 1; min-width: var(--s-4); }
+
+.view {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: var(--s-7);
+}
+.view__inner {
+  max-width: var(--view-max);
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-6);
+}
+
+/* ---- grids ------------------------------------------------------------ */
+.grid {
+  display: grid;
+  gap: var(--s-6);
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  align-items: start;
+}
+.grid--2 { grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); }
+
+/* Two balanced columns that collapse to one. Use instead of .grid when cards
+   have uneven heights and auto-fit would leave a hole in the last row. */
+.cols {
+  display: grid;
+  gap: var(--s-6);
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
+}
+@media (max-width: 1040px) { .cols { grid-template-columns: minmax(0, 1fr); } }
+.grid--metrics { grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: var(--s-5); align-items: stretch; }
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: var(--s-4);
+  flex-wrap: wrap;
+}
+.row--tight { gap: var(--s-3); }
+.row--between { justify-content: space-between; }
+.spacer { flex: 1; }
+
+.stack { display: flex; flex-direction: column; gap: var(--s-5); }
+.stack--tight { gap: var(--s-3); }
+
+/* ---- narrow ----------------------------------------------------------- */
+@media (max-width: 880px) {
+  .app { grid-template-columns: 1fr; }
+  .sidebar {
+    position: fixed;
+    inset: 0 auto 0 0;
+    width: var(--sidebar-w);
+    z-index: var(--z-overlay);
+    transform: translateX(-100%);
+    transition: transform var(--dur-2) var(--ease-out);
+    box-shadow: var(--shadow-lg);
+  }
+  .app.is-nav-open .sidebar { transform: translateX(0); }
+  .view { padding: var(--s-5); }
+}
+@media (min-width: 881px) {
+  .nav-toggle { display: none; }
+}

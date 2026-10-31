@@ -179,7 +179,7 @@ def _app(tmp_path):
 
 
 def test_deploy_endpoint_returns_the_readable_message(tmp_path, monkeypatch):
-    def boom(vercel_token, project_name=""):
+    def boom(vercel_token, project_name="", secret=""):
         raise RelayDeployError("Vercel rejected the API token (HTTP 403).", detail="raw")
 
     monkeypatch.setattr("zcode_gateway.relay_manager.deploy_vercel", boom)

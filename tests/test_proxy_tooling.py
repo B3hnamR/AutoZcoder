@@ -22,6 +22,9 @@ import proxy_pool                 # noqa: E402
 @pytest.fixture()
 def pool_dir(monkeypatch):
     with tempfile.TemporaryDirectory() as d:
+        # Routine unit tests never contact TEST-NET; calibration has its own
+        # socket-mocked tests below.
+        monkeypatch.setattr(proxy_pool, "tcp_interception_detected", lambda: False)
         proxy_pool.set_output_dir(d)
         proxy_pool.POOL_FILE = os.path.join(d, "pool.json")
         yield Path(d)
@@ -60,7 +63,12 @@ def test_parse_json_and_html():
         {"proto": "http", "host": "3.3.3.3", "port": 8080, "auth": ""}]
 
 
-def test_parse_cidr_expands():
+def test_parse_cidr_expands(monkeypatch):
+    # RFC1918 space is blocked by default now (internal-network probing via
+    # user-editable sources); the opt-in env re-enables LAN CIDR lists
+    monkeypatch.delenv("ZAI_ALLOW_PRIVATE", raising=False)
+    assert pp.parse_proxy_list("10.20.30.0/30:8080", "socks5") == []
+    monkeypatch.setenv("ZAI_ALLOW_PRIVATE", "1")
     got = pp.parse_proxy_list("10.20.30.0/30:8080", "socks5")
     assert [e["host"] for e in got] == ["10.20.30.1", "10.20.30.2"]
     assert all(e["proto"] == "socks5" for e in got)
@@ -90,11 +98,19 @@ def test_two_letter_usernames_are_credentials():
     assert facts == [{"proto": "http", "host": "1.2.3.4", "port": 8080, "auth": ""}]
 
 
-def test_endpoint_rejects_metadata_and_multicast():
+def test_endpoint_rejects_metadata_and_multicast(monkeypatch):
     assert not pp.valid_endpoint("169.254.169.254", 80)
     assert not pp.valid_endpoint("224.0.0.1", 80)
     assert not pp.valid_endpoint("255.255.255.255", 80)
-    assert pp.valid_endpoint("10.0.0.1", 80)      # LAN proxies stay allowed
+    monkeypatch.delenv("ZAI_ALLOW_PRIVATE", raising=False)
+    # private ranges (10/8, 172.16/12, 192.168/16, 100.64/10) rejected by
+    # default: sources are user-editable and must not probe internal hosts
+    assert not pp.valid_endpoint("10.0.0.1", 80)
+    assert not pp.valid_endpoint("172.16.0.1", 80)
+    assert not pp.valid_endpoint("192.168.1.1", 80)
+    assert not pp.valid_endpoint("100.64.0.1", 80)
+    monkeypatch.setenv("ZAI_ALLOW_PRIVATE", "1")
+    assert pp.valid_endpoint("10.0.0.1", 80)    # LAN opt-in for private operators
 
 
 def test_loopback_rejected_by_default(monkeypatch):
@@ -295,6 +311,102 @@ def test_probe_endpoint_open_and_closed(monkeypatch):
 
 
 # --------------------------------------------------------------------------- verify pipeline
+
+def test_tcp_interception_requires_both_negative_controls(monkeypatch):
+    calls = []
+
+    def accepted(host, port, timeout):
+        calls.append((host, port))
+        return True, ""
+
+    monkeypatch.setattr(proxy_pool, "probe_endpoint", accepted)
+    assert proxy_pool.tcp_interception_detected()
+    assert calls == [("192.0.2.1", 9), ("198.51.100.1", 9)]
+    monkeypatch.setattr(proxy_pool, "probe_endpoint", lambda *_: (False, "tcp_timeout"))
+    assert not proxy_pool.tcp_interception_detected()
+
+
+def test_protocol_probe_uses_real_tunnel_negotiation(monkeypatch):
+    import socks
+    seen = {}
+
+    class Sock:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            pass
+
+        def settimeout(self, value):
+            seen["timeout"] = value
+
+        def set_proxy(self, *args, **kwargs):
+            seen["proxy"] = args
+            seen["options"] = kwargs
+
+        def connect(self, address):
+            seen["target"] = address
+
+    monkeypatch.setattr(socks, "socksocket", Sock)
+    assert proxy_pool.probe_proxy_protocol("socks5://u:p%40ss@1.2.3.4:1080") == (True, "")
+    assert seen["proxy"] == (socks.SOCKS5, "1.2.3.4", 1080)
+    assert seen["options"] == {"rdns": True, "username": "u", "password": "p@ss"}
+    assert seen["target"][1] == 443
+
+    def timeout(_self, _address):
+        raise socket.timeout()
+
+    monkeypatch.setattr(Sock, "connect", timeout)
+    assert proxy_pool.probe_proxy_protocol("http://1.2.3.4:8080") == (False, "timeout")
+
+
+def test_tun_protocol_prefilter_does_not_promote_bare_tcp_accept(pool_dir, monkeypatch):
+    monkeypatch.setattr(proxy_pool, "tcp_interception_detected", lambda: True)
+    # One endpoint can be a SOCKS proxy but not an HTTP proxy.
+    good = "socks5://1.1.1.1:1080"
+    bad = "http://1.1.1.1:1080"
+    monkeypatch.setattr(proxy_pool, "probe_proxy_protocol",
+                        lambda u, _: (True, "") if u == good else (False, "timeout"))
+    calls = []
+    monkeypatch.setattr(proxy_pool, "probe_detailed",
+                        lambda u, _: (calls.append(u) or 0.5, "ok"))
+    events = []
+    monkeypatch.setattr(proxy_pool, "emit", lambda **event: events.append(event))
+    opts = proxy_pool.resolve_scan_options(prefilter=True, retry_failed=False, concurrency=400)
+    alive, reasons, _ = proxy_pool._verify_list([bad, good], opts, "checking", quiet=True)
+    assert calls == [good]
+    assert alive == [(0.5, good)]
+    assert reasons["timeout"] == 1
+    warning = next(e for e in events if e["t"] == "network_warning")
+    assert warning["concurrency"] == 64
+    assert next(e for e in events if e["t"] == "start")["concurrency"] == 64
+
+
+@pytest.mark.parametrize("reply,expected", [(b"HTTP/1.1 200 Connection established\r\n\r\n", True),
+                                            (b"HTTP/1.1 403 Forbidden\r\n\r\n", False),
+                                            (b"", False)])
+def test_protocol_filter_against_local_connect_responder(reply, expected):
+    ready = threading.Event()
+    with socket.socket() as server:
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        server.settimeout(3)
+        port = server.getsockname()[1]
+
+        def respond():
+            with server.accept()[0] as conn:
+                conn.settimeout(2)
+                request = conn.recv(4096)
+                if b"CONNECT " in request and reply:
+                    conn.sendall(reply)
+                ready.set()
+
+        worker = threading.Thread(target=respond)
+        worker.start()
+        ok, _ = proxy_pool.probe_proxy_protocol(f"http://127.0.0.1:{port}", timeout=1)
+        worker.join(timeout=4)
+        assert ready.is_set()
+        assert ok is expected
 
 def test_verify_second_chance_and_reasons(pool_dir, monkeypatch):
     calls = {}

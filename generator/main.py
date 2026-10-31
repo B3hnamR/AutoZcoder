@@ -3,6 +3,7 @@ import shutil
 import urllib.parse
 # silence PIL/pngjs chunk-stream debug spam
 logging.getLogger('PIL').setLevel(logging.WARNING)
+logging.getLogger('urllib3.connectionpool').setLevel(logging.WARNING)
 os.environ.setdefault('PYTHONWARNINGS', 'ignore')
 
 import time
@@ -14,6 +15,7 @@ import logging
 import sys
 import re
 import html
+import traceback
 from pathlib import Path
 from playwright.sync_api import sync_playwright
 
@@ -23,12 +25,60 @@ from captcha_solver import CaptchaSolver
 from config import CONFIG
 
 # Where results land. ZAI_OUTPUT_DIR lets the gateway redirect worker output
-# into its own portable folder; default stays ZCODEAUTO's output/.
-OUTPUT_DIR = os.environ.get('ZAI_OUTPUT_DIR', 'output')
+# into its portable folder; source-checkout defaults come from CONFIG.
+OUTPUT_DIR = os.environ.get('ZAI_OUTPUT_DIR') or CONFIG.get('output_dir', 'output')
 os.makedirs(OUTPUT_DIR, exist_ok=True)   # log handler writes inside OUTPUT_DIR
 
 root_logger = logging.getLogger()
 root_logger.setLevel(logging.DEBUG)
+
+class _SecretFilter(logging.Filter):
+    """Sanitize the rendered record, including third-party args and tracebacks."""
+
+    def __init__(self):
+        super().__init__()
+        self.secrets = set()
+
+    def remember(self, value):
+        if isinstance(value, str) and value:
+            self.secrets.add(value)
+
+    def sanitize(self, text):
+        secrets = self.secrets | {
+            value for key, value in os.environ.items() if value
+            and re.search(r'(PASSWORD|PASSWD|SECRET|TOKEN|API_KEY|APP_PW)', key, re.I)
+        }
+        for secret in sorted(secrets, key=len, reverse=True):
+            for value in {secret, urllib.parse.quote(secret, safe=''),
+                          urllib.parse.quote_plus(secret)}:
+                text = text.replace(value, '[REDACTED]')
+        # Relative request URLs are logged by HTTP clients as well as full URLs.
+        text = re.sub(r'([?&](?:amp;)?[^\s?&#=\'"<>]+)=([^\s&#\'"<>]*)',
+                      r'\1=[REDACTED]', text)
+        text = re.sub(r'(?i)(\bbearer\s+)[^\s\'",;<>]+', r'\1[REDACTED]', text)
+        text = re.sub(r'\beyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]*)?',
+                      '[REDACTED]', text)
+        text = re.sub(
+            r'(?i)([\'\"]?(?:password|passwd|token|access_token|refresh_token|'
+            r'securityToken|captcha_verify_param|api_key|secret)[\'\"]?\s*[:=]\s*)'
+            r'(?:"[^"\r\n]*"|\'[^\'\r\n]*\'|[^\s,;}]+)',
+            r'\1[REDACTED]', text)
+        return re.sub(r'(://)[^\s/@]+@', r'\1[REDACTED]@', text)
+
+    def filter(self, record):
+        record.msg = self.sanitize(record.getMessage())
+        record.args = ()
+        if record.exc_info:
+            record.exc_text = self.sanitize(''.join(traceback.format_exception(*record.exc_info)))
+            record.exc_info = None
+        elif record.exc_text:
+            record.exc_text = self.sanitize(record.exc_text)
+        if record.stack_info:
+            record.stack_info = self.sanitize(record.stack_info)
+        return True
+
+
+_secret_filter = _SecretFilter()
 
 # stdout under the packaged exe is a cp1252 pipe: z.ai's Chinese error
 # messages (SIGNUP_RATE_LIMITED etc.) crashed the handler with
@@ -72,6 +122,8 @@ main_log_handler.setLevel(logging.DEBUG)
 main_log_handler.setFormatter(logging.Formatter('[%(asctime)s] %(message)s', datefmt='%H:%M:%S'))
 
 root_logger.handlers = [console_handler, main_log_handler]
+for _handler in root_logger.handlers:
+    _handler.addFilter(_secret_filter)
 
 logger = logging.getLogger(__name__)
 
@@ -176,6 +228,16 @@ ACC_FILE = os.path.join(RESULTS_DIR, f'accounts{OUT_SUFFIX}.txt')
 PLANS_FILE = os.path.join(RESULTS_DIR, f'plans{OUT_SUFFIX}.jsonl')
 STARTER_FILE = os.path.join(RESULTS_DIR, f'starter{OUT_SUFFIX}.txt')
 
+def _save_recovery_account(email, password, state):
+    """Credentials belong only in the private recovery file, never the logs."""
+    path = Path(OUTPUT_DIR) / 'recovery_accounts.txt'
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, 'O_NOFOLLOW', 0)
+    fd = os.open(path, flags, 0o600)
+    with os.fdopen(fd, 'a', encoding='utf-8') as stream:
+        if os.name != 'nt':
+            os.fchmod(stream.fileno(), 0o600)
+        stream.write(f'{email}:{password}:{state}\n')
+
 # Dedicated chromium profile per process: lets us identify (and kill) browsers left
 # behind by a killed run without ever touching the user's own Chrome.
 PROFILE_DIR = os.path.join(PROFILES_DIR, '.pw-profile' + OUT_SUFFIX)
@@ -186,6 +248,88 @@ def env_on(name):
     """Routing flags: '1' = on; '0'/''/absent = off (the panel sends explicit
     '0' to defeat parent-shell inheritance)."""
     return os.environ.get(name, '').strip() == '1'
+
+
+def _auto_result(category='failed', email=None):
+    """Diagnostics only; the manager verifies billing and registration itself."""
+    messages = {
+        'mail_error': 'Mail setup or verification failed.',
+        'mail_timeout': 'Account created, but no verification email arrived.',
+        'captcha_failed': 'Captcha verification did not complete.',
+        'browser_failed': 'Browser setup or signup page interaction failed.',
+        'finish_signup_failed': 'Signup finalization failed without an account token; see private recovery output.',
+        'pool_empty': 'No verified proxy is available.',
+        'rate_limited': 'Signup was rate limited.',
+        'no_plan': 'Account created without a confirmed Start Plan.',
+        'generated': 'Account created with a confirmed Start Plan.',
+        'failed': 'Worker did not complete account generation.',
+    }
+    if category not in messages:
+        category = 'failed'
+    result = {'category': category, 'message': messages[category]}
+    if email:
+        result['email'] = email
+    return result
+
+
+def _publish_auto_result(result):
+    # Rebuild from the allowlist: never serialize tokens, passwords or exceptions.
+    safe = _auto_result(result.get('category'), result.get('email'))
+    print('AUTO_GENERATE_RESULT ' + json.dumps(safe, ensure_ascii=True), flush=True)
+
+
+def _save_auto_route_metadata():
+    """Write credentials only to the parent's expected private handoff file."""
+    target = os.environ.get('ZAI_AUTO_ROUTE_FILE')
+    if not target:
+        return
+    from pathlib import Path
+    import tempfile
+    from urllib.parse import urlsplit
+
+    path = Path(target)
+    if (not path.is_absolute() or path.parent.name != 'auto-private'
+            or not path.parent.is_dir() or path.parent.is_symlink() or path.is_symlink()):
+        raise ValueError('Invalid private route metadata path')
+    policy = os.environ.get('ZAI_ROUTE_POLICY', '').strip().lower()
+    proxy = CURRENT_PROXY or ''
+    valid = policy == 'direct' and not proxy
+    if policy == 'proxy' and isinstance(proxy, str):
+        try:
+            parsed = urlsplit(proxy)
+            valid = (parsed.scheme in ('http', 'https', 'socks4', 'socks4a', 'socks5', 'socks5h')
+                     and parsed.hostname and parsed.port
+                     and not any(c.isspace() for c in proxy)
+                     and parsed.path in ('', '/') and not parsed.query and not parsed.fragment)
+        except ValueError:
+            valid = False
+    if not valid:
+        raise ValueError('Invalid private worker route')
+    fd, temporary = tempfile.mkstemp(prefix=path.name + '.', suffix='.tmp', dir=path.parent)
+    try:
+        # mkstemp creates mode 0600 on POSIX; Windows inherits the private
+        # directory ACL configured by the parent.
+        with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+            json.dump({'proxy': proxy}, stream, ensure_ascii=True)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _account_profile(email):
+    name = re.sub(r'[^a-zA-Z0-9]', '_', email.split('@')[0])[:24]
+    if env_on('ZAI_AUTO_GENERATE'):
+        import hashlib
+        worker = os.environ.get('ZAI_WORKER_ID') or str(os.getpid())
+        # Keep a readable worker prefix without allowing path characters or
+        # sanitized/truncated worker IDs to collide.
+        prefix = re.sub(r'[^a-zA-Z0-9_-]', '_', worker)[:40]
+        digest = hashlib.sha256(worker.encode('utf-8')).hexdigest()[:16]
+        name = f'{prefix}-{digest}-{name}'
+    return os.path.join(PROFILES_DIR, '.pw-profile-' + name)
 
 
 def _env_proxy():
@@ -219,7 +363,9 @@ def notify_gateway(category: str, message: str, level: str = 'info') -> None:
     try:
         import requests
         base = os.environ.get('ZAI_GATEWAY_URL') or 'http://127.0.0.1:8788'
-        internal = os.environ.get('ZAI_GATEWAY_INTERNAL_TOKEN') or 'gateway-internal'
+        internal = os.environ.get('ZAI_GATEWAY_INTERNAL_TOKEN', '')
+        if not internal:
+            return
         requests.post(f'{base}/admin/dash/notifications/emit',
                       json={'category': category, 'message': message,
                             'level': level},
@@ -546,7 +692,30 @@ def _rm_profile(profile_dir):
             pass
 
 
+def _enter_signup_form(page, timeout=20000):
+    """Confirm the SPA switched modes; click completion is not a transition."""
+    name = page.locator('input[name="name"]:visible, input[autocomplete="name"]:visible, '
+                        'input[placeholder="Enter Your Full Name"]:visible').first
+    if name.count() and name.is_visible():
+        return name
+    for attempt in range(2):
+        # Deployments render this toggle as either a button or a link. Exact
+        # role/name matching avoids accidentally submitting the Sign in form.
+        toggle = page.locator('button:visible, a:visible').filter(
+            has_text=re.compile(r'^\s*sign\s*up\s*$', re.I)).first
+        toggle.wait_for(state='visible', timeout=timeout)
+        toggle.click(timeout=timeout)
+        try:
+            name.wait_for(state='visible', timeout=timeout)
+            return name
+        except Exception:
+            if attempt:
+                raise RuntimeError('Signup form did not appear after Sign up; still on login or page transition failed') from None
+            logger.warning('Sign up click did not reveal the signup form; retrying the transition once')
+
+
 def signup(email, password, mail=None):
+    _secret_filter.remember(password)
     logger.info(f"Starting: {email}")
     timing.start('total_signup')
 
@@ -570,7 +739,7 @@ def signup(email, password, mail=None):
                         f"{ident['hardware_concurrency']}c/{ident['device_memory']}G · "
                         f"cc={ident['country']} · tz={ident['timezone_id']} · locale={ident['locale']}")
 
-            account_profile = os.path.join(PROFILES_DIR, '.pw-profile-' + re.sub(r'[^a-zA-Z0-9]', '_', email.split('@')[0])[:24])
+            account_profile = _account_profile(email)
             try:
                 shutil.rmtree(account_profile, ignore_errors=True)
             except Exception:
@@ -684,14 +853,14 @@ def signup(email, password, mail=None):
 
                 _fill_when_ready(SELECTORS['email_input'], email)
                 _fill_when_ready(SELECTORS['password_input'], password)
-                _click_when_ready(SELECTORS['signup_button'])
+                name_field = _enter_signup_form(page)
 
                 name = generate_human_name()
                 logger.info(f"Using name: {name}")
-                try:
-                    _fill_when_ready(SELECTORS['name_input'], name, timeout=20000)
-                except Exception:
-                    page.locator('input[type="text"]').first.fill(name)
+                name_field.fill(name)
+                # Changing SPA mode can remount/reset the credential controls.
+                _fill_when_ready(SELECTORS['email_input'], email)
+                _fill_when_ready(SELECTORS['password_input'], password)
 
                 # "Create Account" must be present before we click — it appears late on
                 # a slow IP, and clicking early is what broke the captcha trigger.
@@ -783,7 +952,7 @@ def signup(email, password, mail=None):
                         take_screenshot(page, "captcha_failed")
                         browser.close()
                         _rm_profile(account_profile)
-                        return None
+                        return 'CAPTCHA_FAILED' if env_on('ZAI_AUTO_GENERATE') else None
 
                 if isinstance(result, str) and len(result) > 20:
                     logger.info(f"Captcha solved, got verification token")
@@ -861,7 +1030,7 @@ def signup(email, password, mail=None):
                     logger.info("Waiting for the verification email...")
                     link = mail.get_verification_link(timeout=90)
                     if link:
-                        logger.info(f"verify link: {link[:100]}...")
+                        logger.info("Verification link received")
                         # capture the FULL token value (any chars until & or
                         # end) — the old hex-only regex silently TRUNCATED
                         # tokens containing other characters, and the
@@ -871,6 +1040,7 @@ def signup(email, password, mail=None):
                         m = re.search(r'[?&]token=([^&\s"\'<>]+)', link)
                         if m:
                             verify_token = m.group(1)
+                            _secret_filter.remember(verify_token)
                             if not re.fullmatch(r'verify-[0-9a-fA-F]+', verify_token):
                                 logger.warning(
                                     f"verify token has an unexpected shape "
@@ -892,14 +1062,12 @@ def signup(email, password, mail=None):
                     # its password exists nowhere. Persist credentials for
                     # manual recovery and make this a HARD failure.
                     try:
-                        rec = Path(CONFIG.get('output_dir') or 'output') / 'recovery_accounts.txt'
-                        rec.parent.mkdir(parents=True, exist_ok=True)
-                        with open(rec, 'a', encoding='utf-8') as fh:
-                            fh.write(f"{email}:{password}:unverified"
-                                     f"{'|bad_link' if verify_link_bad else '|no_link'}\n")
+                        _save_recovery_account(email, password,
+                                               'unverified|bad_link' if verify_link_bad
+                                               else 'unverified|no_link')
                         logger.error(
                             f"account created but unverified — credentials "
-                            f"appended to {rec.name} for manual recovery; "
+                            f"appended to recovery_accounts.txt for manual recovery; "
                             f"NOT retrying (a retry cannot verify this account)")
                     except OSError:
                         logger.error("account created but unverified, and writing "
@@ -910,13 +1078,17 @@ def signup(email, password, mail=None):
                                    level='warning')
                     browser.close()
                     _rm_profile(account_profile)
-                    return 'SIGNUP_UNVERIFIED'
+                    return ('MAIL_TIMEOUT' if mail and not verify_link_bad
+                            and env_on('ZAI_AUTO_GENERATE') else 'SIGNUP_UNVERIFIED')
 
                 finish_token = None
+                finish_status = None
+                verify_status = None
                 finish_rate_limited = None   # (retry_after_s, scope) when IP-blocked
                 if verify_token:
                     r = _page_post('/api/v1/auths/verify_email',
                                    {'username': username, 'email': email, 'token': verify_token})
+                    verify_status = r['status']
                     logger.info(f"verify_email: status={r['status']} body={str(r['body'])[:200]}")
                     # finish_signup returns the session token in its body:
                     #   {"success":true,"user":{"token":"eyJ...","email":"..."}}
@@ -925,7 +1097,8 @@ def signup(email, password, mail=None):
                                    {'username': username, 'email': email, 'token': verify_token,
                                     'password': password,
                                     'profile_image_url': AVATAR_DATA_URI,
-                                    'sso_redirect': None})
+                                     'sso_redirect': None})
+                    finish_status = r['status']
                     logger.info(f"finish_signup: status={r['status']} body={str(r['body'])[:200]}")
                     try:
                         fj = json.loads(r['body'])
@@ -953,17 +1126,25 @@ def signup(email, password, mail=None):
                 # fallback token's email MUST match the account we just created — a
                 # persistent profile can hold a previous identity's session.
                 token = finish_token
+                if token and (is_guest_token(token) or token_email(token) != email):
+                    token = None
                 if not token:
-                    for c in context.cookies('https://chat.z.ai'):
-                        if c.get('name') == 'token':
-                            v = c.get('value', '')
-                            if v and not is_guest_token(v) and token_email(v) == email:
-                                token = v
+                    try:
+                        for c in context.cookies('https://chat.z.ai'):
+                            if c.get('name') == 'token':
+                                v = c.get('value', '')
+                                if v and not is_guest_token(v) and token_email(v) == email:
+                                    token = v
+                    except Exception:
+                        logger.debug('Could not read fallback session cookies')
                 if not token:
-                    lt = page.evaluate(
-                        "() => localStorage.getItem('token') || sessionStorage.getItem('token')")
-                    if lt and not is_guest_token(lt) and token_email(lt) == email:
-                        token = lt
+                    try:
+                        lt = page.evaluate(
+                            "() => localStorage.getItem('token') || sessionStorage.getItem('token')")
+                        if lt and not is_guest_token(lt) and token_email(lt) == email:
+                            token = lt
+                    except Exception:
+                        logger.debug('Could not read fallback browser session storage')
 
                 if token:
                     logger.info(f"Account token email={token_email(token)}")
@@ -973,7 +1154,10 @@ def signup(email, password, mail=None):
 
                 logger.warning("No non-guest token obtained — account not confirmed")
                 logger.info(f"    auth calls seen: {captured['calls']}")
-                browser.close()
+                try:
+                    browser.close()
+                except Exception:
+                    pass
                 _rm_profile(account_profile)
                 if finish_rate_limited:
                     # The account EXISTS and its email is VERIFIED — only the final
@@ -982,11 +1166,9 @@ def signup(email, password, mail=None):
                     # window (or from a different IP) completes the account.
                     retry_after_s, scope = finish_rate_limited
                     try:
-                        rec = Path(CONFIG.get('output_dir') or 'output') / 'recovery_accounts.txt'
-                        rec.parent.mkdir(parents=True, exist_ok=True)
-                        with open(rec, 'a', encoding='utf-8') as fh:
-                            fh.write(f"{email}:{password}:finish_blocked"
-                                     f"|retry_after={retry_after_s}|scope={scope or 'unknown'}\n")
+                        _save_recovery_account(
+                            email, password, f'finish_blocked|retry_after={retry_after_s}'
+                            f'|scope={scope or "unknown"}')
                     except OSError:
                         logger.error("writing the recovery file failed", exc_info=True)
                     logger.error(
@@ -999,6 +1181,19 @@ def signup(email, password, mail=None):
                                    f"to recovery, route switched or stopped",
                                    level='warning')
                     return 'SIGNUP_IP_LIMITED'
+                if finish_status is not None:
+                    try:
+                        verification = ('verified' if verify_status == 200
+                                        else 'verification_unconfirmed')
+                        _save_recovery_account(email, password,
+                                               f'finish_failed|{verification}'
+                                               f'|http_status={finish_status}')
+                    except OSError:
+                        logger.error('Writing the recovery file failed', exc_info=True)
+                    logger.error('finish_signup failed (HTTP %s), no account token; '
+                                 'credentials saved to recovery_accounts.txt if writable; '
+                                 'NOT retrying', finish_status)
+                    return 'SIGNUP_FINISH_FAILED'
                 return None
 
             except Exception as e:
@@ -1009,11 +1204,11 @@ def signup(email, password, mail=None):
                 except:
                     pass
                 _rm_profile(account_profile)
-                return None
+                return 'BROWSER_FAILED' if env_on('ZAI_AUTO_GENERATE') else None
 
     except Exception as e:
         logger.error(f"Browser launch error: {e}")
-        return None
+        return 'BROWSER_FAILED' if env_on('ZAI_AUTO_GENERATE') else None
 
 
 class CatchAllMail:
@@ -1049,6 +1244,8 @@ class CatchAllMail:
                 pass
         self.email = None
         self.password = None
+        for value in (self.app_pw, self.inbox_secret):
+            _secret_filter.remember(value)
 
     def _pick_domain(self) -> str:
         """Rotation across the user's configured domains (ZAI_MAIL_DOMAIN wins)."""
@@ -1170,13 +1367,25 @@ class CatchAllMail:
         return None
 
 
-def main():
+def _main(auto_result=None):
     global IS_HEADLESS
+    auto = auto_result is not None
+    route_policy = os.environ.get('ZAI_ROUTE_POLICY', '').strip().lower() if auto else ''
     print("\n" + "="*50)
     print(f"Z.ai Auto Signup ({CONFIG.get('mail_domain') or 'no mail domain set'} catch-all)")
     print("="*50)
 
-    kill_stale_browsers()   # clear windows orphaned by a previously killed run
+    if not auto:
+        kill_stale_browsers()   # legacy cleanup must never touch auto siblings
+
+    if auto:
+        if route_policy not in ('direct', 'proxy'):
+            logger.error('AUTO MODE: invalid route policy')
+            return auto_result
+        if route_policy == 'direct':
+            set_proxy(None)
+        elif CURRENT_PROXY:
+            set_proxy(CURRENT_PROXY)
 
     # Headless flag resolved once, in main()'s scope: signup() uses it for the
     # browser and the invite-claim stage reuses it (was a NameError before —
@@ -1189,7 +1398,8 @@ def main():
         IS_HEADLESS = CONFIG.get('headless', False)
 
     # ZAI_USE_POOL=1 -> auto-pick a verified proxy from output/proxies.txt at startup.
-    if env_on('ZAI_USE_POOL') and not CURRENT_PROXY:
+    use_pool = route_policy == 'proxy' if auto else env_on('ZAI_USE_POOL')
+    if use_pool and not CURRENT_PROXY:
         picked = pick_verified_proxy()
         if picked:
             set_proxy(picked)
@@ -1199,29 +1409,45 @@ def main():
             # falls back to direct burns the home IP AND hides the reason.
             logger.error("POOL MODE: no live pool proxy found — aborting "
                          "(run proxy_pool.py verify, or switch IP source)")
-            return
+            if auto:
+                auto_result.update(_auto_result('pool_empty'))
+            return auto_result
+
+    if auto and route_policy == 'proxy' and not pw_proxy():
+        logger.error('AUTO MODE: selected proxy is not a valid browser route')
+        auto_result.update(_auto_result('pool_empty'))
+        return auto_result
 
     mail = CatchAllMail(logger_instance=logger)
     if not mail.create_account():
         print("Failed to create mail account")
-        return
+        if auto:
+            auto_result.update(_auto_result('mail_error'))
+        return auto_result
 
     email = mail.email
     password = mail.password
+    _secret_filter.remember(password)
+    if auto:
+        auto_result.update(_auto_result(email=email))
 
     if not mail.get_token():
         print("Failed to init mail reader")
-        return
+        if auto:
+            auto_result.update(_auto_result('mail_error', email))
+        return auto_result
 
     count = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() \
         else CONFIG.get('count', 1)
+    if auto:
+        count = 1
 
     logger.info(f"Email: {email}")
     # full password no longer logged — output.txt is a shared log and ends up
     # in captures/HARs; the password is already in ACC_FILE for the operator
-    logger.info(f"Password: {'*' * len(password)}")
+    logger.info('Password: [REDACTED]')
     logger.info(f"Count: {count}")
-    logger.info(f"Headless: {CONFIG.get('headless', False)}")
+    logger.info(f"Headless: {IS_HEADLESS}")
     logger.info("="*50)
 
     success = 0
@@ -1230,6 +1456,7 @@ def main():
     skipped = 0
     unverified = 0
     ip_limited = 0
+    finish_failed = 0
 
     # Retry count + routing mode resolved ONCE, before the loop — the panel
     # sends ZAI_PROXY_RETRIES and it must govern the retry loop below.
@@ -1245,7 +1472,7 @@ def main():
 
         # Fresh exit IP per account — the Starter gate is IP-based, so each signup
         # must come from a different proxy. Never in pinned mode.
-        if env_on('ZAI_USE_POOL') and (i > 0 or not CURRENT_PROXY):
+        if use_pool and (i > 0 or not CURRENT_PROXY):
             newp = pick_verified_proxy()
             if newp:
                 set_proxy(newp)
@@ -1268,14 +1495,14 @@ def main():
         # with a fresh email. Pool mode ROTATES to a new proxy each retry; pinned
         # and direct modes retry on the SAME route (retries must stay enabled —
         # disabling them on pin was a bug: the route is chosen, not the effort).
-        max_proxy_retries = CONFIG.get('proxy_retries', 3)
+        max_proxy_retries = 0 if auto else CONFIG.get('proxy_retries', 3)
         rotate = bool(CURRENT_PROXY) and not pinned_mode   # pool: new IP per retry
         result = None
         for pr in range(max_proxy_retries + 1):
             result = signup(email, password, mail)
             # SIGNUP_UNVERIFIED is a HARD failure (account exists, cannot be
             # completed) — never retry it with a fresh email/proxy
-            if result == 'SIGNUP_UNVERIFIED' or pr >= max_proxy_retries:
+            if result in ('SIGNUP_UNVERIFIED', 'SIGNUP_FINISH_FAILED', 'MAIL_TIMEOUT') or pr >= max_proxy_retries:
                 break
             # SIGNUP_IP_LIMITED: the account exists (saved to recovery) but the
             # ROUTE is poisoned for the lockout window. Retrying the same route
@@ -1313,6 +1540,8 @@ def main():
                         f"{route} email={email}")
 
         if result == 'CAPTCHA_NOT_LOADED':
+            if auto:
+                auto_result.update(_auto_result('captcha_failed', email))
             skipped += 1
             logger.warning(f"Account {i+1} SKIPPED — captcha widget never loaded "
                             f"(IP-blocked). Change IP and retry.")
@@ -1320,7 +1549,29 @@ def main():
                 time.sleep(2)
             continue
 
+        if result in ('CAPTCHA_FAILED', 'BROWSER_FAILED'):
+            if auto:
+                auto_result.update(_auto_result(
+                    'captcha_failed' if result == 'CAPTCHA_FAILED' else 'browser_failed', email))
+            continue
+
+        if result == 'SIGNUP_FINISH_FAILED':
+            if auto:
+                auto_result.update(_auto_result('finish_signup_failed', email))
+            finish_failed += 1
+            logger.error('Account %s signup finalization failed; see private '
+                         'recovery_accounts.txt (no signup retry)', i + 1)
+            continue
+
+        if result == 'MAIL_TIMEOUT':
+            if auto:
+                auto_result.update(_auto_result('mail_timeout', email))
+            unverified += 1
+            continue
+
         if result == 'SIGNUP_UNVERIFIED':
+            if auto:
+                auto_result.update(_auto_result('mail_error', email))
             # hard failure: the account exists but could not be verified —
             # credentials were already appended to recovery_accounts.txt
             # inside signup(); do NOT burn another email+proxy on it
@@ -1330,6 +1581,8 @@ def main():
             continue
 
         if result == 'SIGNUP_IP_LIMITED':
+            if auto:
+                auto_result.update(_auto_result('rate_limited', email))
             # account exists + verified, finish_signup was IP-rate-limited;
             # credentials were appended to recovery_accounts.txt by signup().
             ip_limited += 1
@@ -1340,6 +1593,8 @@ def main():
 
         if result:
             if isinstance(result, dict) and result.get('needs_verification'):
+                if auto:
+                    auto_result.update(_auto_result('mail_error', email))
                 verification_needed += 1
                 with open(ACC_FILE, 'a') as f:
                     f.write(f"{email}:{password}:VERIFICATION_NEEDED\n")
@@ -1347,7 +1602,6 @@ def main():
             else:
                 success += 1
                 token = result if isinstance(result, str) else "SUCCESS"
-                token_display = token[:50] + "..." if len(token) > 50 else token
 
                 # Plan check: a created account is only worth keeping if it actually
                 # got the Starter plan (granted to only some signups).
@@ -1358,6 +1612,8 @@ def main():
                         try:
                             plan = check_account_plan(token, log=logger.info)
                         except Exception as e:
+                            if auto:
+                                raise   # strict auto routes never retry directly
                             # The plan is tied to the ACCOUNT, not the IP, so if the
                             # proxy died mid-check just retry directly.
                             logger.warning(f"plan check via proxy failed ({type(e).__name__}) "
@@ -1401,7 +1657,7 @@ def main():
                     try:
                         from claim_start import claim_start as run_claim_start
                         rc = run_claim_start(token, log=logger.info,
-                                             force_direct=False)
+                                             force_direct=auto and route_policy == 'direct')
                         start_plan = bool(rc.get('claimed'))
                         start_plan_id = rc.get('plan_id') or ''
                         if start_plan and rc.get('already_claimed'):
@@ -1455,6 +1711,8 @@ def main():
                 # a claimed Start Plan makes the account poolable exactly like
                 # the old signup-granted Starter did
                 starter = starter or start_plan
+                if auto:
+                    auto_result.update(_auto_result('generated' if starter else 'no_plan', email))
 
                 # Cohort forensics: which Start Plan variant a signup gets
                 # (0817 vs nt-1026) does not follow a simple country rule, so
@@ -1499,7 +1757,7 @@ def main():
                         f.write(f"{email}:{password}:{token}\n")
                     logger.info(f"Account {i+1} 500M giveaway claimed -> accounts500m.txt")
 
-                logger.info(f"Account {i+1} created with token: {token_display}")
+                logger.info(f"Account {i+1} created with an account token (not logged)")
 
         if i < count - 1:
             time.sleep(2)
@@ -1510,13 +1768,35 @@ def main():
     print(f"{starter_count} with Starter plan  ->  {STARTER_FILE}")
     if skipped:
         print(f"{skipped} skipped (captcha widget never loaded — IP-blocked)")
-    if unverified or ip_limited:
-        print(f"{unverified + ip_limited} recoverable in recovery_accounts.txt "
-              f"({unverified} unverified, {ip_limited} finish_signup IP-limited)")
+    if unverified or ip_limited or finish_failed:
+        print(f"{unverified + ip_limited + finish_failed} recoverable in recovery_accounts.txt "
+              f"({unverified} unverified, {ip_limited} finish_signup IP-limited, "
+              f"{finish_failed} finish_signup failed)")
     print(f"{verification_needed} need email verification")
     print(f"{ACC_FILE}")
     print(f"{_log_file}")
     print(timing.summary())
+    return auto_result
+
+
+def main():
+    if not env_on('ZAI_AUTO_GENERATE'):
+        return _main()
+    result = _auto_result()
+    try:
+        _main(result)
+    except Exception:
+        result.update(_auto_result(email=result.get('email')))
+        logger.error('AUTO MODE: worker failed; see the diagnostic result')
+    finally:
+        try:
+            _save_auto_route_metadata()
+        except Exception:
+            if result.get('category') in ('generated', 'no_plan'):
+                result.update(_auto_result(email=result.get('email')))
+            logger.error('AUTO MODE: private route metadata could not be saved')
+        _publish_auto_result(result)
+    return result
 
 
 if __name__ == "__main__":

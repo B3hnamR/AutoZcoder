@@ -4,6 +4,9 @@
   "type": "module",
   "version": "1.0.0",
   "description": "Mint one Aliyun traceless-captcha verify param for the ZCode billing claim",
+  "scripts": {
+    "test": "bun test audit.test.ts"
+  },
   "dependencies": {
     "happy-dom": "^20.11.6",
     "undici": "^8.10.0"

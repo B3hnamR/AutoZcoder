@@ -1,6 +1,7 @@
 """Shared pool, persistence and dashboard with a native ZCode transport."""
 from __future__ import annotations
 import asyncio
+import copy
 import json
 import logging
 import re
@@ -11,7 +12,7 @@ from dataclasses import dataclass
 
 import httpx
 from .aggregate import aggregate_openai_stream
-from .pool import Account, AccountState
+from .pool import Account
 from .breaker import EdgeBlockBreaker
 from .model_retry import is_model_overload, overload_delay, retry_after_seconds, wait_for_retry
 from .zcode_protocol import MessageAccumulator, OpenAITranslator, usage_openai
@@ -61,8 +62,7 @@ class CallResult:
 
 
 def _snapshot_payload(payload):
-    """Copy of a request payload that survives open_stream mutating it (the
-    account pin is popped out of payload['_anthropic'] on each attempt)."""
+    """Keep routing selectors available for a later stream reopen."""
     snap = dict(payload)
     if isinstance(snap.get('_anthropic'), dict):
         snap['_anthropic'] = dict(snap['_anthropic'])
@@ -122,7 +122,8 @@ class ChatService:
             if hasattr(self, 'registry') and self.registry is not None else None
         return build_upstream_body(payload, variant, self.cfg.models.default_max_tokens,
                                    model_caps=caps,
-                                   default_effort=getattr(self.cfg.models, 'default_effort', 'high'))
+                                   default_effort=getattr(self.cfg.models, 'default_effort', 'high'),
+                                   harness=getattr(self.cfg.upstream, 'bootstrap_harness', True))
 
     async def _edge_probe(self):
         """Cheap GET against the upstream host for the breaker's prober.
@@ -207,8 +208,8 @@ class ChatService:
                 # quota appears.
                 account.quota_strikes = getattr(account, 'quota_strikes', 0) + 1
                 if account.quota_strikes >= 3:
-                    account.state = AccountState.EXHAUSTED
-                    account.last_error = 'repeated quota rejection with no visible buckets'
+                    await self.pool.retire(account, 'repeated quota rejection with no visible buckets',
+                                           paid_only=False)
                     try:
                         self.pool.notify('quota',
                                          f"account {account.id} EXHAUSTED — repeated "
@@ -222,9 +223,14 @@ class ChatService:
                                       reason='11113' if code == '11113' else '1005',
                                       message=message)
         elif status == 429 or code == 'rate_limit_error':
-            try: seconds = min(3600, max(1, float((headers or {}).get('retry-after', self.cfg.pool.cooldown_seconds))))
-            except ValueError: seconds = self.cfg.pool.cooldown_seconds
-            await self.pool.cap_model(account, model, seconds, reason='MODEL_CAPPED', message=message)
+            # reuse the shared parser: handles retry-after-ms, seconds and
+            # HTTP-dates (a millisecond hint used to fall through to the
+            # default cooldown)
+            from .model_retry import retry_after_seconds
+            hinted = retry_after_seconds(headers or {})
+            seconds = min(3600, max(1, hinted if hinted is not None
+                                    else self.cfg.pool.cooldown_seconds))
+            await self.pool.cap_model(account, model, seconds, reason='RATE_LIMITED', message=message)
         elif status == 403:
             await self.pool.cap_model(account, model, 300, reason='ENTITLEMENT_ERROR', message=message)
         elif status == 451:
@@ -337,7 +343,7 @@ class ChatService:
                 # upstream's real rate-limit code — `rate_limit_error` was
                 # missing from this list, so a 429 on the paid model never
                 # fell back to the free one (measured: 0 retries on 429).
-                if exc.code not in ('11113', '1005', 'rate_limit_error', 'MODEL_CAPPED', 'MODEL_PARKED',
+                if exc.code not in ('11113', '1005', 'rate_limit_error', 'RATE_LIMITED', 'MODEL_CAPPED', 'MODEL_PARKED',
                                     'INFERENCE_CAP_ERROR', 'ENTITLEMENT_ERROR',
                                     'UNUSUAL_ACTIVITY', '3012', '405', 'HTTP_405',
                                     'HTTP_451', 'http_451'):
@@ -381,10 +387,12 @@ class ChatService:
             raise UpstreamFailure(400, 'invalid_request_error', str(exc)) from exc
         if not body.get('messages'):
             raise UpstreamFailure(400, 'invalid_request_error', 'at least one user or assistant message is required')
-        supplied_metadata = 'metadata' in body
+        original_metadata = body.get('metadata')
+        generated_identity = original_metadata is None or (
+            isinstance(original_metadata, dict) and 'user_id' not in original_metadata)
         target_account = (
-            payload.get("_anthropic", {}).pop("account", None)
-            or payload.get("_anthropic", {}).pop("account_id", None)
+            payload.get("_anthropic", {}).get("account")
+            or payload.get("_anthropic", {}).get("account_id")
             or payload.get("account")
             or payload.get("account_id")
         )
@@ -400,16 +408,9 @@ class ChatService:
                 raise NoAccountsAvailable()
             headers = build_headers(account.access_token, self.cfg.upstream.fingerprint,
                                     device_mid=account.notes.get('device_mid'), include_device_mid=False)
-            if not supplied_metadata:
+            if generated_identity:
                 device_mid = account.notes.get('device_mid') or self.cfg.upstream.fingerprint.device_mid
-                body['metadata'] = {'user_id': json.dumps({'device_id': device_mid,
-                    'account_uuid': '', 'session_id': headers['x-session-id']}, separators=(',', ':'))}
-            elif isinstance(body.get('metadata'), dict) and 'user_id' not in body['metadata']:
-                # A client-supplied Anthropic `metadata` field used to skip the
-                # device binding entirely — every such request went upstream
-                # with no device id (an "unusual activity" signal). Merge it.
-                device_mid = account.notes.get('device_mid') or self.cfg.upstream.fingerprint.device_mid
-                body['metadata'] = {**body['metadata'],
+                body['metadata'] = {**(original_metadata or {}),
                     'user_id': json.dumps({'device_id': device_mid,
                         'account_uuid': '', 'session_id': headers['x-session-id']}, separators=(',', ':'))}
             resp, handle, transferred = None, None, False
@@ -515,13 +516,24 @@ class ChatService:
                 # relay set, so the next attempt would go DIRECT (all relays
                 # are cooling) and burn the home IP. Fail the request now
                 # with the real code; relays uncool in 60s.
-                from .upstream import UpstreamBlockThroughRelay
+                from .upstream import UpstreamBlockThroughRelay, RelayTransportError
                 if isinstance(exc, UpstreamBlockThroughRelay):
                     raise UpstreamFailure(
                         405, '3012',
                         'relay exit IP(s) flagged (unusual activity): all relays '
                         'cooled ~60s — retry shortly; a different relay '
                         'rotation is not needed, it happens automatically'
+                    ) from exc
+                if isinstance(exc, RelayTransportError):
+                    # the relays themselves failed (connection error / relay
+                    # 5xx): the account did nothing wrong — cooling it would
+                    # punish one innocent account per dead relay. Surface a
+                    # 502 with relay attribution instead.
+                    relay = getattr(exc, 'relay_url', '') or 'relay'
+                    raise UpstreamFailure(
+                        502, 'relay_transport_error',
+                        f'could not reach ZCode through {relay} '
+                        '(relays cooled ~60s): ' + str(exc)
                     ) from exc
                 await self.pool.cool(account, reason='transport_error')
                 last = UpstreamFailure(502, 'transport_error', 'could not reach ZCode')
@@ -655,7 +667,7 @@ class ChatService:
                 if dialect != 'anthropic': chunks.extend(sse_frame(c) for c in translator.feed(handle.first))
                 async for event in handle.events:
                     seen += 1
-                    if event.get('type') == 'error':
+                    if event.get('type') == 'error' or (event.get('type') is None and 'error' in event):
                         info = event.get('error') or event
                         code = str(info.get('code') or info.get('type') or 'api_error')
                         status = 529 if is_model_overload(502, code) else (429 if code in ('11113', 'rate_limit_error') else (405 if is_block_code(code) else 502))
@@ -704,8 +716,10 @@ class ChatService:
                    duration_ms=duration, prompt_tokens=converted['prompt_tokens'],
                    completion_tokens=converted['completion_tokens'], total_tokens=converted['total_tokens'],
                    error_code=None if status == 200 else f'http_{status}')
-        cap = dict(request_headers=headers, request_body=body, status=status,
-                   response_headers=dict(response_headers), response_body=response)
+        cap = dict(request_headers=dict(headers), request_body=copy.deepcopy(body), status=status,
+                   response_headers=dict(response_headers), response_body=response,
+                   duration_ms=duration, account_id=account.id, dialect=dialect,
+                   model=model, variant='anthropic')
         # Disk I/O off the event loop: SQLite/JSONL writes (and AV scans on
         # those files) used to stall every concurrent stream while they ran.
         try:

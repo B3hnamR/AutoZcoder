@@ -22,6 +22,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { Worker } from "node:worker_threads";
+import { CaptchaDeadline } from "./captcha-deadline.ts";
 
 // -- Blocking fetch for sync XHR (self-contained builds) --------------------
 // happy-dom implements sync XHR by spawning `process.argv[0] -e <script>`,
@@ -53,13 +54,16 @@ const SYNC_WORKER_SRC = `
       // Fixed-size header (bytes), NOT i32.length * 4 -- that is the whole SAB.
       const payloadAt = 64;
       const fail = (msg) => {
-        const b = enc.encode(msg);
+        const b = enc.encode(msg).subarray(0, u8.length - payloadAt);
         u8.set(b, payloadAt);
         i32[5] = b.length; i32[1] = 0; i32[2] = 0; i32[3] = 0; i32[4] = 0;
         i32[0] = 2; Atomics.notify(i32, 0);
       };
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), Math.max(0, m.deadlineAt - Date.now()));
       try {
-        const res = await fetch(m.url, m.init);
+        if (Date.now() >= m.deadlineAt) throw new Error("sync fetch timeout");
+        const res = await fetch(m.url, { ...m.init, signal: controller.signal });
         const body = Buffer.from(await res.arrayBuffer());
         const headers = {};
         for (const [k, v] of res.headers) headers[k] = v;
@@ -67,6 +71,9 @@ const SYNC_WORKER_SRC = `
         const statusText = enc.encode(res.statusText || "");
         const headersJson = enc.encode(JSON.stringify(headers));
         const setCookieJson = enc.encode(JSON.stringify(setCookie));
+        if (statusText.length + headersJson.length + setCookieJson.length + body.length > u8.length - payloadAt) {
+          throw new Error("sync fetch response exceeds shared buffer");
+        }
         let off = payloadAt;
         u8.set(statusText, off); i32[2] = statusText.length; off += statusText.length;
         u8.set(headersJson, off); i32[3] = headersJson.length; off += headersJson.length;
@@ -76,6 +83,9 @@ const SYNC_WORKER_SRC = `
         i32[0] = 1; Atomics.notify(i32, 0);
       } catch (err) {
         fail(String((err && err.message) || err));
+      } finally {
+        clearTimeout(timer);
+        controller.abort();
       }
     })();
   });
@@ -84,6 +94,8 @@ const SYNC_WORKER_SRC = `
 function ensureSyncFetchWorker(): Worker {
   if (_syncFetchWorker) return _syncFetchWorker;
   _syncFetchWorker = new Worker(SYNC_WORKER_SRC, { eval: true });
+  const worker = _syncFetchWorker;
+  worker.on("error", () => { if (_syncFetchWorker === worker) shutdownSyncFetchWorker(); });
   return _syncFetchWorker;
 }
 
@@ -92,13 +104,18 @@ function syncFetchBlocking(url: string, init: Record<string, unknown>, timeoutMs
   setCookie: string[]; body: Buffer;
 } | { error: string } {
   try {
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return { error: "sync fetch timeout" };
+    const deadlineAt = Date.now() + timeoutMs;
     const worker = ensureSyncFetchWorker();
     const sab = new SharedArrayBuffer(SYNC_FETCH_HEADER_BYTES + SYNC_FETCH_BUF_BYTES);
     const i32 = new Int32Array(sab);
     const u8 = new Uint8Array(sab);
-    worker.postMessage({ sab, url, init });
-    const waitResult = Atomics.wait(i32, 0, 0, timeoutMs);
-    if (waitResult === "timed-out") return { error: "sync fetch timeout" };
+    worker.postMessage({ sab, url, init, deadlineAt });
+    const waitResult = Atomics.wait(i32, 0, 0, Math.max(0, deadlineAt - Date.now()));
+    if (waitResult === "timed-out") {
+      shutdownSyncFetchWorker();
+      return { error: "sync fetch timeout" };
+    }
     const dec = new TextDecoder();
     const payloadAt = SYNC_FETCH_HEADER_BYTES;
     let off = payloadAt;
@@ -115,14 +132,13 @@ function syncFetchBlocking(url: string, init: Record<string, unknown>, timeoutMs
     return { status: i32[1], statusText, headers, setCookie, body };
   } catch (err: any) {
     // A crashed worker must not poison later solves -- reset it.
-    try { _syncFetchWorker?.terminate(); } catch {}
-    _syncFetchWorker = null;
+    shutdownSyncFetchWorker();
     return { error: `sync fetch error: ${err?.message ?? err}` };
   }
 }
 
 function shutdownSyncFetchWorker(): void {
-  try { _syncFetchWorker?.terminate(); } catch {}
+  try { void _syncFetchWorker?.terminate().catch(() => {}); } catch {}
   _syncFetchWorker = null;
 }
 
@@ -260,10 +276,10 @@ function getCachedBody(url) {
   return null;
 }
 
-async function fetchAndStore(url) {
+async function fetchAndStore(url, deadline) {
   try {
-    const res = await fetch(url, { headers: { "user-agent": fp.userAgent } });
-    const buf = Buffer.from(await res.arrayBuffer());
+    const buf = await deadline.fetch(url, { headers: { "user-agent": fp.userAgent } },
+      async (res) => Buffer.from(await res.arrayBuffer()));
     if (buf.length > 0) {
       rememberCdnBody(url, buf);
       try {
@@ -362,10 +378,39 @@ function storeSetCookies(res, url) {
 
 // -- The interceptor: replaces happy-dom's network layer completely ---------
 // All frame requests (scripts, XHR, fetch, images) funnel through here.
-function makeInterceptor(bypassPeCache = false) {
+export function installBufferedRequest(w) {
+  const OriginalRequest = w.Request;
+  w.Request = class Request extends OriginalRequest {
+    constructor(input, init) {
+      // SyncFetch rebuilds XHR's Request as new Request(url, request). Its
+      // public .body is a stream, so preserve the private buffer before that
+      // reconstruction loses it. Forward other getters with their real receiver.
+      const buffer = init instanceof OriginalRequest ? init[PropertySymbol.bodyBuffer] : null;
+      super(input, buffer !== null && buffer !== undefined
+        ? new Proxy(init, {
+            get(target, key) {
+              return key === "body" ? buffer : Reflect.get(target, key, target);
+            },
+          })
+        : init);
+    }
+  };
+}
+
+function syncResponse(w, url, status, statusText, headers, body) {
+  return {
+    status, statusText, ok: status >= 200 && status < 300, url, redirected: false,
+    headers: new w.Headers(headers), body: Buffer.from(body),
+    [PropertySymbol.virtualServerFile]: null,
+  };
+}
+
+function makeInterceptor(bypassPeCache = false, getDeadline = () => null, blockingFetch = syncFetchBlocking) {
   const skipPeCache = (url) => bypassPeCache && /dynamicJS\/.*\/pe\.\d+\./.test(url);
   return {
     async beforeAsyncRequest({ request, window: w }) {
+      const deadline = getDeadline();
+      deadline?.remaining();
       const url = request.url;
       noteRequest({ at: Date.now(), method: request.method, url });
       injectRequestHeaders(request);
@@ -385,6 +430,7 @@ function makeInterceptor(bypassPeCache = false) {
         // above warms the cache on first load, so misses fall through to
         // the async fetch path handled by happy-dom.
         if (body) {
+          deadline?.remaining();
           if (/dynamicJS\/[^/]*\/pe\.\d+\./.test(url)) {
             try { w.__lastPeUrl = url; } catch (_) {}
           }
@@ -404,18 +450,15 @@ function makeInterceptor(bypassPeCache = false) {
         const bs = new URL(url);
         const cookie = cookieHeader(request, w, global.__browserFrame);
         if (cookie) init.headers.cookie = cookie;
-        let hasBody = false;
-        try {
-          if (request.body) {
-            const ab = await request.arrayBuffer();
-            if (ab && ab.byteLength > 0) {
-              init.body = ab;
-              hasBody = true;
-            }
+        if (request.body) {
+          const ab = await deadline.run(() => request.arrayBuffer());
+          if (ab && ab.byteLength > 0) {
+            init.body = ab;
           }
-        } catch (_) {}
-        const res = await fetch(url, init);
-        const buf = Buffer.from(await res.arrayBuffer());
+        }
+        const { res, buf } = await deadline.fetch(url, init, async (res) => ({
+          res, buf: Buffer.from(await res.arrayBuffer()),
+        }));
         storeSetCookies(res, url);
         if (_DEBUG && /captcha-open|verify\.|device\.saf|cloudauth-device|upload\./i.test(url) && buf.length && buf.length < 4096) {
           try {
@@ -442,6 +485,13 @@ function makeInterceptor(bypassPeCache = false) {
     },
     beforeSyncRequest({ request, window: w }) {
       const url = request.url;
+      const failed = (err) => {
+        process.stderr.write(`[sync-xhr-err] ${url}: ${err?.message ?? err}\n`);
+        return syncResponse(w, url, 503, "sync fetch failed", {}, Buffer.alloc(0));
+      };
+      try {
+      const deadline = getDeadline();
+      deadline?.remaining();
       noteRequest({ at: Date.now(), method: request.method, url, sync: true });
       injectRequestHeaders(request);
       let body = null;
@@ -462,19 +512,12 @@ function makeInterceptor(bypassPeCache = false) {
         // the async fetch path handled by happy-dom.
       }
       if (body) {
+        deadline?.remaining();
         if (/dynamicJS\/[^/]*\/pe\.\d+\./.test(url)) {
           try { w.__lastPeUrl = url; } catch (_) {}
         }
-        return {
-          status: 200,
-          statusText: "OK",
-          ok: true,
-          url,
-          redirected: false,
-          headers: new w.Headers({ "content-type": sniffMime(url) }),
-          body: patchPeBundle(Buffer.from(body), url),
-          [PropertySymbol.virtualServerFile]: null,
-        };
+        return syncResponse(w, url, 200, "OK", { "content-type": sniffMime(url) },
+          patchPeBundle(Buffer.from(body), url));
       }
       // Non-CDN sync request: serve it blocking via a worker thread. Never
       // fall through to happy-dom's own sync fetch -- it spawns a child
@@ -485,17 +528,18 @@ function makeInterceptor(bypassPeCache = false) {
       });
       const cookie = cookieHeader(request, w, global.__browserFrame);
       if (cookie) init.headers.cookie = cookie;
-      try {
-        if (request.body) {
-          const ab = request.body;
-          if (ab && (ab as any).byteLength > 0) init.body = ab;
-        }
-      } catch (_) {}
-      const res = syncFetchBlocking(url, init as any) as any;
-      if (res.error) {
-        process.stderr.write(`[sync-xhr-err] ${url}: ${res.error}\n`);
-        return new w.Response("", { status: 503, statusText: "sync fetch failed" });
+      const bodyBuffer = request[PropertySymbol.bodyBuffer];
+      if (bodyBuffer !== null && bodyBuffer !== undefined) {
+        init.body = Buffer.from(bodyBuffer);
+      } else if (request.body) {
+        throw new Error("sync request body is not buffered");
       }
+      const res = blockingFetch(url, init as any,
+        Math.min(SYNC_FETCH_TIMEOUT_MS, deadline?.remaining() ?? SYNC_FETCH_TIMEOUT_MS)) as any;
+      if (res.error) {
+        return failed(res.error);
+      }
+      deadline?.remaining();
       try {
         for (const raw of res.setCookie || []) {
           const cookieContainer = global.__cookieContainer;
@@ -529,16 +573,10 @@ function makeInterceptor(bypassPeCache = false) {
       // Sync interceptor contract: PLAIN OBJECT with Buffer body (happy-dom's
       // SyncFetch reads `.body.toString()`); a window.Response here would
       // stringify its ReadableStream body and corrupt script loading.
-      return {
-        status: res.status,
-        statusText: res.statusText || "",
-        ok: res.status >= 200 && res.status < 300,
-        url,
-        redirected: false,
-        headers: new w.Headers(hdrs),
-        body: Buffer.from(res.body),
-        [PropertySymbol.virtualServerFile]: null,
-      };
+      return syncResponse(w, url, res.status, res.statusText || "", hdrs, res.body);
+      } catch (err) {
+        return failed(err);
+      }
     },
   };
 }
@@ -719,8 +757,10 @@ function installEvalInstrumentation(w) {
         if (/^https?:/.test(filename)) {
           (async () => {
             try {
-              const res = await fetch(filename, { headers: { "user-agent": fp.userAgent } });
-              const fresh = Buffer.from(await res.arrayBuffer());
+              const { res, fresh } = await w.__capDeadline.fetch(filename,
+                { headers: { "user-agent": fp.userAgent } }, async (res) => ({
+                  res, fresh: Buffer.from(await res.arrayBuffer()),
+                }));
               process.stderr.write(
                 `[EVAL-CACHE-COMPARE] cachedLen=${src.length} freshLen=${fresh.length} freshSha1=${crypto.createHash("sha1").update(fresh).digest("hex")} http=${res.status}\n`,
               );
@@ -1739,34 +1779,40 @@ function simulateBehavior(w, durationMs = 600) {
   moveStep();
 }
 
-function waitFor(cond, timeoutMs = 15_000, intervalMs = 40) {
+function waitFor(cond, deadline, intervalMs = 40) {
   return new Promise((res, rej) => {
-    const started = Date.now();
+    const signal = deadline.controller.signal;
+    const stop = () => {
+      clearInterval(timer);
+      signal.removeEventListener("abort", onAbort);
+    };
+    const onAbort = () => { stop(); rej(new Error("captcha deadline exceeded")); };
     const timer = setInterval(() => {
       let ok = false;
       try {
+        deadline.remaining();
         ok = cond();
-      } catch (_) {}
+      } catch (err) { stop(); rej(err); return; }
       if (ok) {
-        clearInterval(timer);
+        stop();
         res();
-      } else if (Date.now() - started > timeoutMs) {
-        clearInterval(timer);
-        rej(new Error("timeout"));
       }
     }, intervalMs);
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) onAbort();
   });
 }
 
 // -- createDom --------------------------------------------------------------
-async function createDom(region, prefix) {
+async function createDom(region, prefix, deadline = new CaptchaDeadline()) {
+  deadline.remaining();
   let cookies = [];
   const now = Date.now();
   if (_cookieCache.ts > 0 && now - _cookieCache.ts < COOKIE_CACHE_TTL_MS) {
     cookies = _cookieCache.cookies;
   } else {
     try {
-      const res = await fetch("https://zcode.z.ai/", {
+      cookies = await deadline.fetch("https://zcode.z.ai/", {
         headers: {
           "User-Agent": fp.userAgent,
           "sec-ch-ua": '"Chromium";v="' + fp.uaMajor + '", "Not)A;Brand";v="24"',
@@ -1774,13 +1820,14 @@ async function createDom(region, prefix) {
           "sec-ch-ua-platform": '"Linux"',
           "Accept-Language": "en-US,en;q=0.9",
         },
-      });
-      cookies = typeof res.headers.getSetCookie === "function" ? res.headers.getSetCookie() : [];
+      }, async (res) => typeof res.headers.getSetCookie === "function" ? res.headers.getSetCookie() : []);
       _cookieCache = { cookies, ts: Date.now() };
     } catch (_) {}
   }
 
-  const interceptor = makeInterceptor(_bypassPeCacheOnce);
+  deadline.remaining();
+  let w;
+  const interceptor = makeInterceptor(_bypassPeCacheOnce, () => w?.__capDeadline ?? deadline);
   _bypassPeCacheOnce = false;
   // Registered once per process -- adding it inside createDom leaked a new
   // EventEmitter listener per solve (MaxListenersExceededWarning + growth).
@@ -1817,7 +1864,8 @@ async function createDom(region, prefix) {
         trace: (...a) => process.stderr.write(`[guest-trace] ${a.map((x) => (typeof x === "object" ? safeJson(x) : String(x))).join(" ")}\n`),
       }
     : { log: noop, warn: noop, error: noop, info: noop, debug: noop, trace: noop };
-  const w = new Window({
+  try {
+  w = new Window({
     url: "https://zcode.z.ai/",
     console: guestConsole,
     settings: {
@@ -1832,6 +1880,8 @@ async function createDom(region, prefix) {
       },
     },
   });
+  w.__capDeadline = deadline;
+  installBufferedRequest(w);
 
   // Reach into the frame for cookie container + frame ref (host side helpers).
   // WindowBrowserContext imported at module scope
@@ -1898,6 +1948,7 @@ async function createDom(region, prefix) {
   if (needsGlobalAlias) {
     const g = globalThis;
     installGlobalWindowAlias(g, w);
+    w.__capGlobalAliasInstalled = true;
   }
   if (w.Error) {
     w.Error.prepareStackTrace = Error.prepareStackTrace;
@@ -1916,8 +1967,10 @@ async function createDom(region, prefix) {
       if (/^https?:/.test(String(url))) {
         (async () => {
           try {
-            const res = await fetch(url, { headers: { "user-agent": fp.userAgent } });
-            const fresh = Buffer.from(await res.arrayBuffer());
+            const { res, fresh } = await w.__capDeadline.fetch(url,
+              { headers: { "user-agent": fp.userAgent } }, async (res) => ({
+                res, fresh: Buffer.from(await res.arrayBuffer()),
+              }));
             process.stderr.write(
               `[${kind}-CACHE-COMPARE] cachedLen=${s.length} freshLen=${fresh.length} freshSha1=${crypto.createHash("sha1").update(fresh).digest("hex")} http=${res.status}\n`,
             );
@@ -1942,7 +1995,13 @@ async function createDom(region, prefix) {
 
   w.AliyunCaptchaConfig = { region, prefix };
 
+  deadline.remaining();
   return { window: w, browserFrame };
+  } catch (err) {
+    if (w) destroyDom(w);
+    else deadline.dispose();
+    throw err;
+  }
 }
 
 // Bun-only: alias the active window on globalThis (script tags run in the
@@ -2228,17 +2287,24 @@ function reclaimCaptchaHeap() {
 }
 
 function destroyDom(win) {
+  try { win.__capDeadline?.dispose(); } catch (_) {}
   try {
     const cap = win.document.getElementById("cap");
     if (cap) cap.replaceChildren();
-    win.happyDOM.close();
+  } catch (_) {}
+  try {
+    const closing = win.happyDOM.close();
+    if (closing?.catch) closing.catch(() => {});
   } catch (_) {}
   try {
     global.__cookieContainer = null;
     global.__browserFrame = null;
   } catch (_) {}
   try {
-    if (typeof Bun !== "undefined") removeGlobalWindowAlias(globalThis, win);
+    if (win.__capGlobalAliasInstalled) {
+      win.__capGlobalAliasInstalled = false;
+      removeGlobalWindowAlias(globalThis, win);
+    }
   } catch (_) {}
   // The scope holds window-bound timer functions; dropping it releases the
   // closed window and makes any straggler's `new Function` fall back to the
@@ -2360,6 +2426,9 @@ function guestErrorSummary(w, max = 4) {
   }
 }
 
+let domFactoryForTest = null;
+export function __setDomFactoryForTest(factory) { domFactoryForTest = factory; }
+
 async function solveTraceless(opts) {
   const scene = opts.scene || "11xygtvd";
   const region = opts.region || "sgp";
@@ -2369,38 +2438,49 @@ async function solveTraceless(opts) {
   // handle it; the worker path terminates on the same env knob.
   // Override: CAPTCHA_SOLVE_TIMEOUT_MS.
   const timeoutMs = opts.timeoutMs ?? Number(process.env.CAPTCHA_SOLVE_TIMEOUT_MS || 20_000);
+  const deadline = new CaptchaDeadline(timeoutMs, opts.deadlineAt);
+  const solveStart = Date.now();
 
   const wantReuse = opts.reuseWindow ?? process.env.CAPTCHA_WINDOW_REUSE !== "0";
   let dom;
+  let w;
+  let browserFrame;
   let reused = false;
-  if (wantReuse) {
-    dom = takeReusableWindow();
-    if (dom) reused = true;
-  }
-  if (!dom) {
-    dom = await createDom(region, prefix);
-  }
-  const { window: w, browserFrame } = dom;
-  const solveStart = Date.now();
-  let solveSucceeded = false;
   let keepWindow = false;
   try {
-    await waitFor(() => typeof w.initAliyunCaptcha === "function", timeoutMs, 50);
+    deadline.remaining();
+    if (wantReuse) {
+      dom = takeReusableWindow();
+      if (dom) reused = true;
+    }
+    if (!dom) {
+      dom = await (domFactoryForTest ?? createDom)(region, prefix, deadline);
+    }
+    ({ window: w, browserFrame } = dom);
+    w.__capDeadline = deadline;
+    await waitFor(() => typeof w.initAliyunCaptcha === "function", deadline, 50);
+    deadline.remaining();
 
     simulateBehavior(w, 600);
 
     const param = await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
+      let settled = false;
+      const signal = deadline.controller.signal;
+      const finish = (fn) => (value) => {
+        if (settled) return;
+        settled = true;
+        clearInterval(stallTimer);
+        signal.removeEventListener("abort", onAbort);
+        fn(value);
+      };
+      const onAbort = () => {
         const peUrl = (() => { try { return w.__lastPeUrl || "?"; } catch (_) { return "?"; } })();
         const reqs = _requestLog
           .filter((r) => r.at >= solveStart)
           .map((r) => `${(r.at - solveStart)}ms ${r.method} ${String(r.url).replace(/^https?:\/\//, "").slice(0, 60)}`)
           .slice(-12);
-        reject(new Error(`captcha solve timeout pe=${peUrl.split("/").pop() || peUrl} reqs=${JSON.stringify(reqs)}`));
-      }, timeoutMs);      // Fail-fast stall detector: healthy solves keep firing XHRs until verify
-      // (~3s). If no XHR for stallMs and none pending, this pe-VM variant
-      // stalled (seen across rotated pe.0xx versions) -- abort early so the
-      // caller can retry with a fresh InitCaptchaV3 (new pe version).
+        finish(reject)(new Error(`captcha solve timeout pe=${peUrl.split("/").pop() || peUrl} reqs=${JSON.stringify(reqs)}`));
+      };
       // Fail-fast stall detector: healthy solves keep firing XHRs until
       // verify (~3s, gaps <2s). If no XHR for 6s, this pe-VM variant stalled
       // (seen across rotated pe.0xx versions) -- abort early so the caller
@@ -2415,16 +2495,11 @@ async function solveTraceless(opts) {
             .filter((r) => r.at >= solveStart)
             .map((r) => `${(r.at - solveStart)}ms ${r.method} ${String(r.url).replace(/^https?:\/\//, "").slice(0, 60)}`)
             .slice(-12);
-          clearTimeout(timer);
-          clearInterval(stallTimer);
-          reject(new Error(`captcha solve stall pe=${peUrl.split("/").pop() || peUrl} lastXhr=${(last.at - solveStart)}ms reqs=${JSON.stringify(reqs)}`));
+          finish(reject)(new Error(`captcha solve stall pe=${peUrl.split("/").pop() || peUrl} lastXhr=${(last.at - solveStart)}ms reqs=${JSON.stringify(reqs)}`));
         }
       }, 500);
-      const finish = (fn) => (value) => {
-        clearTimeout(timer);
-        clearInterval(stallTimer);
-        fn(value);
-      };
+      signal.addEventListener("abort", onAbort, { once: true });
+      if (signal.aborted) { onAbort(); return; }
       try {
         w.initAliyunCaptcha({
           SceneId: scene,
@@ -2437,14 +2512,18 @@ async function solveTraceless(opts) {
           captchaLogoImg: "",
           showErrorTip: false,
           getInstance: (inst) => {
+            if (settled) return;
             try {
+              deadline.remaining();
               (inst.startTracelessVerification || inst.show).call(inst);
             } catch (e) {
               finish(reject)(new Error(`start: ${e.message}`));
             }
           },
           success: (result) => {
+            if (settled) return;
             try {
+              deadline.remaining();
               finish(resolve)(handleCaptchaResult(result));
             } catch (err) {
               finish(reject)(err);
@@ -2454,8 +2533,7 @@ async function solveTraceless(opts) {
           onError: (err) => finish(reject)(new Error(`onError: ${JSON.stringify(err)}`)),
         });
       } catch (err) {
-        clearTimeout(timer);
-        reject(err);
+        finish(reject)(err);
       }
     });
 
@@ -2480,7 +2558,7 @@ async function solveTraceless(opts) {
       } catch (_) {}
     }
 
-    solveSucceeded = true;
+    deadline.remaining();
     const out = extractVerifyParam(param);
     if (wantReuse) {
       if (reused) noteWindowSolved();
@@ -2499,10 +2577,11 @@ async function solveTraceless(opts) {
     }
     throw err;
   } finally {
+    deadline.dispose();
     // Reuse mode: on success the window stays pooled (keepWindow) for the next
     // solve -- a ~48% CPU cut. On failure it is destroyed: a stalled window must
     // not poison later solves, and the retry rolls a fresh pe anyway.
-    if (!keepWindow) {
+    if (!keepWindow && w) {
       if (_reusePool.window === w) _reusePool.window = null;
       destroyDom(w);
     }
@@ -2522,4 +2601,5 @@ export function __captchaMemStats() {
   };
 }
 
-export { solveTraceless, createDom, destroyDom, noteRequest, rememberCdnBody, reclaimCaptchaHeap };
+export { solveTraceless, createDom, destroyDom, noteRequest, rememberCdnBody, reclaimCaptchaHeap,
+  makeInterceptor as __makeInterceptorForTest, waitFor as __waitForForTest };

@@ -1,8 +1,7 @@
 # ZCode 3.14.4 protocol notes
 
-Evidence: the user's six model captures and OAuth/billing flows from
-`D:\JB\zcode-mitm`, plus the locally installed
-`C:\Program Files\ZCode\resources\glm\zcode.cjs` and `resources\app.asar`.
+Evidence: six retained model captures and OAuth/billing flows, plus the installed
+ZCode client's `resources/glm/zcode.cjs` bundle and `resources/app.asar` archive.
 No live credential values are included in this document or the committed fixtures.
 
 ## Messages
@@ -19,7 +18,7 @@ native bootstrap blocks are preserved without duplication; caller instructions
 follow the defaults. No captured workspace context or extra tools are injected.
 Model requests include HTTP-Referer and carry the saved ZCode device identity
 in metadata; billing/OAuth requests also include X-Device-Mid. See
-[the 3012 investigation](DIAGNOSIS-3012.md) for the resolved initialization issue.
+[the 3012 investigation](../troubleshooting/DIAGNOSIS-3012.md) for the resolved initialization issue.
 The coding-plan catalog is separate from `chat.z.ai/api/models` and the API-key
 providers. Only GLM-5.3 and GLM-5.3-Flash were validated in the supplied captures.
 

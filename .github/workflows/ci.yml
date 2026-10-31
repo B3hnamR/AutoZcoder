@@ -14,6 +14,19 @@ permissions:
   contents: read
 
 jobs:
+  test-sidecar:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+      - name: Install locked sidecar dependencies and run offline regressions
+        working-directory: tools/captcha-mint
+        run: |
+          bun install --frozen-lockfile
+          bun run test
+
   test:
     runs-on: windows-latest
     steps:
@@ -25,9 +38,30 @@ jobs:
         run: |
           python -m venv .venv
           .\.venv\Scripts\python -m pip install --upgrade pip
-          .\.venv\Scripts\python -m pip install -r requirements.txt -r requirements-dev.txt
+          .\.venv\Scripts\python -m pip install -r requirements/windows.txt -r requirements/dev.txt
+      - name: "Ruff (runtime-error subset: undefined names, syntax, duplicate keys)"
+        run: |
+          .\.venv\Scripts\python -m pip install ruff
+          .\.venv\Scripts\python -m ruff check --select E9,F63,F7,F82,F811,F841 zcode_gateway generator gui_main.py
       - name: Run tests
         run: .\.venv\Scripts\python -m pytest tests -q
       - name: Syntax check generator package
         run: |
           .\.venv\Scripts\python -m py_compile generator\main.py generator\invite_claim.py generator\captcha_solver.py generator\proxy_pool.py generator\fingerprint.py generator\claim100.py
+
+  test-linux:
+    # the Linux port is a supported target (headless VPS + dashboard): the
+    # suite must pass cross-platform on every push, not only on Windows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Create venv + install deps (headless requirements)
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/python -m pip install -r requirements/server.txt -r requirements/dev.txt
+      - name: Run tests
+        run: .venv/bin/python -m pytest tests -q

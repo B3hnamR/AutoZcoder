@@ -22,6 +22,16 @@ if str(GEN) not in sys.path:
 
 import plan_check  # noqa: E402
 import claim_start as cs  # noqa: E402
+import invite_claim as ic  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _offline_only(monkeypatch):
+    def forbidden(*args, **kwargs):
+        pytest.fail("unexpected real HTTP request")
+
+    monkeypatch.setattr(plan_check.requests.Session, "send", forbidden)
+    monkeypatch.setenv("ZAI_CLAIM_START_PROXY_FALLBACK", "0")
 
 
 class _Resp:
@@ -306,3 +316,236 @@ def test_sessions_are_per_thread():
     assert seen and seen[0] is not main           # no cookie jar shared
     assert seen[0].trust_env is False
     assert main.trust_env is False
+
+
+@pytest.mark.parametrize("data", [[], {"plans": []}])
+def test_strict_preview_accepts_valid_empty_data(monkeypatch, data):
+    monkeypatch.setattr(plan_check.requests, "get",
+                        lambda *a, **k: _Resp({"code": 0, "data": data}))
+    assert plan_check.preview_plans("jwt", strict=True) == []
+
+
+@pytest.mark.parametrize("failure,kind,route_problem", [
+    ("http", "http", True),
+    ("non_json", "non_json", True),
+    ("business", "business", False),
+    ("blocked", "business", True),
+    ("transport", "transport", True),
+    ("list_envelope", "malformed", True),
+    ("missing_code", "malformed", True),
+    ("missing_data", "malformed", True),
+])
+def test_preview_failures_are_not_empty_offers(monkeypatch, failure, kind, route_problem):
+    secret = "sensitive-account-or-proxy-detail"
+
+    def fake_get(*args, **kwargs):
+        if failure == "transport":
+            raise plan_check.requests.ConnectionError(secret)
+        if failure == "non_json":
+            response = _Resp(secret)
+            response.json = lambda: (_ for _ in ()).throw(ValueError(secret))
+            return response
+        payload = {
+            "http": {"code": 0, "data": {"plans": []}},
+            "business": {"code": 1005, "msg": secret, "data": {"plans": []}},
+            "blocked": {"code": 3012, "msg": secret, "data": {}},
+            "list_envelope": [],
+            "missing_code": {"data": []},
+            "missing_data": {"code": 0},
+        }[failure]
+        return _Resp(payload, status=502 if failure == "http" else 200)
+
+    monkeypatch.setattr(plan_check.requests, "get", fake_get)
+    logs = []
+    # Legacy callers keep their non-throwing list contract.
+    assert plan_check.preview_plans("jwt", log=logs.append) == []
+    with pytest.raises(plan_check.PreviewError) as caught:
+        plan_check.preview_plans("jwt", log=logs.append, strict=True)
+    assert caught.value.kind == kind
+    assert caught.value.route_problem is route_problem
+    assert secret not in str(caught.value)
+    assert secret not in "\n".join(logs)
+
+    monkeypatch.setattr(cs, "device_login", lambda *a, **k: ("jwt", True))
+    monkeypatch.setattr(cs, "get_plan", lambda *a, **k: {})
+    monkeypatch.setattr(cs, "report_app_activity", lambda *a, **k: True)
+    result = cs.claim_start("chat", force_direct=True, plan_id="explicit-plan", log=logs.append)
+    assert result["claimed"] is False
+    assert result["preview_error"] == kind
+    assert result["route_problem"] is route_problem
+    assert "no claimable plan" not in result["error"]
+    assert secret not in result["error"]
+
+
+@pytest.mark.parametrize("fallback", [None, True, False])
+@pytest.mark.parametrize("failure", ["login", "preview", "claim"])
+def test_direct_mode_never_uses_pool_fallback(monkeypatch, fallback, failure):
+    monkeypatch.setenv("ZAI_PROXY", "http://signup-proxy:8080")
+    monkeypatch.setenv("ZAI_CLAIM_START_PROXY_FALLBACK", "1")
+    monkeypatch.setattr(cs.time, "sleep", lambda *a: None)
+
+    def forbidden(*a, **k):
+        pytest.fail("direct mode selected a pool proxy")
+
+    monkeypatch.setattr(cs, "_verified_pool_proxy", forbidden)
+    monkeypatch.setattr(cs, "device_login",
+                        lambda *a, **k: (None if failure == "login" else "jwt", False))
+    monkeypatch.setattr(cs, "get_plan", lambda *a, **k: {})
+    monkeypatch.setattr(cs, "report_app_activity", lambda *a, **k: True)
+
+    def preview(*a, **k):
+        if failure == "preview":
+            raise plan_check.PreviewError("preview transport failed", kind="transport")
+        return [{"plan_id": "zcode-v3-start-plan-referral"}]
+
+    monkeypatch.setattr(cs, "preview_plans", preview)
+    monkeypatch.setattr(cs, "_captcha_token", lambda *a, **k: ("", ""))
+    monkeypatch.setattr(cs, "claim_plan", lambda *a, **k: {"code": -1, "msg": "request failed"})
+    result = cs.claim_start("chat", force_direct=True, proxy_fallback=fallback, log=lambda m: None)
+    assert result["claimed"] is False and result["route_problem"] is True
+    assert plan_check._proxies()["https"] == "http://signup-proxy:8080"
+
+
+@pytest.mark.parametrize("force_direct", [True, False])
+def test_full_chain_uses_trusted_session_and_requested_route(monkeypatch, force_direct):
+    monkeypatch.setenv("ZAI_PROXY", "http://signup-proxy:8080")
+    monkeypatch.setenv("HTTP_PROXY", "http://ambient-proxy:8080")
+    monkeypatch.setenv("HTTPS_PROXY", "http://ambient-proxy:8080")
+    monkeypatch.setenv("ALL_PROXY", "http://ambient-proxy:8080")
+    monkeypatch.setattr(plan_check._tls, "session", None, raising=False)
+    seen = []
+    balances = []
+    pid = "zcode-v3-start-plan-referral"
+
+    def send(session, request, **kwargs):
+        seen.append((request.url, kwargs["proxies"]))
+        assert session.trust_env is False
+        url = request.url
+        if "/cli/init" in url:
+            return _Resp({"code": 0, "data": {"flow_id": "flow", "authorize_url": "?state=s"}})
+        if "/oauth/authorize" in url:
+            return _Resp({"redirect_url": "https://callback/?code=code-abcd"})
+        if "/cli/poll/" in url:
+            return _Resp({"data": {"status": "ready", "token": "jwt",
+                                   "zai": {"access_token": "zai"}}})
+        if "/billing/balance" in url:
+            balances.append(url)
+            return _Resp(EMPTY if len(balances) == 1 else _balance([pid]))
+        if "/billing/preview" in url:
+            return _Resp({"code": 0, "data": {"plans": [{"plan_id": pid}]}})
+        if "/client/configs" in url:
+            return _Resp({"data": {"configs": {}}})
+        return _Resp({"code": 0})
+
+    monkeypatch.setattr(plan_check.requests.Session, "send", send)
+
+    def captcha(log, **kwargs):
+        cs._captcha_config(log)
+        return "", ""
+
+    monkeypatch.setattr(cs, "_captcha_token", captcha)
+    result = cs.claim_start("chat", force_direct=force_direct, proxy_fallback=False, log=lambda m: None)
+    assert result["claimed"] is True
+    assert len(seen) == 14  # OAuth, login telemetry, zai login, balances, activity, preview, config, claim
+    expected = {} if force_direct else {"http": "http://signup-proxy:8080", "https": "http://signup-proxy:8080"}
+    assert all(proxies == expected for _, proxies in seen)
+    assert ic._FORCE_DIRECT is False
+    assert plan_check._proxies()["https"] == "http://signup-proxy:8080"
+
+
+def test_direct_context_restores_after_exception(monkeypatch):
+    monkeypatch.setenv("ZAI_PROXY", "http://signup-proxy:8080")
+
+    def fail(*a, **k):
+        assert plan_check._proxies() is None
+        raise RuntimeError("test failure")
+
+    monkeypatch.setattr(cs, "_run_chain", fail)
+    with pytest.raises(RuntimeError, match="test failure"):
+        cs.claim_start("chat", force_direct=True)
+    assert plan_check._proxies()["https"] == "http://signup-proxy:8080"
+
+
+def test_proxy_mode_can_still_retry_a_failed_preview(monkeypatch):
+    import os
+
+    original = "http://signup-proxy:8080"
+    fallback = "http://fallback-proxy:8080"
+    monkeypatch.setenv("ZAI_PROXY", original)
+    monkeypatch.setattr(cs, "_verified_pool_proxy", lambda log: fallback)
+    routes = []
+
+    def chain(*a, **kw):
+        routes.append(os.environ["ZAI_PROXY"])
+        if len(routes) == 1:
+            return {"claimed": False, "zjwt": True, "route_problem": True}, "jwt"
+        assert kw["zjwt"] == "jwt"
+        return {"claimed": True}, "jwt"
+
+    monkeypatch.setattr(cs, "_run_chain", chain)
+    result = cs.claim_start("chat", proxy_fallback=True, log=lambda m: None)
+    assert routes == [original, fallback]
+    assert result["claimed"] is True and result["via_proxy"] == fallback
+    assert os.environ["ZAI_PROXY"] == original
+
+
+def test_direct_request_scope_is_nested_and_thread_local(monkeypatch):
+    import threading
+
+    monkeypatch.setenv("ZAI_PROXY", "http://signup-proxy:8080")
+    seen = []
+    with plan_check.direct_requests(True):
+        with plan_check.direct_requests(False):
+            assert plan_check._proxies() is None
+        thread = threading.Thread(target=lambda: seen.append(plan_check._proxies()))
+        thread.start()
+        thread.join()
+        assert plan_check._proxies() is None
+    assert seen[0]["https"] == "http://signup-proxy:8080"
+    assert plan_check._proxies()["https"] == "http://signup-proxy:8080"
+
+
+def test_standalone_direct_oauth_keeps_get_post_patchable(monkeypatch):
+    monkeypatch.setenv("ZAI_PROXY", "http://signup-proxy:8080")
+    seen = []
+
+    def post(url, **kwargs):
+        seen.append(kwargs["proxies"])
+        if "/cli/init" in url:
+            return _Resp({"data": {"flow_id": "flow", "authorize_url": "?state=s"}})
+        if "/oauth/authorize" in url:
+            return _Resp({"redirect_url": "?code=code-abcd"})
+        return _Resp({"code": 200})
+
+    def get(url, **kwargs):
+        seen.append(kwargs["proxies"])
+        return _Resp({"data": {"status": "ready", "token": "jwt",
+                               "zai": {"access_token": "zai"}}})
+
+    monkeypatch.setattr(plan_check.requests, "post", post)
+    monkeypatch.setattr(plan_check.requests, "get", get)
+    assert ic.device_login("chat", force_direct=True, log=lambda m: None) == ("jwt", True)
+    assert seen == [None] * 7
+    assert ic._FORCE_DIRECT is False
+    assert plan_check._proxies()["https"] == "http://signup-proxy:8080"
+
+
+def test_direct_captcha_sidecar_does_not_inherit_proxy_settings(monkeypatch):
+    import os
+    import subprocess
+
+    for key in ("ZAI_PROXY", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "https_proxy"):
+        monkeypatch.setenv(key, "http://proxy:8080")
+    monkeypatch.setenv("ZAI_CAPTCHA_CMD", "fake-mint")
+    monkeypatch.setattr(cs, "_captcha_config", lambda log: {})
+    seen = {}
+
+    def run(*a, **kw):
+        seen.update(kw["env"])
+        return types.SimpleNamespace(returncode=0, stdout="V" * 40 + " sgp\n")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    assert cs._captcha_token(lambda m: None, force_direct=True) == ("V" * 40, "sgp")
+    assert not any(k.upper() in ("ZAI_PROXY", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY") for k in seen)
+    assert seen["NO_PROXY"] == "*"
+    assert os.environ["ZAI_PROXY"] == "http://proxy:8080"

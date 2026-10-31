@@ -145,9 +145,15 @@ def _clean_output(s: str) -> str:
     return "\n".join(ln.rstrip() for ln in s.split("\n"))
 
 
+_NOISE_LINE = re.compile(r"^\s*(?:⛅️?\s*wrangler\b.*|[─━\-=]{6,}|.*Logs were written to.*)$")
+
+
 def _tail(s: str, limit: int = 700) -> str:
-    """Cleaned output, trimmed to the last `limit` chars on a whole-line edge."""
-    s = _clean_output(s).strip()
+    """Cleaned output, trimmed to the last `limit` chars on a whole-line edge.
+    The wrangler banner is dropped so the dashboard (which shows the first
+    line) shows the actual error."""
+    lines = [ln for ln in _clean_output(s).split("\n") if not _NOISE_LINE.match(ln)]
+    s = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
     if len(s) <= limit:
         return s
     return "…" + s[-limit:].split("\n", 1)[-1]
@@ -165,11 +171,67 @@ def _child_kwargs() -> dict:
     would pop a console window for every worker / proxy check.
     """
     if os.name != "nt":
-        return {}
+        # own session/process group: _kill_tree can then signal the whole
+        # python -> playwright -> chromium tree, like taskkill /T on Windows
+        return {"start_new_session": True}
     si = subprocess.STARTUPINFO()
     si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
     si.wShowWindow = subprocess.SW_HIDE
     return {"creationflags": subprocess.CREATE_NO_WINDOW, "startupinfo": si}
+
+
+def _kill_tree(proc: subprocess.Popen | None) -> None:
+    """Terminate a worker process tree, Windows-first, POSIX-safe.
+
+    Windows: taskkill /T takes the whole child tree (the generator spawns
+    python -> playwright -> chromium). POSIX: workers start in their own
+    session (see _child_kwargs), so SIGKILL goes to the whole process group."""
+    if proc is None:
+        return
+    if os.name == "nt":
+        try:
+            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                           capture_output=True, timeout=5, **_child_kwargs())
+        except Exception:
+            pass
+    else:
+        try:
+            import signal
+            # never signal our own group (a child that did not get its own
+            # session would take the gateway down with it)
+            if proc.pid != os.getpgid(0):
+                os.killpg(proc.pid, signal.SIGKILL)
+        except Exception:
+            pass
+    try:
+        if proc.poll() is None:
+            proc.kill()
+    except Exception:
+        pass
+
+
+def _python_has_pip(py: str) -> bool:
+    try:
+        return subprocess.run(
+            [py, "-c", "import pip, sys; sys.exit(0 if sys.prefix != sys.base_prefix else 1)"],
+            capture_output=True, timeout=20, **_child_kwargs()).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def venv_python(*, ready: bool = True) -> str:
+    """Python of the gateway's private generator venv (<app dir>/genenv), or ''.
+
+    Debian/Ubuntu mark the system Python "externally managed" (PEP 668), so
+    pip refuses to install the generator packages into it. The installer — or
+    the dashboard's Environment Setup — builds this venv instead."""
+    from .paths import app_dir
+    base = app_dir() / "genenv"
+    for rel in (("bin", "python"), ("Scripts", "python.exe")):
+        cand = base.joinpath(*rel)
+        if cand.is_file() and (not ready or _python_has_pip(str(cand))):
+            return str(cand)
+    return ""
 
 
 def resolve_python(explicit: str = "") -> str:
@@ -184,6 +246,9 @@ def resolve_python(explicit: str = "") -> str:
         p = Path(explicit)
         if p.exists():
             return str(p)
+    venv = venv_python()
+    if venv:
+        return venv
     if not getattr(sys, "frozen", False):
         return sys.executable
     import shutil
@@ -210,7 +275,71 @@ def resolve_python(explicit: str = "") -> str:
 GEN_DEPS = ["playwright", "ddddocr", "cv2", "PIL", "numpy", "requests",
             "urllib3", "certifi", "socks"]
 # pip names for the ones whose import name differs or that are missing
-GEN_PIP_NAMES = {"cv2": "opencv-python", "PIL": "Pillow", "socks": "PySocks"}
+GEN_PIP_NAMES = {"cv2": "opencv-python" if os.name == "nt" else "opencv-python-headless",
+                 "PIL": "Pillow", "socks": "PySocks"}
+
+
+def _chromium_install_argv(py: str, *, with_deps: bool = True) -> list[str]:
+    """Only explicit environment setup may provision root's system libraries."""
+    argv = [py, "-m", "playwright", "install"]
+    if with_deps and os.name != "nt" and hasattr(os, "geteuid") and os.geteuid() == 0:
+        argv.append("--with-deps")
+    return argv + ["chromium"]
+
+
+def _run_installer(argv: list[str], emit, timeout: float = 1200, cwd=None) -> bool:
+    """Drain progress concurrently; a stalled/open pipe cannot defeat the deadline."""
+    deadline = time.monotonic() + timeout
+    try:
+        proc = subprocess.Popen(
+            argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace", cwd=cwd,
+            **_child_kwargs())
+    except Exception as exc:
+        emit(f"  failed to start: {type(exc).__name__}: {exc}")
+        return False
+
+    def pump():
+        try:
+            for line in proc.stdout or []:
+                if line.strip():
+                    emit("  " + line.rstrip()[:200])
+        finally:
+            if proc.stdout:
+                proc.stdout.close()
+
+    reader = threading.Thread(target=pump, daemon=True, name="installer-output")
+    reader.start()
+    try:
+        proc.wait(timeout=max(0, deadline - time.monotonic()))
+        reader.join(timeout=max(0, deadline - time.monotonic()))
+        if reader.is_alive():
+            raise subprocess.TimeoutExpired(argv, timeout)
+        return proc.returncode == 0
+    except subprocess.TimeoutExpired:
+        _kill_tree(proc)
+        try:
+            proc.wait(timeout=5)
+        finally:
+            reader.join(timeout=5)
+        emit("  step timed out - killed process tree")
+        return False
+
+
+def _bundled_captcha_env() -> dict[str, str]:
+    """Resolve in the parent: external Python has no PyInstaller extraction root."""
+    explicit = os.environ.get("ZAI_CAPTCHA_CMD")
+    if explicit:
+        return {"ZAI_CAPTCHA_CMD": explicit}
+    name = "captcha-mint.exe" if os.name == "nt" else "captcha-mint"
+    roots = [Path(sys.executable).resolve().parent]
+    if getattr(sys, "_MEIPASS", None):
+        roots.insert(0, Path(sys._MEIPASS))
+    for root in roots:
+        candidate = root / "captcha-mint" / name
+        if candidate.is_file():
+            return {"ZAI_CAPTCHA_CMD": f'"{candidate}"'}
+    return {}
 
 
 class EnvSetup:
@@ -222,14 +351,15 @@ class EnvSetup:
     setup modal polls. Runs in a background thread; one installation at a
     time; Retry just restarts the missing-items list."""
 
-    def __init__(self) -> None:
+    def __init__(self, python_exe: str = "") -> None:
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
+        self.on_python = None          # called with the interpreter the setup settled on
         self.lines: deque[str] = deque(maxlen=400)
         self.state = "idle"            # idle|checking|installing|done|failed
         self.missing: list[dict] = []
         self.error: str = ""
-        self.python_exe: str = ""
+        self.python_exe: str = python_exe or ""
         self.started_at: float = 0.0
         self.finished_at: float = 0.0
 
@@ -264,12 +394,20 @@ class EnvSetup:
         import shutil
         import glob
         # explicit/configured path first
-        if self.python_exe and self._python_real(self.python_exe):
+        partial = venv_python(ready=False)
+        if (self.python_exe and self._python_real(self.python_exe)
+                and (not partial or Path(self.python_exe).parent != Path(partial).parent
+                     or _python_has_pip(self.python_exe))):
             return self.python_exe
+        venv = venv_python()
+        if venv and self._python_real(venv):
+            return venv
         # PATH (verified — the Store alias must never win)
         for cand in ("python", "python3"):
             found = shutil.which(cand)
-            if found and self._python_real(found):
+            if (found and self._python_real(found)
+                    and (not partial or Path(found).parent != Path(partial).parent
+                         or _python_has_pip(found))):
                 return found
         # standard install locations
         for pat in (
@@ -300,9 +438,17 @@ class EnvSetup:
     def _install_python(self) -> bool:
         """No real Python on the machine: install one for the user.
 
-        Order: winget (silent, no UAC for user scope) → official installer
-        download (per-user, /passive). PATH is stale afterwards, so the
-        caller must re-scan, not trust os.environ."""
+        Windows order: winget (silent, no UAC for user scope) → official
+        installer download (per-user, /passive). PATH is stale afterwards, so
+        the caller must re-scan, not trust os.environ. On Linux a bare image
+        needs the distro package manager — emit the commands and fail; there
+        is no silent cross-distro install."""
+        if os.name != "nt":
+            self._emit("no usable Python found — install Python 3.9+ with your package manager, then press Retry:")
+            self._emit("  Debian/Ubuntu:  sudo apt install python3 python3-pip")
+            self._emit("  Fedora/RHEL:    sudo dnf install python3")
+            self._emit("  Arch:           sudo pacman -S python")
+            return False
         self._emit("no usable Python found — installing Python 3.12 (one-time, ~70 MB)…")
         # 1) winget
         try:
@@ -370,6 +516,36 @@ class EnvSetup:
         # Store package installs land here too
         return self._find_python()
 
+    # ------------------------------------------------------------- venv
+    def _externally_managed(self, py: str) -> bool:
+        """True for a system Python pip must not touch (PEP 668 marker)."""
+        if os.name == "nt":
+            return False
+        script = ("import os, sys, sysconfig\n"
+                  "marker = os.path.join(sysconfig.get_path('stdlib'), 'EXTERNALLY-MANAGED')\n"
+                  "print(1 if os.path.exists(marker) and sys.prefix == sys.base_prefix else 0)")
+        try:
+            r = subprocess.run([py, "-c", script], capture_output=True, text=True,
+                               timeout=30, **_child_kwargs())
+            return (r.stdout or "").strip().endswith("1")
+        except Exception:
+            return False
+
+    def _ensure_venv(self, py: str) -> str:
+        """Create <app dir>/genenv from `py`; returns its python or ''."""
+        from .paths import app_dir
+        existing = venv_python()
+        if existing:
+            return existing
+        target = app_dir() / "genenv"
+        self._emit("creating or repairing a private Python "
+                   f"private environment at {target}")
+        if not self._run([py, "-m", "venv", str(target)]):
+            self._emit("  venv creation failed — on Debian/Ubuntu run: "
+                       "apt install python3-venv python3-pip")
+            return ""
+        return venv_python()
+
     # --------------------------------------------------------------- deps
     def _missing_deps(self, py: str) -> list[str]:
         """Which generator imports fail in the resolved Python."""
@@ -403,35 +579,44 @@ class EnvSetup:
             return False
 
     def _pip_install(self, py: str, pkgs: list[str]) -> bool:
+        """Install the missing pip packages. ddddocr carries the tightest
+        dependency pins (numpy/onnxruntime), so it goes LAST, and every
+        stage starts WITHOUT --upgrade: batch-upgrading all nine against
+        whatever the user's Python already has is how ResolutionImpossible
+        used to happen on user machines. Batch → per-package →
+        per-package+upgrade, so one hostile pin can only fail its own
+        install, never the whole set."""
+        pkgs = [p for p in pkgs if p != "ddddocr"] \
+            + (["ddddocr"] if "ddddocr" in pkgs else [])
         self._emit(f"pip install {' '.join(pkgs)} …")
-        return self._run([py, "-m", "pip", "install", "--upgrade"] + pkgs)
+        if self._run([py, "-m", "pip", "install"] + pkgs):
+            return True
+        self._emit("  batch install failed (dependency conflict?) — "
+                   "retrying package by package")
+        ok = True
+        for pkg in pkgs:
+            if self._run([py, "-m", "pip", "install", pkg]):
+                continue
+            # the pin may conflict with an already-installed neighbour:
+            # let THIS package upgrade only its own deps
+            if self._run([py, "-m", "pip", "install", "--upgrade", pkg]):
+                self._emit(f"  {pkg}: installed after upgrading its deps")
+                continue
+            self._emit(f"  {pkg}: still failing — its pins conflict; "
+                       "see the resolver lines above")
+            ok = False
+        return ok
 
     def _run(self, argv: list[str], timeout: int = 1200) -> bool:
-        try:
-            proc = subprocess.Popen(
-                argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, encoding="utf-8", errors="replace",
-                **_child_kwargs())
-        except Exception as e:
-            self._emit(f"  failed to start: {type(e).__name__}: {e}")
-            return False
-        last = 0.0
-        for line in proc.stdout or []:
-            line = line.rstrip()
-            if not line:
-                continue
-            # stream installer output but throttle to keep the log readable
-            now = time.time()
-            if now - last > 0.5 or "%" not in line:
-                self._emit("  " + line[:200])
-                last = now
-        try:
-            proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            self._emit("  step timed out — killed")
-            return False
-        return proc.returncode == 0
+        tail: deque[str] = deque(maxlen=3)
+
+        def emit(line):
+            tail.append(line)
+            self._emit(line)
+
+        ok = _run_installer(argv, emit, timeout)
+        self._last_output_tail = list(tail)
+        return ok
 
     # ---------------------------------------------------------- the flow
     def check(self) -> dict:
@@ -494,6 +679,19 @@ class EnvSetup:
                                   "restart the tool and press Retry.")
                     return
                 self.python_exe = py
+            if self._externally_managed(py) or (venv_python(ready=False) and not venv_python()):
+                venv = self._ensure_venv(py)
+                if not venv:
+                    self.state = "failed"
+                    self.error = ("system Python is externally managed and a virtual "
+                                  "environment could not be created — install "
+                                  "python3-venv (apt install python3-venv python3-pip)")
+                    return
+                py = venv
+                self.python_exe = py
+            self.python_exe = py
+            if callable(self.on_python):
+                self.on_python(py)
             self._emit(f"using Python: {py}")
 
             # -- 2) pip deps (full requirement set in one shot)
@@ -502,7 +700,9 @@ class EnvSetup:
                 pip_names = [GEN_PIP_NAMES.get(m, m) for m in missing]
                 if not self._pip_install(py, pip_names):
                     self.state = "failed"
-                    self.error = "pip install failed — see the log lines above"
+                    tail = getattr(self, "_last_output_tail", [])
+                    self.error = "pip install failed — " \
+                        + (tail[-1] if tail else "see the log lines above")
                     return
                 still = self._missing_deps(py)
                 if still:
@@ -515,7 +715,7 @@ class EnvSetup:
             # -- 3) chromium
             if not self._chromium_ok(py):
                 self._emit("installing Playwright Chromium (one-time, ~170 MB)…")
-                if not self._run([py, "-m", "playwright", "install", "chromium"]):
+                if not self._run(_chromium_install_argv(py)):
                     self.state = "failed"
                     self.error = "chromium install failed — see the log above"
                     return
@@ -547,64 +747,105 @@ class PlaywrightSetup:
 
     The exe cannot bundle Playwright + Chromium (~200 MB); instead, the first
     time a signup worker or 100M claim needs a browser, missing pieces are
-    installed into the system Python right then: `pip install playwright`
+    installed into the selected Python right then: `pip install playwright`
     and `playwright install chromium`. Progress streams into the dashboard
-    log so the user sees what is happening."""
+    log so the user sees what is happening. Runtime never installs OS packages;
+    system libraries must be provisioned outside the hardened service."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._done = False           # verified once per process
+        self._done = False
+        self._ready: set[tuple[str, str | None]] = set()
+        self._setup_lock = threading.Lock()
         self._installing = False
+        self._python_exe = ""
 
     def status(self) -> dict:
         return {"installing": self._installing, "ready": self._done}
 
-    def _run(self, argv: list[str], emit) -> bool:
-        try:
-            proc = subprocess.Popen(
-                argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, encoding="utf-8", errors="replace",
-                cwd=str(Path(argv[0]).parent) if os.path.isfile(argv[0]) else None,
-                **_child_kwargs())
-        except Exception as e:
-            emit(f"  playwright setup failed to start: {type(e).__name__}: {e}")
-            return False
-        for line in proc.stdout or []:
-            line = line.rstrip()
-            if line:
-                emit(f"  {line[:160]}")
-        proc.wait()
-        return proc.returncode == 0
+    def _run(self, argv: list[str], emit, timeout: float = 1200) -> bool:
+        return _run_installer(argv, emit, timeout,
+                              cwd=str(Path(argv[0]).parent) if os.path.isfile(argv[0]) else None)
+
+    @staticmethod
+    def _probe(py: str) -> str:
+        """Read the selected interpreter's browser cache without installing anything."""
+        script = (
+            "import importlib.util, os\n"
+            "if importlib.util.find_spec('playwright') is None:\n"
+            "    print('package-missing')\n"
+            "else:\n"
+            "    from playwright.sync_api import sync_playwright\n"
+            "    with sync_playwright() as p:\n"
+            "        exe = p.chromium.executable_path\n"
+            "        print('ready' if exe and os.path.isfile(exe) else 'chromium-missing')\n"
+        )
+        # -B keeps even Python's import cache read-only. Both subprocess paths
+        # inherit PLAYWRIGHT_BROWSERS_PATH and the rest of the service environment.
+        result = subprocess.run([py, "-B", "-c", script], capture_output=True,
+                                text=True, timeout=60, **_child_kwargs())
+        state = (result.stdout or "").strip()
+        if result.returncode != 0 or state not in {"ready", "package-missing", "chromium-missing"}:
+            detail = _tail(result.stderr or result.stdout or "no readiness result", limit=400)
+            raise RuntimeError(f"Playwright preflight failed for {py!r}: {detail}")
+        return state
 
     def ensure(self, python_exe: str, emit=print) -> bool:
+        with self._setup_lock:
+            return self._ensure_serialized(python_exe, emit)
+
+    def _ensure_serialized(self, python_exe: str, emit=print) -> bool:
         """Make sure `python_exe` can run Playwright + Chromium. Fast no-op
         when everything is already installed."""
+        def report(line):
+            try:
+                emit(line)
+            except Exception:
+                # A disconnected dashboard/log consumer must not abort setup.
+                log.exception("playwright progress callback failed")
+
+        if not isinstance(python_exe, str) or not python_exe or "\0" in python_exe:
+            report("Playwright preflight needs a valid Python interpreter path.")
+            return False
+        key = (python_exe, os.environ.get("PLAYWRIGHT_BROWSERS_PATH"))
         with self._lock:
+            self._python_exe = python_exe
+            self._done = key in self._ready
             if self._done:
                 return True
             self._installing = True
+        guidance = ("Run the external installer or Environment Setup outside the hardened service "
+                    f"using {python_exe!r} and the same PLAYWRIGHT_BROWSERS_PATH. "
+                    "For missing Linux system libraries, run that Python with "
+                    "'-m playwright install-deps chromium' as an administrator outside the service. "
+                    "Keep service filesystem protections and browser sandboxing enabled.")
         try:
             py = python_exe
-            # 1) package present?
-            chk = subprocess.run([py, "-c", "import playwright"],
-                                 capture_output=True, **_child_kwargs())
-            if chk.returncode != 0:
-                emit("playwright not found — installing into your Python "
-                     "(one-time, ~40 MB)…")
+            state = self._probe(py)
+            if state == "package-missing":
+                report("playwright not found - installing into your Python (one-time, ~40 MB)...")
                 if not self._run([py, "-m", "pip", "install", "--upgrade",
-                                  "playwright"], emit):
-                    emit("  playwright install FAILED — see lines above")
+                                  "playwright"], report):
+                    report("  playwright install FAILED - " + guidance)
                     return False
-            # 2) chromium browser present? `playwright install` is idempotent:
-            # it verifies the cache and exits fast when up to date.
-            emit("checking chromium browser (one-time setup)…")
-            if not self._run([py, "-m", "playwright", "install", "chromium"],
-                             emit):
-                emit("  chromium install FAILED — see lines above")
+                state = self._probe(py)
+            if state == "chromium-missing":
+                report("installing missing Chromium browser (no OS package changes)...")
+                if not self._run(_chromium_install_argv(py, with_deps=False), report):
+                    report("  chromium install FAILED - " + guidance)
+                    return False
+                state = self._probe(py)
+            if state != "ready":
+                report("  Chromium executable still missing after setup. " + guidance)
                 return False
-            self._done = True
-            emit("playwright ready ✓")
+            with self._lock:
+                self._ready.add(key)
+                self._done = True
+            report("playwright browser files ready")
             return True
+        except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+            report(f"  Playwright setup failed for Python {python_exe!r}: {exc}. " + guidance)
+            return False
         finally:
             self._installing = False
 
@@ -647,6 +888,12 @@ class GenWorker:
         out_dir = Path(env.get("ZAI_OUTPUT_DIR", gen_dir / "output"))
         self.account_file = out_dir / "results" / f"accounts{env.get('ZAI_OUT_SUFFIX', '')}.txt"
         self._account_rows_at_start = self._rows_now()
+        self.done = threading.Event()
+        self.result = {}
+        self.script_result = {}
+        self._thread = None
+        self._finalized = False
+        self._finalize_lock = threading.Lock()
 
     def _rows_now(self) -> int:
         try:
@@ -668,21 +915,63 @@ class GenWorker:
                 **_child_kwargs())
         except Exception as e:
             self.state = "failed"
-            self.lines.append(f"launch error: {e}")
-            if self.on_exit:
-                self.on_exit(self)
+            self.lines.append(f"launch error: {type(e).__name__}")
+            self.result = {"qualified": False, "category": "launch_error", "error": "Worker could not launch"}
+            self._finish()
             return
         self.state = "running"
-        threading.Thread(target=self._pump, daemon=True).start()
+        self._thread = threading.Thread(target=self._pump, daemon=True, name=self.name + "-output")
+        try:
+            self._thread.start()
+        except Exception:
+            self.stop()
+            self._finish()
+
+    def _finish(self):
+        with self._finalize_lock:
+            if self._finalized:
+                return
+            self._finalized = True
+        try:
+            if self.on_exit:
+                self.on_exit(self)
+        except Exception:
+            self.result = {"qualified": False, "category": "registration_error", "error": "Registration did not complete"}
+            log.exception("worker completion failed for %s", self.name)
+        finally:
+            if self.env.get("ZAI_AUTO_GENERATE") == "1" and self.env.get("ZAI_AUTO_ROUTE_FILE"):
+                try:
+                    Path(self.env["ZAI_AUTO_ROUTE_FILE"]).unlink(missing_ok=True)
+                except OSError:
+                    log.warning("Could not remove private route metadata for %s", self.name)
+            self.done.set()
 
     def _pump(self):
+        try:
+            self._pump_body()
+        except Exception:
+            if self.proc and self.proc.poll() is None:
+                _kill_tree(self.proc)
+            self.state = "killed" if self.stopped else "failed"
+            self.result = {"qualified": False, "category": "failed", "error": "Worker output processing failed"}
+            self._finish()
+
+    def _pump_body(self):
         import re
         if not (self.proc and self.proc.stdout):
             self.state = "failed"
+            self._finish()
             return
         for line in self.proc.stdout:
             line = line.rstrip()
             self.lines.append(line)
+            if line.startswith("AUTO_GENERATE_RESULT "):
+                try:
+                    payload = json.loads(line[len("AUTO_GENERATE_RESULT "):])
+                    if isinstance(payload, dict):
+                        self.script_result = payload
+                except ValueError:
+                    pass
             if "Account token email=" in line:
                 self.email = line.split("Account token email=")[-1].strip()
             elif "Using pool proxy:" in line:
@@ -713,9 +1002,7 @@ class GenWorker:
         else:
             self.state = "exited"
         self.exit_code = code
-        self.check_new_account()
-        if self.on_exit:
-            self.on_exit(self)
+        self._finish()
 
     def check_new_account(self):
         """A successful run leaves one more row in accounts<SUF>.txt — surface
@@ -739,18 +1026,11 @@ class GenWorker:
 
     def stop(self):
         self.stopped = True
+        self.state = "killed"
         if self.proc and self.proc.poll() is None:
-            try:
-                subprocess.run(["taskkill", "/PID", str(self.proc.pid), "/T", "/F"],
-                               capture_output=True, timeout=5, **_child_kwargs())
-            except Exception:
-                pass
-            try:
-                if self.proc and self.proc.poll() is None:
-                    self.proc.kill()
-            except Exception:
-                pass
-            self.state = "killed"
+            _kill_tree(self.proc)
+        if self.proc is None:
+            self._finish()
 
     def alive(self) -> bool:
         return bool(self.proc and self.proc.poll() is None)
@@ -762,6 +1042,8 @@ class GenWorker:
             "captcha": self.captcha,
             "state": self.state,
             "exit_code": self.exit_code,
+            "auto_generate": self.env.get("ZAI_AUTO_GENERATE") == "1",
+            "outcome": {k: v for k, v in self.result.items() if k in ("qualified", "category", "error", "account_id")},
             "email": self.email,
             "starter": self.starter,
             "giveaway500": self.giveaway500,
@@ -800,21 +1082,24 @@ class ProxyChecker:
         self.auto_interval_min = 45
         self._auto_thread: threading.Thread | None = None
         self._auto_stop = threading.Event()
+        self._closed = False
         self.last_verified_at: float | None = None
 
     def set_auto_verify(self, enabled: bool, interval_min: int | None = None) -> dict:
         """Background re-verify loop: re-probes the usable pool so the claim
         picker never faces an all-stale candidate set."""
         with self._lock:
+            if self._closed:
+                return {"error": "checker is shut down"}
             self.auto_verify = bool(enabled)
             if interval_min:
                 self.auto_interval_min = max(5, int(interval_min))
-        if enabled and not (self._auto_thread and self._auto_thread.is_alive()):
-            self._auto_stop.clear()
-            self._auto_thread = threading.Thread(target=self._auto_loop, daemon=True)
-            self._auto_thread.start()
-        if not enabled:
-            self._auto_stop.set()
+            if enabled and not (self._auto_thread and self._auto_thread.is_alive()):
+                self._auto_stop.clear()
+                self._auto_thread = threading.Thread(target=self._auto_loop, daemon=True)
+                self._auto_thread.start()
+            if not enabled:
+                self._auto_stop.set()
         return {"auto_verify": self.auto_verify,
                 "interval_min": self.auto_interval_min}
 
@@ -841,6 +1126,8 @@ class ProxyChecker:
             probe_concurrency: int | None = None) -> dict:
         action = action if action in self.ACTIONS else "verify"
         with self._lock:
+            if self._closed:
+                return {"error": "checker is shut down"}
             if self.alive():
                 return {"error": "checker already running", "action": self.action}
             self.action = action
@@ -850,7 +1137,7 @@ class ProxyChecker:
             for key in ("probed", "alive", "total", "best", "median", "raw",
                         "pool", "scanned", "ever_good", "reasons", "labels",
                         "second_chance", "prefilter", "prefilter_phase",
-                        "countries_resolved", "countries_missing", "elapsed"):
+                        "countries_resolved", "countries_missing", "elapsed", "network_warning"):
                 self.stats.pop(key, None)
             self.refresh_stats()
             env = os.environ.copy()
@@ -892,6 +1179,8 @@ class ProxyChecker:
             for key in ("timeout", "concurrency", "prefilter"):
                 if key in ev:
                     self.stats[key] = ev[key]
+        elif t == "network_warning":
+            self.stats["network_warning"] = ev.get("message", "")
         elif t == "prefilter":
             self.stats.update(prefilter={"endpoints": ev.get("endpoints", 0),
                                          "open": ev.get("open", 0),
@@ -908,7 +1197,9 @@ class ProxyChecker:
                 "open": ev.get("open", 0)}
         elif t == "reasons":
             self.stats.update(probed=ev.get("probed", 0), total=ev.get("total", 0),
-                              alive=ev.get("alive", 0), reasons=ev.get("reasons") or {})
+                              alive=ev.get("alive", 0))
+            if "reasons" in ev:
+                self.stats["reasons"] = ev["reasons"] or {}
             if ev.get("labels"):
                 self.stats["labels"] = ev["labels"]
         elif t == "second_chance":
@@ -992,17 +1283,21 @@ class ProxyChecker:
 
     def stop(self):
         if self.alive():
-            try:
-                subprocess.run(["taskkill", "/PID", str(self.proc.pid), "/T", "/F"],
-                               capture_output=True, timeout=5, **_child_kwargs())
-            except Exception:
-                pass
-            try:
-                if self.proc and self.proc.poll() is None:
-                    self.proc.kill()
-            except Exception:
-                pass
+            _kill_tree(self.proc)
             self.state = "exited"
+
+    def shutdown(self):
+        with self._lock:
+            self._closed = True
+            self.auto_verify = False
+            self._auto_stop.set()
+            _kill_tree(self.proc)
+            self.state = "exited"
+        if self.proc:
+            self.proc.wait(timeout=5)
+        for thread in (self._auto_thread, self._thread):
+            if thread and thread is not threading.current_thread():
+                thread.join(timeout=5)
 
     def _count(self, name: str) -> int:
         try:
@@ -1199,9 +1494,7 @@ def classify_proxy_entry(entry: dict, url: str, bad: set, used: set, max_fails: 
       working  - the latest check passed: ready to be handed out
       failing  - checked, and the latest check failed (or too many failures)
 
-    The checker tiles and the "Proxy pool" card both use this, so their numbers
-    agree (they used to disagree: one counted "never failed" as healthy, the other
-    read fields that do not exist and called everything unverified)."""
+    Used by checker counters; untested candidates must not count as working."""
     if url in bad:
         return "bad"
     if url in used:
@@ -1223,10 +1516,11 @@ def _run_capture(args, cwd, timeout, env=None) -> subprocess.CompletedProcess:
     timeout. `npx` is a .cmd shim in front of node: run()'s own kill only hits
     the shim, orphaning node — which then keeps wrangler's OAuth port bound and
     makes the next login attempt fail with "address in use"."""
+    extra = {"start_new_session": True} if os.name != "nt" else {}
     proc = subprocess.Popen(
         args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, encoding="utf-8", errors="replace", shell=False, env=env,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), **extra)
     try:
         out, err = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -1234,6 +1528,10 @@ def _run_capture(args, cwd, timeout, env=None) -> subprocess.CompletedProcess:
             if os.name == "nt":
                 subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
                                capture_output=True, timeout=10, **_child_kwargs())
+            else:
+                # whole group: npx -> node -> wrangler (keeps the OAuth port bound)
+                import signal
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             proc.kill()
         except Exception:
             pass
@@ -1243,6 +1541,28 @@ def _run_capture(args, cwd, timeout, env=None) -> subprocess.CompletedProcess:
             out = err = ""
         raise subprocess.TimeoutExpired(args, timeout, output=out, stderr=err)
     return subprocess.CompletedProcess(args, proc.returncode, out, err)
+
+
+def _private_node_bin() -> Path:
+    """<app dir>/node/bin — where the installer / auto-install puts Node.js on
+    Linux (a system Node is used when it is new enough)."""
+    from .paths import app_dir
+    return app_dir() / "node" / "bin"
+
+
+def _use_private_node() -> None:
+    """Put the private Node.js first on PATH (POSIX only; a no-op when absent)."""
+    if os.name == "nt":
+        return
+    d = _private_node_bin()
+    if d.is_dir() and str(d) not in os.environ.get("PATH", "").split(os.pathsep):
+        os.environ["PATH"] = str(d) + os.pathsep + os.environ.get("PATH", "")
+
+
+def _is_headless() -> bool:
+    """A Linux session with no display: wrangler's browser login cannot work."""
+    return sys.platform.startswith("linux") \
+        and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
 
 def claim_result_landed(res) -> bool:
@@ -1267,18 +1587,21 @@ class ClaimJob:
 
     def __init__(self, name: str, email: str, mode: str, proxy: str,
                  gen_dir: Path, python_exe: str, invite_code: str,
-                 data_dir: Path | None = None, kind: str = "start"):
+                 data_dir: Path | None = None, kind: str = "start", child_env=None):
         self.name, self.email, self.mode, self.proxy = name, email, mode, proxy
         self.kind = kind if kind in ("100m", "500m", "start") else "start"
         self.gen_dir = Path(gen_dir)
         self.data_dir = Path(data_dir) if data_dir else self.gen_dir / "output"
         self.python_exe = python_exe
+        self.child_env = child_env or {}
         self.argv = self._build_argv()
         self.invite_code = invite_code
         self.proc: subprocess.Popen | None = None
         self.state = "starting"      # starting|running|exited|failed|killed
         self.stopped = False
         self.started = 0.0
+        self.finished = 0.0
+        self.done = threading.Event()
         self.result: dict | None = None
         self.lines: deque[str] = deque(maxlen=220)
         self._thread: threading.Thread | None = None
@@ -1308,6 +1631,8 @@ class ClaimJob:
     def fail(self, message: str) -> None:
         self.lines.append(message)
         self.state = "failed"
+        self.finished = time.time()
+        self.done.set()
 
     def alive(self) -> bool:
         if self.proc is not None:
@@ -1316,7 +1641,15 @@ class ClaimJob:
         return self.state == "starting" and not self.stopped
 
     def start(self):
+        with self._lock:
+            if self.stopped:
+                return
+            self._start()
+
+    def _start(self):
         env = os.environ.copy()
+        env.update(self.child_env)
+        env.update(_bundled_captcha_env())
         env.update({"PYTHONUNBUFFERED": "1",
                     "ZAI_OUTPUT_DIR": str(self.data_dir),
                     "ZAI_INVITE_CODE": self.invite_code or ""})
@@ -1333,6 +1666,8 @@ class ClaimJob:
         except Exception as e:
             self.state = "failed"
             self.lines.append(f"launch error: {e}")
+            self.finished = time.time()
+            self.done.set()
             return
         self._thread = threading.Thread(target=self._pump, daemon=True)
         self._thread.start()
@@ -1345,7 +1680,7 @@ class ClaimJob:
         return {"name": self.name, "email": self.email, "mode": self.mode,
                 "kind": self.kind,
                 "proxy": re.sub(r"//[^/]*@", "//", self.proxy) if self.proxy else "", "state": self.state,
-                "elapsed": int(time.time() - self.started) if self.started else 0,
+                "elapsed": int((self.finished or time.time()) - self.started) if self.started else 0,
                 "result": res,
                 "lines": list(self.lines)[-12:]}
 
@@ -1370,7 +1705,8 @@ class ClaimJob:
                 continue
             self.lines.append(line)
         self.proc.wait()
-        self.state = "exited" if self.proc.returncode == 0 else "failed"
+        self.finished = time.time()
+        self.state = "killed" if self.stopped else "exited" if self.proc.returncode == 0 else "failed"
         # completion hook: let the gateway re-settle the account (a dead
         # account that just claimed a plan must return to rotation)
         if self.on_exit:
@@ -1378,21 +1714,15 @@ class ClaimJob:
                 self.on_exit(self)
             except Exception:
                 log.exception("claim on_exit callback failed for %s", self.email)
+        self.done.set()
 
     def stop(self):
-        self.stopped = True
-        if self.proc and self.proc.poll() is None:
-            try:
-                subprocess.run(["taskkill", "/PID", str(self.proc.pid), "/T", "/F"],
-                               capture_output=True, timeout=5, **_child_kwargs())
-            except Exception:
-                pass
-            try:
-                if self.proc and self.proc.poll() is None:
-                    self.proc.kill()
-            except Exception:
-                pass
-        self.state = "killed"
+        with self._lock:
+            self.stopped = True
+            _kill_tree(self.proc)
+            self.state = "killed"
+            self.finished = time.time()
+            self.done.set()
 
 
 class GeneratorManager:
@@ -1426,10 +1756,23 @@ class GeneratorManager:
                                     data_dir=self.data_dir)
         self._seq = 0
         self._lock = threading.Lock()
+        self._registration_lock = threading.Lock()
+        self._ledger_lock = threading.Lock()
+        self._closed = threading.Event()
+        self._claim_all_cancel = threading.Event()
+        self._claim_all_running = False
+        self._claim_all_job = ""
+        self._claim_all_status = {"state": "idle", "total": 0, "completed": 0,
+                                  "succeeded": 0, "failed": 0, "skipped": 0,
+                                  "current_email": "", "mode": "direct", "error": ""}
+        self._display_lock = threading.Lock()
+        self._display_proc = None
+        self._display = ""
         # per-run internal auth token for gateway admin calls from children
         self.internal_token = ""
-        # AI-captcha fallback: port + client key children use for /v1 calls
-        self._gateway_port = 8788
+        # Set by the API integration, including a TLS SAN-valid host when needed.
+        self.gateway_origin = "http://127.0.0.1:8788"
+        self.gateway_ca_file = ""
         self._client_key_for_children = ""
         # gateway accounts dir (config accounts.dir) — _pool_health() counts
         # account snapshots here; set from api_dash at manager creation.
@@ -1437,10 +1780,11 @@ class GeneratorManager:
         # on-demand playwright installer (signup workers + 100M claims)
         self.playwright = PlaywrightSetup()
         # full first-run environment setup (python + deps + chromium)
-        self.env_setup = EnvSetup()
+        self.env_setup = EnvSetup(python_exe)
+        self.env_setup.on_python = self._adopt_python
         # options (dashboard-editable)
-        self.captcha = "manual"             # manual | ai | classic | auto
-        self.captcha_strategy = "auto"      # strategy when captcha != manual
+        self.captcha = "ai" if sys.platform.startswith("linux") else "manual"
+        self.captcha_strategy = "ai" if sys.platform.startswith("linux") else "auto"
         # custom OpenAI-compatible vision endpoint for the AI judge. Empty
         # fields = use the gateway's own GLM-5.3-Flash. When set, workers get
         # ZAI_GATEWAY_URL/KEY/MODEL pointing at the user's endpoint instead.
@@ -1456,6 +1800,7 @@ class GeneratorManager:
         self.claim500 = False               # legacy 500M giveaway claim (withdrawn 2026-10-26)
         self.claim_start = True             # Start Plan preview -> billing/claim (default)
         self.headless = False               # default: visible window (manual captcha needs it)
+        self.browser_display = "auto"       # auto | desktop | virtual (Linux Xvfb)
         self._invite_code = "MT9GNDQ8"      # referral code ('' = off; overridden by config)
         self.pool_file = self.data_dir / "proxies.txt"
         self.evergood_file = self.data_dir / "proxies_evergood.txt"
@@ -1470,6 +1815,9 @@ class GeneratorManager:
         self.load_options()
         # tidy a legacy-flat data dir into the sorted layout (once, best-effort)
         self._cleanup_layout()
+        from .auto_generate import AutoGenerateController
+        self.auto_generate = AutoGenerateController(self.data_dir, launch=self._auto_launch,
+                                                    preflight=self._auto_preflight)
 
     # ---- email system -------------------------------------------------------
 
@@ -1487,10 +1835,23 @@ class GeneratorManager:
             self.mail_cfg.setdefault(k, v)
 
     def _save_mail_config(self):
-        self.mail_cfg_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.mail_cfg_path.with_suffix('.json.tmp')
-        tmp.write_text(json.dumps(self.mail_cfg, indent=1), encoding='utf-8')
-        os.replace(tmp, self.mail_cfg_path)
+        with self._mail_config_lock():
+            self.mail_cfg_path.parent.mkdir(parents=True, exist_ok=True)
+            fd, name = tempfile.mkstemp(prefix=".mail-", suffix=".tmp",
+                                        dir=self.mail_cfg_path.parent)
+            tmp = Path(name)
+            try:
+                # mkstemp creates a distinct, private (0600 on POSIX) file.
+                with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                    json.dump(dict(self.mail_cfg), stream, indent=1)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(tmp, self.mail_cfg_path)
+            finally:
+                tmp.unlink(missing_ok=True)
+
+    def _mail_config_lock(self):
+        return self.__dict__.setdefault("_mail_lock", threading.RLock())
 
     def mail_config(self) -> dict:
         """Current config with the secret masked for display."""
@@ -1509,6 +1870,7 @@ class GeneratorManager:
         m["routing_all_done"] = bool(doms) and all(d in done for d in doms)
         m["routing_pending"] = [d for d in doms if d not in done]
         m.pop("inbox_secret", None)
+        m["cf_token_set"] = bool(m.pop("cf_api_token", ""))
         return m
 
     def mark_inbox_verified(self, ok: bool) -> None:
@@ -1525,14 +1887,256 @@ class GeneratorManager:
         d = str(domain or "").strip().lower()
         if not d:
             return self.mail_config()
-        doms = [str(x).strip().lower() for x in (self.mail_cfg.get("routing_done") or [])]
-        if done and d not in doms:
-            doms.append(d)
-        elif not done and d in doms:
-            doms.remove(d)
-        self.mail_cfg["routing_done"] = doms
-        self._save_mail_config()
+        # never wait on the mail lock: a deploy holds it for minutes, and the
+        # callers are dashboard routes. (Re-entrant, so auto_route_domain —
+        # which already holds it — still gets through.)
+        lock = self._mail_config_lock()
+        if not lock.acquire(blocking=False):
+            raise ValueError("email deployment/configuration is busy; retry after it finishes")
+        try:
+            doms = [str(x).strip().lower() for x in (self.mail_cfg.get("routing_done") or [])]
+            if done and d not in doms:
+                doms.append(d)
+            elif not done and d in doms:
+                doms.remove(d)
+            self.mail_cfg["routing_done"] = doms
+            self._save_mail_config()
+        finally:
+            lock.release()
         return self.mail_config()
+
+    # ---- Cloudflare Email Routing through the REST API ----------------------- #
+    # Step 3 of the wizard used to be fully manual. With an API token that has
+    # Zone:Read, DNS:Edit and Email Routing Rules:Edit the gateway turns routing
+    # on for the domain and points the catch-all at the worker by itself.
+
+    _CF_API = "https://api.cloudflare.com/client/v4"
+    _CF_PERMS = ("the token needs Zone → Zone: Read, Zone → DNS: Edit, "
+                 "Zone → Email Routing Rules: Edit and Zone → Zone Settings: Edit")
+
+    def _cf_call(self, method: str, path: str, json_body=None, params=None) -> dict:
+        """One Cloudflare API call with the stored token. Returns the parsed
+        envelope; raises RuntimeError with a readable message on any failure."""
+        import httpx as _hx
+        token = str(self.mail_cfg.get("cf_api_token") or "").strip()
+        if not token:
+            raise RuntimeError("no Cloudflare API token saved")
+        try:
+            r = _hx.request(method, self._CF_API + path, json=json_body, params=params,
+                            headers={"Authorization": f"Bearer {token}"}, timeout=30)
+        except _hx.HTTPError as exc:
+            raise RuntimeError(f"Cloudflare API unreachable ({type(exc).__name__})") from exc
+        try:
+            data = r.json()
+        except ValueError:
+            data = {}
+        if r.status_code >= 400 or not data.get("success", False):
+            msgs = "; ".join(str(e.get("message")) for e in (data.get("errors") or [])
+                             if isinstance(e, dict)) or f"HTTP {r.status_code}"
+            hint = f" — {self._CF_PERMS}" if r.status_code in (401, 403) else ""
+            raise RuntimeError(msgs + hint)
+        return data
+
+    def _cf_zone_for(self, domain: str) -> tuple[str, str, str]:
+        """(zone_id, zone_name, status) of the zone that contains `domain`
+        (mail.example.com -> the example.com zone)."""
+        labels = domain.split(".")
+        for i in range(len(labels) - 1):
+            cand = ".".join(labels[i:])
+            res = self._cf_call("GET", "/zones", params={"name": cand}).get("result") or []
+            if res:
+                return res[0]["id"], res[0]["name"], str(res[0].get("status") or "")
+        raise RuntimeError(
+            f"{domain} is not in this Cloudflare account — add the domain to "
+            "Cloudflare and set the two nameservers it shows at your registrar")
+
+    def _cf_pick_account(self) -> tuple[str, str]:
+        """(account_id, error) for a token that can see several Cloudflare
+        accounts: wrangler cannot choose one without a terminal, so take the
+        account that owns one of our mail domains. ('', '') = leave it to wrangler."""
+        try:
+            accts = [a for a in (self._cf_call("GET", "/accounts").get("result") or [])
+                     if isinstance(a, dict) and a.get("id")]
+        except RuntimeError:
+            return "", ""
+        if len(accts) == 1:
+            return accts[0]["id"], ""
+        if not accts:
+            return "", ""
+        ids = {a["id"] for a in accts}
+        for dom in self.mail_cfg.get("domains") or []:
+            labels = str(dom).strip().lower().split(".")
+            for i in range(len(labels) - 1):
+                try:
+                    zones = self._cf_call("GET", "/zones",
+                                          params={"name": ".".join(labels[i:])}).get("result") or []
+                except RuntimeError:
+                    break
+                owner = ((zones[0].get("account") or {}).get("id") if zones else "") or ""
+                if owner in ids:
+                    return owner, ""
+                if zones:
+                    break
+        listing = "; ".join(f"{a.get('name') or 'account'}: {a['id']}" for a in accts)
+        return "", ("This token can see several Cloudflare accounts (" + listing + "). "
+                    "Paste the id of the one that holds your domain into the "
+                    "'account id' box and deploy again.")
+
+    def _worker_name(self) -> str:
+        try:
+            toml = (self._worker_dir() / "wrangler.toml").read_text(encoding="utf-8")
+        except OSError:
+            return "zai-mail"
+        m = re.search(r'^\s*name\s*=\s*"([^"]+)"', toml, re.M)
+        return m.group(1) if m else "zai-mail"
+
+    def auto_route_domain(self, domain: str, *, replace_existing: bool = False,
+                          confirmation_fingerprint: str = "") -> dict:
+        lock = self._mail_config_lock()
+        if not lock.acquire(blocking=False):
+            return {"ok": False, "domain": str(domain or ""), "error": "email setup is running; wait before changing routing"}
+        try:
+            return self._auto_route_domain_locked(domain, replace_existing=replace_existing,
+                                                   confirmation_fingerprint=confirmation_fingerprint)
+        finally:
+            lock.release()
+
+    def _auto_route_domain_locked(self, domain: str, *, replace_existing: bool = False,
+                                 confirmation_fingerprint: str = "") -> dict:
+        """Enable Email Routing for `domain` and point its catch-all at the
+        worker; verified by reading the rule back. Marks routing done on success."""
+        d = str(domain or "").strip().lower().lstrip("@")
+        if not d:
+            return {"ok": False, "domain": d, "error": "no domain"}
+        try:
+            zone_id, zone, zstatus = self._cf_zone_for(d)
+            if d != zone.lower().rstrip("."):
+                return {"ok": False, "domain": d,
+                        "error": "automatic subdomain routing is unsupported; configure this domain manually"}
+            if zstatus and zstatus != "active":
+                return {"ok": False, "domain": d,
+                        "error": f"the Cloudflare zone for {zone} is '{zstatus}' — finish "
+                                 "the nameserver change at your registrar first"}
+            worker = self._worker_name()
+            catch_all = f"/zones/{zone_id}/email/routing/rules/catch_all"
+            existing = self._cf_call("GET", catch_all).get("result") or {}
+            desired_actions = [{"type": "worker", "value": [worker]}]
+            desired_matchers = [{"type": "all"}]
+            def rule_semantics(rule):
+                # API metadata and an omitted empty value do not change an action.
+                return {"enabled": rule.get("enabled"),
+                        "actions": [{"type": a.get("type"), "value": a.get("value") or []}
+                                    for a in (rule.get("actions") or [])],
+                        "matchers": [{"type": m.get("type"), "field": m.get("field") or "",
+                                      "value": m.get("value") or ""}
+                                     for m in (rule.get("matchers") or [])]}
+
+            desired_rule = {"enabled": True, "actions": desired_actions,
+                            "matchers": desired_matchers}
+            expected = rule_semantics(desired_rule)
+
+            def fingerprint(rule):
+                import hashlib
+                # Bind approval to the entire raw rule, its zone and the new worker.
+                raw = json.dumps([zone_id, d, worker, rule], sort_keys=True,
+                                 separators=(",", ":"), ensure_ascii=True)
+                return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+            def needs_confirmation(rule, changed=False):
+                return {"ok": False, "domain": d, "zone": zone, "worker": worker,
+                        "needs_confirmation": True,
+                        "confirmation_fingerprint": fingerprint(rule),
+                        "existing_rule": rule_semantics(rule), "expected_rule": expected,
+                        "error": ("catch-all changed; review it again before replacement" if changed else
+                                  "existing catch-all preserved; confirm replacement after reviewing its destinations")}
+
+            def safe_without_confirmation(rule):
+                semantics = rule_semantics(rule)
+                # Only the disabled, destination-free drop placeholder is disposable.
+                return (not rule or semantics == expected or
+                        (rule.get("enabled") is False and
+                         semantics["actions"] == [{"type": "drop", "value": []}] and
+                         semantics["matchers"] in ([], expected["matchers"])))
+
+            already_routed = rule_semantics(existing) == expected
+            if not safe_without_confirmation(existing):
+                if (replace_existing is not True or not confirmation_fingerprint or
+                        confirmation_fingerprint != fingerprint(existing)):
+                    return needs_confirmation(existing, bool(confirmation_fingerprint))
+            # reading/enabling the routing *settings* needs a different token
+            # permission than editing the rules; remember a refusal, still set
+            # the catch-all, and report it at the end
+            enable_err = ""
+            try:
+                enabled = bool((self._cf_call(
+                    "GET", f"/zones/{zone_id}/email/routing").get("result") or {}).get("enabled"))
+            except RuntimeError:
+                enabled = False
+            if not enabled:
+                try:
+                    self._cf_call("POST", f"/zones/{zone_id}/email/routing/dns", {"name": zone})
+                except RuntimeError as first:
+                    try:                    # older name of the same operation
+                        self._cf_call("POST", f"/zones/{zone_id}/email/routing/enable", {})
+                    except RuntimeError:
+                        enable_err = str(first)
+            if not already_routed:
+                # Enabling routing can take time. Re-read immediately before the
+                # write so a concurrent rule change never uses stale approval.
+                current = self._cf_call("GET", catch_all).get("result") or {}
+                # compare what the rule DOES, not its raw JSON: Cloudflare may
+                # touch metadata (ids, priority, name) when routing is switched
+                # on, which must not read as somebody else changing the rule
+                if rule_semantics(current) != rule_semantics(existing):
+                    return needs_confirmation(current, True)
+                if rule_semantics(current) != expected:
+                    self._cf_call("PUT", catch_all, {
+                        "name": f"{worker} catch-all", "enabled": True,
+                        "matchers": desired_matchers, "actions": desired_actions})
+            rule = self._cf_call(
+                "GET", f"/zones/{zone_id}/email/routing/rules/catch_all").get("result") or {}
+            routed = rule_semantics(rule) == expected
+            if not routed:
+                return {"ok": False, "domain": d,
+                        "error": "the catch-all rule did not read back as enabled → worker"}
+            if enable_err:
+                return {"ok": False, "domain": d,
+                        "error": "the catch-all now points at the worker, but Email Routing "
+                                 f"could not be turned on ({enable_err}). Add Zone → Zone "
+                                 "Settings: Edit to the API token, or open Email → Email "
+                                 "Routing → Onboard Domain for this domain in Cloudflare once"}
+            try:
+                status = (self._cf_call("GET", f"/zones/{zone_id}/email/routing")
+                          .get("result") or {}).get("status", "")
+            except RuntimeError:
+                status = ""
+            self.set_routing_done(d, True)
+            return {"ok": True, "domain": d, "zone": zone, "worker": worker,
+                    "routing_status": status}
+        except RuntimeError as exc:
+            return {"ok": False, "domain": d, "error": str(exc)}
+
+    def auto_route_all(self, progress=None, only: str = "", *, replace_existing: bool = False,
+                       confirmation_fingerprint: str = "") -> list[dict]:
+        """auto_route_domain for `only`, or for every domain not yet routed."""
+        doms = [str(x).strip().lower() for x in (self.mail_cfg.get("domains") or [])]
+        done = {str(x).strip().lower() for x in (self.mail_cfg.get("routing_done") or [])}
+        targets = [only.strip().lower()] if only else [x for x in doms if x not in done]
+        results = []
+        for d in targets:
+            if progress:
+                try:
+                    progress(f"routing mail for {d} to the worker…")
+                except Exception:
+                    pass
+            if replace_existing or confirmation_fingerprint:
+                # An approval is only meaningful for one explicitly selected domain.
+                results.append(self.auto_route_domain(
+                    d, replace_existing=replace_existing is True and bool(only),
+                    confirmation_fingerprint=confirmation_fingerprint if only else ""))
+            else:
+                results.append(self.auto_route_domain(d))
+        return results
 
     # ---- registration ledger ------------------------------------------------ #
 
@@ -1551,12 +2155,17 @@ class GeneratorManager:
         email = str(email or "").strip().lower()
         if not email:
             return
-        got = self.registered_emails() | {email}
-        p = self._registered_path()
-        p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps({"emails": sorted(got)}, indent=1), encoding="utf-8")
-        os.replace(tmp, p)
+        with self._ledger_lock:
+            got = self.registered_emails() | {email}
+            p = self._registered_path()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            fd, filename = tempfile.mkstemp(prefix=".registered-", suffix=".tmp", dir=p.parent)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                    json.dump({"emails": sorted(got)}, stream)
+                os.replace(filename, p)
+            finally:
+                Path(filename).unlink(missing_ok=True)
 
     def pending_accounts(self) -> list[dict]:
         """Accounts sitting in accounts*.txt / starter*.txt that never reached
@@ -1597,6 +2206,67 @@ class GeneratorManager:
                     out.append({"email": email, "password": password,
                                 "chat_token": token})
         return out
+
+    def unclaimed_accounts(self) -> list[dict]:
+        """Successful signup credentials minus explicit grants, not pool registration."""
+        import base64
+        granted = {j.email for j in list(self.claims.values())
+                   if claim_result_landed(j.result)}
+        accounts = {}
+        for base in (self.data_dir / "results", self.data_dir):
+            for pattern in ("startplan*.txt", "starter*.txt", "accounts500m*.txt"):
+                for path in base.glob(pattern):
+                    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                        if line.count(":") >= 2:
+                            granted.add(line.split(":", 1)[0].strip().lower())
+            for path in base.glob("plans*.jsonl"):
+                for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                    try:
+                        record = json.loads(line)
+                        if any(record.get(k) for k in ("starter", "start_plan", "giveaway500", "global_build", "plans")):
+                            granted.add(str(record.get("email") or "").strip().lower())
+                    except (ValueError, AttributeError):
+                        continue
+            for path in sorted(base.glob("accounts*.txt")):
+                for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                    try:
+                        email, password, token = line.strip().split(":", 2)
+                        email, token = email.strip().lower(), token.strip()
+                        payload = token.split(".")[1]
+                        ident = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+                        # These are locally produced records, not authenticated
+                        # JWT validation. Reject placeholders and guest sessions.
+                        if (not password or "@" not in email or not token.startswith("eyJ")
+                                or str(ident.get("email") or "").lower() != email
+                                or email.endswith("@guest.com") or email.startswith("guest-")):
+                            continue
+                        accounts.setdefault(email, {"email": email, "password": password,
+                                                    "chat_token": token})
+                    except (ValueError, IndexError, AttributeError):
+                        continue
+        return [info for email, info in accounts.items() if email not in granted]
+
+    def _claim_done(self, job: ClaimJob) -> None:
+        if job.kind == "start" and claim_result_landed(job.result):
+            # Reuse the grant ledger so recovery stays idempotent after restart.
+            for base in (self.data_dir / "results", self.data_dir):
+                found = False
+                for path in sorted(base.glob("accounts*.txt")):
+                    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                        if line.split(":", 1)[0].strip().lower() == job.email and line.count(":") >= 2:
+                            target = self.data_dir / "results" / "startplan_claimed.txt"
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            with target.open("a", encoding="utf-8") as output:
+                                output.write(line.strip() + "\n")
+                            found = True
+                            break
+                    if found:
+                        break
+                if found:
+                    break
+        settle = getattr(self, "_claim_settle", None)
+        if settle:
+            settle(job)
 
     # ---- 100M referral finisher --------------------------------------------- #
     # The invite chain needs: bind + login_device + ONE client message. The
@@ -1675,6 +2345,7 @@ class GeneratorManager:
         """Full path to npx. Windows CreateProcess does NOT apply PATHEXT, so a
         bare 'npx' raises WinError 2 — always resolve through shutil.which."""
         import shutil as _sh
+        _use_private_node()
         npx = _sh.which("npx") or _sh.which("npx.cmd") or _sh.which("npx.exe")
         if npx:
             return npx
@@ -1738,11 +2409,14 @@ class GeneratorManager:
                 except Exception:
                     pass
 
+        _use_private_node()
         if _sh.which("node") and _sh.which("npm") and self._node_version_ok():
             npx = self._npx()
             if npx:
                 return {"ok": True, "node": _sh.which("node"),
                         "npm": _sh.which("npm"), "npx": npx}
+        if os.name != "nt":
+            return self._install_node_posix(say)
         if _sh.which("node") and not self._node_version_ok():
             say(f"Node.js is installed but older than {self._NODE_MIN_MAJOR} "
                 "(wrangler 4 needs >= 22) — installing a current LTS…")
@@ -1814,8 +2488,156 @@ class GeneratorManager:
         say("Node.js ready")
         return {"ok": True, "node": node, "npm": npm, "npx": npx}
 
+    def _install_node_posix(self, say) -> dict:
+        """Linux/macOS: fetch the official Node.js LTS build (>= 22) from
+        nodejs.org, verify its SHA-256, unpack it to <app dir>/node. No root,
+        no package manager, nothing outside the gateway folder."""
+        import hashlib
+        import platform
+        import shutil as _sh
+        import tarfile
+        import tempfile
+        import httpx as _hx
+        from .paths import app_dir
+        osname = "darwin" if sys.platform == "darwin" else "linux"
+        arch = {"x86_64": "x64", "amd64": "x64", "aarch64": "arm64",
+                "arm64": "arm64"}.get(platform.machine().lower())
+        manual = "install Node.js >= 22 (https://nodejs.org) and retry"
+        if not arch:
+            return {"ok": False, "error": f"no prebuilt Node.js for {platform.machine()} — {manual}"}
+        try:
+            say(f"Node.js >= {self._NODE_MIN_MAJOR} not found — installing the official "
+                "build into the gateway folder (one time, ~30 MB)…")
+            idx = _hx.get("https://nodejs.org/dist/index.json", timeout=30).json()
+            ent = next((e for e in idx if e.get("lts")
+                        and int(str(e["version"]).lstrip("v").split(".")[0])
+                        >= self._NODE_MIN_MAJOR), None)
+            if not ent:
+                raise RuntimeError("no suitable LTS release listed")
+            ver = ent["version"]
+            name = f"node-{ver}-{osname}-{arch}.tar.xz"
+            base = f"https://nodejs.org/dist/{ver}"
+            sums = _hx.get(f"{base}/SHASUMS256.txt", timeout=30).text
+            expected = next((ln.split()[0] for ln in sums.splitlines()
+                             if ln.strip().endswith(" " + name)), "")
+            if not expected:
+                raise RuntimeError(f"{name} is not in the published checksums")
+            tmp = Path(tempfile.mkdtemp(prefix="node-dl-", dir=str(app_dir())))
+            try:
+                archive = tmp / name
+                digest = hashlib.sha256()
+                with _hx.stream("GET", f"{base}/{name}", timeout=120,
+                                follow_redirects=True) as resp:
+                    resp.raise_for_status()
+                    with open(archive, "wb") as fh:
+                        for chunk in resp.iter_bytes(1 << 20):
+                            digest.update(chunk)
+                            fh.write(chunk)
+                if digest.hexdigest() != expected:
+                    raise RuntimeError("SHA-256 mismatch — refusing the download")
+                say("unpacking Node.js…")
+                with tarfile.open(archive) as tf:
+                    try:
+                        tf.extractall(tmp, filter="data")
+                    except TypeError:          # Python < 3.12: no extraction filters
+                        tf.extractall(tmp)
+                dest = app_dir() / "node"
+                if dest.exists():
+                    _sh.rmtree(dest)
+                os.replace(tmp / name[:-len(".tar.xz")], dest)
+            finally:
+                _sh.rmtree(tmp, ignore_errors=True)
+        except Exception as exc:
+            return {"ok": False, "error": f"automatic Node.js install failed "
+                                          f"({type(exc).__name__}: {exc}) — {manual}"}
+        _use_private_node()
+        node, npm, npx = _sh.which("node"), _sh.which("npm"), self._npx()
+        if not (node and npm and npx):
+            return {"ok": False, "error": f"Node.js unpacked but not runnable — {manual}"}
+        say("Node.js ready")
+        return {"ok": True, "node": node, "npm": npm, "npx": npx}
+
     def _node_tools(self) -> dict:
         return self._ensure_node()
+
+    # ---- Cloudflare credentials (API token = the login for browser-less servers)
+    def _cf_env(self) -> dict:
+        """CLOUDFLARE_* variables for every wrangler call. An API token skips
+        `wrangler login` entirely — the only way on a server with no browser."""
+        env = {}
+        token = str(self.mail_cfg.get("cf_api_token") or "").strip()
+        account = str(self.mail_cfg.get("cf_account_id") or "").strip()
+        if token:
+            env["CLOUDFLARE_API_TOKEN"] = token
+        if account:
+            env["CLOUDFLARE_ACCOUNT_ID"] = account
+        return env
+
+    def _full_env(self) -> dict:
+        env = dict(os.environ)
+        env.update(self._cf_env())
+        return env
+
+    def set_cf_credentials(self, token: str = "", account_id: str = "") -> str:
+        lock = self._mail_config_lock()
+        if not lock.acquire(blocking=False):
+            return "email setup is running; wait before changing credentials"
+        try:
+            return self._set_cf_credentials_locked(token, account_id)
+        finally:
+            lock.release()
+
+    def _set_cf_credentials_locked(self, token: str = "", account_id: str = "") -> str:
+        """Validate + persist a Cloudflare API token / account id. Returns an
+        error string ('' = ok). Empty values leave the stored ones untouched."""
+        token, account_id = (token or "").strip(), (account_id or "").strip()
+        if token:
+            if not re.fullmatch(r"[A-Za-z0-9_\-]{20,128}", token):
+                return "that does not look like a Cloudflare API token"
+            self.mail_cfg["cf_api_token"] = token
+        if account_id:
+            if not re.fullmatch(r"[0-9a-f]{32}", account_id.lower()):
+                return "the Cloudflare account id is 32 hex characters"
+            self.mail_cfg["cf_account_id"] = account_id.lower()
+        if token or account_id:
+            self._whoami_cache = None
+            self._save_mail_config()
+        return ""
+
+    def save_cf_credentials(self, token: str = "", account_id: str = "",
+                            clear: bool = False) -> dict:
+        lock = self._mail_config_lock()
+        if not lock.acquire(blocking=False):
+            return {"ok": False, "error": "email setup is running; wait before changing credentials"}
+        try:
+            return self._save_cf_credentials_locked(token, account_id, clear)
+        finally:
+            lock.release()
+
+    def _save_cf_credentials_locked(self, token: str = "", account_id: str = "",
+                                    clear: bool = False) -> dict:
+        """Replace (or remove) the stored Cloudflare token without a redeploy —
+        a rerolled token must not force the whole worker setup to run again.
+        Returns {ok, error?, accounts?}; accounts lists what the new token sees."""
+        if clear:
+            self.mail_cfg.pop("cf_api_token", None)
+            self.mail_cfg.pop("cf_account_id", None)
+            self._whoami_cache = None
+            self._save_mail_config()
+            return {"ok": True, "cleared": True}
+        if not (token or "").strip() and not (account_id or "").strip():
+            return {"ok": False, "error": "paste the new token first"}
+        bad = self.set_cf_credentials(token, account_id)
+        if bad:
+            return {"ok": False, "error": bad}
+        try:
+            accts = [a for a in (self._cf_call("GET", "/accounts").get("result") or [])
+                     if isinstance(a, dict) and a.get("id")]
+        except RuntimeError as exc:
+            return {"ok": False, "saved": True,
+                    "error": f"token saved, but Cloudflare did not accept it: {exc}"}
+        return {"ok": True,
+                "accounts": [{"id": a["id"], "name": a.get("name") or ""} for a in accts]}
 
     def worker_deploy_status(self) -> dict:
         """What the dashboard needs to show before/after a deploy."""
@@ -1823,6 +2645,8 @@ class GeneratorManager:
         info = {"worker_dir": str(wdir), "exported": wdir.is_dir(),
                 "has_url": bool(self.mail_cfg.get("inbox_url")),
                 "has_secret": bool(self.mail_cfg.get("inbox_secret")),
+                "headless": _is_headless(),
+                "has_token": bool(self.mail_cfg.get("cf_api_token")),
                 "node_ok": bool(self._npx())}
         if not info["exported"]:
             return info
@@ -1855,7 +2679,8 @@ class GeneratorManager:
             # Email card must not show a red error before the user did anything.
             fields: dict = {}
             try:
-                r = _run_capture([npx, "wrangler", "whoami"], cwd=str(wdir), timeout=60)
+                r = _run_capture([npx, "wrangler", "whoami"], cwd=str(wdir), timeout=60,
+                                 env=self._full_env())
             except subprocess.TimeoutExpired:
                 fields = {"wrangler_authed": None, "whoami_timeout": True}
             else:
@@ -1866,26 +2691,185 @@ class GeneratorManager:
                         if "@" in tok and "." in tok:
                             fields["account"] = tok.strip("👋🔐 ")
                             break
+            # whoami names the token's owner, which can belong to a different
+            # Cloudflare account than the one deployed to — show the real one
+            acct_id = str(self.mail_cfg.get("cf_account_id") or "")
+            if fields.get("wrangler_authed") and acct_id and self.mail_cfg.get("cf_api_token"):
+                try:
+                    name = (self._cf_call("GET", f"/accounts/{acct_id}").get("result") or {}).get("name")
+                except RuntimeError:
+                    name = ""
+                if name:
+                    fields["account"] = str(name)
             self._whoami_cache = (time.time(), fields)
             return dict(fields)
 
-    def deploy_worker(self, progress=None) -> dict:
+    def deploy_worker(self, progress=None, cf_token: str = "",
+                      cf_account_id: str = "") -> dict:
         """One-click deploy: export files, ensure Node (auto-install if
         missing), wrangler login (browser only if needed), create KV namespace
         + patch wrangler.toml, deploy, set INBOX_SECRET, return the worker URL.
         `progress` gets human strings."""
         # one deploy at a time: two tabs (or a double-click) racing wrangler
         # interleaved wrangler.toml writes and double KV creation
-        if getattr(self, "_deploy_lock", None) is None:
-            self._deploy_lock = threading.Lock()
+        self.__dict__.setdefault("_deploy_lock", threading.Lock())
         if not self._deploy_lock.acquire(blocking=False):
             return {"ok": False,
                     "error": "a deploy is already running — wait for it to finish"}
+        mail_lock = self._mail_config_lock()
+        if not mail_lock.acquire(blocking=False):
+            self._deploy_lock.release()
+            return {"ok": False, "error": "email configuration is busy; retry shortly"}
         try:
-            return self._deploy_worker_locked(progress)
+            self.mail_cfg["inbox_ok"] = False
+            self._save_mail_config()
+            bad = self.set_cf_credentials(cf_token, cf_account_id)
+            if bad:
+                return {"ok": False, "error": "Cloudflare credentials could not be configured; check the token/account settings"}
+            res = self._deploy_worker_locked(progress)
+            # the worker exists now: wire Cloudflare's catch-all to it as well
+            if res.get("ok") and self.mail_cfg.get("cf_api_token") \
+                    and self.mail_cfg.get("domains"):
+                res["routing"] = self.auto_route_all(progress)
+            config = self.mail_config()
+            res["inbox_ok"] = config.get("inbox_ok") is True
+            res["routing_ok"] = config.get("routing_all_done") is True
+            res["ready"] = res["inbox_ok"] and res["routing_ok"]
+            res["config"] = config
+            return self._redact_mail_result(res)
+        except Exception as exc:
+            # Exceptions may contain a request URL with its secret query parameter.
+            return {"ok": False, "error": f"worker deployment failed ({type(exc).__name__}); "
+                    "check the deployment configuration and retry"}
         finally:
             self._whoami_cache = None        # login state may have just changed
+            mail_lock.release()
             self._deploy_lock.release()
+
+    def _redact_mail_result(self, value):
+        from urllib.parse import quote, quote_plus
+
+        sensitive = [self.mail_cfg.get("inbox_secret"), self.mail_cfg.get("cf_api_token")]
+        if isinstance(value, str):
+            for secret in sensitive:
+                if secret:
+                    for encoded in (str(secret), quote(str(secret), safe=""), quote_plus(str(secret))):
+                        value = value.replace(encoded, "[redacted]")
+            return value
+        if isinstance(value, dict):
+            return {key: self._redact_mail_result(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [self._redact_mail_result(item) for item in value]
+        return value
+
+    @staticmethod
+    def _production_worker_url(output: str, worker_name: str) -> str | None:
+        from urllib.parse import urlsplit
+
+        matches = set()
+        for candidate in re.findall(r"https://[^\s<>\"']+", output, re.I):
+            try:
+                url = urlsplit(candidate.rstrip(".,);"))
+            except ValueError:
+                continue
+            host = (url.hostname or "").lower()
+            labels = host.split(".")
+            if (len(labels) == 4 and labels[0] == worker_name.lower()
+                    and labels[2:] == ["workers", "dev"]
+                    and re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", labels[1])
+                    and url.netloc.lower() == host and url.path in ("", "/")
+                    and not url.query and not url.fragment):
+                matches.add("https://" + host)
+        if len(matches) > 1:
+            raise ValueError("ambiguous production workers.dev URLs in deployment output")
+        return next(iter(matches), None)
+
+    @staticmethod
+    def _verify_inbox(url: str, secret: str, *, deadline_seconds: float = 30) -> dict:
+        import asyncio
+        import httpx
+        from urllib.parse import urlsplit
+
+        try:
+            parsed = urlsplit(url)
+            valid_url = (parsed.scheme in ("http", "https") and bool(parsed.hostname)
+                         and parsed.path == "/inbox" and not parsed.query
+                         and not parsed.fragment and not parsed.username and not parsed.password)
+        except ValueError:
+            valid_url = False
+        if not valid_url:
+            return {"ok": False, "error": "use the worker's exact /inbox URL without query parameters"}
+        if not secret:
+            return {"ok": False, "error": "inbox secret is not configured; deploy the worker first"}
+
+        def inbox_record(record):
+            return (isinstance(record, dict)
+                    and all(isinstance(record.get(key), str) for key in ("to", "from", "subject"))
+                    and (record.get("link") is None or isinstance(record.get("link"), str))
+                    and "link" in record and type(record.get("ts")) in (int, float))
+
+        result = {"ok": False, "error": "inbox verification deadline expired"}
+
+        async def check():
+            nonlocal result
+            async with httpx.AsyncClient(follow_redirects=False, trust_env=False, timeout=5) as client:
+                for attempt in range(11):
+                    try:
+                        async with client.stream("GET", url, params={"k": secret}) as response:
+                            status = response.status_code
+                            result = {"ok": False, "status": status}
+                            if status == 404:
+                                return {**result, "error": "HTTP 404: wrong worker endpoint; use its production /inbox URL"}
+                            if status == 200:
+                                payload = bytearray()
+                                async for chunk in response.aiter_bytes():
+                                    if len(payload) + len(chunk) > 256 * 1024:
+                                        return {**result, "error": "inbox response exceeded the verification size limit"}
+                                    payload.extend(chunk)
+                                try:
+                                    body = json.loads(payload)
+                                except (ValueError, UnicodeError):
+                                    body = None
+                                if isinstance(body, list) and all(inbox_record(item) for item in body):
+                                    return {"ok": True, "status": status}
+                                return {**result, "error": "HTTP 200 but not an inbox message array; check the worker /inbox endpoint"}
+                            if status == 401:
+                                result["error"] = ("HTTP 401: endpoint/secret mismatch after deployment; check the production "
+                                                   "worker URL and redeploy its inbox secret. Domain email routing does not fix authentication.")
+                            elif status == 503:
+                                result["error"] = "HTTP 503: worker unavailable or INBOX_SECRET not configured; redeploy and retry"
+                            else:
+                                result["error"] = f"HTTP {status}: inbox verification failed; check the worker endpoint"
+                            if status not in (401, 408, 425, 429) and status < 500:
+                                return result
+                    except Exception as exc:
+                        result = {"ok": False, "error": f"inbox request failed ({type(exc).__name__}); check worker reachability"}
+                    if attempt < 10:
+                        await asyncio.sleep(3)
+            return result
+
+        async def bounded_check():
+            try:
+                # Bounds headers, slow streaming bodies, and retry delays together.
+                return await asyncio.wait_for(check(), timeout=max(0, deadline_seconds))
+            except asyncio.TimeoutError:
+                return {**result, "error": result.get("error", "inbox response did not complete")
+                        + " (verification deadline expired)"}
+
+        return asyncio.run(bounded_check())
+
+    def test_inbox(self) -> dict:
+        lock = self._mail_config_lock()
+        if not lock.acquire(blocking=False):
+            return {"ok": False, "error": "email deployment/configuration is busy; retry after it finishes"}
+        try:
+            config = dict(self.mail_cfg)
+            self.mark_inbox_verified(False)
+            result = self._verify_inbox(config.get("inbox_url") or "", config.get("inbox_secret") or "")
+            self.mark_inbox_verified(bool(result.get("ok")))
+            return result
+        finally:
+            lock.release()
 
     # `wrangler login` strategies, tried in order. Wrangler's default OAuth
     # callback listens on `localhost`, which Node resolves to IPv6 ::1 first;
@@ -1938,6 +2922,7 @@ class GeneratorManager:
         import re as _re
 
         def say(msg):
+            msg = self._redact_mail_result(msg)
             log.info("worker deploy: %s", msg)
             if progress:
                 try:
@@ -1956,9 +2941,8 @@ class GeneratorManager:
         say("worker files exported")
 
         def run(args, timeout=300, env_extra=None):
-            env = None
+            env = self._full_env()
             if env_extra:
-                env = dict(os.environ)
                 env.update({k: v for k, v in env_extra.items() if v})
             return _run_capture(args, cwd=str(wdir), timeout=timeout, env=env)
 
@@ -1972,7 +2956,8 @@ class GeneratorManager:
             m = _re.search(r"([0-9a-f]{32})", out)   # whoami prints the id hex
             return m.group(1) if m else ""
 
-        account_id = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
+        account_id = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "") \
+            or str(self.mail_cfg.get("cf_account_id") or "")
 
         def kv_id_for_title(title: str = "MAIL") -> str:
             """Find an existing KV namespace by title. Idempotent deploys: the
@@ -1995,9 +2980,29 @@ class GeneratorManager:
                     return m.group(1)
             return ""
 
+        # with an API token, settle the account through the REST API up front
+        if not account_id and self.mail_cfg.get("cf_api_token"):
+            account_id, why = self._cf_pick_account()
+            if why:
+                return {"ok": False, "error": why}
+            if account_id:
+                say(f"using Cloudflare account {account_id[:8]}…")
+                self.mail_cfg["cf_account_id"] = account_id
+                self._save_mail_config()
+
         # 1) auth: whoami first — if logged in, skip the browser entirely
-        r = run([npx, "wrangler", "whoami"], timeout=90)
+        r = run([npx, "wrangler", "whoami"], timeout=90,
+                env_extra={"CLOUDFLARE_ACCOUNT_ID": account_id} if account_id else None)
         out = _clean_output((r.stdout or "") + (r.stderr or ""))
+        if "You are logged in" not in out and _is_headless():
+            # a browser login would hang for ~14 minutes on a server with no
+            # display (and its localhost callback is unreachable anyway)
+            return {"ok": False,
+                    "error": "This server has no browser, so the Cloudflare login "
+                             "cannot open. Create an API token (Cloudflare → My "
+                             "Profile → API Tokens → Create Token → Create Custom Token; "
+                             "the exact permissions are listed in the dashboard), paste it in the token "
+                             "box above and deploy again."}
         if "You are logged in" not in out:
             say("opening browser for Cloudflare login (one time)…")
             logged_in, out = self._wrangler_login(run, npx, say)
@@ -2064,15 +3069,17 @@ class GeneratorManager:
         say("deploying worker…")
         r = run([npx, "wrangler", "deploy"], timeout=600, env_extra=wrangler_env)
         out = _clean_output((r.stdout or "") + (r.stderr or ""))
-        # the URL is https://<worker>.<account-subdomain>.workers.dev — the
-        # subdomain is its own label, so allow dotted labels before .workers.dev
-        m = _re.search(r"https://[a-z0-9][a-z0-9.\-]*\.workers\.dev", out, _re.I)
         if r.returncode != 0:
             # a FAILED deploy can still print a workers.dev URL (wrangler
             # prints the route in several error paths) — the URL alone must
             # never turn a failed deploy into a success
             return {"ok": False, "error": "deploy failed: " + _tail(out)}
-        base_url = m.group(0).rstrip(".,)") if m else None
+        name_match = _re.search(r'^\s*name\s*=\s*"([^"]+)"', toml_src, _re.M)
+        try:
+            base_url = self._production_worker_url(out, name_match.group(1) if name_match else "")
+        except ValueError:
+            return {"ok": False, "error": "worker deployed, but production URL is ambiguous; "
+                    "check the worker's production workers.dev route before retrying"}
         if not base_url:
             # deployed fine but the account has no workers.dev route enabled
             low = out.lower()
@@ -2087,7 +3094,7 @@ class GeneratorManager:
                     "error": "deployed but could not read the workers.dev URL "
                              "from wrangler output — paste the worker's /inbox "
                              "URL into the field below and press Save manually. "
-                             "Deploy said: " + _tail(out, 300)}
+                              "Preview URLs are not accepted."}
         say("deployed at " + base_url)
 
         # 4) INBOX_SECRET: use the configured one, or generate and store it
@@ -2098,45 +3105,38 @@ class GeneratorManager:
             self.mail_cfg["inbox_secret"] = secret
             self._save_mail_config()
         say("uploading INBOX_SECRET…")
-        _secret_env = dict(os.environ)
+        _secret_env = self._full_env()
         _secret_env.update(wrangler_env)
-        proc = subprocess.Popen(
-            [npx, "wrangler", "secret", "put", "INBOX_SECRET"],
-            cwd=str(wdir), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, text=True, encoding="utf-8",
-            errors="replace", shell=False, env=_secret_env,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        out, _ = proc.communicate(input=secret + "\n", timeout=180)
-        clean = _clean_output(out or "")
-        if proc.returncode != 0 or "success" not in clean.lower():
+        proc = None
+        try:
+            proc = subprocess.Popen(
+                [npx, "wrangler", "secret", "put", "INBOX_SECRET"],
+                cwd=str(wdir), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, text=True, encoding="utf-8",
+                errors="replace", shell=False, env=_secret_env,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                **({"start_new_session": True} if os.name != "nt" else {}))
+            # EOF terminates piped input; do not alter the configured value.
+            proc.communicate(input=secret, timeout=180)
+        except (OSError, subprocess.TimeoutExpired):
+            if proc is not None:
+                _kill_tree(proc)
+                try:
+                    proc.communicate(timeout=5)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+            return {"ok": False, "error": "worker deployed but secret upload could not complete; retry deployment"}
+        # Wrangler's exit status is its command contract, not localized prose.
+        if proc.returncode != 0:
             return {"ok": False, "inbox_url": base_url + "/inbox",
                     "secret_generated": True,
-                    "error": "worker deployed but the secret upload failed: "
-                             + _tail(out)}
+                    "error": "worker deployed but the secret upload failed; check API token permissions and retry deployment"}
 
         # 5) persist the URL and smoke-test
         self.mail_cfg["inbox_url"] = base_url + "/inbox"
         self._save_mail_config()
         say("testing inbox…")
-        import time as _time
-        test = {"ok": False}
-        for _ in range(3):
-            try:
-                import httpx as _hx
-                resp = _hx.get(base_url + "/inbox",
-                               params={"k": secret}, timeout=15)
-                # 200 alone is not proof: the worker used to answer 200 'ok'
-                # to EVERY path except exactly /inbox. Require the response
-                # to look like the inbox endpoint's JSON body.
-                body_txt = (resp.text or "")[:200].strip()
-                test = {"ok": resp.status_code == 200
-                        and body_txt.startswith(("{", "[")),
-                        "status": resp.status_code}
-                if test["ok"]:
-                    break
-            except Exception as e:
-                test = {"ok": False, "error": str(e)}
-                _time.sleep(3)
+        test = self._verify_inbox(base_url + "/inbox", secret)
         # remember the result so the wizard can mark step 3 done (persisted)
         self.mark_inbox_verified(bool(test.get("ok")))
         if not test.get("ok"):
@@ -2153,7 +3153,16 @@ class GeneratorManager:
                 "secret_generated": True, "test": test}
 
     def set_mail_config(self, **kw) -> dict:
-        cfg = self.mail_cfg
+        lock = self._mail_config_lock()
+        if not lock.acquire(blocking=False):
+            raise ValueError("email deployment/configuration is busy; retry after it finishes")
+        try:
+            return self._set_mail_config_locked(**kw)
+        finally:
+            lock.release()
+
+    def _set_mail_config_locked(self, **kw) -> dict:
+        cfg = dict(self.mail_cfg)
         # `domains: null` arrives from the dashboard's inbox-URL autosave —
         # it means "not editing domains", NOT "clear them". The old
         # `if "domains" in kw` read the key's presence as replace-with-empty
@@ -2181,6 +3190,7 @@ class GeneratorManager:
         if "inbox_secret" in kw and str(kw["inbox_secret"] or "").strip():
             cfg["inbox_secret"] = str(kw["inbox_secret"]).strip()
             cfg["inbox_ok"] = False       # new secret → re-verify
+        self.mail_cfg = cfg
         self._save_mail_config()
         return self.mail_config()
 
@@ -2223,7 +3233,7 @@ class GeneratorManager:
 
     _OPTION_FIELDS = ("captcha", "ip_source", "country", "proxy_types",
                       "pin_proxy", "retries", "claim", "claim500", "claim_start", "headless",
-                      "invite_code", "captcha_strategy",
+                      "invite_code", "captcha_strategy", "browser_display",
                       "custom_ai_url", "custom_ai_key", "custom_ai_model")
 
     def save_options(self) -> None:
@@ -2241,7 +3251,9 @@ class GeneratorManager:
             "retries": self.retries,
             "claim": self.claim,
             "claim500": self.claim500,
+            "claim_start": self.claim_start,
             "headless": self.headless,
+            "browser_display": self.browser_display,
             "invite_code": self._invite_code,
         }
         try:
@@ -2266,6 +3278,8 @@ class GeneratorManager:
         # (on = 100M, off = off), so don't let claim500's default turn it on
         if "claim" in kw and "claim500" not in kw:
             kw["claim500"] = False
+        if "claim_start" not in kw and ("claim" in kw or "claim500" in kw):
+            kw["claim_start"] = False
         if kw:
             self.set_options(**kw)
 
@@ -2304,16 +3318,22 @@ class GeneratorManager:
         if "claim500" in kw:
             v = kw["claim500"]
             self.claim500 = v if isinstance(v, bool) else (str(v).lower() in ("true", "1", "yes", "on"))
-        # mutually exclusive by design: the 500M giveaway wins over the 100M
-        # referral claim (a fresh account can hold both, but the pipeline runs
-        # one chain; the dashboard exposes a single "claim type" dropdown).
-        if "claim500" in kw and self.claim500:
-            self.claim = False
-        elif "claim" in kw and self.claim:
-            self.claim500 = False
+        # An explicitly enabled mode wins; one pipeline runs per signup.
+        for chosen in ("claim_start", "claim500", "claim"):
+            if chosen in kw and getattr(self, chosen):
+                for other in ("claim_start", "claim500", "claim"):
+                    if other != chosen:
+                        setattr(self, other, False)
+                break
         if "headless" in kw:
             v = kw["headless"]
             self.headless = v if isinstance(v, bool) else (str(v).lower() in ("true", "1", "yes", "on", "auto"))
+            # Existing saved Linux "headless" preferences meant background
+            # operation. Honor that intent with headed Chromium on Xvfb.
+            if sys.platform.startswith("linux") and "browser_display" not in kw:
+                self.browser_display = "virtual" if self.headless else "auto"
+        if kw.get("browser_display") in ("auto", "desktop", "virtual", "headless"):
+            self.browser_display = kw["browser_display"]
         # manual captcha means a human must see and solve it — a headless browser
         # makes that impossible, so headless is forced off whenever captcha=manual
         if self.captcha == "manual":
@@ -2448,6 +3468,7 @@ class GeneratorManager:
                 "claim": self.claim, "claim500": self.claim500,
                 "claim_start": self.claim_start,
                 "headless": self.headless,
+                "browser_display": self.browser_display,
                 "invite_code": self._invite_code,
                 "socks_available": tc["socks"],
                 "mail": self.mail_config(),
@@ -2502,8 +3523,101 @@ class GeneratorManager:
             emit = lambda line: log.info("playwright-setup: %s", line)
         return self.playwright.ensure(self.python_exe, emit)
 
+    def _ensure_display(self, *, interactive: bool = False) -> str:
+        """Headed signup needs X11. Own a virtual display when Xvfb is available."""
+        if not sys.platform.startswith("linux"):
+            return ""
+        mode = getattr(self, "browser_display", "auto")
+        if os.environ.get("DISPLAY") and (interactive or mode != "virtual"):
+            return ""
+        if interactive:
+            return ("Manual browser interaction requires a visible DISPLAY. Configure a remote "
+                    "desktop/display, or choose automatic captcha solving for managed Xvfb.")
+        if mode == "desktop":
+            return "Desktop window requires a visible DISPLAY; choose Virtual display or Automatic."
+        import shutil
+        with self._display_lock:
+            if self._closed.is_set():
+                return "generator is shut down"
+            if self._display_proc and self._display_proc.poll() is None:
+                return ""
+            xvfb = shutil.which("Xvfb")
+            if not xvfb:
+                return ("Headed signup requires DISPLAY or Xvfb. Install Xvfb or configure "
+                        "a working virtual display before starting; no signup/proxy was attempted.")
+            # -displayfd lets Xvfb atomically choose a free server number and
+            # report it only once the X server is ready; never expose TCP X11.
+            display_args = []
+            socket_dir = Path("/tmp/.X11-unix")
+            if os.environ.get("WSL_DISTRO_NAME") and socket_dir.is_dir() and not os.access(socket_dir, os.W_OK):
+                # WSLg owns a read-only filesystem socket directory. Use a
+                # private abstract socket instead; never alter WSLg's mount.
+                import secrets
+                display_args = [":" + str(1000 + secrets.randbelow(59000))]
+                display_args += ["-nolisten", "unix"]
+            with tempfile.TemporaryFile() as ready:
+                try:
+                    proc = subprocess.Popen(
+                        [xvfb, *display_args, "-displayfd", str(ready.fileno()), "-screen", "0", "1280x720x24",
+                         "-nolisten", "tcp"], pass_fds=(ready.fileno(),),
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **_child_kwargs())
+                except OSError as exc:
+                    return f"Xvfb could not start ({exc}); configure a working DISPLAY before retrying"
+                self._display_proc = proc
+                deadline = time.monotonic() + 10
+                while proc.poll() is None and time.monotonic() < deadline and not self._closed.is_set():
+                    ready.seek(0)
+                    number = ready.read().strip()
+                    if number.isdigit():
+                        self._display = ":" + number.decode("ascii")
+                        return ""
+                    time.sleep(0.05)
+                _kill_tree(proc)
+                proc.wait(timeout=5)
+                self._display_proc = None
+                return "Xvfb did not become ready; configure a working DISPLAY before retrying signup"
+
+    def _child_env(self, *, virtual_display: bool = False) -> dict[str, str]:
+        env = _bundled_captcha_env()
+        env["ZAI_GATEWAY_URL"] = self.gateway_origin.rstrip("/")
+        env["ZAI_GATEWAY_INTERNAL_TOKEN"] = self.internal_token
+        env["ZAI_GATEWAY_CA_FILE"] = self.gateway_ca_file
+        if self.gateway_ca_file:
+            # Requests uses one process-wide bundle; retain public roots for
+            # upstream signup/device requests as well as the local TLS CA.
+            import certifi
+            ca = Path(self.gateway_ca_file)
+            stamp = (str(ca), ca.stat().st_mtime_ns)
+            bundle = self.data_dir / "gateway-child-ca.pem"
+            if getattr(self, "_ca_stamp", None) != stamp or not bundle.is_file():
+                with tempfile.NamedTemporaryFile(dir=self.data_dir, delete=False) as output:
+                    temporary = Path(output.name)
+                    try:
+                        output.write(Path(certifi.where()).read_bytes() + b"\n" + ca.read_bytes())
+                        output.close()
+                        os.replace(temporary, bundle)
+                    finally:
+                        temporary.unlink(missing_ok=True)
+                self._ca_stamp = stamp
+            env["REQUESTS_CA_BUNDLE"] = str(bundle)
+        if virtual_display and self._display:
+            env["DISPLAY"] = self._display
+            # WSLg's Wayland socket must not bypass the selected Xvfb screen.
+            env["WAYLAND_DISPLAY"] = ""
+            env["XDG_SESSION_TYPE"] = "x11"
+        return env
+
     def start_workers(self, count: int = 1) -> dict:
+        if getattr(self, "auto_generate", None) and self.auto_generate.status().get("status") in ("preparing", "running", "paused", "stopping"):
+            return {"error": "Stop the Auto Generate run before starting manual workers"}
+        display_error = self._ensure_display(interactive=self.captcha == "manual")
+        if display_error:
+            return {"error": display_error}
         with self._lock:
+            if self.auto_generate.status().get("status") in ("preparing", "running", "paused", "stopping"):
+                return {"error": "Stop the Auto Generate run before starting manual workers"}
+            if self._closed.is_set():
+                return {"error": "generator is shut down"}
             # AI judge against the GATEWAY's own model needs a live account
             # pool to serve /v1/chat/completions. A fresh install has zero
             # accounts: warn instead of spawning workers whose every AI call
@@ -2531,9 +3645,86 @@ class GeneratorManager:
                 w = GenWorker(name, [self.python_exe, "-u", "main.py", "1"], env,
                               self.gen_dir, on_exit=self._worker_done)
                 self.workers[name] = w
-                w.start()
                 started.append(name)
+            launch = [self.workers[name] for name in started]
+        for worker in launch:
+            worker.start()
         return {"started": started}
+
+    def _auto_preflight(self, config: dict) -> None:
+        if self._closed.is_set():
+            raise ValueError("Generator is shut down")
+        with self._lock:
+            if any(not worker.done.is_set() and worker.env.get("ZAI_AUTO_GENERATE") != "1"
+                   for worker in self.workers.values()):
+                raise ValueError("Finish or stop existing signup workers first")
+        check = self.env_setup.check()
+        if not check.get("all_ok"):
+            raise ValueError("Environment is not ready; open Environment setup")
+        mail = dict(self.mail_cfg)
+        if not mail.get("active") or not mail.get("inbox_url") or not mail.get("inbox_secret"):
+            raise ValueError("Configure a mail domain and inbox before starting")
+        inbox = self._verify_inbox(mail["inbox_url"], mail["inbox_secret"], deadline_seconds=12)
+        if not inbox.get("ok"):
+            raise ValueError("Inbox verification failed; repair Email setup before generating")
+        ready = getattr(self, "auto_ai_ready", None)
+        if self.custom_ai_url:
+            if not self.custom_ai_model or not self.custom_ai_key:
+                raise ValueError("Custom AI needs a model and API key")
+        elif not (ready() if ready else self._pool_health().get("ready")):
+            raise ValueError("AI judge needs usable GLM-5.3-Flash quota or an external vision endpoint")
+        if config["ip_source"] == "proxy" and not self._pool_has_candidates():
+            raise ValueError("No proxy candidates available; verify the pool or choose direct")
+        import copy
+        snapshot = copy.copy(self)
+        snapshot.mail_cfg = mail
+        snapshot.captcha = snapshot.captcha_strategy = "ai"
+        snapshot.ip_source = "pool" if config["ip_source"] == "proxy" else "direct"
+        snapshot.claim, snapshot.claim500, snapshot.claim_start = False, False, True
+        snapshot.retries = 0
+        background = config.get("browser_display", "background") == "background"
+        snapshot.browser_display = "headless" if background else "desktop"
+        # Do not allocate Xvfb on a throwaway manager copy: the real manager
+        # must own it and clean it up at shutdown.
+        if __import__('sys').platform.startswith("linux"):
+            snapshot.browser_display = "virtual" if background else "desktop"
+            original = self.browser_display
+            try:
+                self.browser_display = snapshot.browser_display
+                problem = self._ensure_display(interactive=False)
+            finally:
+                self.browser_display = original
+            if problem:
+                raise ValueError(problem)
+            snapshot._display = self._display
+        self._auto_runtime_snapshot = snapshot
+
+    def _pool_has_candidates(self) -> bool:
+        try:
+            return any(line.strip() and not line.startswith("#") for line in self.pool_file.read_text().splitlines())
+        except OSError:
+            return False
+
+    def _auto_launch(self, config: dict, attempt_id: str) -> GenWorker:
+        if self._closed.is_set():
+            raise ValueError("Generator is shut down")
+        import uuid
+        name = "auto-" + uuid.uuid4().hex[:16]
+        snapshot = self._auto_runtime_snapshot
+        env = snapshot._worker_env(name)
+        env.update(ZAI_AUTO_GENERATE="1", ZAI_ROUTE_POLICY=config["ip_source"],
+                   ZAI_WORKER_ID=name, ZAI_PROXY_RETRIES="0", ZAI_AUTO_RUN_ID=attempt_id.rsplit("-", 1)[0])
+        private = self.data_dir / "auto-private"
+        private.mkdir(mode=0o700, exist_ok=True)
+        env["ZAI_AUTO_ROUTE_FILE"] = str(private / (name + ".json"))
+        worker = GenWorker(name, [self.python_exe, "-u", "main.py", "1"], env,
+                           self.gen_dir, on_exit=self._worker_done)
+        with self._lock:
+            if self._closed.is_set():
+                raise ValueError("Generator is shut down")
+            self.workers[name] = worker
+        worker.start()
+        return worker
 
     def _worker_log_path(self, name: str) -> Path:
         """Sorted per-worker logs: <data>/logs/workers/<name>_<HHMMSS>.log"""
@@ -2666,20 +3857,26 @@ class GeneratorManager:
     def start_workers_checked(self, count: int = 1, emit=print) -> dict:
         """start_workers, but with a guaranteed Playwright setup first
         (streams one-time install progress to the caller via `emit`)."""
+        display_error = self._ensure_display(interactive=self.captcha == "manual")
+        if display_error:
+            return {"error": display_error}
         if not self._ensure_playwright(emit):
             return {"error": "playwright setup failed — check the log"}
         return self.start_workers(count)
 
     def _worker_env(self, name: str) -> dict[str, str]:
+        virtual_display = sys.platform.startswith("linux") and self.captcha != "manual" and (
+            self.browser_display == "virtual" or not os.environ.get("DISPLAY"))
         env = {
+            **self._child_env(virtual_display=virtual_display),
             "ZAI_OUT_SUFFIX": name,
             "ZAI_OUTPUT_DIR": str(self.data_dir),
             "ZAI_PROXY": "0", "ZAI_USE_POOL": "0", "ZAI_SOCKS_ONLY": "0",
             "ZAI_PROXY_COUNTRY": self.country or "ALL",
             "ZAI_MANUAL": "1" if self.captcha == "manual" else "0",
-            # headless signup is always-lose (F001, see below) — forced off
-            # whenever a captcha must be solved
-            "ZAI_HEADLESS": "0",
+            # Windows background is native headless; Linux background uses
+            # headed Chromium on a private Xvfb screen instead.
+            "ZAI_HEADLESS": "1" if sys.platform == "win32" and self.browser_display == "headless" and self.captcha != "manual" else "0",
             "ZAI_PROXY_RETRIES": str(self.retries),
             # per-worker log file: every browser gets its own full solve log
             # under <data>/logs/workers/<name>_<timestamp>.log
@@ -2687,24 +3884,12 @@ class GeneratorManager:
         }
         if self.captcha != "manual":
             env["ZAI_CAPTCHA_STRATEGY"] = self.captcha_strategy
-            # F001 (measured A/B, GLM-Free-API's Aliyun report): the signup
-            # captcha is judged by the BROWSER that registered the device —
-            # a headless browser is rejected exactly like an HTTP client, no
-            # fingerprint fixes it. Headless signup is a guaranteed burn of
-            # email+proxy per attempt; force the window on.
-            env["ZAI_HEADLESS"] = "0"
-        if self.internal_token and not self.custom_ai_url:
-            env["ZAI_GATEWAY_INTERNAL_TOKEN"] = self.internal_token
-            # gateway-AI captcha method: workers call the gateway's own
-            # /v1/chat/completions with a client key as the vision fallback
-            env["ZAI_GATEWAY_URL"] = f"http://127.0.0.1:{self._gateway_port}"
-            env["ZAI_GATEWAY_KEY"] = self._client_key_for_children
-        if self.custom_ai_url:
-            # user's own OpenAI-compatible endpoint overrides the gateway's
-            # model for the AI judge (strategy ai, and auto's fallback)
-            env["ZAI_GATEWAY_URL"] = self.custom_ai_url
-            env["ZAI_GATEWAY_KEY"] = self.custom_ai_key
-            env["ZAI_GATEWAY_AI_MODEL"] = self.custom_ai_model or "gpt-4o-mini"
+        env["ZAI_CUSTOM_AI"] = "1" if self.custom_ai_url else "0"
+        env["ZAI_GATEWAY_KEY"] = self._client_key_for_children
+        env["ZAI_GATEWAY_AI_MODEL"] = "GLM-5.3-Flash"
+        env["ZAI_AI_URL"] = self.custom_ai_url
+        env["ZAI_AI_KEY"] = self.custom_ai_key
+        env["ZAI_AI_MODEL"] = self.custom_ai_model or "gpt-4o-mini"
         if self.claim and self._invite_code:
             env["ZAI_INVITE_CODE"] = self._invite_code
         else:
@@ -2712,23 +3897,6 @@ class GeneratorManager:
         # Start Plan claim (billing preview -> billing/claim) is the default
         # path now: the plan is no longer granted by the signup itself.
         env["ZAI_CLAIM_START"] = "1" if self.claim_start else "0"
-        # Captcha mint sidecar. In a frozen build it lives inside the onefile
-        # extraction (_MEIPASS), but the generator scripts may run under an
-        # external Python where _MEIPASS is unset — resolve it here and hand
-        # the path down, otherwise claim_start can't find it and a plan that
-        # demands a captcha answers 3007.
-        if not env.get("ZAI_CAPTCHA_CMD"):
-            _mint_cands = [
-                Path(getattr(sys, "_MEIPASS", "")) / "captcha-mint" / "captcha-mint.exe",
-                Path(sys.executable).resolve().parent / "captcha-mint" / "captcha-mint.exe",
-            ]
-            for _cand in _mint_cands:
-                try:
-                    if _cand.is_file():
-                        env["ZAI_CAPTCHA_CMD"] = f'"{_cand}"'
-                        break
-                except OSError:
-                    pass
         # Legacy campaigns (100M invite / 1024 500M) are off by default.
         env["ZAI_CLAIM500"] = "1" if self.claim500 else "0"
         # email: the user's own domains + worker inbox (public-ready setup)
@@ -2751,6 +3919,53 @@ class GeneratorManager:
         return env
 
     def _worker_done(self, w: GenWorker):
+        if w.stopped or self._closed.is_set():
+            w.result = {"qualified": False, "category": "stopped" if w.stopped else "failed"}
+            return
+        if w.env.get("ZAI_AUTO_GENERATE") == "1":
+            category = w.script_result.get("category", "failed")
+            if category != "generated":
+                w.result = {"qualified": False, "category": category,
+                            "error": w.script_result.get("message", "No qualifying plan produced")}
+                return
+            if w.exit_code not in (None, 0):
+                w.result = {"qualified": False, "category": "failed", "error": "Worker exited unsuccessfully"}
+                return
+            new = w.check_new_account()
+            if not new:
+                w.result = {"qualified": False, "category": category, "error": w.script_result.get("message", "No qualifying account produced")}
+                return
+            new.update(auto_generate=True, route_policy=w.env.get("ZAI_ROUTE_POLICY"),
+                       cancelled=lambda: w.stopped or self._closed.is_set())
+            route_file = Path(w.env["ZAI_AUTO_ROUTE_FILE"])
+            try:
+                metadata = json.loads(route_file.read_text(encoding="utf-8"))
+                route = metadata.get("proxy")
+                if not isinstance(route, str) or (new["route_policy"] == "proxy" and not route):
+                    raise ValueError()
+                if new["route_policy"] == "direct" and route:
+                    raise ValueError()
+                new["registration_proxy"] = route
+            except (ValueError, OSError):
+                w.result = {"qualified": False, "category": "registration_error", "error": "Worker route verification missing"}
+                return
+            finally:
+                route_file.unlink(missing_ok=True)
+            if self.on_account:
+                # Network work is serialized separately from scheduler/process
+                # ownership, so callbacks never wait under the manager lock.
+                with self._registration_lock:
+                    if w.stopped or self._closed.is_set():
+                        w.result = {"qualified": False, "category": "stopped"}
+                        return
+                    outcome = self.on_account(new)
+                w.result = outcome if isinstance(outcome, dict) else {"qualified": False, "category": "registration_error"}
+            else:
+                w.result = {"qualified": False, "category": "registration_error"}
+            return
+        if w.exit_code not in (None, 0):
+            w.result = {"qualified": False, "category": "failed"}
+            return
         new = w.check_new_account()
         if new and self.on_account:
             try:
@@ -2766,22 +3981,61 @@ class GeneratorManager:
         return False
 
     def stop_all(self):
+        if getattr(self, "auto_generate", None):
+            self.auto_generate.stop()
         for w in self.workers.values():
             if w.alive():
                 w.stop()
+
+    def shutdown(self) -> None:
+        """Stop owned work permanently; queued routes cannot spawn after this."""
+        if getattr(self, "auto_generate", None):
+            self.auto_generate.shutdown()
+        with self._lock:
+            self._closed.set()
+            self._claim_all_cancel.set()
+            jobs = list(self.claims.values())
+            workers = list(self.workers.values())
+            for job in jobs:
+                job.stop()
+            for worker in workers:
+                worker.stop()
+        try:
+            self.checker.shutdown()
+            for job in jobs + workers:
+                # one child that is slow to die must not abort the cleanup of
+                # the rest (or leave the virtual display behind)
+                try:
+                    if job.proc:
+                        job.proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    _kill_tree(job.proc)
+                thread = getattr(job, "_thread", None)
+                if thread and thread is not threading.current_thread():
+                    thread.join(timeout=5)
+        finally:
+            with self._display_lock:
+                _kill_tree(self._display_proc)
+                if self._display_proc:
+                    try:
+                        self._display_proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass
+                self._display_proc = None
+                self._display = ""
 
     def remove_worker(self, name: str) -> bool:
         """Drop one worker card (running ones are killed first)."""
         w = self.workers.get(name)
         if not w:
             return False
-        if w.alive():
+        if not w.done.is_set():
             w.stop()
         self.workers.pop(name, None)
         return True
 
     def remove_finished_workers(self) -> int:
-        names = [n for n, w in self.workers.items() if not w.alive()]
+        names = [n for n, w in self.workers.items() if w.done.is_set()]
         for n in names:
             self.workers.pop(n, None)
         return len(names)
@@ -2790,6 +4044,17 @@ class GeneratorManager:
 
     def _launch_claim(self, kind: str, email: str, mode: str,
                       allow_direct_fallback: bool = True) -> dict:
+        if kind == "100m":
+            display_error = self._ensure_display(interactive=True)
+            if display_error:
+                return {"error": display_error}
+        with self._lock:
+            if self._closed.is_set():
+                return {"error": "generator is shut down"}
+            return self._queue_claim(kind, email, mode, allow_direct_fallback)
+
+    def _queue_claim(self, kind: str, email: str, mode: str,
+                     allow_direct_fallback: bool = True) -> dict:
         """Queue one claim job and return AT ONCE.
 
         Picking a verified proxy can take minutes (live probes, a busy checker).
@@ -2811,20 +4076,27 @@ class GeneratorManager:
         while name in self.claims:
             name += "x"
         job = ClaimJob(name, email, mode, "", self.gen_dir, self.python_exe,
-                       self._invite_code, data_dir=self.data_dir, kind=kind)
+                       self._invite_code, data_dir=self.data_dir, kind=kind,
+                       child_env=self._child_env())
         job._internal_token = self.internal_token
-        job.on_exit = getattr(self, "_claim_settle", None)
+        job.on_exit = self._claim_done
         job.lines.append("looking for a verified proxy…" if mode == "proxy"
                          else "starting on the direct IP…")
         job.started = time.time()          # elapsed counts from the click, not from process start
         self.claims[name] = job
-        threading.Thread(target=self._resolve_claim_route, args=(job, allow_direct_fallback),
-                         daemon=True, name=f"{name}-route").start()
+        try:
+            threading.Thread(target=self._resolve_claim_route, args=(job, allow_direct_fallback),
+                             daemon=True, name=f"{name}-route").start()
+        except Exception:
+            job.fail("Could not start claim routing thread")
+            return {"error": "Could not start claim routing thread"}
         return {"started": name, "proxy": "", "mode": mode}
 
     def _resolve_claim_route(self, job: "ClaimJob", allow_direct_fallback: bool) -> None:
         """Background half of _launch_claim: pick the route, then launch."""
         try:
+            if job.stopped or self._closed.is_set():
+                return
             mode, proxy = job.mode, ""
             if mode == "proxy":
                 progress = job.lines.append
@@ -2837,7 +4109,7 @@ class GeneratorManager:
                                      + ("waiting for the running proxy scan…" if already
                                         else "running a quick recheck of the pool…"))
                     try:
-                        if not already:
+                        if not already and not job.stopped and not self._closed.is_set():
                             self.checker.run("recheck")
                         for sec in range(90):
                             if job.stopped or not self.checker.alive():
@@ -2867,8 +4139,11 @@ class GeneratorManager:
                 return
             if job.stopped:
                 return
-            job.set_route(mode, proxy)
-            job.start()
+            with self._lock:
+                if job.stopped or self._closed.is_set():
+                    return
+                job.set_route(mode, proxy)
+                job.start()
         except Exception as exc:
             log.exception("claim %s could not start", job.name)
             from .neterr import friendly
@@ -2911,26 +4186,98 @@ class GeneratorManager:
         except Exception:
             return -1
 
-    def claim_all_pending(self, mode: str = "proxy") -> dict:
-        """Queue 100M claims sequentially for every starter account whose
-        referral summary shows the Global Build not yet issued."""
+    def start_claim_all(self, mode: str = "direct") -> dict:
+        with self._lock:
+            if self._closed.is_set():
+                return {"error": "generator is shut down"}
+            if self._claim_all_running:
+                return {"error": "claim-all already running"}
+            self._claim_all_running = True
+            self._claim_all_cancel.clear()
+            self._claim_all_status = {"state": "running", "total": 0, "completed": 0,
+                                      "succeeded": 0, "failed": 0, "skipped": 0,
+                                      "current_email": "", "mode": mode, "error": ""}
+        def run():
+            try:
+                self.claim_all_pending(mode)
+                with self._lock:
+                    self._claim_all_status["state"] = "cancelled" if self._claim_all_cancel.is_set() else "completed"
+            except Exception:
+                log.exception("claim-all batch failed")
+                with self._lock:
+                    self._claim_all_status.update(state="failed", error="Batch failed; inspect gateway logs")
+            finally:
+                with self._lock:
+                    self._claim_all_running = False
+                    self._claim_all_job = ""
+                    self._claim_all_status["current_email"] = ""
+        try:
+            threading.Thread(target=run, daemon=True, name="claim-all").start()
+        except Exception:
+            with self._lock:
+                self._claim_all_running = False
+                self._claim_all_status.update(state="failed", error="Could not start batch thread")
+            return {"error": "Could not start batch thread"}
+        return {"started": True, "mode": mode}
+
+    def claim_all_status(self) -> dict:
+        with self._lock:
+            return {**self._claim_all_status, "running": self._claim_all_running}
+
+    def stop_claim_all(self) -> dict:
+        with self._lock:
+            self._claim_all_cancel.set()
+            job = self.claims.get(self._claim_all_job)
+            if self._claim_all_running:
+                self._claim_all_status["state"] = "stopping"
+        if job:
+            job.stop()
+        return self.claim_all_status()
+
+    def claim_all_pending(self, mode: str = "direct") -> dict:
+        """Recover successful signups without an observed plan grant."""
         started, skipped, errors = [], [], []
-        for info in self.pending_accounts():
+        pending = self.unclaimed_accounts()
+        with self._lock:
+            self._claim_all_status["total"] = len(pending)
+        for info in pending:
+            if self._closed.is_set() or self._claim_all_cancel.is_set():
+                break
             email = (info.get("email") or "").strip().lower()
             if not email:
                 continue
-            if any(j.email == email for j in self.claims.values()):
+            if any(j.email == email and j.alive() for j in list(self.claims.values())):
                 skipped.append(email)
+                with self._lock:
+                    self._claim_all_status["skipped"] += 1
                 continue
+            with self._lock:
+                self._claim_all_status["current_email"] = email
             res = self.start_claim_start(email, mode=mode)
             if res.get("started"):
                 started.append(email)
                 # throttle: wait for the job to finish before the next one
                 job = self.claims.get(res["started"])
-                while job and job.alive():
-                    time.sleep(2)
+                with self._lock:
+                    self._claim_all_job = res["started"]
+                deadline = time.monotonic() + 600
+                while job and not job.done.is_set():
+                    if self._claim_all_cancel.wait(.25) or self._closed.is_set():
+                        job.stop()
+                        break
+                    if time.monotonic() >= deadline:
+                        job.stop()
+                        job.fail("Claim exceeded the 10 minute batch deadline")
+                        break
+                with self._lock:
+                    self._claim_all_status["completed"] += 1
+                    self._claim_all_status["succeeded" if job and claim_result_landed(job.result) else "failed"] += 1
+                    self._claim_all_job = ""
             else:
                 errors.append(f"{email}: {res.get('error', '?')}")
+                with self._lock:
+                    self._claim_all_status["completed"] += 1
+                    self._claim_all_status["failed"] += 1
         return {"started": started, "skipped": skipped, "errors": errors}
 
     def _proxy_for_claim(self, kind: str = "100m", progress=None) -> str:
@@ -2940,8 +4287,15 @@ class GeneratorManager:
         so several waves are tried — freshest first — before giving up. The
         500M claim is plain HTTP and also accepts non-socks proxies; the 100M
         browser flow stays socks-only."""
+        if self._closed.is_set():
+            return ""
         o = self.options()
-        pinned = str(o.get("pinned") or "").strip()
+        # options() exposes the pinned proxy as "pin_proxy"; older saved
+        # option sets may still carry "pinned" — read both, or the pinned
+        # proxy was silently ignored and claims always left from a pool IP
+        # (signup exit != claim exit, exactly the pattern the pin exists to
+        # prevent)
+        pinned = str(o.get("pin_proxy") or o.get("pinned") or "").strip()
         if pinned:
             return pinned
         try:
@@ -2951,6 +4305,8 @@ class GeneratorManager:
             return ""
         waves = [(True, 25), (True, 40)] + ([(False, 40)] if kind in ("500m", "start") else [])
         for n, (socks, tries) in enumerate(waves, 1):
+            if self._closed.is_set():
+                return ""
             if progress:
                 progress(f"testing proxies live ({'socks' if socks else 'any type'}, "
                          f"round {n}/{len(waves)})…")
@@ -2965,6 +4321,17 @@ class GeneratorManager:
 
     def claims_public(self) -> list[dict]:
         return [j.to_public() for j in self.claims.values()]
+
+    def _adopt_python(self, py: str) -> None:
+        """The environment setup settled on a (venv) interpreter: use it for
+        every worker/claim/proxy-check started from now on."""
+        if self.python_exe != py:
+            self.playwright._done = False
+        self.python_exe = py
+        try:
+            self.checker.python_exe = py
+        except Exception:
+            pass
 
     def stop_claim(self, name: str) -> bool:
         j = self.claims.get(name)
@@ -2994,4 +4361,5 @@ class GeneratorManager:
             "workers": [w.to_public() for w in self.workers.values()],
             "claims": self.claims_public(),
             "alive": sum(1 for w in self.workers.values() if w.alive()),
+            "auto_generate": self.auto_generate.status(),
         }

@@ -11,7 +11,13 @@ from zcode_gateway.pool import Account, PoolManager
 def _mgr(tmp_path, accounts):
     m = PoolManager(PoolConfig(), accounts)
     m.set_caps_path(tmp_path / "model-caps.json")
+    # persistence is debounced in production; tests await the flush explicitly
+    m._CAPS_SAVE_DEBOUNCE_S = 0.01
     return m
+
+
+async def _flush(m: PoolManager):
+    await m.aclose()
 
 
 @pytest.mark.asyncio
@@ -20,6 +26,7 @@ async def test_cap_persists_across_restart(tmp_path):
     m1 = _mgr(tmp_path, [acc])
     await m1.cap_model(acc, "GLM-5.3", 900,
                        reason="UNUSUAL_ACTIVITY", message="blocked")
+    await _flush(m1)
     assert (tmp_path / "model-caps.json").exists()
 
     # "restart": fresh manager, same account ids, same file
@@ -36,6 +43,7 @@ async def test_expired_cap_not_restored(tmp_path):
     acc = Account(id="acc-1", email="a@x.io", access_token="t")
     m1 = _mgr(tmp_path, [acc])
     await m1.cap_model(acc, "GLM-5.3", 1.0, reason="GEO_BLOCKED", message="451")
+    await _flush(m1)
     # force-expire it on disk
     import json
     p = tmp_path / "model-caps.json"
@@ -55,6 +63,7 @@ async def test_other_model_not_blocked(tmp_path):
     acc = Account(id="acc-1", email="a@x.io", access_token="t")
     m1 = _mgr(tmp_path, [acc])
     await m1.cap_model(acc, "GLM-5.3", 900, reason="UNUSUAL_ACTIVITY")
+    await _flush(m1)
 
     acc2 = Account(id="acc-1", email="a@x.io", access_token="t")
     m2 = _mgr(tmp_path, [acc2])
@@ -68,6 +77,7 @@ async def test_removed_account_pruned(tmp_path):
     acc = Account(id="gone", email="a@x.io", access_token="t")
     m1 = _mgr(tmp_path, [acc])
     await m1.cap_model(acc, "GLM-5.3", 900, reason="UNUSUAL_ACTIVITY")
+    await _flush(m1)
 
     acc2 = Account(id="other", email="b@x.io", access_token="t")
     m2 = _mgr(tmp_path, [acc2])

@@ -17,6 +17,14 @@ _REAL_GETADDRINFO = socket.getaddrinfo
 
 
 @pytest.fixture(autouse=True)
+def _trusted_testserver(monkeypatch):
+    """TestClient's synthetic host is explicitly trusted only in the suite."""
+    from zcode_gateway.config import ServerConfig
+    original = ServerConfig.trusted_hosts
+    monkeypatch.setattr(ServerConfig, "trusted_hosts", lambda self: original(self) | {"testserver"})
+
+
+@pytest.fixture(autouse=True)
 def _no_live_zcode_api(monkeypatch):
     attempts: list[str] = []
 

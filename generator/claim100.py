@@ -105,11 +105,11 @@ def main():
     log(f"claim100: {email} mode={mode}"
         + (f" proxy={proxy[:40]}…" if proxy and mode == 'proxy' else ""))
     try:
-        zjwt, ok = ic.device_login(token, log=log, force_direct=False)
+        zjwt, _ok = ic.device_login(token, log=log, force_direct=False)
         log(f"claim100: zjwt {'ok' if zjwt else 'FAILED'}")
     except Exception as e:
         log(f"claim100: device_login crashed: {type(e).__name__}: {e}")
-        zjwt, ok = None, False
+        zjwt, _ok = None, False
     res = {'email': email, 'zjwt': bool(zjwt), 'summary': None, 'summary_before': None}
     if zjwt:
         try:

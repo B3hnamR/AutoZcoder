@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from zcode_gateway import gui
+from zcode_gateway import cap_display as gui
 
 
 class TehranDateTime(datetime):

@@ -1,0 +1,166 @@
+/* Design tokens. The only file that may name a raw colour or a raw pixel
+   ramp — every other stylesheet reads these. Dark is the default (this is an
+   ops console); light is a real theme, not an inversion. */
+
+:root {
+  /* ---- type ---------------------------------------------------------- */
+  --font-ui: "Inter", "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --font-mono: "Cascadia Code", "Cascadia Mono", "JetBrains Mono", "SF Mono", Consolas, monospace;
+
+  --text-xs: 11px;
+  --text-sm: 12px;
+  --text-base: 13px;
+  --text-md: 14px;
+  --text-lg: 16px;
+  --text-xl: 20px;
+  --text-2xl: 26px;
+
+  --leading-tight: 1.25;
+  --leading-normal: 1.55;
+
+  --weight-normal: 400;
+  --weight-medium: 500;
+  --weight-semibold: 600;
+
+  /* Tabular digits everywhere a number can change under you. */
+  --nums: "tnum" 1, "cv05" 1;
+
+  /* ---- space (4px base) ---------------------------------------------- */
+  --s-0: 0;
+  --s-1: 2px;
+  --s-2: 4px;
+  --s-3: 6px;
+  --s-4: 8px;
+  --s-5: 12px;
+  --s-6: 16px;
+  --s-7: 20px;
+  --s-8: 24px;
+  --s-9: 32px;
+  --s-10: 40px;
+  --s-11: 56px;
+
+  /* ---- radii ---------------------------------------------------------- */
+  --r-sm: 4px;
+  --r-md: 6px;
+  --r-lg: 10px;
+  --r-xl: 14px;
+  --r-full: 999px;
+
+  /* ---- layout --------------------------------------------------------- */
+  --sidebar-w: 228px;
+  --topbar-h: 52px;
+  --view-max: 1280px;
+
+  /* ---- motion --------------------------------------------------------- */
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+  --dur-1: 110ms;
+  --dur-2: 180ms;
+  --dur-3: 260ms;
+
+  /* ---- z -------------------------------------------------------------- */
+  --z-sticky: 10;
+  --z-dropdown: 40;
+  --z-overlay: 60;
+  --z-modal: 70;
+  --z-toast: 90;
+}
+
+/* ---- dark (default) --------------------------------------------------- */
+:root,
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --bg: #0b0d11;
+  --bg-sunken: #07090c;
+  --surface: #111419;
+  --surface-2: #171b22;
+  --surface-3: #1e232c;
+  --surface-hover: #1b2029;
+
+  --border: #242a35;
+  --border-strong: #333b49;
+  --border-subtle: #1a1f27;
+
+  --fg: #e6e9ef;
+  --fg-muted: #949cad;
+  --fg-faint: #6b7384;
+  --fg-on-accent: #0b0d11;
+
+  --accent: #7c8cff;
+  --accent-hover: #8e9bff;
+  --accent-fg: #aeb7ff;
+  --accent-bg: #181b2e;
+  --accent-border: #2e3356;
+
+  --ok: #3fb950;
+  --ok-bg: #0e2514;
+  --ok-border: #1d4427;
+
+  --warn: #e3b341;
+  --warn-bg: #2a2109;
+  --warn-border: #4a3a12;
+
+  --err: #f1707b;
+  --err-bg: #2d1115;
+  --err-border: #55222a;
+
+  --info: #58a6ff;
+  --info-bg: #0d2033;
+  --info-border: #1b3a5c;
+
+  --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.4);
+  --shadow-md: 0 4px 16px rgb(0 0 0 / 0.45);
+  --shadow-lg: 0 16px 48px rgb(0 0 0 / 0.55);
+
+  --focus-ring: 0 0 0 2px var(--bg), 0 0 0 4px var(--accent);
+}
+
+/* ---- light ------------------------------------------------------------ */
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  --bg: #f6f7f9;
+  --bg-sunken: #eceef2;
+  --surface: #ffffff;
+  --surface-2: #f8f9fb;
+  --surface-3: #f0f2f6;
+  --surface-hover: #f2f4f8;
+
+  --border: #dfe3ea;
+  --border-strong: #c3cad6;
+  --border-subtle: #ebeef3;
+
+  --fg: #11161f;
+  --fg-muted: #5b6475;
+  --fg-faint: #828b9c;
+  --fg-on-accent: #ffffff;
+
+  --accent: #4f5bd5;
+  --accent-hover: #4350c4;
+  --accent-fg: #3a44a8;
+  --accent-bg: #eef0fd;
+  --accent-border: #ccd2f7;
+
+  --ok: #1a7f37;
+  --ok-bg: #e8f5ec;
+  --ok-border: #bfe0c9;
+
+  --warn: #9a6700;
+  --warn-bg: #fdf3da;
+  --warn-border: #ecd9a6;
+
+  --err: #cf222e;
+  --err-bg: #fdeced;
+  --err-border: #f5c2c7;
+
+  --info: #0969da;
+  --info-bg: #e7f1fd;
+  --info-border: #bcd9f7;
+
+  --shadow-sm: 0 1px 2px rgb(16 22 32 / 0.06);
+  --shadow-md: 0 4px 16px rgb(16 22 32 / 0.10);
+  --shadow-lg: 0 16px 48px rgb(16 22 32 / 0.16);
+
+  --focus-ring: 0 0 0 2px var(--surface), 0 0 0 4px var(--accent);
+}

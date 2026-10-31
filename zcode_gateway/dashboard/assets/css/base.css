@@ -1,0 +1,95 @@
+/* Reset + element defaults. No component lives here. */
+
+*,
+*::before,
+*::after { box-sizing: border-box; }
+
+* { margin: 0; padding: 0; }
+
+html { height: 100%; -webkit-text-size-adjust: 100%; }
+
+body {
+  height: 100%;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font-ui);
+  font-size: var(--text-base);
+  line-height: var(--leading-normal);
+  font-variant-numeric: tabular-nums;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  overflow: hidden;
+}
+
+h1, h2, h3, h4 { line-height: var(--leading-tight); font-weight: var(--weight-semibold); }
+h1 { font-size: var(--text-lg); }
+h2 { font-size: var(--text-md); }
+h3 { font-size: var(--text-base); }
+
+a { color: var(--accent-fg); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+b, strong { font-weight: var(--weight-semibold); }
+small { font-size: var(--text-xs); }
+
+button, input, select, textarea {
+  font: inherit;
+  color: inherit;
+  font-variant-numeric: inherit;
+}
+
+button { background: none; border: 0; cursor: pointer; }
+button:disabled { cursor: not-allowed; }
+
+svg { display: block; flex: none; }
+
+table { border-collapse: collapse; width: 100%; }
+
+code, kbd, pre, .mono {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  font-variant-ligatures: none;
+}
+
+hr { border: 0; border-top: 1px solid var(--border); }
+
+/* Keyboard focus only — a mouse click must not paint a ring. */
+:focus { outline: none; }
+:focus-visible { box-shadow: var(--focus-ring); border-radius: var(--r-sm); }
+
+::selection { background: var(--accent); color: var(--fg-on-accent); }
+
+::placeholder { color: var(--fg-faint); opacity: 1; }
+
+/* Scrollbars: thin, themed, never a bright OS slab on dark. */
+* { scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; }
+*::-webkit-scrollbar { width: 10px; height: 10px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border: 3px solid transparent;
+  border-radius: var(--r-full);
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-thumb:hover { background: var(--fg-faint); background-clip: content-box; }
+
+[hidden] { display: none !important; }
+
+.visually-hidden {
+  position: absolute;
+  width: 1px; height: 1px;
+  margin: -1px; padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* One global switch for people who asked the OS to calm things down. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

@@ -21,11 +21,24 @@ from zcode_gateway.upstream import UpstreamClient, UpstreamConfig
 def test_relay_manager_defaults(tmp_path: Path):
     mgr = RelayManager(data_dir=tmp_path)
     st = mgr.get_settings()
-    assert st["enabled"] is True
+    assert st["enabled"] is False
     # By default, only GLM-5.3 routes through relay!
     assert st["models"] == ["GLM-5.3"]
     assert st["active_url"] == ""
     assert st["relays"] == []
+
+
+def test_saved_relay_enable_choice_survives_new_default(tmp_path: Path):
+    mgr = RelayManager(data_dir=tmp_path)
+    mgr.update_options(enabled=True)
+    assert RelayManager(data_dir=tmp_path).get_settings()["enabled"] is True
+
+
+def test_adding_relay_does_not_enable_routing(tmp_path: Path):
+    mgr = RelayManager(data_dir=tmp_path)
+    mgr.add_relay("cf", "https://relay.workers.dev", "cloudflare")
+    assert mgr.get_settings()["enabled"] is False
+    assert mgr.get_relay_for_model("GLM-5.3") is None
 
 
 def test_relay_manager_add_and_select(tmp_path: Path):
@@ -41,6 +54,7 @@ def test_relay_manager_add_and_select(tmp_path: Path):
     assert st["active_id"] == entry["id"]
 
     # Model routing check
+    mgr.update_options(enabled=True)
     assert mgr.get_relay_for_model("GLM-5.3") == "https://relay.workers.dev"
     assert mgr.get_relay_for_model("glm-5.3") == "https://relay.workers.dev"
     # GLM-5.3-Flash is NOT routed by default
@@ -52,7 +66,7 @@ def test_relay_manager_model_toggle(tmp_path: Path):
     mgr.add_relay("cf", "https://relay.workers.dev", "cloudflare")
 
     # Add GLM-5.3-Flash to enabled models
-    mgr.update_options(models=["GLM-5.3", "GLM-5.3-Flash"])
+    mgr.update_options(enabled=True, models=["GLM-5.3", "GLM-5.3-Flash"])
     assert mgr.get_relay_for_model("GLM-5.3") == "https://relay.workers.dev"
     assert mgr.get_relay_for_model("GLM-5.3-Flash") == "https://relay.workers.dev"
 
@@ -152,6 +166,7 @@ def test_deploy_cloudflare_fails_when_workers_dev_enable_fails(monkeypatch):
 async def test_upstream_client_routes_through_relay(tmp_path: Path):
     mgr = RelayManager(data_dir=tmp_path)
     mgr.add_relay("cf", "https://cf-relay.workers.dev", "cloudflare")
+    mgr.update_options(enabled=True)
 
     cfg = UpstreamConfig(base_url="https://zcode.z.ai/api/v1", chat_path="/zcode-plan/anthropic/v1/messages")
     client = UpstreamClient(cfg, relay_manager=mgr)
@@ -182,7 +197,7 @@ def test_strategy_single_uses_active(tmp_path: Path):
     mgr = RelayManager(data_dir=tmp_path)
     r1 = mgr.add_relay("cf1", "https://cf1.workers.dev", "cloudflare")
     mgr.add_relay("cf2", "https://cf2.workers.dev", "cloudflare")
-    mgr.update_options(strategy="single", active_id=r1["id"])
+    mgr.update_options(enabled=True, strategy="single", active_id=r1["id"])
     for _ in range(5):
         assert mgr.get_relay_for_model("GLM-5.3") == "https://cf1.workers.dev"
 
@@ -191,7 +206,7 @@ def test_strategy_round_robin_cycles(tmp_path: Path):
     mgr = RelayManager(data_dir=tmp_path)
     mgr.add_relay("cf1", "https://cf1.workers.dev", "cloudflare")
     mgr.add_relay("cf2", "https://cf2.workers.dev", "cloudflare")
-    mgr.update_options(strategy="round_robin")
+    mgr.update_options(enabled=True, strategy="round_robin")
     picks = [mgr.get_relay_for_model("GLM-5.3") for _ in range(4)]
     assert picks == ["https://cf1.workers.dev", "https://cf2.workers.dev",
                      "https://cf1.workers.dev", "https://cf2.workers.dev"]
@@ -201,7 +216,7 @@ def test_strategy_random_picks_from_pool(tmp_path: Path):
     mgr = RelayManager(data_dir=tmp_path)
     mgr.add_relay("cf1", "https://cf1.workers.dev", "cloudflare")
     mgr.add_relay("cf2", "https://cf2.workers.dev", "cloudflare")
-    mgr.update_options(strategy="random")
+    mgr.update_options(enabled=True, strategy="random")
     allowed = {"https://cf1.workers.dev", "https://cf2.workers.dev"}
     picks = {mgr.get_relay_for_model("GLM-5.3") for _ in range(30)}
     assert picks.issubset(allowed) and len(picks) >= 1
@@ -211,7 +226,7 @@ def test_failed_relay_is_skipped_and_recovers(tmp_path: Path):
     mgr = RelayManager(data_dir=tmp_path)
     mgr.add_relay("cf1", "https://cf1.workers.dev", "cloudflare")
     r2 = mgr.add_relay("cf2", "https://cf2.workers.dev", "cloudflare")
-    mgr.update_options(strategy="round_robin")
+    mgr.update_options(enabled=True, strategy="round_robin")
 
     # cool down cf1: rotation must fall to cf2 only
     mgr.mark_relay_failed("https://cf1.workers.dev")
@@ -229,8 +244,8 @@ def test_all_relays_failed_still_routes(tmp_path: Path):
     mgr = RelayManager(data_dir=tmp_path)
     mgr.add_relay("cf1", "https://cf1.workers.dev", "cloudflare")
     mgr.add_relay("cf2", "https://cf2.workers.dev", "cloudflare")
+    mgr.update_options(enabled=True)
     mgr.mark_relay_failed("https://cf1.workers.dev")
     mgr.mark_relay_failed("https://cf2.workers.dev")
     assert mgr.get_relay_for_model("GLM-5.3") in {
         "https://cf1.workers.dev", "https://cf2.workers.dev"}
-

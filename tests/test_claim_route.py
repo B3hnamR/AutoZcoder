@@ -86,6 +86,7 @@ def test_no_proxy_and_no_fallback_fails_the_job_visibly(tmp_path, monkeypatch):
 
 def test_500m_claim_never_waits_for_playwright_but_100m_does(tmp_path, monkeypatch):
     mgr = _mgr(tmp_path)
+    monkeypatch.setattr(mgr, "_ensure_display", lambda **kw: "")
     calls = []
     started = []
     monkeypatch.setattr(mgr, "_ensure_playwright", lambda *a, **k: calls.append("pw") or False)

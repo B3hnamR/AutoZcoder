@@ -52,6 +52,31 @@ def allow_loopback() -> bool:
         os.environ.get("PROXYHIVE_ALLOW_LOOPBACK") == "1"
 
 
+def allow_private_networks() -> bool:
+    """Off by default: a user-editable proxy source that lists RFC1918 /
+    CGNAT addresses makes the generator probe internal hosts (VPS on a corp
+    network, home LAN with a router admin panel, cloud metadata peers).
+    ZAI_ALLOW_PRIVATE=1 opts a private-network operator back in."""
+    return os.environ.get("ZAI_ALLOW_PRIVATE") == "1"
+
+
+def _is_private_octets(parts: list[int]) -> bool:
+    """RFC1918 (10/8, 172.16/12, 192.168/16) + CGNAT (100.64/10)."""
+    o1, o2 = parts[0], parts[1]
+    if o1 == 10:
+        return True
+    if o1 == 172 and 16 <= o2 <= 31:
+        return True
+    if o1 == 192 and o2 == 168:
+        return True
+    if o1 == 100 and 64 <= o2 <= 127:
+        return True
+    return False
+
+
+_warned_private = False
+
+
 def valid_endpoint(host: str, port: int) -> bool:
     if not (0 < port < 65536):
         return False
@@ -70,6 +95,13 @@ def valid_endpoint(host: str, port: int) -> bool:
         return False
     first = parts[0]
     if first >= 224:
+        return False
+    if not allow_private_networks() and _is_private_octets(parts):
+        global _warned_private
+        if not _warned_private:
+            _warned_private = True
+            print("proxy_parse: private-network proxy (10/8, 172.16/12, 192.168/16, "
+                  "100.64/10) skipped - set ZAI_ALLOW_PRIVATE=1 to use LAN/VPN proxies")
         return False
     return True
 

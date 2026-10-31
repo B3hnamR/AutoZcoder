@@ -202,6 +202,7 @@ def test_countries_action_replaces_the_geo_database_download(tmp_path, monkeypat
 
 def test_nothing_in_the_app_downloads_a_location_database():
     gen = ROOT.parent / "generator"
-    for path in [*ROOT.glob("*.py"), *gen.glob("*.py"), ROOT / "dashboard" / "index.html"]:
+    for path in [*ROOT.glob("*.py"), *gen.glob("*.py"),
+                 *(ROOT / "dashboard/assets/js").rglob("*.js")]:
         text = path.read_text(encoding="utf-8", errors="ignore").lower()
         assert "db-ip.com" not in text and "dbip-" not in text, path.name

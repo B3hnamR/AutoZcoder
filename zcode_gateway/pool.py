@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -19,9 +20,18 @@ from .config import AccountsConfig, PoolConfig
 # grant-window clock-skew grace: a starts_at less than this far in the future
 # counts as "open now" both for routing and for WINDOW_CLOSED parking
 WINDOW_GRACE_S = 30
+QUOTA_CAP_REASONS = frozenset({'WINDOW_CLOSED', 'MODEL_CAPPED', '11113', '1005'})
 
 
 log = logging.getLogger("zcode_gateway.pool")
+
+
+def _quota_cap(info: dict) -> bool:
+    code = info.get('code')
+    # Older versions also used MODEL_CAPPED for rate limits. Only billing's
+    # known message proves that a persisted park with that code is quota-owned.
+    return code in QUOTA_CAP_REASONS and (
+        code != 'MODEL_CAPPED' or info.get('message') == 'daily ZCode token quota exhausted')
 
 
 def _is_ent(code: str) -> bool:
@@ -54,6 +64,7 @@ class Account:
     balance_micro: int | None = None
     balance_checked_at: float = 0.0
     last_error: str = ""
+    death_reason: str = ""
     # rolling autopsy log: last N upstream errors with timestamps, for the
     # dashboard "why did this account die" view and the health sparkline
     error_history: deque = field(default_factory=lambda: deque(maxlen=50))
@@ -88,6 +99,10 @@ class Account:
     # 3 strikes -> EXHAUSTED. Observed live: a plan-less account churning
     # "exceed quota limit" every 30s cool-off for 10+ minutes.
     quota_strikes: int = 0
+    # consecutive auth failures toward kill_after_strikes (see pool 401 path):
+    # assigned dynamically by the upstream error handler — declared here so
+    # the dataclass has a stable field instead of per-instance attributes
+    auth_strikes: int = 0
 
     # ------------------------------------------------------------------ #
 
@@ -168,11 +183,15 @@ class Account:
             "in_flight": self.in_flight,
             "error_count": self.error_count,
             "balance_micro": self.balance_micro,
+            "balance_checked_at": self.balance_checked_at,
+            "quota_check_attempted_at": self.notes.get("quota_check_attempted_at"),
+            "quota_check_error": self.notes.get("quota_check_error", ""),
             "last_used": self.last_used,
             "token_fingerprint": __import__("hashlib").sha256(tok.encode()).hexdigest()[:12],
             "quotas": self.notes.get("quotas", {}),
             "plans": self.notes.get("plans", []),
             "has_refresh_token": bool(self.refresh_token),
+            "imported_jwt": bool(self.notes.get("imported_jwt") or self.source == "jwt-import"),
             "last_error": self.last_error,
             "error_history": [
                 {**e, "ts": round(e.get("ts", 0), 1),
@@ -248,6 +267,8 @@ def load_from_pool_file(path: str) -> list[Account]:
                 refresh_token=item.get("refresh_token") or item.get("refreshToken", ""),
                 expires_at=_expiry_ms(item.get("expires_at") or item.get("expiresAt")),
                 source="pool.json",
+                notes={"imported_jwt": bool(item.get("imported_jwt") or item.get("source") == "jwt-import"),
+                       "name": item.get("name", ""), "device_mid": item.get("device_mid", "")},
             ))
     return out
 
@@ -366,12 +387,37 @@ class PoolManager:
         # persisted per-model parks (UNUSUAL_ACTIVITY / GEO_BLOCKED / caps):
         # a gateway restart must not forget them and re-burn every account
         self.caps_path: Path | None = None
+        # debounced caps persistence state (see _schedule_caps_save)
+        self._caps_dirty = False
+        self._caps_save_task: asyncio.Task | None = None
+        self._caps_write_task: asyncio.Task | None = None
+        self._caps_io_lock = threading.Lock()
+        self._caps_close_lock = asyncio.Lock()
+        self._caps_closing = False
         # notification center (attached in app setup); pool events worth a
         # human's attention go through here, safe from any thread
         self._notify = None
 
     def attach_notifications(self, center) -> None:
         self._notify = center
+
+    async def aclose(self) -> None:
+        """Join the actual disk writer before flushing the latest snapshot."""
+        async with self._caps_close_lock:
+            self._caps_closing = True
+            task = self._caps_save_task
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            if self._caps_write_task is not None:
+                if not await asyncio.shield(self._caps_write_task):
+                    self._caps_dirty = True
+            while self._caps_dirty and self.caps_path:
+                if not await self._flush_caps():
+                    break
 
     def notify(self, category: str, message: str, level: str = "info") -> None:
         """Emit a dashboard notification if a center is attached. Never raises."""
@@ -414,10 +460,61 @@ class PoolManager:
         if changed:
             self._save_caps()
 
-    def _save_caps(self) -> None:
-        """Atomic write of all unexpired parks. Called under the pool lock."""
-        if not self.caps_path:
+    _CAPS_SAVE_DEBOUNCE_S = 5.0
+
+    def _schedule_caps_save(self) -> None:
+        """Debounced, off-loop persistence for model parks.
+
+        The old code wrote model-caps.json synchronously INSIDE
+        `async with self._lock` — the request path, the balance loop and the
+        token loop all stalled behind that disk flush. This only marks dirty
+        and arms a timer; the actual snapshot+write happens outside the lock
+        in a thread."""
+        self._caps_dirty = True
+        if self._caps_closing:
             return
+        task = self._caps_save_task
+        if task is not None and not task.done():
+            return
+        self._caps_save_task = asyncio.get_running_loop().create_task(
+            self._caps_save_later())
+
+    async def _caps_save_later(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(self._CAPS_SAVE_DEBOUNCE_S)
+                if not self._caps_dirty or not self.caps_path:
+                    return
+                if not await self._flush_caps():
+                    return
+                # loop: parks marked dirty during the snapshot/write re-arm
+                # the timer instead of being silently dropped (the old
+                # single-shot version left dirty data with no timer armed)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # a failed flush must not lose the write: re-mark dirty so the
+            # next cap event (or the aclose final flush) retries it
+            self._caps_dirty = True
+            log.debug("debounced caps save failed", exc_info=True)
+
+    async def _flush_caps(self) -> bool:
+        if self._caps_write_task is not None:
+            if not await asyncio.shield(self._caps_write_task):
+                self._caps_dirty = True
+        async with self._lock:
+            self._caps_dirty = False
+            out = self._caps_snapshot()
+        # Shielding keeps the executor awaiter alive when the timer is cancelled.
+        self._caps_write_task = asyncio.create_task(
+            asyncio.to_thread(self._write_caps_snapshot, out))
+        ok = await asyncio.shield(self._caps_write_task)
+        if not ok:
+            self._caps_dirty = True
+        return ok
+
+    def _caps_snapshot(self) -> dict:
+        """All unexpired parks, keyed by account id. Caller holds the lock."""
         now = time.time()
         out: dict[str, dict[str, dict]] = {}
         for acc in self._accounts.values():
@@ -433,12 +530,32 @@ class PoolManager:
                     }
             if caps:
                 out[acc.id] = caps
+        return out
+
+    def _write_caps_snapshot(self, out: dict) -> bool:
+        """Returns False when the write failed so the debounced saver can
+        keep the data dirty and retry."""
+        # an EMPTY snapshot must still be written: pruning the last park
+        # used to skip the write and leave stale accounts on disk forever
+        if not self.caps_path:
+            return True
         try:
-            tmp = self.caps_path.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(out, indent=1), encoding="utf-8")
-            os.replace(tmp, self.caps_path)
+            with self._caps_io_lock:
+                tmp = self.caps_path.with_suffix(".json.tmp")
+                tmp.write_text(json.dumps(out, indent=1), encoding="utf-8")
+                os.replace(tmp, self.caps_path)
+            return True
         except OSError:
             log.debug("could not persist model caps", exc_info=True)
+            return False
+
+    def _save_caps(self) -> None:
+        """Atomic write of all unexpired parks. Synchronous callers only
+        (startup load_caps); the async request path uses _schedule_caps_save."""
+        if not self.caps_path:
+            return
+        out = self._caps_snapshot()
+        self._write_caps_snapshot(out)
 
     # -- access ---------------------------------------------------------- #
 
@@ -512,7 +629,7 @@ class PoolManager:
 
     async def cap_model(self, account: Account, model: str,
                         seconds: float, reason: str = "inference_cap",
-                        message: str = "") -> None:
+                        message: str = "", *, quota_only: bool = False) -> None:
         """Record a per-model daily cap. Deliberately does NOT cool the account:
         other models on the same account remain usable.
 
@@ -527,6 +644,8 @@ class PoolManager:
             # 1-2s skew cap wrote garbage parks to disk every boundary)
             existing_until = account.model_caps.get(model, 0.0)
             existing_code = (account.model_cap_info.get(model) or {}).get("code")
+            if quota_only and existing_until > time.time() and not _quota_cap(account.model_cap_info.get(model, {})):
+                return
             if existing_until > time.time() and existing_code == reason \
                     and abs(existing_until - release_at) < 5.0:
                 return
@@ -540,7 +659,17 @@ class PoolManager:
             }
             account.last_error = f"{reason}:{model}"
             # persist so a restart doesn't forget the park and re-burn accounts
-            self._save_caps()
+            # (debounced, written off the lock — see _schedule_caps_save)
+            self._schedule_caps_save()
+
+    async def clear_quota_cap(self, account: Account, model: str) -> None:
+        """Billing resolves quota/window parks, not risk or rate-limit parks."""
+        async with self._lock:
+            if not _quota_cap(account.model_cap_info.get(model, {})):
+                return
+            account.model_caps.pop(model, None)
+            account.model_cap_info.pop(model, None)
+            self._schedule_caps_save()
 
     async def unavailable_reason(self, model: str) -> dict | None:
         """Why can this model not be served right now?
@@ -616,6 +745,7 @@ class PoolManager:
         specifically want the cap/entitlement case)."""
         reason = await self.unavailable_reason(model)
         if reason and reason.get("code") in ("MODEL_CAPPED", "MODEL_PARKED",
+                                             "RATE_LIMITED",
                                              "INFERENCE_CAP_ERROR",
                                              "ENTITLEMENT_ERROR",
                                              "DAILY_FREE_LIMIT",
@@ -639,9 +769,14 @@ class PoolManager:
             if account.state is AccountState.COOLING:
                 account.state = AccountState.READY
 
-    async def restore(self, account: Account) -> None:
+    async def restore(self, account: Account, *, plan_recovered: bool = False) -> bool:
         """A retired account's balance recovered: back into rotation."""
         async with self._lock:
+            if account.state is AccountState.DEAD:
+                if not plan_recovered or account.death_reason != 'plan_lost':
+                    return False
+                account.state = AccountState.READY
+                account.death_reason = ''
             account.paid_exhausted = False
             if account.state is AccountState.EXHAUSTED:
                 account.state = AccountState.READY
@@ -651,10 +786,13 @@ class PoolManager:
             # rejection (2 strikes already banked)
             account.quota_strikes = 0
             account.auth_strikes = 0
+            return True
 
     async def cool(self, account: Account, seconds: int | None = None,
                    reason: str = "") -> None:
         async with self._lock:
+            if account.state is AccountState.DEAD:
+                return
             account.state = AccountState.COOLING
             account.cooldown_until = time.time() + (seconds or self.cfg.cooldown_seconds)
             account.error_count += 1
@@ -668,6 +806,8 @@ class PoolManager:
         """402. Credit exhaustion is per model-class: by default only the paid
         lane is retired, because zcode-free/* models do not consume credits."""
         async with self._lock:
+            if account.state is AccountState.DEAD:
+                return
             account.last_error = reason
             if paid_only:
                 account.paid_exhausted = True
@@ -676,13 +816,21 @@ class PoolManager:
             else:
                 account.state = AccountState.EXHAUSTED
 
-    async def kill(self, account: Account, reason: str = "") -> None:
+    async def kill(self, account: Account, reason: str = "", *, cause: str = "") -> bool:
         async with self._lock:
+            if cause == 'plan_lost' and account.state is AccountState.DEAD:
+                return False
             account.state = AccountState.DEAD
             account.last_error = reason
+            account.death_reason = cause or reason
+            if cause == 'plan_lost':
+                account.error_history.append(
+                    {'ts': time.time(), 'status': None, 'code': cause,
+                     'message': reason, 'state': 'dead'})
         self.notify('account_dead',
                     f"account {account.id} marked DEAD — {reason}",
                     level='error')
+        return True
 
     async def kill_after_strikes(self, account: Account, reason: str = "",
                                  strikes: int = 3) -> None:
@@ -694,9 +842,14 @@ class PoolManager:
         re-tried; only repeated failures escalate to DEAD."""
         async with self._lock:
             n = getattr(account, 'auth_strikes', 0) + 1
+            if account.state is AccountState.DEAD:
+                account.death_reason = reason or 'authentication_error'
+                account.last_error = reason
+                return
             account.auth_strikes = n
             if n >= strikes:
                 account.state = AccountState.DEAD
+                account.death_reason = reason or 'authentication_error'
                 account.last_error = reason
                 account.error_history.append(
                     {"ts": time.time(), "status": 401, "code": "auth_dead",
@@ -719,6 +872,7 @@ class PoolManager:
             if not acc:
                 return False
             acc.state = AccountState.READY
+            acc.death_reason = ''
             acc.paid_exhausted = False
             acc.cooldown_until = 0.0
             acc.error_count = 0
@@ -744,6 +898,8 @@ class PoolManager:
             existing.expires_at = account.expires_at
             existing.email = account.email or existing.email
             existing.state = account.state if account.state is not AccountState.DEAD else existing.state
+            if existing.state is not AccountState.DEAD:
+                existing.death_reason = ''
             existing.paid_exhausted = account.paid_exhausted
             if account.notes:
                 existing.notes.update(account.notes)

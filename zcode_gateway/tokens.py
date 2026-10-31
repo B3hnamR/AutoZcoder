@@ -16,11 +16,19 @@ from .upstream import build_headers
 log = logging.getLogger('zcode_gateway.tokens')
 
 class TokenManager:
+    # One accounts-directory scan serves every expiring account within this
+    # window: refresh() used to call load_accounts PER expiring account, so
+    # N accounts meant N full directory scans every 30s loop.
+    _SCAN_TTL_S = 10.0
+
     def __init__(self, cfg: Config, pool: PoolManager):
         self.cfg, self.pool = cfg, pool
         self._client = httpx.AsyncClient(timeout=httpx.Timeout(30, connect=10))
         self._locks = {}
         self._stop = asyncio.Event()
+        self._scan_lock = asyncio.Lock()
+        self._scan_cache: list | None = None
+        self._scan_at = 0.0
 
     def _lock_for(self, ident):
         return self._locks.setdefault(ident, asyncio.Lock())
@@ -32,14 +40,29 @@ class TokenManager:
         self._stop.set()
         await self._client.aclose()
 
+    async def _found_accounts(self, force_scan: bool = False):
+        """Cached load_accounts: one directory scan per cycle, shared across
+        every expiring account. force_scan bypasses the cache (a 401 strike
+        needs the freshest possible on-disk token)."""
+        async with self._scan_lock:
+            now = time.time()
+            if force_scan or self._scan_cache is None \
+                    or now - self._scan_at > self._SCAN_TTL_S:
+                try:
+                    self._scan_cache = await asyncio.to_thread(
+                        load_accounts, self.cfg.accounts)
+                except (OSError, ValueError):
+                    return None
+                self._scan_at = now
+            return self._scan_cache
+
     async def refresh(self, account, force=False):
         # Captured JWT has no exp or refresh token. Never invent a refresh API.
         async with self._lock_for(account.id):
             if not force and account.access_token and account.expires_in() > 0:
                 return True
-            try:
-                found = await asyncio.to_thread(load_accounts, self.cfg.accounts)
-            except (OSError, ValueError):
+            found = await self._found_accounts(force_scan=force)
+            if found is None:
                 return False
             for fresh in found:
                 if fresh.id == account.id and fresh.access_token != account.access_token:
@@ -64,8 +87,9 @@ class TokenManager:
                                  'name': account.notes.get('name', ''),
                                  'access_token': account.access_token,
                                  'expires_at_ms': str(account.expires_at),
-                                 'device_mid': account.notes.get('device_mid', ''),
-                                 'source': account.notes.get('source', 'token refresh')})
+                                  'device_mid': account.notes.get('device_mid', ''),
+                                  'imported_jwt': 'true' if account.notes.get('imported_jwt') else 'false',
+                                  'source': account.notes.get('source', 'token refresh')})
                     except Exception:
                         log.debug('snapshot persist after refresh failed for %s',
                                   account.id, exc_info=True)
@@ -77,6 +101,7 @@ class TokenManager:
             account.access_token, account.expires_at = access_token, expires_at
             account.last_error = ''
             account.state = AccountState.READY
+            account.death_reason = ''
 
     async def refresh_loop(self):
         while not self._stop.is_set():
@@ -116,27 +141,48 @@ class TokenManager:
             await asyncio.sleep(max(1, self.cfg.pool.balance_poll_seconds))
 
     async def check_account(self, account):
+        account.notes['quota_check_attempted_at'] = time.time()
         headers = build_headers(account.access_token, self.cfg.upstream.fingerprint,
                                 device_mid=account.notes.get('device_mid'))
         url = self.cfg.upstream.base_url.rstrip('/') + '/zcode-plan/billing/balance'
         try:
-            resp = await self._client.get(url, params={'app_version': self.cfg.upstream.fingerprint.client_version},
-                                          headers=headers)
+            for attempt in range(2):
+                try:
+                    resp = await self._client.get(url, params={'app_version': self.cfg.upstream.fingerprint.client_version},
+                                                  headers=headers)
+                    break
+                except httpx.TransportError:
+                    if attempt:
+                        raise
             if resp.status_code == 401:
+                account.notes['quota_check_error'] = 'Quota check rejected (HTTP 401); refreshing credentials'
                 if not await self.refresh(account, force=True):
                     await self.pool.kill(account, 'ZCode token revoked; sign in again')
                 return None
             resp.raise_for_status()
             payload = resp.json()
+            if not isinstance(payload, dict):
+                raise ValueError('Invalid quota response')
             if payload.get('code') != 0 or not isinstance(payload.get('data'), dict):
+                account.notes['quota_check_error'] = 'Quota API rejected the check (code %s)' % payload.get('code')
                 log.warning('quota check rejected for %s (code %s)', account.id, payload.get('code'))
                 return None
             data = payload['data']
             plans, quotas = parse_balance(data, time.time())
-        except (httpx.HTTPError, ValueError, TypeError, KeyError):
+        except (httpx.HTTPError, ValueError, TypeError, KeyError, AttributeError) as exc:
+            # Keep the last successful values and expose a credential-safe
+            # status instead of pretending this account was never checked.
+            if isinstance(exc, httpx.HTTPStatusError):
+                detail = 'HTTP %s' % exc.response.status_code
+            elif isinstance(exc, httpx.TimeoutException):
+                detail = 'request timed out'
+            else:
+                detail = type(exc).__name__
+            account.notes['quota_check_error'] = 'Quota check unavailable: ' + detail
             log.warning('quota check unavailable for %s', account.id)
             return None
         account.notes['plans'] = plans
+        account.notes.pop('quota_check_error', None)
         account.notes['quotas'] = quotas
         account.notes['plan'] = ', '.join(p['name'] or p['plan_id'] or '' for p in plans)
         account.balance_checked_at = time.time()
@@ -148,20 +194,10 @@ class TokenManager:
         # skips it and the dashboard shows it red instead of ready. If a plan
         # reappears on a later poll (renewal/recovery), restore() brings it
         # back automatically.
-        from .pool import AccountState
-        if not plans and not quotas and account.state is not AccountState.DEAD:
-            account.state = AccountState.DEAD
-            account.last_error = 'plan lost — no active plan or quota buckets'
-            account.error_history.append(
-                {"ts": time.time(), "status": None, "code": "plan_lost",
-                 "message": "balance poll: no active plan, no quota buckets",
-                 "state": "dead"})
-            log.warning('account %s: plan lost (poll confirmed) — marked DEAD',
-                        account.id)
-            self.pool.notify('account_dead',
-                             f"account {account.id} ({account.email or 'no email'}) "
-                             f"lost its plan — marked dead, out of rotation",
-                             level='error')
+        if not plans and not quotas:
+            if await self.pool.kill(account, 'plan lost - no active plan or quota buckets',
+                                    cause='plan_lost'):
+                log.warning('account %s: plan lost (poll confirmed) - marked DEAD', account.id)
             return None
         now = time.time()
         from .pool import WINDOW_GRACE_S
@@ -176,22 +212,20 @@ class TokenManager:
                 # clock-skew blip and clients saw quota errors flash.
                 await self.pool.cap_model(account, model, starts - now,
                                           reason='WINDOW_CLOSED',
-                                          message='grant window not open yet (e.g. night-only)')
+                                          message='grant window not open yet (e.g. night-only)',
+                                          quota_only=True)
                 continue
             if quota.get('remaining', 0) <= 0:
                 if quota.get('resets_at', 0) > now:
                     await self.pool.cap_model(account, model, quota['resets_at'] - now,
-                                              reason='MODEL_CAPPED', message='daily ZCode token quota exhausted')
+                                              reason='MODEL_CAPPED', message='daily ZCode token quota exhausted',
+                                              quota_only=True)
                     continue
                 # remaining 0 but the reset window already passed: leave any
                 # existing park alone (the next poll sees the refreshed
                 # remaining and clears it below)
             else:
-                # quota available again: clear whatever park this model had
-                # (WINDOW_CLOSED from a boundary blip, MODEL_CAPPED/11113 from
-                # a spent bucket that has since reset)
-                account.model_caps.pop(model, None)
-                account.model_cap_info.pop(model, None)
+                await self.pool.clear_quota_cap(account, model)
         # fully drained: every known quota bucket at zero and none waiting on
         # a reset window -> retire the whole account, not just per-model caps.
         # Conversely: a retired account whose buckets recovered (daily 03:00
@@ -199,24 +233,22 @@ class TokenManager:
         # EXHAUSTED was a one-way death.
         if quotas and all(q.get('remaining', 0) <= 0 for q in quotas.values()) \
                 and not any((q.get('starts_at', 0) or 0) > now for q in quotas.values()):
-            if account.state.name != 'EXHAUSTED':
+            if account.state not in (AccountState.EXHAUSTED, AccountState.DEAD):
                 log.info('account %s drained (all quotas 0) — retired from rotation', account.id)
                 self.pool.notify('quota',
                                  f"account {account.id} drained — all quotas at 0, "
                                  f"retired from rotation",
                                  level='warning')
-            account.state = AccountState.EXHAUSTED
-            account.last_error = 'no tokens remaining on any model'
+            await self.pool.retire(account, 'no tokens remaining on any model', paid_only=False)
         elif account.state is AccountState.EXHAUSTED:
-            await self.pool.restore(account)
-            log.info('account %s quotas recovered — back in rotation', account.id)
+            if await self.pool.restore(account):
+                log.info('account %s quotas recovered — back in rotation', account.id)
         # plan recovered after a plan_lost DEAD mark: revive. Only this
         # specific cause — a credential-dead account stays dead.
-        if account.state is AccountState.DEAD and plans and \
-                any(p.get('status') == 'active' for p in plans):
-            if any(e.get('code') == 'plan_lost' for e in account.error_history):
-                await self.pool.restore(account)
-                account.last_error = ''
+        if account.state is AccountState.DEAD and plans and account.plan_active(now) and \
+                any(q.get('remaining', 0) > 0 and (q.get('starts_at') or 0) <= now + WINDOW_GRACE_S
+                    for q in quotas.values()):
+            if await self.pool.restore(account, plan_recovered=True):
                 log.info('account %s plan recovered — back in rotation', account.id)
                 self.pool.notify('quota',
                                  f"account {account.id} plan recovered — "

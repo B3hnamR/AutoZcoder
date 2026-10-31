@@ -4,6 +4,12 @@ The gateway can create z.ai accounts and claim the referral **Global Build**
 (100M GLM-5.3-Flash) automatically. This file covers the parts that need **you**
 (once), and the portable layout.
 
+For repository layout, source dependencies and build commands, see the
+[README](../../README.md). Commands below assume the repository root unless
+they explicitly change directories. Read [SECURITY.md](../../SECURITY.md)
+before exposing the gateway beyond loopback; Linux deployment is covered in
+the [VPS guide](VPS-DEPLOY.md).
+
 ---
 
 ## Portable install

@@ -11,10 +11,12 @@
  * ZAI_CAPTCHA_CMD and parses the single stdout line.
  */
 import { runCaptchaSolve } from "./captcha-solver.ts";
+import { CaptchaDeadline } from "./captcha-deadline.ts";
 
 const appVersion = (process.env.ZAI_APP_VERSION || "3.16.3").trim();
 
-async function readConfig(): Promise<{ scene: string; region: string; prefix: string }> {
+export async function readConfig(deadline: CaptchaDeadline): Promise<{ scene: string; region: string; prefix: string }> {
+  deadline.remaining();
   const envScene = (process.env.ZAI_CAPTCHA_SCENE || "").trim();
   const envPrefix = (process.env.ZAI_CAPTCHA_PREFIX || "").trim();
   const envRegion = (process.env.ZAI_CAPTCHA_REGION || "").trim();
@@ -24,8 +26,10 @@ async function readConfig(): Promise<{ scene: string; region: string; prefix: st
   const url =
     "https://zcode.z.ai/api/v1/client/configs" +
     `?app_version=${encodeURIComponent(appVersion)}&platform=win32-x64`;
-  const resp = await fetch(url);
-  const json = (await resp.json()) as {
+  const json = (await deadline.fetch(url, {}, async (resp) => {
+    if (!resp.ok) throw new Error(`captcha config HTTP ${resp.status}`);
+    return resp.json();
+  })) as {
     data?: { configs?: { captcha?: { enabled?: boolean; prefix?: string; sceneId?: string; region?: string } } };
   };
   const cfg = json?.data?.configs?.captcha;
@@ -39,17 +43,24 @@ async function readConfig(): Promise<{ scene: string; region: string; prefix: st
   };
 }
 
-async function main(): Promise<void> {
-  const cfg = await readConfig();
-  if (process.env.CAPTCHA_MINT_DEBUG) {
-    process.stderr.write(`[mint] scene=${cfg.scene} region=${cfg.region} prefix=${cfg.prefix}\n`);
+export async function main(): Promise<void> {
+  const deadline = new CaptchaDeadline();
+  try {
+    const cfg = await readConfig(deadline);
+    if (process.env.CAPTCHA_MINT_DEBUG) {
+      process.stderr.write(`[mint] scene=${cfg.scene} region=${cfg.region} prefix=${cfg.prefix}\n`);
+    }
+    const param = await deadline.run(() => runCaptchaSolve(cfg.scene, cfg.region, cfg.prefix, deadline.at));
+    if (!param || param.length <= 20 || /\s/.test(param) || !/^[A-Za-z0-9_-]+$/.test(cfg.region)) {
+      throw new Error("solver returned invalid token protocol");
+    }
+    process.stdout.write(`${param} ${cfg.region}\n`);
+  } finally {
+    deadline.dispose();
   }
-  const param = await runCaptchaSolve(cfg.scene, cfg.region, cfg.prefix);
-  if (!param || param.length < 20) throw new Error("solver returned no verify param");
-  process.stdout.write(`${param} ${cfg.region}\n`);
 }
 
-main().then(
+if (import.meta.main) main().then(
   () => process.exit(0),
   (err) => {
     process.stderr.write(`[mint] ${(err as Error)?.stack || String(err)}\n`);

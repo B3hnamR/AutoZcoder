@@ -46,7 +46,10 @@ from invite_claim import (        # noqa: E402
 from plan_check import (          # noqa: E402
     APP_VERSION,
     PLATFORM,
+    PreviewError,
+    _request,
     claim_plan,
+    direct_requests,
     get_plan,
     is_start_plan,
     per_account_device_mid,
@@ -60,11 +63,10 @@ FALLBACK_PROXIES = 2
 def _captcha_config(log) -> dict:
     """`data.configs.captcha` from /client/configs — {enabled, prefix, sceneId, region}."""
     try:
-        import requests
-        r = requests.get(
-            "https://zcode.z.ai/api/v1/client/configs",
+        r = _request(
+            "GET", "https://zcode.z.ai/api/v1/client/configs",
             params={"app_version": APP_VERSION, "platform": PLATFORM},
-            timeout=15, verify=_VERIFY,
+            timeout=15, verify=_VERIFY, log=log, tries=1,
         )
         cfg = ((r.json() or {}).get("data") or {}).get("configs", {}).get("captcha") or {}
         if cfg.get("enabled") and cfg.get("sceneId"):
@@ -76,17 +78,22 @@ def _captcha_config(log) -> dict:
 
 
 def _find_mint_exe() -> str:
-    """Locate the bundled captcha-mint sidecar (frozen or source tree)."""
+    """Locate the bundled captcha-mint sidecar (frozen or source tree).
+
+    Platform-aware: `captcha-mint.exe` on Windows, the extensionless ELF
+    binary (`captcha-mint`) on Linux — bun emits different names per host.
+    """
     here = os.path.dirname(os.path.abspath(__file__))
+    binary = "captcha-mint.exe" if os.name == "nt" else "captcha-mint"
     cands = []
     meipass = getattr(sys, "_MEIPASS", "")
     if meipass:
-        cands.append(os.path.join(meipass, "captcha-mint", "captcha-mint.exe"))
+        cands.append(os.path.join(meipass, "captcha-mint", binary))
     exe_dir = os.path.dirname(os.path.abspath(sys.executable))
     cands += [
-        os.path.join(exe_dir, "captcha-mint", "captcha-mint.exe"),
-        os.path.join(os.path.dirname(here), "tools", "captcha-mint", "captcha-mint.exe"),
-        os.path.join(here, "captcha-mint.exe"),
+        os.path.join(exe_dir, "captcha-mint", binary),
+        os.path.join(os.path.dirname(here), "tools", "captcha-mint", binary),
+        os.path.join(here, binary),
     ]
     for p in cands:
         if os.path.isfile(p):
@@ -94,7 +101,7 @@ def _find_mint_exe() -> str:
     return ""
 
 
-def _captcha_token(log):
+def _captcha_token(log, force_direct=False):
     """Mint an Aliyun captcha verify param for the claim.
 
     Priority:
@@ -120,16 +127,24 @@ def _captcha_token(log):
         prefix = cfg.get("prefix", "")
         env = dict(os.environ, ZAI_CAPTCHA_SCENE=scene, ZAI_CAPTCHA_REGION=region,
                    ZAI_CAPTCHA_PREFIX=prefix, ZAI_APP_VERSION=APP_VERSION)
+        if force_direct:
+            for key in list(env):
+                if key.upper() in ('ZAI_PROXY', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY'):
+                    env.pop(key)
+            env['NO_PROXY'] = '*'
         try:
             bare = cmd.strip().strip('"')
             argv = [bare] if os.path.isfile(bare) else shlex.split(cmd)
             out = subprocess.run(argv, capture_output=True, text=True,
                                  timeout=120, env=env)
-            parts = (out.stdout or "").strip().split()
-            if len(parts) >= 1 and len(parts[0]) > 20:
-                return parts[0], (parts[1] if len(parts) > 1 else region)
-            log(f"  claim_start: captcha sidecar gave no token "
-                f"(rc={out.returncode} {((out.stderr or out.stdout) or '')[:160]})")
+            # Exactly one `<param> <region>` record, not a best-effort scan of
+            # logs. A failed child must never hand its partial token upstream.
+            record = re.fullmatch(r"([^\s]+) ([A-Za-z0-9_-]+)(?:\r?\n)?",
+                                  out.stdout or "")
+            if out.returncode == 0 and record and len(record[1]) > 20:
+                return record[1], record[2]
+            log(f"  claim_start: captcha sidecar failed output protocol "
+                f"(rc={out.returncode})")
         except Exception as e:
             log(f"  claim_start: captcha sidecar failed ({type(e).__name__}: {e})")
     return "", ""
@@ -264,7 +279,15 @@ def _run_chain(token: str, plan_id: str, log, force_direct: bool,
     # the preview stays empty without recent app telemetry
     report_app_activity(zjwt, log=log)
 
-    offer = preview_plans(zjwt, log=log)
+    try:
+        offer = preview_plans(zjwt, log=log, strict=True)
+    except PreviewError as e:
+        res['error'] = str(e)
+        res['preview_error'] = e.kind
+        res['route_problem'] = e.route_problem
+        if e.code is not None:
+            res['code'] = e.code
+        return res, zjwt
     res['preview'] = [p['plan_id'] for p in offer]
 
     candidates = []
@@ -294,7 +317,7 @@ def _run_chain(token: str, plan_id: str, log, force_direct: bool,
     for pid in candidates:
         for attempt in range(1, claim_attempts + 1):
             # a token is single-use: mint a fresh one for every attempt
-            vparam, vregion = _captcha_token(log)
+            vparam, vregion = _captcha_token(log, force_direct=force_direct)
             if not vparam:
                 log('  claim_start: no captcha token available — the claim will '
                     'answer 3007 (set ZAI_CAPTCHA_PARAM or ZAI_CAPTCHA_CMD)')
@@ -364,38 +387,45 @@ def _run_chain(token: str, plan_id: str, log, force_direct: bool,
 def claim_start(token: str, log=print, force_direct: bool = False,
                 plan_id: str = '', proxy_fallback=None,
                 dry_run: bool = False) -> dict:
-    """Full Start Plan claim chain. Returns a dict for CLAIM_RESULT."""
-    if proxy_fallback is None:
-        proxy_fallback = os.environ.get('ZAI_CLAIM_START_PROXY_FALLBACK', '1').strip() != '0'
-    res, zjwt = _run_chain(token, plan_id, log, force_direct, dry_run=dry_run)
-    if res['claimed'] or not proxy_fallback:
+    """Full Start Plan claim chain. Direct mode forbids proxy fallback.
+
+    Direct requests ignore application/system proxy settings, not OS TUN routing.
+    Returns a dict for CLAIM_RESULT without changing the caller's direct route.
+    """
+    with direct_requests(force_direct):
+        if force_direct:
+            proxy_fallback = False
+        elif proxy_fallback is None:
+            proxy_fallback = os.environ.get('ZAI_CLAIM_START_PROXY_FALLBACK', '1').strip() != '0'
+        res, zjwt = _run_chain(token, plan_id, log, force_direct, dry_run=dry_run)
+        if res['claimed'] or not proxy_fallback:
+            return res
+        if not res.get('route_problem', True) or res.get('needs_captcha'):
+            return res
+        saved = os.environ.get('ZAI_PROXY')
+        try:
+            for n in range(1, FALLBACK_PROXIES + 1):
+                proxy = _verified_pool_proxy(log)
+                if not proxy:
+                    log('  claim_start: no verified pool proxy available to retry with')
+                    break
+                log(f'  claim_start: first route failed — retrying through verified pool proxy '
+                    f'{n}/{FALLBACK_PROXIES} ({_redact(proxy)})')
+                os.environ['ZAI_PROXY'] = proxy
+                res2, zjwt = _run_chain(token, plan_id, log, force_direct=False,
+                                        zjwt=zjwt, claim_attempts=1, dry_run=dry_run)
+                if res2['claimed']:
+                    res2['via_proxy'] = _redact(proxy)
+                    return res2
+                if not res2.get('route_problem', True) or res2.get('needs_captcha'):
+                    return res2
+                res = res2 if res2.get('zjwt') or not res.get('zjwt') else res
+        finally:
+            if saved is None:
+                os.environ.pop('ZAI_PROXY', None)
+            else:
+                os.environ['ZAI_PROXY'] = saved
         return res
-    if not res.get('route_problem', True) or res.get('needs_captcha'):
-        return res
-    saved = os.environ.get('ZAI_PROXY')
-    try:
-        for n in range(1, FALLBACK_PROXIES + 1):
-            proxy = _verified_pool_proxy(log)
-            if not proxy:
-                log('  claim_start: no verified pool proxy available to retry with')
-                break
-            log(f'  claim_start: first route failed — retrying through verified pool proxy '
-                f'{n}/{FALLBACK_PROXIES} ({_redact(proxy)})')
-            os.environ['ZAI_PROXY'] = proxy
-            res2, zjwt = _run_chain(token, plan_id, log, force_direct=False,
-                                    zjwt=zjwt, claim_attempts=1, dry_run=dry_run)
-            if res2['claimed']:
-                res2['via_proxy'] = _redact(proxy)
-                return res2
-            if not res2.get('route_problem', True) or res2.get('needs_captcha'):
-                return res2
-            res = res2 if res2.get('zjwt') or not res.get('zjwt') else res
-    finally:
-        if saved is None:
-            os.environ.pop('ZAI_PROXY', None)
-        else:
-            os.environ['ZAI_PROXY'] = saved
-    return res
 
 
 def main():

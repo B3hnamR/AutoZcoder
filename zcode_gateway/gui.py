@@ -14,7 +14,6 @@ Theme: dark + purple. Branding: "Zcode Gateway, Coded by @B3hnamR".
 from __future__ import annotations
 
 import json
-import math
 import os
 import queue
 import secrets
@@ -31,6 +30,7 @@ from pathlib import Path
 from tkinter import messagebox, ttk
 
 from .accounts_dir import parse_snapshot, write_snapshot
+from .cap_display import format_cap_release, format_caps
 from .zcode_detect import ZCODE_DOWNLOAD_URL, detect_zcode, jwt_claims
 from .client_sync import inspect_kilo, sync_kilo
 
@@ -86,49 +86,6 @@ F_MONO = ("Cascadia Mono", 9)
 # spacing grid (px) — 4/8 rhythm, generous at card level
 PAD = 14
 GAP = 8
-
-
-def format_cap_release(info: dict, now: float | None = None, *, exact=False) -> str:
-    """Convert at the viewer, never at the gateway which may run in UTC."""
-    now = time.time() if now is None else now
-    try:
-        dt = datetime.fromisoformat(info.get("release_at"))
-        if dt.tzinfo is None:
-            raise ValueError("ambiguous timestamp")
-    except (TypeError, ValueError):
-        seconds = info.get("release_in_s")
-        if not isinstance(seconds, (int, float)) or not math.isfinite(seconds):
-            return "Reset time unavailable"
-        dt = datetime.fromtimestamp(now + max(0, seconds), timezone.utc)
-    local = dt.astimezone()
-    seconds = max(0, math.ceil(dt.timestamp() - now))
-    minutes = math.ceil(seconds / 60)
-    left = (f"{minutes // 60}h {minutes % 60}m" if minutes >= 60
-            else f"{minutes}m" if seconds >= 60 else f"{seconds}s")
-    if exact and seconds >= 60:
-        left += f" ({seconds}s)"
-    offset = local.strftime("%z")
-    zone = f"UTC{offset[:3]}:{offset[3:]}"
-    return (f"{local:%Y-%m-%d %H:%M:%S} {zone} · "
-            + (f"in {left}" if seconds else "Reset due"))
-
-
-def format_caps(account: dict, now: float | None = None, *, detail=False) -> str:
-    now = time.time() if now is None else now
-    caps = account.get("model_caps") or {}
-    models = sorted(set(caps) | set(account.get("capped_models") or []))
-    lines = []
-    for model in models:
-        info = caps.get(model) or {}
-        name = model if detail else model.rsplit("/", 1)[-1]
-        line = f"{name} → {format_cap_release(info, now, exact=detail)}" if info else name
-        if detail:
-            if info.get("code"):
-                line += f"\n  {info['code']}"
-            if info.get("message"):
-                line += f"\n  {info['message']}"
-        lines.append(line)
-    return ("\n\n" if detail else "; ").join(lines) or "—"
 
 
 def _dark_titlebar(widget: tk.Misc) -> None:
@@ -345,13 +302,14 @@ from .paths import (  # noqa: F401
 # Written on first launch when no config.yaml or config.example.yaml is present.
 # This is what lets a lone .exe work with nothing alongside it.
 # Keys are per-install random, never a shared hardcoded default.
+# Canonical implementations live in paths.py (tkinter-free); re-exported here
+# so existing callers keep working.
+from .paths import DEFAULT_CONFIG_YAML as DEFAULT_CONFIG_YAML  # noqa: F401
+
+
 def _default_config_yaml() -> str:
-    return DEFAULT_CONFIG_YAML.replace(
-        "gw-admin-local", f"gw-admin-{secrets.token_hex(8)}").replace(
-        "gw-local-1", f"gw-client-{secrets.token_hex(8)}")
-
-
-DEFAULT_CONFIG_YAML = 'server:\n  host: 127.0.0.1\n  port: 8788\n  require_client_key: true\n  admin_key: gw-admin-local\n  client_keys:\n    - key: gw-local-1\n      name: local\nupstream:\n  base_url: https://zcode.z.ai/api/v1\n  chat_path: /zcode-plan/anthropic/v1/messages\n  timeout_connect: 15\n  timeout_read: 600\n  max_attempts: 3\npool:\n  strategy: drain_first\n  cooldown_seconds: 30\n  max_in_flight_per_account: 4\n  acquire_wait_seconds: 5\n  balance_poll_seconds: 60\naccounts:\n  source: accounts_dir\n  providers_json: "~/.zcode/v2/credentials.json"\n  dir: ./accounts\n  pool_file: ./pool.json\nmodels:\n  aliases:\n    glm-5.3: GLM-5.3\n    glm-5.3-flash: GLM-5.3-Flash\n  default: GLM-5.3-Flash\n  default_anthropic: GLM-5.3\n  default_max_tokens: 128000\n  default_effort: high\n  pacing:\n    enabled: true\n    min_gap_ms: 150\n    max_gap_ms: 400\n  auto_free_fallback:\n    enabled: false\n    chain: [GLM-5.3, GLM-5.3-Flash]\nlogging:\n  level: INFO\n  capture: false\n  capture_dir: ./logs\nstore:\n  sqlite_path: ./gateway.db\nupdate:\n  enabled: false\n  repo: B3hnamR/AutoZcoder\ngenerator:\n  enabled: false\n  zcodeauto_dir: ""\n  python_exe: ""\n  captcha: "manual"\n  headless: false\n  claim: true\n  invite_code: "MT9GNDQ8"\n  socks_only: true\n  proxy_types: "socks"\n'
+    from .paths import default_config_yaml
+    return default_config_yaml()
 
 
 

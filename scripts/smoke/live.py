@@ -6,7 +6,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from zcode_gateway.config import load_config
 from zcode_gateway.pool import load_accounts, PoolManager
 from zcode_gateway.tokens import TokenManager

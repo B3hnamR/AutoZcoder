@@ -14,12 +14,14 @@ a cool-down.
 from __future__ import annotations
 
 import json
+import copy
 import os
 import random
 import threading
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from .relay_deploy import (
     deploy_cloudflare,
@@ -75,34 +77,46 @@ class RelayManager:
         """Ping every configured relay once; update health fields + cooldowns."""
         st = self.get_settings()
         out: dict[str, dict] = {}
+        results = []
         for r in st.get("relays") or []:
             url = r.get("url") or ""
             if not url:
                 continue
             try:
-                res = ping_relay(url)
-                r["last_status"] = res.get("status")
-                r["last_error"] = res.get("error")
-                r["last_latency_ms"] = res.get("elapsed_ms")
-                r["last_tested_at"] = time.time()
-                if res.get("ok"):
-                    self.mark_relay_ok(url)
-                else:
-                    self.mark_relay_failed(url)
+                res = ping_relay(url, secret=r.get("secret") or "")
                 out[r["id"]] = {"ok": bool(res.get("ok")),
                                 "latency_ms": res.get("elapsed_ms")}
             except Exception as e:
-                r["last_status"] = None
-                r["last_error"] = str(e)[:120]
-                r["last_tested_at"] = time.time()
-                self.mark_relay_failed(url)
+                res = {"ok": False, "error": str(e)[:120]}
                 out[r["id"]] = {"ok": False, "latency_ms": None}
-        self.save_settings(st)
+            results.append((r, res, time.time()))
+        self._merge_health(results, cooldowns=True)
         return out
+
+    def _merge_health(self, results, *, cooldowns=False) -> None:
+        with self._lock:
+            st = self.get_settings()
+            changed = False
+            for original, res, tested_at in results:
+                target = next((r for r in st['relays'] if r.get('id') == original.get('id')
+                               and r.get('url') == original.get('url')
+                               and r.get('secret') == original.get('secret')), None)
+                if target is None or (target.get('last_tested_at') or 0) > tested_at:
+                    continue
+                target.update(last_status=res.get('status'), last_error=res.get('error'),
+                              last_latency_ms=res.get('elapsed_ms'), last_tested_at=tested_at)
+                if cooldowns:
+                    if res.get('ok'):
+                        self.mark_relay_ok(target['url'])
+                    else:
+                        self.mark_relay_failed(target['url'])
+                changed = True
+            if changed:
+                self.save_settings(st)
 
     def _default_settings(self) -> dict[str, Any]:
         return {
-            "enabled": True,
+            "enabled": False,
             "active_url": "",
             "active_id": "",
             "models": ["GLM-5.3"],  # Default to GLM-5.3 only as required
@@ -113,7 +127,7 @@ class RelayManager:
     def get_settings(self) -> dict[str, Any]:
         with self._lock:
             if self._cache is not None:
-                return dict(self._cache)
+                return copy.deepcopy(self._cache)
             if self.path.exists():
                 try:
                     data = json.loads(self.path.read_text(encoding="utf-8"))
@@ -121,16 +135,16 @@ class RelayManager:
                         settings = self._default_settings()
                         settings.update(data)
                         self._cache = settings
-                        return dict(settings)
+                        return copy.deepcopy(settings)
                 except Exception:
                     pass
             settings = self._default_settings()
             self._cache = settings
-            return dict(settings)
+            return copy.deepcopy(settings)
 
     def save_settings(self, settings: dict[str, Any]) -> None:
         with self._lock:
-            self._cache = settings
+            self._cache = copy.deepcopy(settings)
             self.data_dir.mkdir(parents=True, exist_ok=True)
             tmp = self.path.with_suffix(".tmp")
             tmp.write_text(json.dumps(settings, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -214,8 +228,12 @@ class RelayManager:
     def get_relay_count(self) -> int:
         return len(self.get_settings().get("relays") or [])
 
-    def get_relay_for_model(self, model: str) -> str | None:
-        """Return a relay URL (per strategy) if enabled and applicable for this model."""
+    def pick_relay_for_model(self, model: str) -> dict[str, Any] | None:
+        """Full relay entry (url + optional secret) per strategy and model
+        routing. Falls back to a bare {url: active_url} when no entries exist
+        (legacy config where only active_url was stored). Callers that need
+        the secret (upstream.py) must use this; get_relay_for_model stays the
+        url-only shim."""
         if not model:
             return None
         st = self.get_settings()
@@ -224,17 +242,50 @@ class RelayManager:
         relays = st.get("relays") or []
         if not relays:
             active_url = (st.get("active_url") or "").strip()
-            return active_url or None
+            return {"url": active_url} if active_url else None
         if not self._model_matches(model, st.get("models") or []):
             return None
         pick = self._pick_relay(st)
-        url = ((pick or {}).get("url") or "").strip()
-        return url or (st.get("active_url") or "").strip() or None
+        if pick and (pick.get("url") or "").strip():
+            return pick
+        active_url = (st.get("active_url") or "").strip()
+        return {"url": active_url} if active_url else None
 
-    def add_relay(self, name: str, url: str, type_name: str = "custom") -> dict[str, Any]:
+    def get_relay_for_model(self, model: str) -> str | None:
+        """Return a relay URL (per strategy) if enabled and applicable for this model."""
+        entry = self.pick_relay_for_model(model)
+        if not entry:
+            return None
+        return (entry.get("url") or "").strip() or None
+
+    def _validate_relay_url(self, url: str) -> str:
+        """Relays receive live account bearer tokens — the transport must be
+        encrypted. https is mandatory; plain http is allowed only for
+        loopback hosts (local worker dev)."""
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        if not host:
+            raise ValueError("relay URL has no host")
+        loopback = host in ("127.0.0.1", "::1", "localhost")
+        if parsed.scheme == "https" or (parsed.scheme == "http" and loopback):
+            return url
+        raise ValueError(
+            f"relay URL must be https (got {parsed.scheme!r} for {host}) — "
+            "an unencrypted relay would carry account bearer tokens in "
+            "cleartext")
+
+    def _new_relay_secret(self) -> str:
+        import secrets as _secrets
+        return "zr_" + _secrets.token_hex(16)
+
+    def add_relay(self, name: str, url: str, type_name: str = "custom",
+                  secret: str | None = None) -> dict[str, Any]:
         # Hold the lock across the whole read-modify-write: a concurrent
         # delete_relay building its filtered list between our get and save
         # used to drop the just-added relay from the persisted file.
+        url = self._validate_relay_url((url or "").strip())
+        if secret is None:
+            secret = self._new_relay_secret()
         with self._lock:
             st = self.get_settings()
             # uuid4: timestamp-based ids collided when two adds landed in the same
@@ -245,7 +296,8 @@ class RelayManager:
                 "id": relay_id,
                 "name": name or f"{type_name}-relay",
                 "type": type_name,
-                "url": url.strip(),
+                "url": url,
+                "secret": secret or "",
                 "created_at": time.time(),
                 "last_status": None,
                 "last_error": None,
@@ -304,14 +356,15 @@ class RelayManager:
             return removed
 
     def set_active(self, relay_id: str) -> bool:
-        st = self.get_settings()
-        for r in st["relays"]:
-            if r.get("id") == relay_id:
-                st["active_id"] = r["id"]
-                st["active_url"] = r["url"]
-                self.save_settings(st)
-                return True
-        return False
+        with self._lock:
+            st = self.get_settings()
+            for r in st["relays"]:
+                if r.get("id") == relay_id:
+                    st["active_id"] = r["id"]
+                    st["active_url"] = r["url"]
+                    self.save_settings(st)
+                    return True
+            return False
 
     def update_options(self, models: list[str] | None = None,
                        enabled: bool | None = None,
@@ -347,37 +400,42 @@ class RelayManager:
         target = next((r for r in st["relays"] if r.get("id") == relay_id), None)
         if not target:
             return {"ok": False, "error": "Relay not found"}
-        res = ping_relay(target["url"])
-        target["last_status"] = res.get("status")
-        target["last_error"] = res.get("error")
-        target["last_latency_ms"] = res.get("elapsed_ms")
-        target["last_tested_at"] = time.time()
-        self.save_settings(st)
+        res = ping_relay(target["url"], secret=target.get("secret") or "")
+        self._merge_health([(target, res, time.time())])
         return res
 
     def deploy_and_add(self, relay_type: str, params: dict[str, Any]) -> dict[str, Any]:
         relay_type = (relay_type or "").lower().strip()
+        # one secret per relay, generated here; the deploy bakes it into the
+        # worker (or its env binding) so the gateway's x-relay-secret header
+        # is the only way to use the relay. Override via params for redeploys
+        # of an existing relay that already has a secret.
+        secret = params.get("secret") or self._new_relay_secret()
         if relay_type == "cloudflare":
             res = deploy_cloudflare(
                 account_id=params.get("accountId") or params.get("account_id") or "",
                 api_token=params.get("apiToken") or params.get("api_token") or "",
                 project_name=params.get("projectName") or params.get("project_name") or "",
+                secret=secret,
             )
         elif relay_type == "vercel":
             res = deploy_vercel(
                 vercel_token=params.get("vercelToken") or params.get("token") or "",
                 project_name=params.get("projectName") or params.get("project_name") or "",
+                secret=secret,
             )
         elif relay_type == "deno":
             res = deploy_deno(
                 deno_token=params.get("denoToken") or params.get("token") or "",
                 org_domain=params.get("orgDomain") or params.get("org_domain") or "",
                 app_name=params.get("projectName") or params.get("app_name") or "",
+                secret=secret,
             )
         elif relay_type == "netlify":
             res = deploy_netlify(
                 netlify_token=params.get("netlifyToken") or params.get("token") or "",
                 site_name=params.get("projectName") or params.get("site_name") or "",
+                secret=secret,
             )
         else:
             raise ValueError(f"Unknown relay type: {relay_type}")
@@ -386,5 +444,6 @@ class RelayManager:
             name=res.get("name", f"{relay_type}-relay"),
             url=res.get("url", ""),
             type_name=relay_type,
+            secret=secret,
         )
         return {"ok": True, "relay": entry}

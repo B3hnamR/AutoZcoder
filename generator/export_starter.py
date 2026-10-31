@@ -22,7 +22,11 @@ import sys
 from plan_check import get_zcode_jwt, get_plan, is_start_plan, DEVICE_MID
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-GATEWAY_ACCOUNTS = r'C:\Users\Behnam\Documents\GitHub\ZcodeGate\dist\accounts'
+# destination for exported snapshots; override per machine (or copy the
+# output manually) — the old hardcoded personal path broke on any other box
+GATEWAY_ACCOUNTS = os.environ.get(
+    "ZCODE_GATEWAY_ACCOUNTS",
+    os.path.join(os.path.dirname(HERE), "accounts"))
 
 # mirrors ZcodeGate accounts_dir.write_snapshot field order
 ORDER = [
@@ -66,9 +70,12 @@ def jwt_payload(tok):
 
 
 def collect_accounts():
-    """All email:password:token lines across gen/output/accounts*.txt."""
+    """Current result ledgers, with a legacy-flat fallback under the same root."""
     seen, out = set(), []
-    for path in sorted(glob.glob(os.path.join(HERE, 'output', 'accounts*.txt'))):
+    root = os.environ.get('ZAI_OUTPUT_DIR', 'output')
+    paths = sorted(glob.glob(os.path.join(root, 'results', 'accounts*.txt')))
+    paths += sorted(glob.glob(os.path.join(root, 'accounts*.txt')))
+    for path in paths:
         with open(path, 'r', encoding='utf-8', errors='ignore') as f:
             for line in f:
                 line = line.strip()
@@ -77,7 +84,7 @@ def collect_accounts():
                 parts = line.split(':')
                 if len(parts) < 3:
                     continue
-                email = parts[0]
+                email = parts[0].strip().lower()
                 token = parts[-1]
                 if not token.startswith('eyJ') or email in seen:
                     continue

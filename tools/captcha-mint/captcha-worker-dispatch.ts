@@ -18,6 +18,7 @@
  * transitions are announced once on stderr for operators.
  */
 import { Worker } from "node:worker_threads";
+import { CaptchaDeadline } from "./captcha-deadline.ts";
 
 /** Per-solve timeout: overall deadline the worker gets before termination. */
 const SOLVE_WORKER_TIMEOUT_MS = Number(process.env.CAPTCHA_SOLVE_TIMEOUT_MS || 20_000);
@@ -27,6 +28,7 @@ interface SolveRequest {
   scene: string;
   region: string;
   prefix: string;
+  deadlineAt?: number;
 }
 type SolveResponse = { id: number; ok: true; param: string } | { id: number; ok: false; error: string };
 
@@ -38,6 +40,7 @@ type InProcessSolveFn = (opts: {
   scene: string;
   region: string;
   prefix: string;
+  deadlineAt?: number;
 }) => Promise<string>;
 let inProcessOverride: InProcessSolveFn | null = null;
 let happyMod: { solveTraceless: InProcessSolveFn } | null = null;
@@ -101,18 +104,29 @@ export async function solveViaWorkerOrInProcess(req: {
   scene: string;
   region: string;
   prefix: string;
+  deadlineAt?: number;
 }): Promise<string> {
-  const entryPath = await getWorkerEntryPath();
-  if (entryPath === null) {
-    return (await happy()).solveTraceless(req);
-  }
+  const deadline = new CaptchaDeadline(SOLVE_WORKER_TIMEOUT_MS, req.deadlineAt);
+  const boundedReq = { ...req, deadlineAt: deadline.at };
   try {
-    return await solveInWorker(entryPath, req);
-  } catch (err) {
-    if (err instanceof WorkerUnavailableError) {
-      return (await happy()).solveTraceless(req);
+    const entryPath = await deadline.run(getWorkerEntryPath);
+    if (entryPath === null) {
+      const solver = await deadline.run(happy);
+      return await deadline.run(() => solver.solveTraceless(boundedReq));
     }
-    throw err;
+    try {
+      deadline.remaining();
+      return await solveInWorker(entryPath, boundedReq);
+    } catch (err) {
+      if (err instanceof WorkerUnavailableError) {
+        const solver = await deadline.run(happy);
+        deadline.remaining();
+        return await deadline.run(() => solver.solveTraceless(boundedReq));
+      }
+      throw err;
+    }
+  } finally {
+    deadline.dispose();
   }
 }
 
@@ -124,7 +138,7 @@ export async function solveViaWorkerOrInProcess(req: {
  */
 function solveInWorker(
   entryPath: string,
-  req: { scene: string; region: string; prefix: string },
+  req: { scene: string; region: string; prefix: string; deadlineAt: number },
 ): Promise<string> {
   const id = ++nextSolveId;
   return new Promise<string>((resolve, reject) => {
@@ -134,12 +148,12 @@ function solveInWorker(
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      try { worker?.terminate(); } catch {}
+      try { void worker?.terminate().catch(() => {}); } catch {}
       fn();
     };
     const timer = setTimeout(() => {
       settle(() => reject(new Error(`captcha worker timeout (${SOLVE_WORKER_TIMEOUT_MS}ms)`)));
-    }, SOLVE_WORKER_TIMEOUT_MS);
+    }, Math.max(0, req.deadlineAt - Date.now()));
 
     try {
       worker = new Worker(entryPath);
@@ -152,6 +166,10 @@ function solveInWorker(
     const msg: SolveRequest = { id, ...req };
     worker.on("message", (m: SolveResponse) => {
       if (!m || m.id !== id) return;
+      if (Date.now() >= req.deadlineAt) {
+        settle(() => reject(new Error("captcha worker deadline exceeded")));
+        return;
+      }
       if (m.ok) settle(() => resolve(m.param));
       else settle(() => reject(new Error(m.error)));
     });
@@ -178,7 +196,11 @@ function solveInWorker(
         settle(() => reject(new Error("captcha worker exited before responding")));
       }
     });
-    worker.postMessage(msg);
+    try {
+      worker.postMessage(msg);
+    } catch (err) {
+      settle(() => reject(err));
+    }
   });
 }
 

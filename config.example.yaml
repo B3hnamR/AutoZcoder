@@ -1,10 +1,11 @@
 server:
-  host: 127.0.0.1
+  host: 127.0.0.1        # keep loopback for local use; see docs/guides/VPS-DEPLOY.md before any public bind
   port: 8788
   require_client_key: true
-  admin_key: gw-admin-local
+  admin_key: gw-admin-change-me    # REQUIRED: replace with a long random key (8+ chars);
+                                   # the gateway refuses public binds with any template placeholder
   client_keys:
-    - key: gw-local-1
+    - key: gw-client-change-me     # REQUIRED: replace with a long random key
       name: local
 upstream:
   base_url: https://zcode.z.ai/api/v1

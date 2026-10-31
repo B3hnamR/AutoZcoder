@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import sqlite3
 import threading
@@ -40,6 +41,14 @@ class Store:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(path, check_same_thread=False)
+        # WAL: the request path commits one row per request; with the default
+        # journal every commit fsyncs and blocks readers. WAL keeps commits
+        # cheap and lets /metrics summaries read without stalling writes.
+        try:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
+        except sqlite3.DatabaseError:
+            pass  # e.g. a WAL-less network filesystem; keep the default journal
         self._conn.executescript(SCHEMA)
         self._conn.commit()
 
@@ -146,6 +155,78 @@ class Store:
     # ------------------------------------------------------------------ #
     # analytics (pro dashboard)
     # ------------------------------------------------------------------ #
+
+    def analytics_overview(self, period: str = "24h", *, now: float | None = None) -> dict:
+        """One consistent ledger window, including both partial edge buckets.
+
+        The ledger records attempts, not unique client requests. Epoch-aligned
+        buckets avoid local DST collisions; the browser formats their labels.
+        """
+        windows = {"1h": 3600, "6h": 21600, "24h": 86400,
+                   "7d": 7 * 86400, "30d": 30 * 86400, "all": None}
+        if period not in windows:
+            raise ValueError("unsupported analytics range")
+        until = time.time() if now is None else now
+        window = windows[period]
+        aggregate = """COUNT(*) AS requests,
+            COALESCE(SUM(total_tokens),0) AS total_tokens,
+            COALESCE(SUM(prompt_tokens),0) AS prompt_tokens,
+            COALESCE(SUM(completion_tokens),0) AS completion_tokens,
+            AVG(duration_ms) AS avg_duration_ms,
+            COALESCE(SUM(CASE WHEN status=200 THEN 1 ELSE 0 END),0) AS ok,
+            COALESCE(SUM(CASE WHEN status=402 THEN 1 ELSE 0 END),0) AS insufficient_credits,
+            COALESCE(SUM(CASE WHEN status=429 THEN 1 ELSE 0 END),0) AS rate_limited"""
+
+        def query(sql, params):
+            cursor = self._conn.execute(sql, params)
+            names = [c[0] for c in cursor.description]
+            return [dict(zip(names, row)) for row in cursor.fetchall()]
+
+        with self._lock:
+            first = self._conn.execute("SELECT MIN(ts) FROM usage WHERE ts < ?", (until,)).fetchone()[0]
+            since = until - window if window else (first if first is not None else until)
+            bounds = (since, until)
+            where = "WHERE ts >= ? AND ts < ?"
+            summary = query(f"SELECT {aggregate} FROM usage {where}", bounds)[0]
+            previous = query(f"SELECT {aggregate} FROM usage {where}",
+                             (since - window, since))[0] if window else None
+            span = until - since
+            bucket = 300 if span <= 3600 else 3600 if span <= 86400 else 86400
+            if span / bucket > 180:
+                bucket = math.ceil(span / (180 * 86400)) * 86400
+            grouped = query(f"""SELECT CAST(ts / ? AS INTEGER) * ? AS ts,
+                COUNT(*) AS requests, COALESCE(SUM(total_tokens),0) AS tokens,
+                SUM(CASE WHEN status=200 THEN 1 ELSE 0 END) AS ok,
+                SUM(CASE WHEN status=200 THEN 0 ELSE 1 END) AS errors
+                FROM usage {where} GROUP BY CAST(ts / ? AS INTEGER) ORDER BY ts""",
+                (bucket, bucket, *bounds, bucket))
+            indexed = {int(row["ts"]): row for row in grouped}
+            start = math.floor(since / bucket) * bucket
+            stop = math.floor(math.nextafter(until, -math.inf) / bucket) * bucket
+            series = [indexed.get(ts, {"ts": ts, "requests": 0, "tokens": 0, "ok": 0, "errors": 0})
+                      for ts in range(start, stop + 1, bucket)]
+            values = [row[0] for row in self._conn.execute(
+                f"SELECT duration_ms FROM usage {where} AND status=200 AND duration_ms >= 0 "
+                "ORDER BY duration_ms", bounds).fetchall()]
+            latency = {"samples": len(values)}
+            for key, fraction in (("p50", .50), ("p95", .95), ("p99", .99)):
+                latency[key] = round(values[max(0, math.ceil(len(values) * fraction) - 1)], 1) if values else None
+            errors = query(f"""SELECT status, COALESCE(error_code,'') AS code,
+                COUNT(*) AS count, MAX(ts) AS last_ts FROM usage {where}
+                AND (status IS NULL OR status != 200)
+                GROUP BY status,error_code ORDER BY count DESC,code""", bounds)
+            result = {"range": {"id": period, "since": since, "until": until,
+                                "bucket_seconds": bucket}, "summary": summary,
+                      "previous": previous, "latency": latency, "series": series, "errors": errors}
+            for dimension, column in (("model", "model"), ("account", "account_id"), ("key", "client_key")):
+                # Columns are internal constants, never interpolated user input.
+                rows = query(f"""SELECT {column}, {aggregate}, MAX(ts) AS last_ts
+                    FROM usage {where} GROUP BY {column}
+                    ORDER BY total_tokens DESC, requests DESC, {column}""", bounds)
+                for row in rows:
+                    row["tokens"] = row.pop("total_tokens")
+                result["by_" + dimension] = rows
+        return result
 
     def hourly_series(self, hours: int = 24) -> list[dict]:
         """Per-hour requests/tokens/errors for the analytics chart."""

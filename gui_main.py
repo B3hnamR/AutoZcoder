@@ -10,6 +10,7 @@ from __future__ import annotations
 import ctypes
 import os
 import secrets
+import ssl
 import sys
 import threading
 import time
@@ -35,39 +36,11 @@ def _exe_dir() -> Path:
 def _bootstrap_config() -> Path:
     """First-run config for a standalone, portable install.
 
-    A lone downloaded .exe must work with nothing alongside it: write a
-    config.yaml next to the exe with per-install random keys (never a
-    hardcoded default), portable relative paths (./accounts, ./logs,
-    ./gateway.db — resolved against the config's folder by load_config),
-    and create the accounts folder. If the exe's folder is not writable
-    (e.g. Program Files), fall back to a per-user data dir so the tool
-    still works.
+    Thin wrapper over the canonical tkinter-free implementation in
+    zcode_gateway.paths — kept so existing callers/imports still resolve.
     """
-    base = _exe_dir()
-    cfg = base / "config.yaml"
-    if not cfg.is_file():
-        from zcode_gateway.gui import _default_config_yaml
-        from zcode_gateway.config import Fingerprint
-        import yaml
-        data = yaml.safe_load(_default_config_yaml())
-        data["upstream"]["fingerprint"] = Fingerprint().model_dump()
-        template = yaml.safe_dump(data, sort_keys=False)
-        try:
-            cfg.write_text(template, encoding="utf-8")
-        except OSError:
-            base = Path(os.environ.get("LOCALAPPDATA", ".")) / "ZcodeGateway"
-            base.mkdir(parents=True, exist_ok=True)
-            cfg = base / "config.yaml"
-            if not cfg.is_file():
-                cfg.write_text(template, encoding="utf-8")
-    accounts = cfg.parent / "accounts"
-    try:
-        accounts.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        pass
-    # both the window and the server thread resolve the same file
-    os.environ["ZCODE_GATEWAY_CONFIG"] = str(cfg)
-    return cfg
+    from zcode_gateway.paths import bootstrap_config
+    return bootstrap_config()
 
 
 def _already_running() -> bool:
@@ -89,6 +62,7 @@ def _notify(message: str) -> None:
 # origin of the running gateway (host:port from config); remembered so the
 # window-close cleanup stops workers on CUSTOM-port installs too
 _last_gateway_origin: str | None = None
+_last_gateway_context: ssl.SSLContext | None = None
 
 
 def _fix_streams() -> None:
@@ -105,13 +79,21 @@ def _fix_streams() -> None:
             pass
 
 
-def _wait_for(url: str, timeout: float = 30.0) -> bool:
-    """Poll until the gateway answers /health (then the dashboard can load)."""
-    health = url.rstrip("/")[:-len(DASH_PATH)] + "/health"
+def _gateway_context(ca_file: str) -> ssl.SSLContext:
+    """Trust the listener certificate only in this GUI's HTTPS requests."""
+    context = ssl.create_default_context()
+    if ca_file:
+        context.load_verify_locations(cafile=ca_file)
+    return context
+
+
+def _wait_for(url: str, timeout: float = 30.0, *,
+              context: ssl.SSLContext | None = None) -> bool:
+    """Poll the dashboard itself; /health may be local-only on a TLS SAN origin."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            with urllib.request.urlopen(health, timeout=2) as r:
+            with urllib.request.urlopen(url, timeout=2, context=context) as r:
                 if r.status == 200:
                     return True
         except Exception:
@@ -132,9 +114,12 @@ def _run_server() -> None:
     while True:
         try:
             cfg = load_config(os.environ.get("ZCODE_GATEWAY_CONFIG") or None)
+            global _shutdown_admin_key
+            _shutdown_admin_key = cfg.server.admin_key
             config = uvicorn.Config(
                 create_app(cfg), host=cfg.server.host, port=cfg.server.port,
-                log_level="info", access_log=False, log_config=None)
+                log_level="info", access_log=False, log_config=None,
+                **cfg.server.ssl_kwargs())
             server = uvicorn.Server(config)
             server.run()
             return  # clean shutdown
@@ -243,17 +228,22 @@ def main() -> None:
     if args.headless:
         _run_server()
         return
+    from zcode_gateway.config import load_config
+    cfg = load_config(cfg_path)
+    origin, ca_file = cfg.server.child_connection()
+    context = _gateway_context(ca_file) if origin.startswith("https://") else None
+    url = origin + DASH_PATH
+    global _last_gateway_origin, _last_gateway_context
+    _last_gateway_origin = origin
+    _last_gateway_context = context
     if _already_running():
         # another instance holds the mutex. If it's THIS build the dashboard is
         # already live — open it in the browser. If it's the old Tkinter build
         # (no /dash route) that returns 404, so surface a clear message instead.
-        from zcode_gateway.config import load_config
-        cfg0 = load_config(cfg_path)
-        base = f"http://{cfg0.server.host}:{cfg0.server.port}"
         try:
-            with urllib.request.urlopen(base + DASH_PATH, timeout=3) as r:
+            with urllib.request.urlopen(url, timeout=3, context=context) as r:
                 if r.status == 200:
-                    webbrowser.open(base + DASH_PATH)
+                    webbrowser.open(url)
                     return
         except Exception:
             pass
@@ -264,18 +254,9 @@ def main() -> None:
 
     import webview
 
-    # read host/port from the same config the server will bind
-    from zcode_gateway.config import load_config
-    cfg = load_config(cfg_path)
-    host, port = cfg.server.host, cfg.server.port
-    url = f"http://{host}:{port}{DASH_PATH}"
-    # remembered for _shutdown_generator (worker stop on window close)
-    global _last_gateway_origin
-    _last_gateway_origin = f"http://{host}:{port}"
-
     threading.Thread(target=_run_server, daemon=True, name="gateway").start()
     browser_fallback = False
-    if not _wait_for(url):
+    if not _wait_for(url, context=context):
         browser_fallback = True   # serve in the browser; keep the process (and the gateway thread) alive
     elif not _webview2_available():
         # native window impossible on this machine: install prompt + browser
@@ -319,13 +300,14 @@ def _shutdown_generator() -> None:
         # hardcoded 8788 — custom-port installs used to leak browsers on exit
         base = _last_gateway_origin or "http://127.0.0.1:8788"
         import urllib.request as _ur
-        # the internal sentinel authenticates from loopback only; this is our
-        # own process talking to itself
-        req = _ur.Request(base + "/admin/dash/generator/stopall",
+        key = globals().get("_shutdown_admin_key", "")
+        if not key:
+            return
+        req = _ur.Request(base + "/admin/dash/generator/shutdown",
                           data=b"{}", method="POST",
-                          headers={"Authorization": "Bearer gateway-internal",
+                          headers={"Authorization": "Bearer " + key,
                                    "Content-Type": "application/json"})
-        with _ur.urlopen(req, timeout=5) as _:
+        with _ur.urlopen(req, timeout=90, context=_last_gateway_context) as _:
             pass
     except Exception:
         pass

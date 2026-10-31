@@ -13,6 +13,9 @@ import logging
 import os
 import sys
 import threading
+import tempfile
+import time
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
@@ -60,6 +63,18 @@ _EDITABLE = {
 }
 
 
+def _config_transaction(endpoint):
+    @wraps(endpoint)
+    async def serialized(request: Request, *args, **kwargs):
+        state = get_state(request)
+        lock = getattr(state, "_config_write_lock", None)
+        if lock is None:
+            lock = state._config_write_lock = asyncio.Lock()
+        async with lock:
+            return await endpoint(request, *args, **kwargs)
+    return serialized
+
+
 # Settings whose value is one of a fixed list: (value, label, description).
 # The dashboard renders these as dropdowns, and PUT rejects anything else (a
 # typo in config.yaml used to surface only at the next boot).
@@ -104,6 +119,21 @@ def _read_config_raw(path: Path) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def _atomic_write_yaml(path: Path, data: dict) -> None:
+    """Write config.yaml atomically (tmp + os.replace): a crash or full disk
+    mid-write must never truncate the live config."""
+    fd, name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    tmp = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            yaml.safe_dump(data, stream, sort_keys=False, allow_unicode=True)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 def _config_path(state) -> Path | None:
     """The exact config file the process loaded; None when not derivable."""
     file = getattr(state.cfg, "_config_file", None)
@@ -142,17 +172,13 @@ def _peer_is_loopback(request: Request) -> bool:
     return peer in _LOOPBACK_HOSTS
 
 
-@router.get("/dash", response_class=HTMLResponse)
-def dashboard(request: Request) -> HTMLResponse:
-    index = DASH_DIR / "index.html"
-    if not index.is_file():
-        return HTMLResponse("dashboard not bundled", status_code=404)
-    html = index.read_text(encoding="utf-8")
-    # First-launch convenience: hand the page its own admin key so the login
-    # screen does not gate the local tool (single-user, single-machine — the
-    # Server tab displays the same key anyway). Both the bind address and the
-    # request's own Host must be loopback: a DNS-rebinding page is same-origin
-    # and would otherwise read the key straight out of this response.
+def _inject_admin_key(html: str, request: Request) -> str:
+    """First-launch convenience: hand the page its own admin key so the login
+    screen does not gate the local tool (single-user, single-machine — the
+    Server tab displays the same key anyway). Both the bind address and the
+    request's own Host must be loopback: a DNS-rebinding page is same-origin
+    and would otherwise read the key straight out of this response.
+    """
     try:
         cfg = get_state(request).cfg
         if ((cfg.server.host or "").strip() in _LOOPBACK_HOSTS
@@ -164,7 +190,28 @@ def dashboard(request: Request) -> HTMLResponse:
             html = html.replace(marker, injected, 1)
     except Exception:
         pass
-    return HTMLResponse(html)
+    return html
+
+
+@router.get("/dash", response_class=HTMLResponse)
+def dashboard(request: Request) -> HTMLResponse:
+    index = DASH_DIR / "index.html"
+    if not index.is_file():
+        return HTMLResponse("dashboard not bundled", status_code=404)
+    return HTMLResponse(_inject_admin_key(index.read_text(encoding="utf-8"), request))
+
+
+@router.get("/dash/next", response_class=HTMLResponse)
+def dashboard_next(request: Request) -> HTMLResponse:
+    """Compatibility URL for the canonical index.html shell served at /dash.
+
+    Its CSS/JS live under DASH_DIR/assets and are mounted as static files; only
+    this shell goes through the admin-key injection.
+    """
+    index = DASH_DIR / "index.html"
+    if not index.is_file():
+        return HTMLResponse("dashboard not bundled", status_code=404)
+    return HTMLResponse(_inject_admin_key(index.read_text(encoding="utf-8"), request))
 
 
 def _model_ids(state) -> list[str]:
@@ -173,6 +220,65 @@ def _model_ids(state) -> list[str]:
         return [str(m["id"]) for m in state.registry.catalogue() if m.get("id")]
     except Exception:
         return []
+
+
+@router.get("/admin/dash/capabilities")
+async def dash_capabilities(request: Request, key: str = Depends(admin_key)) -> dict:
+    """What this host can actually do, so the UI hides what would only fail.
+
+    The dashboard must not guess from the browser's user agent: the browser can
+    sit on Windows while the gateway runs on a headless Linux VPS.
+    """
+    frozen = bool(getattr(sys, "frozen", False))
+    windows = os.name == "nt"
+    linux = sys.platform.startswith("linux")
+    has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+    xvfb = None
+    if linux:
+        import shutil
+        xvfb = bool(shutil.which("Xvfb"))
+
+    # The desktop Zcode app only stores credentials here on a workstation; a
+    # server install has no such file and the import button would always 404.
+    try:
+        from .paths import _zcode_providers
+        zcode_app_present = _zcode_providers().is_file()
+    except Exception:
+        zcode_app_present = False
+
+    return {
+        "os": "windows" if windows else ("linux" if linux else sys.platform),
+        "frozen": frozen,
+        "headless": linux and not has_display,
+        "features": {
+            # Swapping the running binary is implemented for the Windows exe
+            # only; on Linux the installer/package replaces it.
+            "self_update": windows and frozen,
+            # Reads the desktop app's credential store.
+            "import_from_app": zcode_app_present,
+            # Killing the process from the UI makes sense for the windowed exe;
+            # under systemd it would just look like a crash and get restarted.
+            "shutdown": windows and frozen,
+            # A visible browser needs a real display, or Xvfb to fake one.
+            "visible_browser": windows or has_display,
+            "manual_captcha": windows or has_display,
+            "xvfb": bool(xvfb),
+        },
+        "notes": {
+            "self_update": "" if (windows and frozen) else
+                ("Update by replacing the binary, or run `autozcoder update`."
+                 if linux else "Self-update is only available in the packaged app."),
+            "import_from_app": "" if zcode_app_present else
+                "No Zcode desktop app credentials found on this machine.",
+            "shutdown": "" if (windows and frozen) else
+                ("Managed by systemd — use `systemctl stop zcodegateway`."
+                 if linux else "Stop the gateway from the terminal that started it."),
+            "visible_browser": "" if (windows or has_display) else
+                ("This host has no display. Headless solving is used instead"
+                 + (" (Xvfb is available for headed runs)." if xvfb else "; install Xvfb for headed runs.")),
+        },
+    }
 
 
 @router.get("/admin/dash/settings")
@@ -213,6 +319,7 @@ async def dash_settings(request: Request, key: str = Depends(admin_key)) -> dict
 
 
 @router.put("/admin/dash/settings")
+@_config_transaction
 async def dash_settings_put(request: Request, body: dict = Body(...),
                             key: str = Depends(admin_key)) -> dict:
     """Write whitelisted settings keys back to config.yaml. A restart is
@@ -289,7 +396,13 @@ async def dash_settings_put(request: Request, body: dict = Body(...),
         cur = raw
         parts = dotted.split(".")
         for part in parts[:-1]:
-            cur = cur.setdefault(part, {})
+            # a scalar config.yaml parent (e.g. `port: 8788` then "port.x")
+            # must not 500 the dashboard
+            node = cur.get(part)
+            if not isinstance(node, dict):
+                node = {}
+                cur[part] = node
+            cur = node
         if cur.get(parts[-1]) != val:
             cur[parts[-1]] = val
             changed.append(dotted)
@@ -301,12 +414,7 @@ async def dash_settings_put(request: Request, body: dict = Body(...),
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from None
     if changed:
-        # atomic write: a crash mid-save must not corrupt config.yaml
-        tmp = cfg_path.with_suffix(".yaml.tmp")
-        tmp.write_text(yaml.safe_dump(raw, sort_keys=False,
-                                      allow_unicode=True),
-                       encoding="utf-8")
-        os.replace(tmp, cfg_path)
+        await asyncio.to_thread(_atomic_write_yaml, cfg_path, raw)
     return {"changed": changed, "restart_required": bool(changed)}
 
 
@@ -444,8 +552,13 @@ async def dash_shutdown(request: Request, key: str = Depends(admin_key)) -> dict
     exit is deliberate: uvicorn's should_exit would free the port but leave
     the windowless process running, which is exactly the bug this fixes.
     """
-    get_state(request)
-    threading.Timer(1.0, lambda: os._exit(0)).start()
+    state = get_state(request)
+    def finish():
+        manager = getattr(state, "generator", None)
+        if manager is not None:
+            manager.shutdown()
+        os._exit(0)
+    threading.Timer(1.0, finish).start()
     return {"stopping": True,
             "note": "the gateway process is exiting; you can close this window"}
 
@@ -457,7 +570,8 @@ async def update_status(request: Request, key: str = Depends(admin_key)) -> dict
     updater = getattr(state, "updater", None)
     if updater is None:
         return {"update_available": False, "checked_at": None}
-    return updater.status
+    return {**updater.status, "updater_phase": getattr(state, "update_phase", "idle"),
+            "downloaded": getattr(state, "update_phase", "idle") == "ready"}
 
 
 @router.post("/admin/dash/update/check")
@@ -467,43 +581,116 @@ async def update_check(request: Request, key: str = Depends(admin_key)) -> dict:
     updater = getattr(state, "updater", None)
     if updater is None:
         raise HTTPException(status_code=503, detail="updater not running")
-    return await updater.check()
+    return await updater.check(force=True)
 
 
 @router.post("/admin/dash/update/download")
 async def update_download(request: Request, key: str = Depends(admin_key)) -> dict:
     """Download the new exe next to the running one (exe builds only)."""
     state = get_state(request)
+    _windows_update_only()
+    _require_newer_update(state)
+    phase = getattr(state, "update_phase", "idle")
+    if phase in ("downloading", "applying"):
+        raise HTTPException(409, "An update operation is already in progress")
+    if phase == "ready":
+        from . import updater as updater_mod
+        staged = updater_mod.exe_dir() / updater_mod.NEW_EXE_NAME
+        if staged.is_file():
+            return {"downloaded": str(staged), "size": staged.stat().st_size}
     updater = getattr(state, "updater", None)
     status = updater.status if updater else {}
     url = status.get("download_url")
     if not (status.get("update_available") and url):
         raise HTTPException(status_code=400, detail="no update available")
     from . import updater as updater_mod
+    state.update_phase = "downloading"
     try:
         path = await updater_mod.download_update(url, status.get("checksum_url"))
     except RuntimeError as exc:
+        state.update_phase = "idle"
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
+        state.update_phase = "idle"
         raise HTTPException(status_code=502,
                             detail=f"download failed ({exc.__class__.__name__})") \
             from exc
+    state.update_phase = "ready"
     return {"downloaded": str(path), "size": path.stat().st_size}
 
 
 @router.post("/admin/dash/update/apply")
 async def update_apply(request: Request, key: str = Depends(admin_key)) -> dict:
     """Swap in the downloaded exe and relaunch (exe builds only)."""
-    get_state(request)
-    from . import updater as updater_mod
+    state = get_state(request)
+    _windows_update_only()
+    _require_newer_update(state)
+    phase = getattr(state, "update_phase", "idle")
+    if phase in ("downloading", "applying"):
+        raise HTTPException(409, "An update operation is already in progress")
+    # Close admission before checking active work; a concurrent Start request
+    # cannot slip in while the binary is being hashed/prepared off-thread.
+    state.update_phase = "applying"
     try:
-        updater_mod.apply_update(updater_mod.exe_dir() / updater_mod.NEW_EXE_NAME)
+        await _check_update_idle(state)
+    except Exception:
+        state.update_phase = phase
+        raise
+    from . import updater as updater_mod
+    if getattr(state, "update_applying", False):
+        raise HTTPException(409, "An update is already being applied")
+    state.update_applying = True
+    try:
+        await asyncio.to_thread(updater_mod.apply_update, updater_mod.exe_dir() / updater_mod.NEW_EXE_NAME,
+                                config_path=getattr(state.cfg, "_config_file", None))
     except RuntimeError as exc:
+        state.update_applying = False
+        state.update_phase = "ready"
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception:
+        state.update_applying = False
+        state.update_phase = "ready"
+        raise HTTPException(500, "Could not prepare the updater; application was not stopped") from None
     # the swapper waits for this process to die; answer first, then exit
-    threading.Timer(1.0, lambda: os._exit(0)).start()
+    def finish():
+        manager = getattr(state, "generator", None)
+        if manager is not None:
+            manager.shutdown()
+        os._exit(0)
+    threading.Timer(1.0, finish).start()
     return {"applying": True, "note": "the gateway exits, swaps the exe, and "
                                       "relaunches itself"}
+
+
+def _windows_update_only() -> None:
+    if not getattr(sys, "frozen", False) or os.name != "nt":
+        raise HTTPException(400, "In-app updates require the Windows exe. On Linux use sudo autozcoder update.")
+
+
+def _require_newer_update(state) -> None:
+    from . import __version__
+    from .updater import is_newer
+    checker = getattr(state, "updater", None)
+    status = checker.status if checker else {}
+    if not status.get("update_available") or not is_newer(status.get("latest", ""), __version__):
+        raise HTTPException(409, "No newer release available; same-version updates and downgrades are blocked")
+
+
+async def _check_update_idle(state) -> None:
+    """Never silently discard generation or streaming work for an update."""
+    pool = await state.pool.snapshot()
+    if any(account.get("in_flight", 0) for account in pool.get("detail", [])):
+        raise HTTPException(409, "Requests are active; wait before applying an update")
+    manager = getattr(state, "generator", None)
+    if manager is None:
+        return
+    auto = getattr(manager, "auto_generate", None)
+    if auto and auto.status().get("status") in ("preparing", "running", "paused", "stopping"):
+        raise HTTPException(409, "Stop Auto Generate before applying an update")
+    if getattr(manager, "_claim_all_running", False):
+        raise HTTPException(409, "Stop the claim batch before applying an update")
+    if any(not worker.done.is_set() for worker in manager.workers.values()) or any(job.alive() for job in manager.claims.values()) or manager.checker.alive():
+        raise HTTPException(409, "Generator, claim or proxy-check jobs are active; stop them before applying an update")
 
 
 @router.get("/admin/dash/logs")
@@ -561,6 +748,22 @@ async def dash_analytics(request: Request, hours: int = 24,
             "accounts": burn}
 
 
+@router.get("/admin/dash/analytics/overview")
+async def analytics_overview(request: Request, range: str = "24h",
+                             key: str = Depends(admin_key)) -> dict:
+    state = get_state(request)
+    if range not in ("1h", "6h", "24h", "7d", "30d", "all"):
+        raise HTTPException(status_code=400, detail="Unsupported analytics range")
+    result = await asyncio.to_thread(state.store.analytics_overview, range)
+    pool = await state.pool.snapshot()
+    accounts = {a["id"]: a for a in pool.get("detail", [])}
+    for row in result["by_account"]:
+        current = accounts.get(row["account_id"], {})
+        row.update(email=current.get("email", ""), state=current.get("state", ""),
+                   expires_in_s=current.get("expires_in_s"))
+    return result
+
+
 # --------------------------------------------------------------------------- #
 # notifications
 # --------------------------------------------------------------------------- #
@@ -591,83 +794,6 @@ async def dash_notifications_clear(request: Request,
                                    key: str = Depends(admin_key)) -> dict:
     get_state(request).notifications.clear()
     return {"ok": True}
-
-
-# --------------------------------------------------------------------------- #
-# proxy health
-# --------------------------------------------------------------------------- #
-
-@router.get("/admin/dash/proxies/health")
-async def dash_proxy_health(request: Request, key: str = Depends(admin_key)) -> dict:
-    """Health view of the proxy pool ledger (pool.json): per-proxy stats with
-    country breakdown, plus summary KPIs. Read-only; the proxy checker itself
-    stays on its existing endpoints."""
-    state = get_state(request)
-    mgr = getattr(state, "generator", None)
-    data_dir = None
-    if mgr is not None:
-        data_dir = getattr(mgr, "data_dir", None)
-    if data_dir is None:
-        # fall back to the same default the manager itself uses
-        from pathlib import Path as _P
-        data_dir = _P(state.cfg.accounts.dir).resolve().parent / "generator-data" \
-            if state.cfg.accounts.dir else _P("./generator-data")
-    pool_file = data_dir / "pool.json"
-    proxies: list[dict] = []
-    countries: dict[str, int] = {}
-    kpis = {"total": 0, "healthy": 0, "working": 0, "failing": 0, "unverified": 0,
-            "used": 0, "bad": 0, "socks": 0, "http": 0}
-
-    def _lines(name: str) -> set:
-        try:
-            return {ln.strip() for ln in (data_dir / name).read_text(
-                encoding="utf-8", errors="ignore").splitlines() if ln.strip()}
-        except OSError:
-            return set()
-
-    try:
-        from .generator import classify_proxy_entry
-        raw = json.loads(pool_file.read_text(encoding="utf-8"))
-        entries = raw if isinstance(raw, dict) else {}
-        bad_set, used_set = _lines("proxies_bad.txt"), _lines("proxies_used.txt")
-        for url, e in entries.items():
-            if not isinstance(e, dict):
-                continue
-            cc = str(e.get("country") or e.get("cc") or "").upper() or "??"
-            status = classify_proxy_entry(e, url, bad_set, used_set)
-            scheme = url.split("://")[0].lower() if "://" in url else "http"
-            kpis["total"] += 1
-            kpis["socks" if scheme.startswith("socks") else "http"] += 1
-            kpis[{"new": "unverified"}.get(status, status)] += 1
-            countries[cc] = countries.get(cc, 0) + 1
-            proxies.append({
-                "url": url, "country": cc, "status": status,
-                "ok": status == "working", "bad": status == "bad",
-                "latency": e.get("latency") or None,
-                "checked_at": e.get("last_check") or None,
-                "checks": int(e.get("checks", 0) or 0),
-                "fails": int(e.get("fails", 0) or 0),
-                "reason": e.get("last_reason") or "",
-            })
-        kpis["healthy"] = kpis["working"]          # old key, same meaning now
-    except FileNotFoundError:
-        return {"available": False, "note": "no proxy pool yet — run the proxy "
-                "checker or import proxies first", "proxies": [], "countries": {},
-                "kpis": kpis, "pool_file": str(pool_file)}
-    except (ValueError, OSError):
-        return {"available": False, "note": "proxy pool file unreadable "
-                "(corrupt?) — the checker's next save rebuilds it from .bak",
-                "proxies": [], "countries": {}, "kpis": kpis,
-                "pool_file": str(pool_file)}
-    # working first (fastest first), then everything else
-    rank = {"working": 0, "failing": 1, "new": 2, "used": 3, "bad": 4}
-    proxies.sort(key=lambda p: (rank.get(p["status"], 9),
-                                p["latency"] if (p["status"] == "working" and p["latency"]) else 9e9,
-                                p["url"]))
-    return {"available": True, "kpis": kpis,
-            "countries": dict(sorted(countries.items(), key=lambda kv: -kv[1])),
-            "proxies": proxies[:500], "total_in_file": len(proxies),
-            "pool_file": str(pool_file)}
 
 
 @router.get("/admin/dash/server")
@@ -777,6 +903,7 @@ async def generator_locate_get(request: Request, key: str = Depends(admin_key)) 
 
 
 @router.post("/admin/dash/generator/locate")
+@_config_transaction
 async def generator_locate_set(request: Request, body: dict = Body(default={}),
                                key: str = Depends(admin_key)) -> dict:
     """Point the gateway at the generator (or auto-detect) and apply it live —
@@ -802,15 +929,20 @@ async def generator_locate_set(request: Request, body: dict = Body(default={}),
                 detail="generator not found automatically — enter its folder "
                        "path (the one containing main.py)")
 
-    # persist + apply in memory
+    # persist + apply in memory (atomic write: tmp + replace, same shape as
+    # the settings PUT — a crash mid-write used to truncate config.yaml)
     cfg_path = _config_path(state)
     if cfg_path is not None:
         raw = _read_config_raw(cfg_path)
+        if not raw:
+            raise HTTPException(status_code=409,
+                                detail="config.yaml is missing or unparsable; restore it before locating the generator")
         gen = raw.setdefault("generator", {})
+        if not isinstance(gen, dict):
+            raise HTTPException(status_code=409, detail="config.yaml generator section must be an object")
         gen["zcodeauto_dir"] = str(root)
         gen["enabled"] = True
-        cfg_path.write_text(yaml.safe_dump(raw, sort_keys=False,
-                                           allow_unicode=True), encoding="utf-8")
+        await asyncio.to_thread(_atomic_write_yaml, cfg_path, raw)
     state.cfg.generator.zcodeauto_dir = str(root)
     state.cfg.generator.enabled = True
     # rebuild the manager so the change takes effect immediately
@@ -827,8 +959,14 @@ async def generator_locate_set(request: Request, body: dict = Body(default={}),
 def _generator(request: Request):
     """The GeneratorManager for this app state, created lazily."""
     state = get_state(request)
+    if getattr(state, "update_phase", "idle") == "applying":
+        raise HTTPException(409, "Gateway is preparing an update; no new generator work can start")
     mgr = getattr(state, "generator", None)
     if mgr is None:
+        try:
+            child_origin, child_ca = state.cfg.server.child_connection()
+        except (ValueError, OSError) as exc:
+            raise HTTPException(status_code=409, detail=f"invalid generator callback configuration: {exc}") from exc
         gen_dir, checked = _find_zcodeauto(state)
         if gen_dir is None:
             hint = "; ".join(str(c) for c in checked[:5])
@@ -850,7 +988,7 @@ def _generator(request: Request):
                 log.warning("generator: quota refresh failed for new account %s",
                             account_id, exc_info=True)
 
-        def register_account(info: dict):
+        def _register_account_impl(info: dict):
             """Worker finished with a new account: mint its zcodeJWT via the
             ZCODEAUTO device flow, write an accounts_dir snapshot and upsert
             into the pool — the same path a manual import takes.
@@ -859,6 +997,12 @@ def _generator(request: Request):
             the gateway's main event loop."""
             email = info.get("email") or ""
             chat_token = info.get("chat_token") or ""
+            auto = bool(info.get("auto_generate"))
+            cancelled = info.get("cancelled", lambda: False)
+            def cancelled_result():
+                return {"qualified": False, "category": "stopped", "error": "Registration cancelled"}
+            if auto and cancelled():
+                return cancelled_result()
             if not chat_token or not chat_token.startswith("eyJ"):
                 return
             try:
@@ -873,6 +1017,8 @@ def _generator(request: Request):
                 import time as _time
                 zjwt = None
                 for attempt in range(1, 4):
+                    if auto and cancelled():
+                        return cancelled_result()
                     try:
                         zjwt = get_zcode_jwt(chat_token, log=lambda *a: None)
                     except Exception as exc:
@@ -894,7 +1040,10 @@ def _generator(request: Request):
                                 "be picked up by the catch-up scan", email)
                     return
                 plans = []
+                plan_info = None
                 for attempt in range(1, 4):
+                    if auto and cancelled():
+                        return cancelled_result()
                     try:
                         plan_info = get_plan(zjwt) or {}
                     except Exception as exc:
@@ -911,10 +1060,26 @@ def _generator(request: Request):
                     log.info("generator: %s has no plan after retries — leaving "
                              "it for the catch-up scan", email)
                     return
+                if auto:
+                    from plan_check import is_start_plan
+                    if not plan_info or plan_info.get("code") != 0 or not any(is_start_plan(p) for p in plans):
+                        return {"qualified": False, "category": "no_plan", "error": "No active Starter/Start Plan verified"}
+                    # The run must count a NEW provider identity, not a duplicate
+                    # token for an account already loaded before registration.
+                    from .zcode_detect import jwt_claims
+                    identity = jwt_claims(zjwt)
+                    ident = identity.get("user_id") or identity.get("sub")
+                    if not ident:
+                        return {"qualified": False, "category": "registration_error", "error": "Account identity missing"}
+                    prior = asyncio.run_coroutine_threadsafe(state.pool.find(ident), main_loop).result(timeout=20)
+                    if prior:
+                        return {"qualified": False, "category": "duplicate", "account_id": ident}
                 chosen_plan = next((p for p in plans
                                     if str(p).startswith("zcode-v3-start-plan-")
                                     and p != "zcode-v3-start-plan-1024"),
                                    plans[0] if plans else "")
+                if auto and cancelled():
+                    return cancelled_result()
                 account = mint_and_register(
                     state.cfg.accounts.dir, email, zjwt,
                     state.cfg.upstream.fingerprint.device_mid,
@@ -924,17 +1089,26 @@ def _generator(request: Request):
                     fut = asyncio.run_coroutine_threadsafe(
                         state.pool.upsert(account), main_loop)
                     fut.result(timeout=30)
+                    if auto:
+                        checked = asyncio.run_coroutine_threadsafe(_verify_auto_account(account.id, plan_info.get("raw")), main_loop).result(timeout=20)
+                        if not checked:
+                            return {"qualified": False, "category": "registration_error",
+                                    "error": "Saved account needs a fresh successful plan/quota check"}
+                        if cancelled():
+                            return {"qualified": False, "category": "stopped", "error": "Account saved during stop; excluded from run goal"}
                     # quota/plan refresh is network-bound and best-effort: fire and
                     # forget, so a slow upstream can never fail the registration
-                    asyncio.run_coroutine_threadsafe(
-                        _settle_new_account(account.id), main_loop)
+                    if not auto:
+                        asyncio.run_coroutine_threadsafe(
+                            _settle_new_account(account.id), main_loop)
                     try:
                         mgr.mark_registered(email)   # done → never re-register
                     except Exception:
-                        pass
+                        if auto:
+                            return {"qualified": False, "category": "registration_error", "error": "Registration ledger could not be saved"}
                     # 2/3 referral (bind ok, message blocked by risk control):
                     # remember it so the background finisher can complete it
-                    if chosen_plan != "zcode-v3-start-plan-referral":
+                    if not auto and chosen_plan != "zcode-v3-start-plan-referral":
                         try:
                             if _referral_needs_finish(zjwt):
                                 mgr.add_pending_referral(email, zjwt)
@@ -942,19 +1116,62 @@ def _generator(request: Request):
                                          "finish (message task pending)", email)
                         except Exception:
                             log.exception("generator: referral queue check failed")
+                    if auto:
+                        return {"qualified": True, "category": "qualified", "account_id": account.id}
             except Exception:
                 log.exception("generator: pool registration failed for %s", email)
+                if auto:
+                    return {"qualified": False, "category": "registration_error", "error": "Provider verification or account registration failed"}
+
+        def register_account(info: dict):
+            if not info.get("auto_generate"):
+                return _register_account_impl(info)
+            sys.path.insert(0, str(gen_dir))
+            from plan_check import request_route
+            with request_route(info.get("registration_proxy") or None):
+                return _register_account_impl(info)
+
+        async def _verify_auto_account(account_id: str, raw: dict) -> bool:
+            account = await state.pool.find(account_id)
+            if account is None or not isinstance(raw, dict):
+                return False
+            now = time.time()
+            from .quota import parse_balance
+            plans, quotas = parse_balance(raw, now)
+            account.notes.update(plans=plans, quotas=quotas)
+            account.notes.pop("quota_check_error", None)
+            account.balance_checked_at = account.plan_checked_at = now
+            account.has_plan = account.plan_active(now)
+            valid_plan = any(str(p.get("plan_id", "")).startswith("zcode-v3-start-plan-")
+                             and p.get("plan_id") != "zcode-v3-start-plan-1024"
+                             and p.get("status") == "active"
+                             and (not p.get("starts_at") or p["starts_at"] <= now)
+                             and (not p.get("ends_at") or p["ends_at"] > now)
+                             for p in plans)
+            quota = any(float(q.get("remaining") or 0) > 0 and (q.get("starts_at") or 0) <= now
+                        and (not q.get("resets_at") or q["resets_at"] > now)
+                        for q in quotas.values())
+            return valid_plan and quota
 
         from .generator import GeneratorManager, claim_result_landed
         gc = state.cfg.generator
         # Portable install: worker output (accounts/plans/proxies) lives beside
-        # the exe in ./generator-data; a source checkout uses ZCODEAUTO's output/.
+        # the exe in ./generator-data; this source checkout keeps it in .local.
+        from .paths import app_dir, base_dir
+        checkout = app_dir()
         data_dir = (Path(sys.executable).resolve().parent / "generator-data"
                     if getattr(sys, "frozen", False)
+                    else base_dir() / "generator-data" if (checkout / ".git").is_dir() and gen_dir.resolve() == (checkout / "generator").resolve()
                     else gen_dir / "output")
         mgr = GeneratorManager(gen_dir, on_account=register_account,
                                python_exe=getattr(gc, "python_exe", ""),
                                data_dir=data_dir)
+        existing_setup = getattr(state, "_env_setup", None)
+        if existing_setup is not None:
+            mgr.env_setup = existing_setup
+            existing_setup.on_python = mgr._adopt_python
+            if existing_setup.python_exe:
+                mgr._adopt_python(existing_setup.python_exe)
 
         def _claim_settle(job) -> None:
             """A claim job just finished: if it claimed, revive + re-settle
@@ -999,13 +1216,17 @@ def _generator(request: Request):
         mgr.internal_token = state.internal_token
         # AI-captcha fallback: children hit the gateway's own /v1 endpoint
         # AND the pool-health guard counts the gateway's real account dir
-        try:
-            mgr._gateway_port = state.cfg.server.port
-            mgr.accounts_dir = str(Path(state.cfg.accounts.dir))
-            ck = (state.cfg.server.client_keys or [None])[0]
-            mgr._client_key_for_children = ck.key if ck else state.cfg.server.admin_key
-        except Exception:
-            log.warning("could not wire gateway-key for AI captcha", exc_info=True)
+        mgr._gateway_port = state.cfg.server.port
+        mgr.gateway_origin, mgr.gateway_ca_file = child_origin, child_ca
+        mgr.accounts_dir = str(Path(state.cfg.accounts.dir))
+        ck = (state.cfg.server.client_keys or [None])[0]
+        mgr._client_key_for_children = ck.key if ck else state.cfg.server.admin_key
+        def auto_ai_ready():
+            async def inspect():
+                return any(a.state.value == "ready" and a.model_eligible("GLM-5.3-Flash")
+                           for a in await state.pool.all())
+            return asyncio.run_coroutine_threadsafe(inspect(), main_loop).result(timeout=20)
+        mgr.auto_ai_ready = auto_ai_ready
         # defaults come from config.yaml; '' invite_code would mean "off", but
         # the shipped default is the project's referral code. claim500 wins
         # over claim when both would be on (the dashboard offers one dropdown).
@@ -1013,9 +1234,11 @@ def _generator(request: Request):
         # the dashboard's saved choice wins (re-seeding every start reverted
         # it, and set_options() below then persisted the reverted value).
         if not mgr._has_saved_options:
-            mgr.claim = bool(gc.claim) and not bool(getattr(gc, "claim500", False))
-            mgr.claim500 = bool(getattr(gc, "claim500", False))
-            mgr.claim_start = bool(getattr(gc, "claim_start", True))
+            legacy500 = bool(getattr(gc, "claim500", False))
+            legacy100 = bool(gc.claim) and not legacy500
+            mgr.claim = legacy100
+            mgr.claim500 = legacy500
+            mgr.claim_start = bool(getattr(gc, "claim_start", True)) and not (legacy100 or legacy500)
         mgr._invite_code = gc.invite_code
         if gc.captcha in ("auto", "manual", "ai", "classic") and not mgr._has_saved_options:
             # First run only (no generator_options.json yet): seed from
@@ -1023,10 +1246,11 @@ def _generator(request: Request):
             # overriding every start reset the user's "ai" back to config's
             # "manual" while captcha_strategy stayed "ai" (inconsistent pair).
             mgr.captcha = gc.captcha
-        mgr.headless = bool(gc.headless) and mgr.captcha != "manual"
-        mgr.set_options(ip_source="direct",
-                        proxy_types=GeneratorManager.normalize_proxy_types(
-                            gc.proxy_types, legacy_socks_only=gc.socks_only))
+        if not mgr._has_saved_options:
+            mgr.headless = bool(gc.headless) and mgr.captcha != "manual"
+            mgr.set_options(ip_source="direct",
+                            proxy_types=GeneratorManager.normalize_proxy_types(
+                                gc.proxy_types, legacy_socks_only=gc.socks_only))
         state.generator = mgr
 
         # catch-up: signups that never reached the pool (gateway was closed, or
@@ -1077,12 +1301,58 @@ async def generator_mail_routing(request: Request, body: dict = Body(...),
     user confirmation — the inbox test only proves the worker is reachable.
     Body: {"domain": "example.com", "done": true} or {"all": true}."""
     mgr = _generator(request)
-    if body.get("all"):
-        for d in (mgr.mail_cfg.get("domains") or []):
-            mgr.set_routing_done(d, bool(body.get("done", True)))
+
+    def apply() -> dict:
+        if body.get("all"):
+            for d in (mgr.mail_cfg.get("domains") or []):
+                mgr.set_routing_done(d, bool(body.get("done", True)))
+        else:
+            mgr.set_routing_done(str(body.get("domain") or ""), bool(body.get("done", True)))
+        return mgr.mail_config()
+
+    # disk write + a lock that a deploy can hold: never on the event loop
+    try:
+        return await asyncio.to_thread(apply)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/admin/dash/generator/mail/routing-auto")
+async def generator_mail_routing_auto(request: Request, body: dict = Body(default={}),
+                                      key: str = Depends(admin_key)) -> dict:
+    """Set up Cloudflare Email Routing (enable + catch-all → worker) through the
+    API token. Replacing a rule requires one domain, replace_existing: true and
+    the confirmation_fingerprint returned with needs_confirmation. Keep these
+    structured results in the response so the UI can request explicit approval."""
+    mgr = _generator(request)
+    only = str((body or {}).get("domain") or "") if isinstance(body, dict) else ""
+    replace_existing = (body or {}).get("replace_existing") is True
+    fingerprint = str((body or {}).get("confirmation_fingerprint") or "")
+    if replace_existing and (not only.strip() or not fingerprint):
+        results = [{"ok": False, "domain": only,
+                    "error": "replacement requires one domain and its current confirmation fingerprint"}]
+    elif replace_existing or fingerprint:
+        results = await asyncio.to_thread(
+            mgr.auto_route_all, None, only, replace_existing=replace_existing,
+            confirmation_fingerprint=fingerprint)
     else:
-        mgr.set_routing_done(str(body.get("domain") or ""), bool(body.get("done", True)))
-    return mgr.mail_config()
+        results = await asyncio.to_thread(mgr.auto_route_all, None, only)
+    return {"ok": all(r.get("ok") for r in results),
+            "results": results, "config": mgr.mail_config()}
+
+
+@router.post("/admin/dash/generator/mail/cf-credentials")
+async def generator_mail_cf_credentials(request: Request, body: dict = Body(default={}),
+                                        key: str = Depends(admin_key)) -> dict:
+    """Save / replace / remove the Cloudflare API token without redeploying.
+    Body: {"cf_token": "...", "cf_account_id": "..."} or {"clear": true}."""
+    mgr = _generator(request)
+    body = body if isinstance(body, dict) else {}
+    res = await asyncio.to_thread(
+        mgr.save_cf_credentials, str(body.get("cf_token") or ""),
+        str(body.get("cf_account_id") or ""), bool(body.get("clear")))
+    res["config"] = mgr.mail_config()
+    return res
 
 
 @router.get("/admin/dash/generator/mail/deploy-status")
@@ -1096,7 +1366,8 @@ async def generator_mail_deploy_status(request: Request, key: str = Depends(admi
 
 
 @router.post("/admin/dash/generator/mail/deploy")
-async def generator_mail_deploy(request: Request, key: str = Depends(admin_key)) -> dict:
+async def generator_mail_deploy(request: Request, body: dict = Body(default={}),
+                                key: str = Depends(admin_key)) -> dict:
     """One-click worker deploy: login (browser only if needed) → KV → deploy
     → secret → URL + smoke test. Long-running: wrangler up to a few minutes,
     so it runs off the event loop."""
@@ -1107,7 +1378,10 @@ async def generator_mail_deploy(request: Request, key: str = Depends(admin_key))
         log_lines.append(msg)
 
     try:
-        result = await asyncio.to_thread(mgr.deploy_worker, progress)
+        body = body if isinstance(body, dict) else {}
+        result = await asyncio.to_thread(
+            mgr.deploy_worker, progress,
+            str(body.get("cf_token") or ""), str(body.get("cf_account_id") or ""))
     except Exception as exc:
         result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
     result["steps"] = log_lines
@@ -1118,25 +1392,10 @@ async def generator_mail_deploy(request: Request, key: str = Depends(admin_key))
 async def generator_mail_test(request: Request, key: str = Depends(admin_key)) -> dict:
     """Round-trip check: is the worker inbox reachable with the stored secret?"""
     mgr = _generator(request)
-    url = (mgr.mail_cfg.get("inbox_url") or "").rstrip('/')
-    if not url:
-        return {"ok": False, "error": "inbox_url not configured"}
     try:
-        # async: a sync httpx.get in an async route stalls the whole event
-        # loop (all /v1/* streaming) for up to the full timeout
-        import httpx as _hx
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        async with _hx.AsyncClient(timeout=15, headers=headers) as client:
-            r = await client.get(url, params={"k": mgr.mail_cfg.get("inbox_secret", "")})
-        ok = r.status_code == 200
-        mgr.mark_inbox_verified(ok)   # drives the wizard's step 3 checkmark
-        return {"ok": ok, "status": r.status_code, "body": r.text[:200]}
-    except Exception as e:
-        try:
-            mgr.mark_inbox_verified(False)
-        except Exception:
-            pass
-        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        return await asyncio.to_thread(mgr.test_inbox)
+    except Exception as exc:
+        return {"ok": False, "error": f"inbox verification failed ({type(exc).__name__}); retry after deployment"}
 
 
 @router.get("/admin/dash/generator/status")
@@ -1159,7 +1418,12 @@ async def generator_options(request: Request, body: dict = Body(...),
 @router.post("/admin/dash/generator/start")
 async def generator_start(request: Request, body: dict = Body(default={}),
                           key: str = Depends(admin_key)) -> dict:
-    count = int(body.get("count", 1)) if isinstance(body, dict) else 1
+    # unvalidated ints 500 on "abc" and a huge number spawned that many workers
+    try:
+        count = int(body.get("count", 1)) if isinstance(body, dict) else 1
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="count must be an integer") from None
+    count = max(1, min(count, 10))
     mgr = _generator(request)
 
     def _emit(line: str) -> None:
@@ -1167,6 +1431,48 @@ async def generator_start(request: Request, body: dict = Body(default={}),
         log.info("playwright-setup: %s", line)
 
     return await asyncio.to_thread(mgr.start_workers_checked, count, _emit)
+
+
+@router.get("/admin/dash/generator/auto")
+async def auto_generate_status(request: Request, key: str = Depends(admin_key)) -> dict:
+    controller = _generator(request).auto_generate
+    return _auto_public(controller)
+
+
+def _auto_public(controller) -> dict:
+    status = controller.status()
+    cooldowns = [value for value in status.get("cooldowns", []) if value > 0]
+    return {"config": controller.config(), "status": {
+        **status, "state": status.get("status", "idle"),
+        "launched": status.get("attempts", 0), "completed": status.get("completed_attempts", 0),
+        "cooling": len(cooldowns), "remaining_cooldown_seconds": min(cooldowns) if cooldowns else 0,
+    }}
+
+
+@router.put("/admin/dash/generator/auto")
+async def auto_generate_save(request: Request, body: dict = Body(...), key: str = Depends(admin_key)) -> dict:
+    controller = _generator(request).auto_generate
+    try:
+        await asyncio.to_thread(controller.save_config, body)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+    except OSError:
+        raise HTTPException(500, "Could not save Auto Generate configuration") from None
+    return _auto_public(controller)
+
+
+@router.post("/admin/dash/generator/auto/{action}")
+async def auto_generate_action(request: Request, action: str, key: str = Depends(admin_key)) -> dict:
+    if action not in ("start", "pause", "resume", "stop"):
+        raise HTTPException(404, "Unknown Auto Generate action")
+    controller = _generator(request).auto_generate
+    try:
+        await asyncio.to_thread(getattr(controller, action))
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(409, str(exc)) from None
+    except OSError:
+        raise HTTPException(500, "Auto Generate state could not be saved") from None
+    return _auto_public(controller)
 
 
 def _env_setup_shared(request: Request):
@@ -1181,7 +1487,13 @@ def _env_setup_shared(request: Request):
     cached = getattr(state, "_env_setup", None)
     if cached is None:
         from .generator import EnvSetup
-        cached = EnvSetup()
+        cached = EnvSetup(getattr(state.cfg.generator, "python_exe", "") or "")
+        def adopt_python(py):
+            state.cfg.generator.python_exe = py
+            manager = getattr(state, "generator", None)
+            if manager is not None:
+                manager._adopt_python(py)
+        cached.on_python = adopt_python
         state._env_setup = cached
     return cached
 
@@ -1219,6 +1531,15 @@ async def generator_stopall(request: Request, key: str = Depends(admin_key)) -> 
     return {"ok": True}
 
 
+@router.post("/admin/dash/generator/shutdown")
+async def generator_shutdown(request: Request, key: str = Depends(admin_key)) -> dict:
+    """Close owned jobs, checker and display without creating a manager."""
+    manager = getattr(get_state(request), "generator", None)
+    if manager is not None:
+        await asyncio.to_thread(manager.shutdown)
+    return {"ok": True}
+
+
 @router.post("/admin/dash/generator/workers/remove")
 async def generator_worker_remove(request: Request, body: dict = Body(...),
                                   key: str = Depends(admin_key)) -> dict:
@@ -1237,7 +1558,7 @@ async def generator_workers_clear(request: Request, key: str = Depends(admin_key
 
 @router.post("/admin/dash/generator/send_claim_message")
 async def generator_send_claim_message(request: Request, body: dict = Body(...),
-                                       key: str = Depends(admin_key)) -> dict:
+                                       key: str = Depends(internal_or_admin)) -> dict:
     zjwt = str(body.get("zjwt") or "").strip()
     if not zjwt:
         raise HTTPException(status_code=400, detail="missing zjwt")
@@ -1400,7 +1721,14 @@ async def add_relay_endpoint(request: Request, body: dict = Body(...),
     type_name = str(body.get("type") or "custom").strip()
     if not url:
         raise HTTPException(status_code=400, detail="Relay URL is required")
-    entry = mgr.add_relay(name, url, type_name)
+    try:
+        # add_relay validates the URL and writes relays.json — off the loop
+        # a relay added by hand keeps the secret the user typed; with none we
+        # send no header (never invent a secret the relay does not know)
+        secret = str(body.get("secret") or "").strip()
+        entry = await asyncio.to_thread(mgr.add_relay, name, url, type_name, secret)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
     return {"ok": True, "relay": entry}
 
 
@@ -1414,7 +1742,10 @@ async def test_relay_endpoint(request: Request, body: dict = Body(...),
         res = await asyncio.to_thread(mgr.test_relay_by_id, relay_id)
     elif url:
         from .relay_deploy import ping_relay
-        res = await asyncio.to_thread(ping_relay, url)
+        # hardened relays require the secret; a bare pre-add test of a URL
+        # carrying its secret in the body must send it or always see 403
+        secret = str(body.get("secret") or "").strip()
+        res = await asyncio.to_thread(ping_relay, url, 12.0, secret)
     else:
         raise HTTPException(status_code=400, detail="Relay ID or URL is required")
     return res
@@ -1429,8 +1760,10 @@ async def save_relay_settings(request: Request, body: dict = Body(...),
     active_id = body.get("active_id")
     strategy = body.get("strategy")
     try:
-        st = mgr.update_options(models=models, enabled=enabled,
-                                active_id=active_id, strategy=strategy)
+        # update_options ends in a relays.json write — off the loop
+        st = await asyncio.to_thread(
+            mgr.update_options, models=models, enabled=enabled,
+            active_id=active_id, strategy=strategy)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from None
     return {"ok": True, "settings": st}
@@ -1444,8 +1777,9 @@ async def delete_relays_endpoint(request: Request, body: dict = Body(...),
     ids = body.get("ids")
     if body.get("all") is not True and not (isinstance(ids, list) and ids):
         raise HTTPException(status_code=400, detail="send {\"ids\": [...]} or {\"all\": true}")
-    removed = mgr.delete_relays(ids if isinstance(ids, list) else None,
-                                all_relays=body.get("all") is True)
+    removed = await asyncio.to_thread(
+        mgr.delete_relays, ids if isinstance(ids, list) else None,
+        all_relays=body.get("all") is True)
     return {"ok": True, "deleted": removed}
 
 
@@ -1453,8 +1787,7 @@ async def delete_relays_endpoint(request: Request, body: dict = Body(...),
 async def delete_relay_endpoint(request: Request, relay_id: str,
                                 key: str = Depends(admin_key)) -> dict:
     mgr = _relay_mgr(request)
-    ok = mgr.delete_relay(relay_id)
+    ok = await asyncio.to_thread(mgr.delete_relay, relay_id)
     if not ok:
         raise HTTPException(status_code=404, detail="Relay not found")
     return {"ok": True, "deleted": relay_id}
-

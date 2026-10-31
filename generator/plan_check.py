@@ -33,6 +33,8 @@ import sys
 import threading
 import time
 import uuid
+from contextlib import contextmanager
+from urllib.parse import urlsplit
 
 import requests
 import urllib3
@@ -75,6 +77,11 @@ _NO_PROXY = {"", "0", "none", "null", "direct", "off", "false", "no"}
 
 
 def _proxies():
+    if getattr(_tls, 'force_direct', False):
+        return None
+    if hasattr(_tls, 'request_proxy'):
+        raw = _tls.request_proxy
+        return {'http': raw, 'https': raw} if raw else None
     # ZAI_PROXY may carry a sentinel meaning 'no proxy' - the gateway sets
     # '0' for direct connections. Anything falsy or one of these tokens means
     # go direct; otherwise the value would be used as a proxy host and every
@@ -96,6 +103,48 @@ def _proxies():
 # account, and a shared Session is neither thread-safe nor a place to share a
 # cookie jar — one account's cf_clearance would ride the next account's flow.
 _tls = threading.local()
+
+
+@contextmanager
+def request_route(proxy_url=None):
+    """Select an explicit route for this thread only; None/empty means direct.
+
+    Nested scopes restore the previous route. direct_requests(True) still
+    forbids proxies, and the transport session never trusts environment proxies.
+    """
+    if proxy_url is None:
+        proxy_url = ''
+    try:
+        parsed = urlsplit(proxy_url)
+        valid = (isinstance(proxy_url, str) and not any(c.isspace() for c in proxy_url)
+                 and parsed.scheme in ('http', 'https', 'socks4', 'socks4a', 'socks5', 'socks5h')
+                 and parsed.hostname and parsed.port
+                 and parsed.path in ('', '/') and not parsed.query and not parsed.fragment)
+    except (TypeError, ValueError, AttributeError):
+        valid = False
+    if proxy_url != '' and not valid:
+        raise ValueError('Invalid explicit request route')
+    missing = object()
+    previous = getattr(_tls, 'request_proxy', missing)
+    _tls.request_proxy = proxy_url
+    try:
+        yield
+    finally:
+        if previous is missing:
+            del _tls.request_proxy
+        else:
+            _tls.request_proxy = previous
+
+
+@contextmanager
+def direct_requests(force_direct=False):
+    """Suppress application proxies for this thread, not OS-level TUN routing."""
+    previous = getattr(_tls, 'force_direct', False)
+    _tls.force_direct = bool(force_direct) or previous
+    try:
+        yield
+    finally:
+        _tls.force_direct = previous
 
 
 def _session():
@@ -439,18 +488,45 @@ def _walk_plan_ids(node, out):
             _walk_plan_ids(v, out)
 
 
-def preview_plans(zcode_jwt, log=print) -> list:
-    """Plans the account is currently eligible to claim (possibly empty)."""
+class PreviewError(RuntimeError):
+    """A failed preview, as distinct from a successful empty offer list."""
+
+    def __init__(self, message, *, kind, route_problem=True, code=None):
+        super().__init__(message)
+        self.kind = kind
+        self.route_problem = route_problem
+        self.code = code
+
+
+def preview_plans(zcode_jwt, log=print, *, strict=False) -> list:
+    """Eligible plans; strict callers receive PreviewError instead of [] on failure."""
     try:
-        r = _request("GET", PREVIEW, headers=build_headers(zcode_jwt), timeout=30,
-                     verify=_VERIFY, log=log, tries=2)
-    except Exception as e:
-        log(f"  plan: preview failed ({type(e).__name__})")
-        return []
-    try:
-        j = r.json()
-    except Exception:
-        log(f"  plan: preview non-json {r.status_code} {r.text[:120]}")
+        try:
+            r = _request("GET", PREVIEW, headers=build_headers(zcode_jwt), timeout=30,
+                         verify=_VERIFY, log=log, tries=2)
+        except Exception as e:
+            raise PreviewError(f"preview transport failed ({type(e).__name__})",
+                               kind="transport") from e
+        if not 200 <= r.status_code < 300:
+            raise PreviewError(f"preview HTTP {r.status_code}", kind="http",
+                               route_problem=(r.status_code in (403, 405, 408, 429)
+                                              or r.status_code >= 500))
+        try:
+            j = r.json()
+        except Exception as e:
+            raise PreviewError("preview non-json response", kind="non_json") from e
+        if not isinstance(j, dict) or type(j.get("code")) is not int:
+            raise PreviewError("preview malformed envelope", kind="malformed")
+        code = j["code"]
+        if code not in (0, 200):
+            raise PreviewError(f"preview business failure (code={code})", kind="business",
+                               code=code, route_problem=code in (3012, 405, -1))
+        if not isinstance(j.get("data"), (dict, list)):
+            raise PreviewError("preview malformed data", kind="malformed")
+    except PreviewError as e:
+        log(f"  plan: {e}")
+        if strict:
+            raise
         return []
     found, seen = [], set()
     _walk_plan_ids(j, found)
