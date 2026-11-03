@@ -11,8 +11,13 @@ The public bootstrap remains at the repository root as
 [`install-linux.sh`](../../install-linux.sh); existing install URLs stay valid.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/B3hnamR/AutoZcoder/v2.0.1/install-linux.sh | sudo bash -s -- install
+curl -fsSL https://github.com/B3hnamR/AutoZcoder/releases/latest/download/install-linux.sh | sudo bash -s -- install
 ```
+
+This URL follows the latest published release automatically; it does not run
+unreleased `master` code. For an existing installation, stop active work and use
+`sudo autozcoder update` instead of reinstalling. Review the installer before
+running it as root if required by your security policy.
 
 Defaults to **HTTPS on the server's bare IP** (Let's Encrypt shortlived IP
 certificate, renewed by a systemd timer), so the dashboard opens at

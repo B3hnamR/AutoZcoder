@@ -58,11 +58,13 @@ On an x86_64 Linux VPS with systemd and glibc 2.35+ (Ubuntu 22.04+ or a
 compatible distribution), run this single command over SSH:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/B3hnamR/AutoZcoder/v2.0.1/install-linux.sh | sudo bash -s -- install
+curl -fsSL https://github.com/B3hnamR/AutoZcoder/releases/latest/download/install-linux.sh | sudo bash -s -- install
 ```
 
-This executes the versioned installer as root. Review it first if your policy
-requires it. The installer obtains and checksum-verifies the release binary,
+This always downloads the installer from the **latest published release**, not
+an unreleased file from `master`. No version number needs changing when a new
+release is published. It executes the installer as root; review it first if
+your policy requires it. The installer obtains and checksum-verifies the release binary,
 creates private keys/configuration, installs the generator environment,
 Chromium/Xvfb and private Node/Wrangler, and starts an unprivileged service.
 It does **not** import accounts or deploy a Cloudflare mail worker for you.
@@ -80,6 +82,10 @@ sudo autozcoder status   # service and dashboard status
 sudo autozcoder logs     # service logs
 sudo autozcoder update   # verified update with deployment rollback
 ```
+
+The one-line command is for installation. For an existing installation, use
+`sudo autozcoder update` to obtain the latest release while preserving settings
+and account data. Stop active work and keep a private backup before updating.
 
 Default data location: `/opt/zcodegateway`. Back it up privately before
 maintenance; `sudo autozcoder info` displays secrets. For manual/source installs,
