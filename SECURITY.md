@@ -11,7 +11,12 @@ The admin API can:
 - rewrite `config.yaml`,
 - stop the process.
 
-Treat the admin key like a root password to the machine it runs on. Never put it in a URL, a screenshot, or a chat.
+Treat the admin key as code-execution authority for the gateway's OS user (root
+if you run the gateway as root). Never put it in a URL, a screenshot, or a chat.
+The Linux installer normally uses an unprivileged service user, keeps the gateway
+binary and private Node installation root-owned, and runs generator-environment,
+browser and npm maintenance as an unprivileged tooling user rather than executing
+service-owned tooling as root.
 
 ## Default posture (local use)
 

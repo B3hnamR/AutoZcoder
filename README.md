@@ -7,7 +7,7 @@ It exposes OpenAI- and Anthropic-compatible endpoints locally, pools multiple
 ZCode accounts behind one key, and can create new accounts for you on demand.
 Runs on **Windows (desktop exe)** and **Linux (headless VPS)**.
 
-**Version 2.0.0** | [Latest downloads](https://github.com/B3hnamR/AutoZcoder/releases/latest)
+**Version 2.0.1** | [Release notes](docs/releases/2.0.1.md) | [Latest published downloads](https://github.com/B3hnamR/AutoZcoder/releases/latest)
 | [Windows exe](https://github.com/B3hnamR/AutoZcoder/releases/latest/download/ZcodeGateway.exe)
 | [Linux installation](#run-on-a-linux-vps)
 
@@ -48,8 +48,9 @@ Dashboard: <http://127.0.0.1:8788/dash>
 In **Settings → Check for updates now**, packaged Windows builds offer
 **Download update**, then a separate **Restart to apply** action. Downloading
 does not stop work; applying requires generator jobs, claims, proxy scans and
-client requests to be idle. The helper retains a backup and rolls back an early
-startup exit; its startup check is not a full application health check.
+client requests to be idle. The helper retains a backup and requires a health
+response matching a per-launch nonce within 60 seconds, rolling back on startup
+failure or timeout. This confirms startup, not successful inference or generation.
 
 ### Run on a Linux VPS
 
@@ -57,7 +58,7 @@ On an x86_64 Linux VPS with systemd and glibc 2.35+ (Ubuntu 22.04+ or a
 compatible distribution), run this single command over SSH:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/B3hnamR/AutoZcoder/v2.0.0/install-linux.sh | sudo bash -s -- install
+curl -fsSL https://raw.githubusercontent.com/B3hnamR/AutoZcoder/v2.0.1/install-linux.sh | sudo bash -s -- install
 ```
 
 This executes the versioned installer as root. Review it first if your policy
@@ -81,7 +82,7 @@ sudo autozcoder update   # verified update with deployment rollback
 ```
 
 Default data location: `/opt/zcodegateway`. Back it up privately before
-maintenance; `autozcoder info` displays secrets. For manual/source installs,
+maintenance; `sudo autozcoder info` displays secrets. For manual/source installs,
 ARM systems, firewall/TLS choices, updates and uninstall precautions, see the
 **[VPS deployment guide](docs/guides/VPS-DEPLOY.md)**.
 
@@ -275,8 +276,9 @@ CLI: `python generator/proxy_pool.py{ fetch | verify | recheck | pick | countrie
   `gateway.db` and packaged `generator-data/` privately, plus any custom data
   paths and TLS material. Stop the service or use SQLite-aware backup tooling
   rather than copying an actively written database alone.
-- **The admin key is local root-equivalent** — it can point the generator at
-  arbitrary code and swap the binary. See **[SECURITY.md](SECURITY.md)**.
+- **The admin key grants code execution as the gateway's OS user** — it can
+  point the generator at arbitrary code and request updates. Installer-managed
+  Linux services normally run unprivileged. See **[SECURITY.md](SECURITY.md)**.
 - Runtime secrets (`config.yaml`, `gateway.db`, `accounts/`, `generator/mail.json`,
   `*.har`) are gitignored — they are never part of the repo or releases.
 - The gateway binds to `127.0.0.1` by default and mints **per-install** random

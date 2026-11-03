@@ -143,12 +143,26 @@ FAIL_LABELS = {
     'tls': 'TLS / certificate error',
     'bad_status': 'Bad HTTP status',
     'bad_response': 'Hijacked / invalid page',
+    'page_redirect': 'Page redirected to another host',
+    'page_too_large': 'Page exceeded size limit',
+    'page_timeout': 'Page deadline exceeded',
+    'captcha_status': 'Captcha host returned bad HTTP status',
+    'captcha_bad_response': 'Captcha response has unsupported encoding',
+    'captcha_redirect': 'Captcha redirected to another host',
+    'captcha_too_large': 'Captcha response exceeded size limit',
+    'captcha_timeout': 'Captcha deadline exceeded',
     'blocked': 'Blocked by the site',
     'local_limit': 'Your PC ran out of connections',
     'other': 'Other error',
 }
 # failures that are often just a bad moment (flaky free proxy): worth a second chance
-RETRY_REASONS = {'timeout', 'reset', 'proxy_rejected', 'bad_status', 'other', 'local_limit'}
+RETRY_REASONS = {'timeout', 'reset', 'proxy_rejected', 'bad_status', 'other', 'local_limit',
+                 'page_timeout', 'captcha_timeout', 'captcha_status'}
+for _reason in ('tls', 'local_limit', 'refused', 'reset', 'proxy_auth',
+                'wrong_protocol', 'proxy_rejected', 'other'):
+    FAIL_LABELS['captcha_' + _reason] = 'Captcha: ' + FAIL_LABELS[_reason]
+    if _reason in RETRY_REASONS:
+        RETRY_REASONS.add('captcha_' + _reason)
 # "this PC ran out of ports/buffers" — our fault, not the proxy's
 LOCAL_LIMIT_ERRNOS = {10055, 10048, 24, 23, 105, 99, 10024}
 
@@ -593,6 +607,54 @@ except Exception as _cert_err:  # noqa: BLE001
           f"trust store; MITM detection is weaker than usual.", flush=True)
 
 
+def _probe_body(response, limit, deadline):
+    """Read available bytes, not a fill-sized recv that a slow trickle can extend."""
+    if (response.headers.get('content-encoding') or 'identity').lower() != 'identity':
+        raise requests.exceptions.ContentDecodingError('encoded probe body refused')
+    body = bytearray()
+    raw = response.raw
+    sock = getattr(getattr(getattr(getattr(raw, '_fp', None), 'fp', None),
+                           'raw', None), '_sock', None)
+    expired = threading.Event()
+
+    def abort():
+        expired.set()
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    timer = threading.Timer(max(0, deadline - time.monotonic()), abort)
+    timer.daemon = True
+    timer.start()
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or expired.is_set():
+                raise TimeoutError('probe body deadline exceeded')
+            if sock is not None:
+                sock.settimeout(remaining)
+            size = min(1024 if not body else 64 << 10, limit - len(body) + 1)
+            try:
+                chunk = raw.read1(size, decode_content=False)
+            except urllib3.exceptions.TimeoutError as e:
+                raise TimeoutError('probe body deadline exceeded') from e
+            except urllib3.exceptions.HTTPError as e:
+                if expired.is_set() or time.monotonic() >= deadline:
+                    raise TimeoutError('probe body deadline exceeded') from e
+                raise
+            if time.monotonic() >= deadline or expired.is_set():
+                raise TimeoutError('probe body deadline exceeded')
+            if not chunk:
+                return bytes(body)
+            if len(body) + len(chunk) > limit:
+                raise ValueError('probe body size limit exceeded')
+            body.extend(chunk)
+    finally:
+        timer.cancel()
+
+
 def probe_detailed(purl, timeout=10):
     """(latency, 'ok') or (None, reason).
 
@@ -601,29 +663,49 @@ def probe_detailed(purl, timeout=10):
       - the Aliyun captcha host is reachable
       - the certificate validates (certifi) → rejects MITM proxies
     """
-    t0 = time.time()
-    try:
-        r = requests.get(CHECK_PAGE, proxies={'http': purl, 'https': purl},
-                         timeout=timeout, verify=_VERIFY, headers={'User-Agent': UA},
-                         allow_redirects=True)
-    except Exception as e:
-        return None, classify_error(e)
-    if r.status_code != 200:
-        return None, 'bad_status'
-    ct = (r.headers.get('content-type') or '').lower()
-    if 'html' not in ct or len(r.text) < 1500:
-        return None, 'bad_response'
-    marker = (PROBE_MARKER or '').lower()
-    if marker and marker not in r.text.lower():
-        return None, 'bad_response'
-    lat = time.time() - t0                       # page latency only
-
-    try:
-        requests.get(CHECK_CAPTCHA, proxies={'http': purl, 'https': purl},
-                     timeout=timeout, verify=_VERIFY, headers={'User-Agent': UA},
-                     allow_redirects=True)
-    except Exception as e:
-        return None, classify_error(e)
+    t0 = time.monotonic()
+    deadline = t0 + max(0.01, min(float(timeout), 120.0))
+    for stage, url, cap in (
+            ('page', CHECK_PAGE, min(1 << 20, max(1, _env_int('PROXY_PAGE_MAX_BYTES', 1 << 20)))),
+            ('captcha', CHECK_CAPTCHA, min(64 << 10, max(1, _env_int('PROXY_CAPTCHA_MAX_BYTES', 64 << 10))))):
+        r = None
+        try:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None, stage + '_timeout'
+            # Refuse redirects rather than downloading an unbounded redirect
+            # body (requests consumes it even with stream=True).
+            r = requests.get(url, proxies={'http': purl, 'https': purl},
+                             timeout=remaining, verify=_VERIFY,
+                             headers={'User-Agent': UA, 'Accept-Encoding': 'identity'},
+                             allow_redirects=False, stream=True)
+            final = urlsplit(r.url)
+            expected = urlsplit(url)
+            if (final.scheme != expected.scheme or final.hostname != expected.hostname
+                    or final.port not in (None, 443) or 300 <= r.status_code < 400):
+                return None, stage + '_redirect'
+            if (r.status_code != 200 if stage == 'page' else not 200 <= r.status_code < 300):
+                return None, 'bad_status' if stage == 'page' else 'captcha_status'
+            body = _probe_body(r, cap, deadline)
+            if stage == 'page':
+                text = body.decode(r.encoding or 'utf-8', errors='replace').lower()
+                ct = (r.headers.get('content-type') or '').lower()
+                marker = (PROBE_MARKER or '').lower()
+                if 'html' not in ct or len(body) < 1500 or (marker and marker not in text):
+                    return None, 'bad_response'
+                lat = time.monotonic() - t0
+        except ValueError:
+            return None, stage + '_too_large'
+        except requests.exceptions.ContentDecodingError:
+            return None, 'bad_response' if stage == 'page' else 'captcha_bad_response'
+        except Exception as e:
+            reason = classify_error(e)
+            if reason == 'timeout' or time.monotonic() >= deadline:
+                return None, stage + '_timeout'
+            return None, 'captcha_' + reason if stage == 'captcha' else reason
+        finally:
+            if r is not None:
+                r.close()
     return lat, 'ok'
 
 

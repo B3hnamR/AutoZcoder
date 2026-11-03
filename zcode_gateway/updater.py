@@ -22,6 +22,7 @@ import logging
 import os
 import re
 import shutil
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -155,6 +156,22 @@ class UpdateChecker:
 
 def exe_dir() -> Path:
     return Path(sys.executable).resolve().parent
+
+
+def _startup_probe_spec(config_path: str | Path | None) -> dict[str, str]:
+    from .config import load_config
+
+    cfg = load_config(config_path)
+    origin, certificate = cfg.server.child_connection()
+    pin = ""
+    if origin.startswith("https://") and certificate:
+        pem = Path(certificate).read_text(encoding="ascii")
+        leaf = re.search(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", pem, re.DOTALL)
+        if leaf is None:
+            raise RuntimeError("listener certificate has no PEM certificate")
+        pin = hashlib.sha256(ssl.PEM_cert_to_DER_cert(leaf[0])).hexdigest()
+    return {"health_url": origin + "/health", "certificate_sha256": pin,
+            "startup_nonce": uuid.uuid4().hex}
 
 
 def _sha256_file(path: Path) -> str:
@@ -314,7 +331,7 @@ function Get-StreamSHA256([IO.Stream]$stream) {
     try { return [BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-', '').ToLowerInvariant() }
     finally { $sha.Dispose() }
 }
-function Start-Application {
+function Start-Application([bool]$checkStartup = $false) {
     $info = New-Object System.Diagnostics.ProcessStartInfo
     $info.FileName = $m.target
     $info.Arguments = $m.argument_line
@@ -325,7 +342,56 @@ function Start-Application {
         if ($name.StartsWith('_PYI_')) { $info.EnvironmentVariables.Remove($name) }
     }
     $info.EnvironmentVariables['PYINSTALLER_RESET_ENVIRONMENT'] = '1'
+    $info.EnvironmentVariables.Remove('ZCODE_GATEWAY_UPDATE_NONCE')
+    if ($checkStartup) {
+        $info.EnvironmentVariables['ZCODE_GATEWAY_UPDATE_NONCE'] = $m.startup_nonce
+    }
     return [System.Diagnostics.Process]::Start($info)
+}
+function Wait-StartupHealth {
+    # The callback is scoped to this request; never disable process-wide TLS.
+    Add-Type -TypeDefinition @'
+using System;
+using System.Net;
+using System.Security.Cryptography;
+public static class ZcodeUpdateHealth {
+    public static bool Matches(string url, string nonce, string pin) {
+        HttpWebRequest request = (HttpWebRequest)WebRequest.Create(url);
+        request.Headers["X-AutoZCoder-Update"] = nonce;
+        request.Proxy = null;
+        request.AllowAutoRedirect = false;
+        request.Timeout = 1500;
+        request.ReadWriteTimeout = 1500;
+        if (!String.IsNullOrEmpty(pin)) {
+            request.ServerCertificateValidationCallback = (sender, cert, chain, errors) => {
+                if (cert == null) return false;
+                using (SHA256 sha = SHA256.Create()) {
+                    string actual = BitConverter.ToString(sha.ComputeHash(cert.GetRawCertData())).Replace("-", "").ToLowerInvariant();
+                    return String.Equals(actual, pin, StringComparison.Ordinal);
+                }
+            };
+        }
+        try {
+            using (HttpWebResponse response = (HttpWebResponse)request.GetResponse()) {
+                return response.StatusCode == HttpStatusCode.OK &&
+                    String.Equals(response.Headers["X-AutoZCoder-Update"], nonce, StringComparison.Ordinal);
+            }
+        } catch (WebException) { return false; }
+    }
+}
+'@
+    $deadline = [DateTime]::UtcNow.AddSeconds($m.startup_seconds)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        if ($newProcess.HasExited) {
+            throw ('Replacement exited during startup, code ' + $newProcess.ExitCode)
+        }
+        if ([ZcodeUpdateHealth]::Matches($m.health_url, $m.startup_nonce, $m.certificate_sha256)) {
+            if ($newProcess.HasExited) { throw 'Replacement exited after startup acknowledgement' }
+            return
+        }
+        Start-Sleep -Milliseconds 250
+    }
+    throw 'Replacement did not acknowledge healthy startup before the deadline'
 }
 try {
     # Keep Process objects (and their creation times), not reusable naked PIDs.
@@ -366,12 +432,10 @@ try {
         Retry-FileOperation { [IO.File]::Replace($m.candidate, $m.target, [NullString]::Value) }
         $replaced = $true
     } finally { $source.Dispose() }
-    $newProcess = Start-Application
+    $newProcess = Start-Application $true
     if ($null -eq $newProcess) { throw 'Replacement could not be started' }
-    if ($newProcess.WaitForExit([int]($m.startup_seconds * 1000))) {
-        throw ('Replacement exited during startup, code ' + $newProcess.ExitCode)
-    }
-    Write-UpdateLog 'Update started; backup retained. Startup liveness is not a health check.'
+    Wait-StartupHealth
+    Write-UpdateLog 'Update healthy startup acknowledged; backup retained'
     Remove-Item -LiteralPath $m.source -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $m.sidecar -Force -ErrorAction SilentlyContinue
 } catch {
@@ -438,8 +502,8 @@ def apply_update(new_exe: Path, *, config_path: str | Path | None = None) -> Non
 
     Spawns a detached swapper that waits for THIS process (and its PyInstaller
     same-executable bootloader parent) to exit, then replaces the file and
-    starts it again. The caller must exit after spawning. Ten-second startup
-    liveness detects early crashes; it is not an application health check.
+    starts it again. The caller must exit after spawning. A per-launch nonce
+    health response is required before accepting the replacement.
     """
     if not getattr(sys, "frozen", False):
         raise RuntimeError("self-update is only available in the exe build")
@@ -473,6 +537,7 @@ def apply_update(new_exe: Path, *, config_path: str | Path | None = None) -> Non
         raise RuntimeError("update file is implausibly small; refusing to apply")
     arguments = list(sys.argv[1:])
     active_config = config_path or os.environ.get("ZCODE_GATEWAY_CONFIG")
+    startup_probe = _startup_probe_spec(active_config)
     if active_config:
         filtered = []
         iterator = iter(arguments)
@@ -495,7 +560,8 @@ def apply_update(new_exe: Path, *, config_path: str | Path | None = None) -> Non
             "pid": os.getpid(), "parent_pid": os.getppid(),
             "started_before_ticks": str(int(time.time() * 10_000_000) + 621355968000000000),
             "argument_line": subprocess.list2cmdline(arguments), "cwd": str(Path.cwd()),
-            "wait_seconds": 120, "retry_seconds": 30, "startup_seconds": 10,
+            "wait_seconds": 120, "retry_seconds": 30, "startup_seconds": 60,
+            **startup_probe,
         }
         (directory / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=True), encoding="utf-8")
         script = directory / "swap.ps1"

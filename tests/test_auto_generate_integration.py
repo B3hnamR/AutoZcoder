@@ -211,11 +211,19 @@ def test_auto_registration_requires_verified_start_plan_and_usable_quota(tmp_pat
     with TestClient(create_app(cfg)) as client:
         client.get('/admin/dash/generator/mail',headers={'Authorization':'Bearer dummy-admin'})
         mgr=client.app.state.app_state.generator
+        mgr.auto_generate._run_id = 'fixture-run'
+        mgr.auto_generate._counts['attempts'] = 1
         result=mgr.on_account({'email':'new@example.test','chat_token':'eyJ.fixture.sig','auto_generate':True,
-                               'route_policy':'direct','registration_proxy':''})
+                               'route_policy':'direct','registration_proxy':'',
+                               'auto_run_id':'fixture-run','auto_attempt_id':'fixture-run-1'})
         assert result['qualified'] is expected
         if expected:
             assert result['account_id']==ident
+            from zcode_gateway.accounts_dir import parse_snapshot
+            persisted = parse_snapshot(next(Path(cfg.accounts.dir).glob('*.txt')))
+            assert persisted['auto_qualified']=='true'
+            assert persisted['auto_run_id']=='fixture-run'
+            assert persisted['auto_attempt_id']=='fixture-run-1'
             assert 'new@example.test' in mgr.registered_emails()
             rows=client.get('/admin/accounts',headers={'Authorization':'Bearer dummy-admin'}).json()['accounts']
             assert rows[0]['quotas']['GLM-5.3-Flash']['remaining']==10

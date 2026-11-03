@@ -12,6 +12,7 @@
  */
 import { runCaptchaSolve } from "./captcha-solver.ts";
 import { CaptchaDeadline } from "./captcha-deadline.ts";
+import { bootstrapCaptchaRoute, readBoundedBody } from "./captcha-transport.ts";
 
 const appVersion = (process.env.ZAI_APP_VERSION || "3.16.3").trim();
 
@@ -28,7 +29,7 @@ export async function readConfig(deadline: CaptchaDeadline): Promise<{ scene: st
     `?app_version=${encodeURIComponent(appVersion)}&platform=win32-x64`;
   const json = (await deadline.fetch(url, {}, async (resp) => {
     if (!resp.ok) throw new Error(`captcha config HTTP ${resp.status}`);
-    return resp.json();
+    return JSON.parse((await readBoundedBody(resp, deadline.controller.signal)).toString("utf8"));
   })) as {
     data?: { configs?: { captcha?: { enabled?: boolean; prefix?: string; sceneId?: string; region?: string } } };
   };
@@ -44,6 +45,7 @@ export async function readConfig(deadline: CaptchaDeadline): Promise<{ scene: st
 }
 
 export async function main(): Promise<void> {
+  bootstrapCaptchaRoute();
   const deadline = new CaptchaDeadline();
   try {
     const cfg = await readConfig(deadline);

@@ -8,6 +8,7 @@ this module never discovers or kills processes belonging to another run.
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 import tempfile
@@ -88,6 +89,12 @@ def _atomic_json(path, value):
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
+        if os.name != "nt":
+            directory = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
     finally:
         if fd is not None:
             os.close(fd)
@@ -108,6 +115,7 @@ class AutoGenerateController:
     def __init__(self, data_dir, launch, preflight=None):
         self._config_path = Path(data_dir) / "auto_generate_config.json"
         self._progress_path = Path(data_dir) / "auto_generate_progress.json"
+        self._journal_path = Path(data_dir) / "auto_generate_registrations.json"
         self._launch = launch
         self._preflight = preflight
         self._lock = threading.RLock()
@@ -122,6 +130,8 @@ class AutoGenerateController:
         self._counts = dict.fromkeys(_COUNTERS, 0)
         self._categories = {}
         self._account_ids = set()
+        self._outcomes = {}
+        self._registrations = {}
         self._active = {}
         self._ready_at = [0.0] * 3
         self._events = deque(maxlen=200)
@@ -149,7 +159,7 @@ class AutoGenerateController:
             if any(type(v) is not int or not 0 <= v <= 10000 for v in counts.values()):
                 raise ValueError("invalid counters")
             ids = saved["account_ids"]
-            if (not isinstance(ids, list) or len(ids) > 1000
+            if (not isinstance(ids, list) or len(ids) > 10000
                     or any(not isinstance(v, str) or not v or len(v) > 256 for v in ids)):
                 raise ValueError("invalid account IDs")
             status = saved["status"]
@@ -165,21 +175,166 @@ class AutoGenerateController:
                 raise ValueError("invalid categories")
             self._run_config, self._counts = config, counts
             self._account_ids, self._categories = set(ids), categories
-            self._run_id = uuid.uuid4().hex
+            run_id = saved.get("id", "")
+            if not isinstance(run_id, str) or not run_id or len(run_id) > 80 or not run_id.isalnum():
+                raise ValueError("invalid run ID")
+            self._run_id = run_id
+            outcomes = saved.get("outcomes", {})
+            if (not isinstance(outcomes, dict) or len(outcomes) > 10000 or any(
+                    not self._valid_attempt_id(k) or v not in _CATEGORIES
+                    for k, v in outcomes.items())):
+                raise ValueError("invalid attempt outcomes")
+            self._outcomes = dict(outcomes)
+            deadlines = saved.get("cooldown_deadlines", [0.0] * 3)
+            if (not isinstance(deadlines, list) or len(deadlines) != 3 or any(
+                    type(v) not in (int, float) or not math.isfinite(v) or v < 0
+                    for v in deadlines)):
+                raise ValueError("invalid cooldown deadlines")
+            now, wall = time.monotonic(), time.time()
+            self._ready_at = [now + min(config["cooldown_seconds"], max(0.0, v - wall))
+                              if v > wall else 0.0 for v in deadlines]
+            active_attempts = saved.get("active_attempts", [])
+            if (not isinstance(active_attempts, list) or len(active_attempts) > 3 or any(
+                    not isinstance(v, dict) or not self._valid_attempt_id(v.get("id"))
+                    or type(v.get("index")) is not int or not 0 <= v["index"] < 3
+                    for v in active_attempts)
+                    or len({v["id"] for v in active_attempts}) != len(active_attempts)):
+                raise ValueError("invalid active attempts")
+            self._load_journal_locked()
             reason = saved.get("reason", "restored")
             if not isinstance(reason, str) or reason not in _REASONS:
                 reason = "restored"
             self._status, self._reason = status, reason
             if status in _ACTIVE_STATUSES or active:
                 self._status, self._reason = "interrupted", "process_restart"
-                self._counts["interrupted_attempts"] += active
-                self._counts["completed_attempts"] += active
-                self._categories["interrupted"] = self._categories.get("interrupted", 0) + active
+                for attempt in active_attempts:
+                    attempt_id = attempt["id"]
+                    if attempt_id in self._outcomes:
+                        continue
+                    receipt = self._registrations.get(attempt_id)
+                    if receipt:
+                        self._active[attempt_id] = {"index": attempt["index"], "cancelled": False}
+                        self._finish_locked(attempt_id, {"qualified": True, "account_id": receipt["account_id"]})
+                        remaining = min(config["cooldown_seconds"], max(0.0,
+                            receipt["registered_at"] + config["cooldown_seconds"] - time.time()))
+                        self._ready_at[attempt["index"]] = time.monotonic() + remaining if remaining else 0.0
+                    else:
+                        self._outcomes[attempt_id] = "interrupted"
+                        self._counts["interrupted_attempts"] += 1
+                        self._counts["completed_attempts"] += 1
+                        self._categories["interrupted"] = self._categories.get("interrupted", 0) + 1
+                # Older snapshots only recorded the active count, not attempt IDs.
+                unknown = max(0, active - len(active_attempts))
+                self._counts["interrupted_attempts"] += unknown
+                self._counts["completed_attempts"] += unknown
+                if unknown:
+                    self._categories["interrupted"] = self._categories.get("interrupted", 0) + unknown
+                self._reconcile_locked()
                 self._persist_locked()
+            else:
+                if self._reconcile_locked():
+                    self._persist_locked()
         except FileNotFoundError:
             pass
         except (ValueError, TypeError, KeyError, OSError):
             self._status, self._reason = "failed", "invalid_saved_progress"
+
+    def _valid_attempt_id(self, attempt_id):
+        if not isinstance(attempt_id, str) or not attempt_id.startswith(self._run_id + "-"):
+            return False
+        number = attempt_id[len(self._run_id) + 1:]
+        return number.isascii() and number.isdigit() and str(int(number)) == number and 1 <= int(number) <= self._counts["attempts"]
+
+    def _load_journal_locked(self):
+        try:
+            value = json.loads(self._journal_path.read_text("utf-8"))
+        except FileNotFoundError:
+            return
+        if not isinstance(value, dict):
+            raise ValueError("invalid registration journal")
+        if value.get("run_id") != self._run_id:
+            return
+        receipts = value.get("registrations")
+        if not isinstance(receipts, dict) or len(receipts) > 10000:
+            raise ValueError("invalid registration journal")
+        for attempt_id, receipt in receipts.items():
+            if (not self._valid_attempt_id(attempt_id) or not isinstance(receipt, dict)
+                    or not isinstance(receipt.get("account_id"), str)
+                    or not 0 < len(receipt["account_id"]) <= 256
+                    or type(receipt.get("registered_at")) not in (int, float)
+                    or not math.isfinite(receipt["registered_at"])):
+                raise ValueError("invalid registration receipt")
+        self._registrations = receipts
+
+    def record_registration(self, attempt_id, account_id):
+        """Durably acknowledge a new, verified, persisted gateway registration.
+
+        The integration writes matching snapshot notes before calling this method.
+        No credentials, email addresses or routes belong in this journal.
+        """
+        with self._lock:
+            if (not self._valid_attempt_id(attempt_id) or not isinstance(account_id, str)
+                    or not 0 < len(account_id) <= 256):
+                raise ValueError("invalid registration acknowledgement")
+            previous = self._registrations.get(attempt_id)
+            if previous:
+                if previous["account_id"] != account_id:
+                    raise ValueError("attempt already acknowledged for another account")
+                return
+            receipts = {**self._registrations, attempt_id: {
+                "account_id": account_id, "registered_at": time.time()}}
+            _atomic_json(self._journal_path, {"run_id": self._run_id, "registrations": receipts})
+            self._registrations = receipts
+            self._wake.set()
+
+    def _reconcile_locked(self):
+        changed = False
+        for attempt_id, receipt in self._registrations.items():
+            old = self._outcomes.get(attempt_id)
+            if attempt_id in self._active or old in {"qualified", "duplicate"}:
+                continue
+            if old:
+                self._categories[old] -= 1
+                if not self._categories[old]:
+                    del self._categories[old]
+                if old == "interrupted":
+                    self._counts["interrupted_attempts"] -= 1
+                else:
+                    self._counts["failed"] -= 1
+                    if old == "no_plan":
+                        self._counts["no_plan"] -= 1
+            else:
+                self._counts["completed_attempts"] += 1
+            account_id = receipt["account_id"]
+            category = "duplicate" if account_id in self._account_ids else "qualified"
+            if category == "qualified":
+                self._account_ids.add(account_id)
+                self._counts["qualified"] += 1
+            else:
+                self._counts["duplicates"] += 1
+                self._counts["failed"] += 1
+            self._categories[category] = self._categories.get(category, 0) + 1
+            self._outcomes[attempt_id] = category
+            changed = True
+        if changed:
+            failures = 0
+            for attempt_id in sorted(self._outcomes, key=lambda value: int(value.rsplit("-", 1)[1]), reverse=True):
+                if self._outcomes[attempt_id] == "qualified":
+                    break
+                if self._outcomes[attempt_id] != "interrupted":
+                    failures += 1
+            self._counts["consecutive_failures"] = failures
+        return changed
+
+    def reconcile_registrations(self, receipts):
+        """Replay verified snapshot receipts after loading the gateway account pool."""
+        with self._lock:
+            for attempt_id, account_id in receipts.items():
+                if self._valid_attempt_id(attempt_id):
+                    self.record_registration(attempt_id, account_id)
+            if self._reconcile_locked():
+                self._persist_locked()
+            return self.status()
 
     def config(self):
         with self._lock:
@@ -213,6 +368,12 @@ class AutoGenerateController:
         value.pop("cooldowns")
         value.pop("events")
         value["account_ids"] = sorted(self._account_ids)
+        value["outcomes"] = dict(self._outcomes)
+        value["active_attempts"] = [{"id": key, "index": slot["index"]}
+                                    for key, slot in self._active.items()]
+        now, wall = time.monotonic(), time.time()
+        value["cooldown_deadlines"] = [wall + deadline - now if deadline > now else 0.0
+                                       for deadline in self._ready_at]
         _atomic_json(self._progress_path, value)
 
     def _persist_or_fail_locked(self):
@@ -233,6 +394,7 @@ class AutoGenerateController:
             self._run_config = value
             self._counts = dict.fromkeys(_COUNTERS, 0)
             self._categories, self._account_ids = {}, set()
+            self._outcomes, self._registrations = {}, {}
             self._ready_at = [0.0] * 3
             self._run_id = uuid.uuid4().hex
             self._status, self._reason = "preparing", "preflight"
@@ -242,7 +404,7 @@ class AutoGenerateController:
             run_id = self._run_id
         return self._prepare(run_id)
 
-    def _prepare(self, run_id):
+    def _prepare(self, run_id, resume_state=None):
         with self._lock:
             if self._run_id != run_id or self._status != "preparing":
                 return self.status()
@@ -258,7 +420,7 @@ class AutoGenerateController:
         except Exception:
             with self._lock:
                 if self._run_id == run_id and self._status == "preparing":
-                    self._status, self._reason = "failed", "preflight_failed"
+                    self._status, self._reason = resume_state or ("failed", "preflight_failed")
                     self._event("Preflight failed; no new browsers will launch. Review the action error.", "error")
                     self._persist_or_fail_locked()
             raise
@@ -297,10 +459,11 @@ class AutoGenerateController:
         with self._lock:
             if self._closed or self._status not in {"paused", "interrupted"}:
                 raise RuntimeError("only paused or interrupted runs can resume")
+            resume_state = self._status, self._reason
             self._status, self._reason = "preparing", "preflight"
             self._event("Resume requested; checking prerequisites again.")
             run_id = self._run_id
-        return self._prepare(run_id)
+        return self._prepare(run_id, resume_state)
 
     @staticmethod
     def _stop_handles(handles):
@@ -348,29 +511,34 @@ class AutoGenerateController:
         )
         self._counts["completed_attempts"] += 1
         result = result if isinstance(result, dict) else {}
+        receipt = self._registrations.get(attempt_id)
+        if receipt:
+            result = {"qualified": True, "account_id": receipt["account_id"]}
         account_id = result.get("account_id")
         category = result.get("category", "failed")
         if not isinstance(category, str) or category not in _CATEGORIES:
             category = "other"
         if category == "qualified":
             category = "failed"
-        if slot["cancelled"]:
+        if slot["cancelled"] and not receipt:
             category = "timeout" if slot.get("timed_out") else "stopped"
         elif result.get("qualified") is True and isinstance(account_id, str) and 0 < len(account_id) <= 256:
             if account_id in self._account_ids:
-                self._counts["duplicates"] += 1
                 category = "duplicate"
             else:
                 self._account_ids.add(account_id)
                 self._counts["qualified"] += 1
                 self._counts["consecutive_failures"] = 0
                 category = "qualified"
+        if category == "duplicate":
+            self._counts["duplicates"] += 1
         if category != "qualified":
             self._counts["failed"] += 1
             self._counts["consecutive_failures"] += 1
         if category == "no_plan":
             self._counts["no_plan"] += 1
         self._categories[category] = self._categories.get(category, 0) + 1
+        self._outcomes[attempt_id] = category
         worker = slot.get("worker", "")
         number = attempt_id.rsplit("-", 1)[-1]
         self._event("Attempt %s finished: %s. Qualified %d; finished %d; failed %d." %

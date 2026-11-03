@@ -13,12 +13,13 @@
  * runtime). Resolution here is dynamic and may legitimately fail: the asset
  * exists only after scripts/build-fork-worker.ts runs, and the esbuild
  * Android bundle marks the asset module external. On such deployments we
- * solve IN-PROCESS instead (the pre-worker behavior, still bounded by the
- * CAPTCHA_SYNC_FETCH_TIMEOUT_MS / CAPTCHA_SOLVE_TIMEOUT_MS caps). Mode
+ * solve IN-PROCESS instead. I/O and asynchronous waits use the absolute
+ * deadline; synchronous guest CPU cannot be preempted without a worker. Mode
  * transitions are announced once on stderr for operators.
  */
 import { Worker } from "node:worker_threads";
 import { CaptchaDeadline } from "./captcha-deadline.ts";
+import { CaptchaLease } from "./captcha-lease.ts";
 
 /** Per-solve timeout: overall deadline the worker gets before termination. */
 const SOLVE_WORKER_TIMEOUT_MS = Number(process.env.CAPTCHA_SOLVE_TIMEOUT_MS || 20_000);
@@ -44,6 +45,21 @@ type InProcessSolveFn = (opts: {
 }) => Promise<string>;
 let inProcessOverride: InProcessSolveFn | null = null;
 let happyMod: { solveTraceless: InProcessSolveFn } | null = null;
+const fallbackLease = new CaptchaLease();
+async function solveInProcess(req: { scene: string; region: string; prefix: string; deadlineAt: number }, deadline: CaptchaDeadline): Promise<string> {
+  const release = await fallbackLease.acquire(deadline);
+  try {
+    const solver = await deadline.run(happy);
+    deadline.remaining();
+    // A race timeout cannot transfer ownership while the old solver still runs.
+    // Its own deadline cancels I/O; synchronous guest CPU requires a real worker.
+    const result = await solver.solveTraceless(req);
+    deadline.remaining();
+    return result;
+  } finally {
+    release();
+  }
+}
 async function happy(): Promise<{ solveTraceless: InProcessSolveFn }> {
   if (inProcessOverride) return { solveTraceless: inProcessOverride };
   if (!happyMod) {
@@ -111,17 +127,14 @@ export async function solveViaWorkerOrInProcess(req: {
   try {
     const entryPath = await deadline.run(getWorkerEntryPath);
     if (entryPath === null) {
-      const solver = await deadline.run(happy);
-      return await deadline.run(() => solver.solveTraceless(boundedReq));
+      return await solveInProcess(boundedReq, deadline);
     }
     try {
       deadline.remaining();
       return await solveInWorker(entryPath, boundedReq);
     } catch (err) {
       if (err instanceof WorkerUnavailableError) {
-        const solver = await deadline.run(happy);
-        deadline.remaining();
-        return await deadline.run(() => solver.solveTraceless(boundedReq));
+        return await solveInProcess(boundedReq, deadline);
       }
       throw err;
     }

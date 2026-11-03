@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import hmac
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Request, Response
 from fastapi.responses import JSONResponse
 
 from .peer import peer_is_local
@@ -25,10 +27,17 @@ def _ops_exposed(request: Request) -> bool:
 
 
 @router.get("/health")
-async def health(request: Request) -> dict:
-    if not _ops_exposed(request):
+async def health(request: Request, response: Response) -> dict:
+    nonce = os.environ.get("ZCODE_GATEWAY_UPDATE_NONCE", "")
+    supplied = request.headers.get("X-AutoZCoder-Update", "")
+    valid_nonce = bool(nonce and len(nonce) <= 128 and all(c in "0123456789abcdef" for c in nonce))
+    update_probe = valid_nonce and hmac.compare_digest(nonce, supplied)
+    if not _ops_exposed(request) and not update_probe:
         return JSONResponse(status_code=404, content={"detail": "Not Found"})
     state = request.app.state.app_state
+    if valid_nonce and (peer_is_local(request) or update_probe):
+        response.headers["X-AutoZCoder-Update"] = nonce
+        response.headers["Cache-Control"] = "no-store"
     out = {"status": "ok"}
     try:
         # surface the IP-wide edge-block breaker so clients/ops can see WHY

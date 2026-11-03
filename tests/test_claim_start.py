@@ -532,20 +532,24 @@ def test_standalone_direct_oauth_keeps_get_post_patchable(monkeypatch):
 
 def test_direct_captcha_sidecar_does_not_inherit_proxy_settings(monkeypatch):
     import os
-    import subprocess
 
-    for key in ("ZAI_PROXY", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "https_proxy"):
+    for key in ("ZAI_PROXY", "ZAI_CAPTCHA_PROXY", "HTTP_PROXY", "HTTPS_PROXY",
+                "ALL_PROXY", "https_proxy", "no_proxy"):
         monkeypatch.setenv(key, "http://proxy:8080")
+    monkeypatch.delenv("ZAI_CAPTCHA_PARAM", raising=False)
     monkeypatch.setenv("ZAI_CAPTCHA_CMD", "fake-mint")
     monkeypatch.setattr(cs, "_captcha_config", lambda log: {})
     seen = {}
 
-    def run(*a, **kw):
-        seen.update(kw["env"])
-        return types.SimpleNamespace(returncode=0, stdout="V" * 40 + " sgp\n")
+    def run(argv, env):
+        assert argv == ["fake-mint"]
+        seen.update(env)
+        return types.SimpleNamespace(returncode=0, stdout="V" * 40 + " sgp\n", stderr="")
 
-    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(cs, "_run_sidecar", run)
     assert cs._captcha_token(lambda m: None, force_direct=True) == ("V" * 40, "sgp")
     assert not any(k.upper() in ("ZAI_PROXY", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY") for k in seen)
     assert seen["NO_PROXY"] == "*"
+    assert seen["ZAI_CAPTCHA_PROXY"] == ""
+    assert "no_proxy" not in seen
     assert os.environ["ZAI_PROXY"] == "http://proxy:8080"

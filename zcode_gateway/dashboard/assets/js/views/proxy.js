@@ -29,6 +29,7 @@ const COUNTERS = [
 
 export async function mount({ root, signal }) {
   let built = false;
+  const loadWarning = el("div", { class: "notice notice--warn", role: "status", hidden: true });
   const relays = createRelaysCard();
   const sources = createSourcesCard(() => load());
 
@@ -217,7 +218,7 @@ export async function mount({ root, signal }) {
     });
 
     fill(root, el("div", { class: "stack" }, [
-      checker, sources.node, maintenance, relays.node,
+      loadWarning, checker, sources.node, maintenance, relays.node,
     ]));
     applyPreset("balanced");
     relays.refresh();
@@ -265,14 +266,24 @@ export async function mount({ root, signal }) {
   }
 
   const load = async () => {
+    if (signal.aborted) return;
     let px;
     try {
       px = await api.get("/admin/dash/generator/proxies", { signal });
     } catch (e) {
-      fill(root, locateCard(e.message, () => { built = false; load(); }));
-      built = false;
+      if (signal.aborted || e.name === "AbortError") return;
+      if (e.status === 404) {
+        fill(root, locateCard(e.message, () => { built = false; load(); }));
+        built = false;
+      } else {
+        loadWarning.textContent = "Proxy status unavailable: " + e.message + ". Use Refresh to retry.";
+        loadWarning.hidden = false;
+        if (!built) fill(root, loadWarning);
+      }
       return;
     }
+    if (signal.aborted) return;
+    loadWarning.hidden = true;
     if (!built) build(px);
     paint(px);
   };

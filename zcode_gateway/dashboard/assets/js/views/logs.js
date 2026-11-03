@@ -20,18 +20,16 @@ function levelClass(l) {
 export async function mount({ root, signal }) {
   let level = "";
   let search = "";
-  let cleared = false;
+  let clearedBefore = null;
   let records = [];
+  let request = 0;
 
   const pane = el("div", { class: "logpane mono", style: { height: "min(62vh, 560px)" } });
 
   function paint() {
-    if (cleared) {
-      fill(pane, el("div", { class: "faint", text: "View cleared. New records appear as they arrive." }));
-      return;
-    }
     if (!records.length) {
-      fill(pane, el("div", { class: "faint", text: "No log records match." }));
+      fill(pane, el("div", { class: "faint", text: clearedBefore !== null
+        ? "View cleared. New records appear as they arrive." : "No log records match." }));
       return;
     }
     const atBottom = pane.scrollHeight - pane.scrollTop - pane.clientHeight < 60;
@@ -45,29 +43,34 @@ export async function mount({ root, signal }) {
   }
 
   const load = async () => {
+    if (signal.aborted) return;
+    const currentRequest = ++request;
     const qs = new URLSearchParams({ limit: "400" });
     if (level) qs.set("level", level);
     if (search) qs.set("q", search);
     const data = await api.get("/admin/dash/logs?" + qs.toString(), { signal });
-    records = data.records || [];
+    if (signal.aborted || currentRequest !== request) return;
+    // The process buffer supplies numeric Unix `ts`, not record IDs. Keep the
+    // watermark across filters so old records never return after Clear.
+    records = (data.records || []).filter(r => clearedBefore === null || Number(r.ts) > clearedBefore);
     paint();
   };
 
   const levelSelect = el("select", {
     class: "select", style: { maxWidth: "140px" }, "aria-label": "Filter by level",
-    on: { change: (e) => { level = e.target.value; cleared = false; load(); } },
+    on: { change: (e) => { level = e.target.value; load().catch(() => {}); } },
   }, LEVELS.map((l) => el("option", { value: l, text: l || "All levels" })));
 
   const searchInput = el("input", {
     class: "input", type: "search", placeholder: "Search logs…",
     style: { maxWidth: "240px" }, "aria-label": "Search logs",
-    on: { input: debounce((e) => { search = e.target.value; cleared = false; load(); }, 300) },
+    on: { input: debounce((e) => { search = e.target.value; load().catch(() => {}); }, 300) },
   });
 
   const clearBtn = button({
     label: "Clear", onClick: () => {
-      cleared = !cleared;
-      clearBtn.querySelector("span:last-child").textContent = cleared ? "Show" : "Clear";
+      clearedBefore = Math.max(clearedBefore ?? 0, ...records.map(r => Number(r.ts) || 0));
+      records = [];
       paint();
     },
   });

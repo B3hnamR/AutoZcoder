@@ -2,6 +2,7 @@ import { afterEach, test } from "node:test";
 import assert from "node:assert/strict";
 import { GlobalWindow as Window, PropertySymbol } from "happy-dom";
 import { CaptchaDeadline } from "./captcha-deadline.ts";
+import { __setCaptchaTransportForTest } from "./captcha-transport.ts";
 
 // Bun resolves these source-tree .js imports to .ts; Node's native loader does not.
 // Register before importing mint's dependency graph, without changing production imports.
@@ -26,8 +27,9 @@ const {
   installBufferedRequest,
 } = await import("./captcha-happy.ts");
 const { readConfig } = await import("./mint.ts");
+const forbidNetwork = async (): Promise<Response> => { throw new Error("offline fixture forbids external network"); };
+__setCaptchaTransportForTest(forbidNetwork);
 
-const originalFetch = globalThis.fetch;
 const deadlines: CaptchaDeadline[] = [];
 const windows: Window[] = [];
 const deadline = (ms = 1_000, at?: number) => {
@@ -47,7 +49,7 @@ const windowFixture = (interceptor?: object) => {
 
 afterEach(async () => {
   __setDomFactoryForTest(null);
-  globalThis.fetch = originalFetch;
+  __setCaptchaTransportForTest(forbidNetwork);
   for (const value of deadlines.splice(0)) value.dispose();
   for (const w of windows.splice(0)) await w.happyDOM.close();
 });
@@ -162,29 +164,29 @@ test("AUD033: deadline covers response consumption and safely cancels rejecting 
   const budget = deadline(40);
   let signal: AbortSignal | undefined;
   let cancellations = 0;
-  globalThis.fetch = (async (_url, init) => {
+  __setCaptchaTransportForTest(async (_url, init) => {
     signal = init?.signal as AbortSignal;
     return {
       body: { cancel: () => { cancellations++; return Promise.reject(new Error("locked fixture")); } },
       arrayBuffer: () => new Promise(() => {}),
     } as unknown as Response;
-  }) as typeof fetch;
+  });
   await assert.rejects(budget.fetch("https://fixture.invalid/body", {}, r => r.arrayBuffer()), /deadline/);
   assert.equal(signal?.aborted, true);
   assert.equal(cancellations, 1);
 });
 
 test("AUD033: synchronous body cancellation errors do not replace successful results", async () => {
-  globalThis.fetch = (async () => ({
+  __setCaptchaTransportForTest(async () => ({
     body: { cancel: () => { throw new Error("locked dummy body"); } },
-  } as unknown as Response)) as typeof fetch;
+  } as unknown as Response));
   assert.equal(await deadline().fetch("https://fixture.invalid/", {}, async () => "dummy-ok"), "dummy-ok");
 });
 
 test("AUD033: late fetch responses are cancelled after the caller timed out", async () => {
   let respond: (response: Response) => void = () => {};
   let cancellations = 0;
-  globalThis.fetch = (() => new Promise<Response>(resolve => { respond = resolve; })) as typeof fetch;
+  __setCaptchaTransportForTest(() => new Promise<Response>(resolve => { respond = resolve; }));
   const budget = deadline(30);
   await assert.rejects(budget.fetch("https://fixture.invalid/late", {}, async () => "unexpected"), /deadline/);
   respond({ body: { cancel: async () => { cancellations++; } } } as unknown as Response);
@@ -199,10 +201,10 @@ test("AUD033: config body parsing cannot outlive the original budget", async () 
     delete process.env.ZAI_CAPTCHA_SCENE;
     delete process.env.ZAI_CAPTCHA_PREFIX;
     let signal: AbortSignal | undefined;
-    globalThis.fetch = (async (_url, init) => {
+    __setCaptchaTransportForTest(async (_url, init) => {
       signal = init?.signal as AbortSignal;
-      return { ok: true, json: () => new Promise(() => {}), body: null } as unknown as Response;
-    }) as typeof fetch;
+      return new Response(new ReadableStream({ pull() { return new Promise(() => {}); } }));
+    });
     await assert.rejects(readConfig(deadline(40)), /deadline/);
     assert.equal(signal?.aborted, true);
   } finally {
@@ -216,11 +218,11 @@ test("AUD033: config body parsing cannot outlive the original budget", async () 
 test("AUD033: setup aborts cookie priming before any DOM or SDK network load", async () => {
   let signal: AbortSignal | undefined;
   let calls = 0;
-  globalThis.fetch = ((_url, init) => {
+  __setCaptchaTransportForTest((_url, init) => {
     calls++;
     signal = init?.signal as AbortSignal;
     return new Promise(() => {});
-  }) as typeof fetch;
+  });
   await assert.rejects(createDom("fixture", "fixture", deadline(40)), /deadline/);
   assert.equal(signal?.aborted, true);
   assert.equal(calls, 1);
@@ -228,7 +230,7 @@ test("AUD033: setup aborts cookie priming before any DOM or SDK network load", a
 
 test("AUD033: an expired absolute budget never starts config or solve setup", async () => {
   let calls = 0;
-  globalThis.fetch = (async () => { calls++; throw new Error("offline fixture forbids network"); }) as typeof fetch;
+  __setCaptchaTransportForTest(async () => { calls++; throw new Error("offline fixture forbids network"); });
   await assert.rejects(readConfig(deadline(1_000, Date.now() - 1)), /deadline/);
   await assert.rejects(solveTraceless({ scene: "fixture", deadlineAt: Date.now() - 1, reuseWindow: false }), /deadline/);
   assert.equal(calls, 0);

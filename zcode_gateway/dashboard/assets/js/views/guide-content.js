@@ -31,7 +31,7 @@ export const GUIDE = [
     ] },
     { title: "Read state, caps, and grant windows", tags: "ready cooling dead capped starts reset plan entitlement", steps: [
       "Ready means eligible at the pool level, not that every model is available. A model-specific cap can coexist with ready state. Cooling is temporary; dead indicates an account currently cannot serve normally.",
-      "Daily quota is per model. Reset times and plan ends differ; some grants start later or apply only during a window. Check the displayed start/reset time before assuming that a positive bucket is immediately spendable.",
+      "Daily quota is per model. Live remaining quota excludes future grants, which are tracked separately; a future grant does not block an already usable balance for the same model. Reset times and plan ends differ, so check the displayed start/reset time.",
       "A failed quota check shows an error and retains last-known values. These can be stale. Refresh quotas to retry; use Logs if the failure persists. No quota buckets after a successful check is different from a check that never succeeded.",
       "Enable restores eligibility but does not create quota, repair a revoked token, or remove a provider-side restriction. Runs counts current in-flight activity, not lifetime request usage.",
     ] },
@@ -70,6 +70,7 @@ export const GUIDE = [
       "An empty country or SOCKS subset cannot be fixed by increasing browser count. Verify the pool, broaden filters, use a valid pinned proxy, or deliberately select your own network.",
       "Kill stops the selected worker or claim. Stop all currently stops signup workers only; stop running claims individually. Finished rows are removed with Clear finished. Stopping after signup may leave an account awaiting email verification.",
       "Claim all pending processes locally saved successful signups without a recorded grant, one at a time. Direct (no proxy) is the default; Proxy pool, then direct is optional. Stop batch cancels its queue and current claim while leaving the gateway running. The progress line reports processed/granted/not-granted/skipped counts. Definitive empty previews are distinct from preview/network failures; no mode guarantees a grant.",
+      "The native Start Plan captcha helper supports direct, HTTP(S) and SOCKS proxy routes. SOCKS uses an internal loopback HTTP bridge; no public listener or extra firewall port is needed. Direct claims do not fall back to a proxy, but still follow OS VPN/TUN routing.",
     ] },
   ] },
   { id: "mail", title: "Email worker and routing", desc: "Worker authentication, DNS routing, and delivery are separate checks.", route: "generator", items: [
@@ -126,13 +127,13 @@ export const GUIDE = [
       "Previous-period comparison uses an equal preceding interval; All time has no comparison. Average latency includes failures, percentiles use successful samples, and recorded duration is not time to first token or full client latency. Bucket labels use the displayed browser timezone.",
     ] },
     { title: "Logs, refresh and saved configuration", tags: "debug errors warnings restart cache old UI", steps: [
-      "Logs reads the process's in-memory ring buffer with level/text filters. Restart clears this ring; Linux systemd logs remain in journalctl. Copy only the minimum useful lines and redact credentials or account exports.",
+      "Logs reads the process's in-memory ring buffer with level/text filters. Clear sets a view watermark: newer records still arrive, and changing filters does not restore older cleared records. It does not erase server logs. Restart clears the ring; Linux systemd logs remain in journalctl. Redact credentials before sharing lines.",
       "Settings marks unsaved rows and saves only changed values. Restart the gateway to apply configuration. Capture logging stores prompts/responses on disk. The key-regeneration control currently refers you to the desktop launcher rather than rotating keys itself. Restart differs from dashboard Refresh, Reload pool, quota checks and catalogue sync.",
       "If controls are missing or labels look old after an update, hard-refresh with Ctrl+Shift+R or test a private window. Browser JavaScript can remain cached even when the server binary was updated.",
     ] },
     { title: "Update safely on Windows and Linux", tags: "updater download restart apply checksum backup rollback release", steps: [
       "Use Settings > Check for updates now for a manual release check. Windows packaged builds offer Download update, then a separate Restart to apply action. Downloading does not stop work; applying requires generation, claim batches, proxy scans and client requests to be idle.",
-      "The Windows helper verifies the staged checksum again, waits for the app and its bootloader, preserves launch arguments/configuration/working directory, and retains a backup. Early startup exit triggers rollback; staying alive for ten seconds is not a complete application health check. Inspect the private helper update.log if relaunch fails.",
+      "The Windows helper verifies the staged checksum again, waits for the app and its bootloader, preserves launch arguments/configuration/working directory, and retains a backup. It requires a health response matching a per-launch nonce within 60 seconds; startup failure or timeout triggers rollback. This confirms startup, not inference or generation. Inspect the private helper update.log if relaunch fails.",
       "Linux notifications show release information, not a Windows exe download. Use sudo autozcoder update after stopping work. The manager stages matching gateway/manager assets from one release, verifies checksums, and rolls back deployment files if restart or health fails. Accounts/configuration are retained; keep a separate private backup.",
       "Published Linux builds require x86_64 and glibc 2.35 or newer. Source/custom supervisor installations need their own compatible build/runtime and manual restart policy. If generator dependencies are incompatible after staging, repair the environment rather than disabling checks. Neither updater needs your account export or Cloudflare token.",
     ] },
@@ -155,7 +156,8 @@ export const GUIDE = [
       "The Linux installer builds/downloads the gateway, provisions generator Python, Chromium/Xvfb, Node/Wrangler, direct HTTPS, a non-root service and renewal. HTTPS defaults to port 8443; issuance may fall back to self-signed TLS, so read the final report. No nginx is required. Builds/downloads can take several minutes.",
       "Run sudo autozcoder for the manager menu. status/logs inspect; start/stop/restart affect availability; update changes the binary and checks restart/health. Source updates need a current staged source tree, not just the old checkout already on the server.",
       "Trusted bare-IP certificates use short-lived issuance and automatic renewal. Port 80 must be reachable for standalone validation; keep firewall/provider rules aligned with the chosen dashboard port. If renewal fails, inspect the timer and installer log rather than repeatedly requesting certificates.",
-      "The service normally runs as autozcoder, not root. After manual copying, check ownership rather than chmod 777 or running as root. ZGW_SKIP_SYSTEMD=1 does not start a service or configure renewal: a custom supervisor must provide both. Uninstall removes runtime state; back up first.",
+      "sudo autozcoder cert stages and validates a certificate/key pair, checks gateway health under systemd, and restores prior TLS/configuration/renewal state if the change fails. The chosen TLS mode persists across reinstalls, including self-signed or loopback HTTP. Manager commands other than help require root.",
+      "The service normally runs as autozcoder, not root. The binary and private Node installation remain root-owned; generator/browser/npm maintenance uses an unprivileged tooling user. After manual copying, check ownership rather than chmod 777 or running as root. ZGW_SKIP_SYSTEMD=1 leaves startup and renewal to your supervisor. Uninstall removes runtime state; back up first.",
     ], commands: ["sudo autozcoder", "sudo autozcoder status", "sudo autozcoder logs", "sudo systemctl status autozcoder-renew.timer", "sudo tail -n 80 /var/log/autozcoder-install.log"] },
     { title: "Where data lives and what to back up", tags: "root opt config YAML database snapshots mail relays generator-data paths", steps: [
       "Default packaged Linux root: /opt/zcodegateway (custom ZGW_INSTALL_DIR can override it). config.yaml has gateway keys/settings; accounts/ has snapshots; gateway.db has usage history; generator-data/ has options, mail_config.json, relays.json and proxy/job data.",
@@ -217,7 +219,7 @@ export const ERRORS = [
     "Use Settings' connection/retry controls deliberately. A gateway-level client rate limit and an upstream provider overload are separate causes; check Logs for the failing stage.",
   ] },
   { title: "Quota check unavailable or Awaiting quota check", tags: "HTTP billing timeout stale refresh plans not checked", route: "accounts", steps: [
-    "Use Refresh quotas. Transport errors receive one retry; failed checks retain last-known data and show an error. Successful checks show their last-update time.",
+    "Use Refresh quotas. Transport errors receive one retry; failed checks retain last-known data and show an error. A billing HTTP 401 first checks for newer saved credentials; unresolved authentication failures use three consecutive strikes rather than immediate retirement. A billing HTTP 404 is a check error, not proof of a dead account. Successful checks show their last-update time.",
     "If it persists, check upstream/network availability and logs. Quota polling interval is not a strict per-account deadline: a slow sweep can delay later checks. Do not delete accounts just because billing temporarily times out.",
   ] },
   { title: "Inbox poll 401 / unauthorized", tags: "email secret INBOX_SECRET worker", route: "generator", steps: [

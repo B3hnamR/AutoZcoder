@@ -29,6 +29,9 @@ windows_only = pytest.mark.skipif(os.name != "nt",
 def windows_platform(monkeypatch):
     # Do not monkeypatch process-wide os.name: pathlib uses it too.
     monkeypatch.setattr(updater_mod, "os", SimpleNamespace(**{**vars(os), "name": "nt"}))
+    monkeypatch.setattr(updater_mod, "_startup_probe_spec", lambda _: {
+        "health_url": "http://127.0.0.1:1/health", "certificate_sha256": "",
+        "startup_nonce": "a" * 32})
 
 
 def test_parse_version_common_forms():
@@ -630,15 +633,16 @@ def test_powershell_swapper_local_fixture(tmp_path, early_failure):
     try:
         completed = subprocess.run([str(powershell), "-NoProfile", "-NonInteractive", "-File", str(script)],
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
-        assert completed.returncode == (1 if early_failure else 0), (helper / "update.log").read_text(encoding="utf-8-sig")
+        # Neither stub acknowledges health: staying alive must also roll back.
+        assert completed.returncode == 1, (helper / "update.log").read_text(encoding="utf-8-sig")
         deadline = time.monotonic() + 3
-        while (not marker.exists() or marker.read_text(encoding="utf-8").splitlines()[0] != ("old" if early_failure else "new")):
+        while (not marker.exists() or marker.read_text(encoding="utf-8").splitlines()[0] != "old"):
             if time.monotonic() > deadline:
                 pytest.fail((helper / "update.log").read_text(encoding="utf-8-sig"))
             time.sleep(0.05)
         lines = marker.read_text(encoding="utf-8").splitlines()
-        assert lines == ["old" if early_failure else "new", str(root), "Unicode \u03a9 & % ' arg", "1"]
-        assert _sha256(target.read_bytes()) == manifest["old_sha256" if early_failure else "sha256"]
+        assert lines == ["old", str(root), "Unicode \u03a9 & % ' arg", "1"]
+        assert _sha256(target.read_bytes()) == manifest["old_sha256"]
         assert _sha256((root / "backup.exe").read_bytes()) == manifest["old_sha256"]
         for name, content in sentinels.items():
             assert (root / name).read_bytes() == content

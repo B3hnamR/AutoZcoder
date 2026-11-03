@@ -200,8 +200,11 @@ async function reloadPool(reload) {
 
 /* ------------------------------------------------------- login modal ---- */
 
-async function loginWithZcode(reload) {
+async function loginWithZcode(reload, signal) {
+  if (signal.aborted) return;
   let poll = null;
+  let closed = false;
+  const controller = new AbortController();
   const status = el("div", { class: "field__help", text: "Opening the approval page…" });
   const link = el("a", {
     class: "btn btn--primary btn--sm",
@@ -222,16 +225,30 @@ async function loginWithZcode(reload) {
     ]),
     el("div", { class: "modal__foot" }, button({
       label: "Cancel", variant: "ghost",
-      onClick: () => { api.post("/admin/dash/auth/login/cancel").catch(() => {}); close(); },
+      onClick: cancel,
     })),
   ]);
   const overlay = el("div", { class: "overlay" }, modal);
   document.body.append(overlay);
 
-  function close() { clearInterval(poll); overlay.remove(); }
+  function close() {
+    if (closed) return;
+    closed = true;
+    clearTimeout(poll);
+    controller.abort();
+    signal.removeEventListener("abort", cancel);
+    overlay.remove();
+  }
+  function cancel() {
+    if (closed) return;
+    close();
+    api.post("/admin/dash/auth/login/cancel").catch(() => {});
+  }
+  signal.addEventListener("abort", cancel, { once: true });
 
   try {
-    const start = await api.post("/admin/dash/auth/login/start");
+    const start = await api.post("/admin/dash/auth/login/start", {}, { signal: controller.signal });
+    if (closed || signal.aborted) return;
     if (start?.verification_url) {
       link.href = start.verification_url;
       link.style.display = "";
@@ -239,14 +256,17 @@ async function loginWithZcode(reload) {
       window.open(start.verification_url, "_blank", "noopener");
     }
   } catch (e) {
+    if (closed || signal.aborted || e.name === "AbortError") return;
     status.textContent = "Could not start login: " + e.message;
     status.className = "field__error";
     return;
   }
 
-  poll = setInterval(async () => {
+  async function checkStatus() {
+    if (closed || signal.aborted) return;
     try {
-      const st = await api.get("/admin/dash/auth/login/status");
+      const st = await api.get("/admin/dash/auth/login/status", { signal: controller.signal });
+      if (closed || signal.aborted) return;
       if (st.verification_url) {
         link.href = st.verification_url;
         link.style.display = "";
@@ -256,13 +276,16 @@ async function loginWithZcode(reload) {
         close();
         toast("Account added", "ok");
         reload();
+        return;
       } else if (["error", "failed", "expired", "cancelled"].includes(st.state)) {
-        clearInterval(poll);
         status.textContent = st.error || ("Login " + st.state + ". Start again to retry.");
         status.className = "field__error";
+        return;
       }
     } catch (_) { /* keep waiting */ }
-  }, 1500);
+    if (!closed && !signal.aborted) poll = setTimeout(checkStatus, 1500);
+  }
+  if (!closed && !signal.aborted) poll = setTimeout(checkStatus, 1500);
 }
 
 /* ------------------------------------------------------------ render ---- */
@@ -279,7 +302,7 @@ function applyFilter(root) {
   if (none) none.hidden = shown > 0;
 }
 
-function render(root, accounts, pool, reload, batch) {
+function render(root, accounts, pool, reload, batch, signal) {
   const rows = accounts.map((a) => Object.assign(a, {
     __searchText: [a.email, a.id, a.state, a.source, ...(a.capped_models || [])]
       .filter(Boolean).join(" ").toLowerCase(),
@@ -306,7 +329,7 @@ function render(root, accounts, pool, reload, batch) {
   }));
 
   const bar = toolbar([
-    button({ label: "Login with Zcode", icon: "key", variant: "primary", onClick: () => loginWithZcode(reload) }),
+    button({ label: "Login with Zcode", icon: "key", variant: "primary", onClick: () => loginWithZcode(reload, signal) }),
     button({ label: "Import account", icon: "key", onClick: () => importJwt(reload) }),
     // No desktop Zcode app on a server: the import would always 404.
     gate(button({ label: "Import from app", icon: "copy", onClick: () => importFromApp(reload) }), "import_from_app"),
@@ -349,7 +372,7 @@ function render(root, accounts, pool, reload, batch) {
       title: "No accounts yet",
       text: "Sign in with Zcode to add the first one — no Zcode install needed.",
       actions: [
-        button({ label: "Login with Zcode", icon: "key", variant: "primary", onClick: () => loginWithZcode(reload) }),
+        button({ label: "Login with Zcode", icon: "key", variant: "primary", onClick: () => loginWithZcode(reload, signal) }),
         can("import_from_app")
           ? button({ label: "Import from app", onClick: () => importFromApp(reload) })
           : null,
@@ -403,16 +426,18 @@ function render(root, accounts, pool, reload, batch) {
 export async function mount({ root, signal }) {
   const batch = createClaimBatch({ signal, compact: true });
   const load = async () => {
+    if (signal.aborted) return;
     const [accs, pool] = await Promise.all([
       api.get("/admin/accounts", { signal }),
       api.get("/admin/pool/state", { signal }),
     ]);
+    if (signal.aborted) return;
     // Do not rebuild while the user is typing in the filter box.
     const active = document.activeElement;
     if (active && active.type === "search" && root.contains(active)) {
       return;
     }
-    render(root, accs.accounts || [], pool || {}, load, batch);
+    render(root, accs.accounts || [], pool || {}, load, batch, signal);
     batch.refresh();
   };
 

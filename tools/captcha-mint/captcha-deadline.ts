@@ -1,14 +1,19 @@
+import { bootstrapCaptchaRoute, captchaFetch, type CaptchaRoute } from "./captcha-transport.ts";
+
 /** One absolute budget, including setup, response bodies and SDK readiness. */
 export class CaptchaDeadline {
   readonly at: number;
   readonly controller = new AbortController();
+  readonly route: CaptchaRoute;
   private readonly timer: ReturnType<typeof setTimeout>;
 
-  constructor(timeoutMs = Number(process.env.CAPTCHA_SOLVE_TIMEOUT_MS || 20_000), at?: number) {
+  constructor(timeoutMs = Number(process.env.CAPTCHA_SOLVE_TIMEOUT_MS || 20_000), at?: number,
+    route: CaptchaRoute = bootstrapCaptchaRoute()) {
     if (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || (at !== undefined && !Number.isFinite(at))) {
       throw new Error("invalid captcha deadline");
     }
     this.at = Math.min(at ?? Infinity, Date.now() + timeoutMs);
+    this.route = route;
     this.timer = setTimeout(() => this.dispose(), Math.max(0, this.at - Date.now()));
   }
 
@@ -49,7 +54,7 @@ export class CaptchaDeadline {
     signal.addEventListener("abort", cancel, { once: true });
     try {
       return await this.run(async () => {
-        response = await fetch(url, { ...init, signal });
+        response = await captchaFetch(url, { ...init, signal }, this.route);
         try {
           this.remaining();
           return await consume(response);

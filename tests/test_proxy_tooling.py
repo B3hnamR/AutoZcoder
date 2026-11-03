@@ -593,3 +593,127 @@ def test_known_country_without_ip_timezone_still_matches(monkeypatch):
     ident = fingerprint.make_identity()
     assert ident["locale"] == "en-US"
     assert ident["timezone_id"].startswith("America/")
+
+
+class _ProbeResponse:
+    def __init__(self, url, body=b'', status=200, on_read=None):
+        self.url = url
+        self.status_code = status
+        self.headers = {'content-type': 'text/html', 'content-length': '0'}
+        self.encoding = 'utf-8'
+        self.body = body
+        self.closed = False
+        self.raw = self
+        self.on_read = on_read
+        self.read_sizes = []
+
+    def read1(self, size, decode_content=True):
+        self.read_sizes.append(size)
+        if self.on_read:
+            self.on_read()
+        chunk, self.body = self.body[:size], self.body[size:]
+        return chunk
+
+    def close(self):
+        self.closed = True
+
+
+def _probe_responses(monkeypatch, page=None, captcha=None):
+    page = page or _ProbeResponse(proxy_pool.CHECK_PAGE, b'z.ai' + b'x' * 1600)
+    captcha = captcha or _ProbeResponse(proxy_pool.CHECK_CAPTCHA, b'ok')
+    replies = iter([page, captcha])
+
+    def get(url, **kw):
+        assert kw['stream'] is True and kw['allow_redirects'] is False
+        assert kw['proxies'] == {'http': 'http://offline:80', 'https': 'http://offline:80'}
+        return next(replies)
+
+    monkeypatch.setattr(proxy_pool.requests, 'get', get)
+    return page, captcha
+
+
+@pytest.mark.parametrize('status', [403, 429, 500])
+def test_probe_captcha_requires_success_status(monkeypatch, status):
+    page, captcha = _probe_responses(monkeypatch, captcha=_ProbeResponse(
+        proxy_pool.CHECK_CAPTCHA, status=status))
+    assert proxy_pool.probe_detailed('http://offline:80')[1] == 'captcha_status'
+    assert page.closed and captcha.closed
+
+
+@pytest.mark.parametrize('stage', ['page', 'captcha'])
+def test_probe_rejects_redirect_hijack(monkeypatch, stage):
+    bad = _ProbeResponse('https://unrelated.invalid/', b'z.ai' + b'x' * 1600)
+    _probe_responses(monkeypatch, **{stage: bad})
+    assert proxy_pool.probe_detailed('http://offline:80')[1] == stage + '_redirect'
+    assert bad.closed
+
+
+@pytest.mark.parametrize('stage,limit', [('page', 1 << 20), ('captcha', 64 << 10)])
+def test_probe_size_caps_ignore_false_content_length(monkeypatch, stage, limit):
+    bad = _ProbeResponse(getattr(proxy_pool, 'CHECK_' + stage.upper()), b'z.ai' + b'x' * limit)
+    _probe_responses(monkeypatch, **{stage: bad})
+    assert proxy_pool.probe_detailed('http://offline:80')[1] == stage + '_too_large'
+    assert bad.closed and bad.read_sizes[0] == 1024
+    assert max(bad.read_sizes) <= 64 << 10
+
+
+def test_probe_success_streams_and_closes_both(monkeypatch):
+    page, captcha = _probe_responses(monkeypatch)
+    assert proxy_pool.probe_detailed('http://offline:80')[1] == 'ok'
+    assert page.closed and captcha.closed
+
+
+def test_probe_refuses_encoded_body_instead_of_unbounded_decompression(monkeypatch):
+    page, _ = _probe_responses(monkeypatch)
+    page.headers['content-encoding'] = 'gzip'
+    assert proxy_pool.probe_detailed('http://offline:80')[1] == 'bad_response'
+    assert page.closed and page.read_sizes == []
+
+
+def test_probe_shared_absolute_deadline(monkeypatch):
+    clock = [0.0]
+
+    def trickle():
+        clock[0] += 0.6
+
+    bad = _ProbeResponse(proxy_pool.CHECK_CAPTCHA, b'x' * 100000, on_read=trickle)
+    _probe_responses(monkeypatch, captcha=bad)
+    monkeypatch.setattr(proxy_pool.time, 'monotonic', lambda: clock[0])
+    assert proxy_pool.probe_detailed('http://offline:80', timeout=1)[1] == 'captcha_timeout'
+    assert bad.closed
+
+
+def test_body_deadline_interrupts_real_local_slow_trickle():
+    import requests
+    with socket.socket() as server:
+        server.bind(('127.0.0.1', 0))
+        server.listen(1)
+        server.settimeout(3)
+        port = server.getsockname()[1]
+        stop = threading.Event()
+
+        def respond():
+            with server.accept()[0] as conn:
+                conn.recv(4096)
+                conn.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n')
+                try:
+                    while not stop.wait(0.03):
+                        conn.sendall(b'x')
+                except OSError:
+                    pass
+
+        worker = threading.Thread(target=respond)
+        worker.start()
+        session = requests.Session()
+        session.trust_env = False
+        try:
+            with session.get(f'http://127.0.0.1:{port}', stream=True, timeout=1) as reply:
+                start = time.monotonic()
+                with pytest.raises((TimeoutError, requests.RequestException, OSError)):
+                    proxy_pool._probe_body(reply, 65536, start + 0.2)
+                assert time.monotonic() - start < 1
+        finally:
+            stop.set()
+            session.close()
+            worker.join(timeout=3)
+        assert not worker.is_alive()

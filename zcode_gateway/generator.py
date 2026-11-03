@@ -894,6 +894,8 @@ class GenWorker:
         self._thread = None
         self._finalized = False
         self._finalize_lock = threading.Lock()
+        self._lifecycle_lock = threading.Lock()
+        self._started = False
 
     def _rows_now(self) -> int:
         try:
@@ -904,6 +906,15 @@ class GenWorker:
             return 0
 
     def start(self):
+        with self._lifecycle_lock:
+            if self.stopped or self._finalized or self._started or self.state != "starting":
+                return
+            self._started = True
+            failed = self._start()
+        if failed:
+            self._finish()
+
+    def _start(self):
         env = os.environ.copy()
         env.update(self.env)
         env["PYTHONUNBUFFERED"] = "1"
@@ -916,16 +927,22 @@ class GenWorker:
         except Exception as e:
             self.state = "failed"
             self.lines.append(f"launch error: {type(e).__name__}")
-            self.result = {"qualified": False, "category": "launch_error", "error": "Worker could not launch"}
-            self._finish()
-            return
+            self.result = {"qualified": False, "category": "launch_failed", "error": "Worker could not launch"}
+            return True
         self.state = "running"
-        self._thread = threading.Thread(target=self._pump, daemon=True, name=self.name + "-output")
         try:
+            self._thread = threading.Thread(target=self._pump, daemon=True, name=self.name + "-output")
             self._thread.start()
         except Exception:
-            self.stop()
-            self._finish()
+            self._thread = None
+            _kill_tree(self.proc)
+            self.proc.wait()
+            if self.proc.stdout:
+                self.proc.stdout.close()
+            self.state = "failed"
+            self.result = {"qualified": False, "category": "launch_failed", "error": "Worker output thread could not start"}
+            return True
+        return False
 
     def _finish(self):
         with self._finalize_lock:
@@ -1025,11 +1042,13 @@ class GenWorker:
         return None
 
     def stop(self):
-        self.stopped = True
-        self.state = "killed"
-        if self.proc and self.proc.poll() is None:
-            _kill_tree(self.proc)
-        if self.proc is None:
+        with self._lifecycle_lock:
+            self.stopped = True
+            self.state = "killed"
+            if self.proc and self.proc.poll() is None:
+                _kill_tree(self.proc)
+            never_started = not self._started
+        if never_started:
             self._finish()
 
     def alive(self) -> bool:
@@ -1050,7 +1069,7 @@ class GenWorker:
             "giveaway500_unavailable": self.giveaway500_unavailable,
             "start_plan": self.start_plan,
             "global_build": getattr(self, "global_build", False),
-            "lines": list(self.lines)[-80:],
+            "lines": list(self.lines.copy())[-80:],
         }
 
 
@@ -1606,6 +1625,9 @@ class ClaimJob:
         self.lines: deque[str] = deque(maxlen=220)
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
+        self._finalize_lock = threading.Lock()
+        self._finalized = False
+        self._started = False
         self.on_exit = None          # set by the gateway (claim settle hook)
 
     def _build_argv(self) -> list[str]:
@@ -1629,10 +1651,12 @@ class ClaimJob:
         self.argv = self._build_argv()
 
     def fail(self, message: str) -> None:
-        self.lines.append(message)
-        self.state = "failed"
-        self.finished = time.time()
-        self.done.set()
+        with self._lock:
+            if self._started or self._finalized:
+                return
+            self.lines.append(message)
+            self.state = "failed"
+        self._finish(notify=False)
 
     def alive(self) -> bool:
         if self.proc is not None:
@@ -1642,9 +1666,12 @@ class ClaimJob:
 
     def start(self):
         with self._lock:
-            if self.stopped:
+            if self.stopped or self._finalized or self._started or self.state != "starting":
                 return
-            self._start()
+            self._started = True
+            failed = self._start()
+        if failed:
+            self._finish()
 
     def _start(self):
         env = os.environ.copy()
@@ -1666,11 +1693,20 @@ class ClaimJob:
         except Exception as e:
             self.state = "failed"
             self.lines.append(f"launch error: {e}")
-            self.finished = time.time()
-            self.done.set()
-            return
-        self._thread = threading.Thread(target=self._pump, daemon=True)
-        self._thread.start()
+            return True
+        try:
+            self._thread = threading.Thread(target=self._pump, daemon=True)
+            self._thread.start()
+        except Exception:
+            self._thread = None
+            _kill_tree(self.proc)
+            self.proc.wait()
+            if self.proc.stdout:
+                self.proc.stdout.close()
+            self.state = "failed"
+            self.lines.append("claim output thread could not start")
+            return True
+        return False
 
     def to_public(self) -> dict:
         # strip the private claim JWT before the result reaches the dashboard
@@ -1682,9 +1718,21 @@ class ClaimJob:
                 "proxy": re.sub(r"//[^/]*@", "//", self.proxy) if self.proxy else "", "state": self.state,
                 "elapsed": int((self.finished or time.time()) - self.started) if self.started else 0,
                 "result": res,
-                "lines": list(self.lines)[-12:]}
+                "lines": list(self.lines.copy())[-12:]}
 
     def _pump(self):
+        try:
+            self._pump_body()
+        except Exception:
+            _kill_tree(self.proc)
+            if self.proc:
+                self.proc.wait()
+            self.state = "killed" if self.stopped else "failed"
+            log.exception("claim output processing failed for %s", self.name)
+        finally:
+            self._finish()
+
+    def _pump_body(self):
         import json as _json
         assert self.proc and self.proc.stdout
         for line in self.proc.stdout:
@@ -1705,24 +1753,32 @@ class ClaimJob:
                 continue
             self.lines.append(line)
         self.proc.wait()
-        self.finished = time.time()
         self.state = "killed" if self.stopped else "exited" if self.proc.returncode == 0 else "failed"
+
+    def _finish(self, notify=True):
+        with self._finalize_lock:
+            if self._finalized:
+                return
+            self._finalized = True
+        self.finished = time.time()
         # completion hook: let the gateway re-settle the account (a dead
         # account that just claimed a plan must return to rotation)
-        if self.on_exit:
-            try:
+        try:
+            if notify and self.on_exit:
                 self.on_exit(self)
-            except Exception:
-                log.exception("claim on_exit callback failed for %s", self.email)
-        self.done.set()
+        except Exception:
+            log.exception("claim on_exit callback failed for %s", self.email)
+        finally:
+            self.done.set()
 
     def stop(self):
         with self._lock:
             self.stopped = True
             _kill_tree(self.proc)
             self.state = "killed"
-            self.finished = time.time()
-            self.done.set()
+            never_started = not self._started
+        if never_started:
+            self._finish(notify=False)
 
 
 class GeneratorManager:
@@ -3523,11 +3579,11 @@ class GeneratorManager:
             emit = lambda line: log.info("playwright-setup: %s", line)
         return self.playwright.ensure(self.python_exe, emit)
 
-    def _ensure_display(self, *, interactive: bool = False) -> str:
+    def _ensure_display(self, *, interactive: bool = False, mode: str | None = None) -> str:
         """Headed signup needs X11. Own a virtual display when Xvfb is available."""
         if not sys.platform.startswith("linux"):
             return ""
-        mode = getattr(self, "browser_display", "auto")
+        mode = mode if mode is not None else getattr(self, "browser_display", "auto")
         if os.environ.get("DISPLAY") and (interactive or mode != "virtual"):
             return ""
         if interactive:
@@ -3688,12 +3744,7 @@ class GeneratorManager:
         # must own it and clean it up at shutdown.
         if __import__('sys').platform.startswith("linux"):
             snapshot.browser_display = "virtual" if background else "desktop"
-            original = self.browser_display
-            try:
-                self.browser_display = snapshot.browser_display
-                problem = self._ensure_display(interactive=False)
-            finally:
-                self.browser_display = original
+            problem = self._ensure_display(interactive=False, mode=snapshot.browser_display)
             if problem:
                 raise ValueError(problem)
             snapshot._display = self._display
@@ -3713,7 +3764,8 @@ class GeneratorManager:
         snapshot = self._auto_runtime_snapshot
         env = snapshot._worker_env(name)
         env.update(ZAI_AUTO_GENERATE="1", ZAI_ROUTE_POLICY=config["ip_source"],
-                   ZAI_WORKER_ID=name, ZAI_PROXY_RETRIES="0", ZAI_AUTO_RUN_ID=attempt_id.rsplit("-", 1)[0])
+                   ZAI_WORKER_ID=name, ZAI_PROXY_RETRIES="0", ZAI_AUTO_RUN_ID=attempt_id.rsplit("-", 1)[0],
+                   ZAI_AUTO_ATTEMPT_ID=attempt_id)
         private = self.data_dir / "auto-private"
         private.mkdir(mode=0o700, exist_ok=True)
         env["ZAI_AUTO_ROUTE_FILE"] = str(private / (name + ".json"))
@@ -3725,6 +3777,11 @@ class GeneratorManager:
             self.workers[name] = worker
         worker.start()
         return worker
+
+    def record_auto_registration(self, run_id: str, attempt_id: str, account_id: str) -> None:
+        if run_id != self.auto_generate.status()["id"] or not attempt_id.startswith(run_id + "-"):
+            raise ValueError("registration does not belong to this auto run")
+        self.auto_generate.record_registration(attempt_id, account_id)
 
     def _worker_log_path(self, name: str) -> Path:
         """Sorted per-worker logs: <data>/logs/workers/<name>_<HHMMSS>.log"""
@@ -3922,6 +3979,8 @@ class GeneratorManager:
         if w.stopped or self._closed.is_set():
             w.result = {"qualified": False, "category": "stopped" if w.stopped else "failed"}
             return
+        if w.result.get("category") == "launch_failed":
+            return
         if w.env.get("ZAI_AUTO_GENERATE") == "1":
             category = w.script_result.get("category", "failed")
             if category != "generated":
@@ -3936,6 +3995,8 @@ class GeneratorManager:
                 w.result = {"qualified": False, "category": category, "error": w.script_result.get("message", "No qualifying account produced")}
                 return
             new.update(auto_generate=True, route_policy=w.env.get("ZAI_ROUTE_POLICY"),
+                       auto_run_id=w.env.get("ZAI_AUTO_RUN_ID", ""),
+                       auto_attempt_id=w.env.get("ZAI_AUTO_ATTEMPT_ID", ""),
                        cancelled=lambda: w.stopped or self._closed.is_set())
             route_file = Path(w.env["ZAI_AUTO_ROUTE_FILE"])
             try:
@@ -3983,8 +4044,10 @@ class GeneratorManager:
     def stop_all(self):
         if getattr(self, "auto_generate", None):
             self.auto_generate.stop()
-        for w in self.workers.values():
-            if w.alive():
+        with self._lock:
+            workers = list(self.workers.values())
+        for w in workers:
+            if not w.done.is_set():
                 w.stop()
 
     def shutdown(self) -> None:
@@ -3996,10 +4059,10 @@ class GeneratorManager:
             self._claim_all_cancel.set()
             jobs = list(self.claims.values())
             workers = list(self.workers.values())
-            for job in jobs:
-                job.stop()
-            for worker in workers:
-                worker.stop()
+        for job in jobs:
+            job.stop()
+        for worker in workers:
+            worker.stop()
         try:
             self.checker.shutdown()
             for job in jobs + workers:
@@ -4035,9 +4098,10 @@ class GeneratorManager:
         return True
 
     def remove_finished_workers(self) -> int:
-        names = [n for n, w in self.workers.items() if w.done.is_set()]
-        for n in names:
-            self.workers.pop(n, None)
+        with self._lock:
+            names = [n for n, w in self.workers.items() if w.done.is_set()]
+            for n in names:
+                self.workers.pop(n, None)
         return len(names)
 
     # ---- per-account 100M claims (Accounts tab) ------------------------------ #
@@ -4143,7 +4207,7 @@ class GeneratorManager:
                 if job.stopped or self._closed.is_set():
                     return
                 job.set_route(mode, proxy)
-                job.start()
+            job.start()
         except Exception as exc:
             log.exception("claim %s could not start", job.name)
             from .neterr import friendly
@@ -4320,7 +4384,9 @@ class GeneratorManager:
         return ""
 
     def claims_public(self) -> list[dict]:
-        return [j.to_public() for j in self.claims.values()]
+        with self._lock:
+            jobs = list(self.claims.values())
+        return [j.to_public() for j in jobs]
 
     def _adopt_python(self, py: str) -> None:
         """The environment setup settled on a (venv) interpreter: use it for
@@ -4350,16 +4416,20 @@ class GeneratorManager:
         return True
 
     def clear_finished_claims(self) -> int:
-        names = [n for n, j in self.claims.items() if not j.alive()]
-        for n in names:
-            self.claims.pop(n, None)
+        with self._lock:
+            names = [n for n, j in self.claims.items() if j.done.is_set()]
+            for n in names:
+                self.claims.pop(n, None)
         return len(names)
 
     def status(self) -> dict:
+        with self._lock:
+            workers = list(self.workers.values())
+            claims = list(self.claims.values())
         return {
             "options": self.options(),
-            "workers": [w.to_public() for w in self.workers.values()],
-            "claims": self.claims_public(),
-            "alive": sum(1 for w in self.workers.values() if w.alive()),
+            "workers": [w.to_public() for w in workers],
+            "claims": [j.to_public() for j in claims],
+            "alive": sum(1 for w in workers if w.alive()),
             "auto_generate": self.auto_generate.status(),
         }

@@ -39,6 +39,9 @@ jobs:
               raise SystemExit("Release dispatch must select a tag, not a branch")
           if not re.fullmatch(r"v\d+\.\d+\.\d+", tag):
               raise SystemExit("Expected a vMAJOR.MINOR.PATCH release tag")
+          notes = Path("docs/releases") / f"{tag[1:]}.md"
+          if not notes.is_file():
+              raise SystemExit(f"Release notes file is required: {notes}")
           module = ast.parse(Path("zcode_gateway/__init__.py").read_text(encoding="utf-8"))
           versions = [ast.literal_eval(node.value) for node in module.body
                       if isinstance(node, ast.Assign)
@@ -264,6 +267,9 @@ jobs:
       GH_REPO: ${{ github.repository }}
       RELEASE_TAG: ${{ github.ref_name }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -308,19 +314,19 @@ jobs:
       - name: Create or resume a draft without modifying a public release
         run: |
           set -euo pipefail
+          notes_file="docs/releases/${RELEASE_TAG#v}.md"
+          test -f "$notes_file"
           # A failed lookup is not treated as absence: auth/network failures fail closed.
           gh api --paginate "repos/$GH_REPO/releases?per_page=100" --jq '.[] | {tag_name, draft}' | jq -s '.' > releases.json
           state=$(jq -r --arg tag "$RELEASE_TAG" '[.[] | select(.tag_name == $tag)] | if length == 0 then "absent" elif length == 1 and .[0].draft then "draft" else "public" end' releases.json)
           case "$state" in
             absent)
-              gh release create "$RELEASE_TAG" --verify-tag --draft --generate-notes --title "$RELEASE_TAG"
+              gh release create "$RELEASE_TAG" --verify-tag --draft --notes-file "$notes_file" --title "$RELEASE_TAG"
               ;;
             draft) ;;
             *) echo "Refusing to overwrite existing public release $RELEASE_TAG" >&2; exit 1 ;;
           esac
-          gh release view "$RELEASE_TAG" --json body --jq '.body' > release-notes.txt
-          printf '\nLinux runtime baseline: x86_64 Ubuntu 22.04 / glibc 2.35 or newer with compatible system libraries. Older glibc, musl/Alpine and other architectures are not supported by this binary.\n' >> release-notes.txt
-          gh release edit "$RELEASE_TAG" --notes-file release-notes.txt
+          gh release edit "$RELEASE_TAG" --notes-file "$notes_file"
       - name: Upload all five assets while the release remains a draft
         run: |
           gh release upload "$RELEASE_TAG" \

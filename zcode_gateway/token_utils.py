@@ -1,6 +1,8 @@
 from typing import Any
 from pathlib import Path
 import os, json
+import tempfile
+from .accounts_dir import snapshot_transaction
 from .config import Config
 from .pool import Account
 
@@ -38,9 +40,20 @@ def _atomic_write(path: Path, text: str) -> None:
     full, AV lock), leaving a partial pool that fails to parse on the next
     start. os.replace is atomic on the same volume, including Windows.
     """
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(text, encoding="utf-8", newline="\n")
-    os.replace(tmp, path)
+    path = Path(path)
+    with snapshot_transaction(path.parent) as folder:
+        path = folder / path.name
+        if path.is_symlink() or path.resolve().parent != folder:
+            raise ValueError("pool snapshot path escapes its directory")
+        folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd, name = tempfile.mkstemp(prefix=".pool-", suffix=".tmp", dir=folder)
+        tmp = Path(name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
+                stream.write(text)
+            os.replace(tmp, path)
+        finally:
+            tmp.unlink(missing_ok=True)
 
 
 def persist_pool_snapshot(cfg: Config, accounts: list[Account]) -> None:
@@ -62,9 +75,4 @@ def persist_pool_snapshot(cfg: Config, accounts: list[Account]) -> None:
             for a in accounts
         ]
     }
-    path.parent.mkdir(parents=True, exist_ok=True)
     _atomic_write(path, json.dumps(payload, indent=2))
-    try:
-        path.chmod(0o600)
-    except OSError:
-        pass

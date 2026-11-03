@@ -47,6 +47,7 @@ from plan_check import (          # noqa: E402
     APP_VERSION,
     PLATFORM,
     PreviewError,
+    _proxies,
     _request,
     claim_plan,
     direct_requests,
@@ -58,22 +59,137 @@ from plan_check import (          # noqa: E402
 )
 
 FALLBACK_PROXIES = 2
+SIDECAR_STDOUT_BYTES = 64 << 10
+SIDECAR_STDERR_BYTES = 256 << 10
+SIDECAR_TIMEOUT = 120
+
+
+def _run_sidecar(argv, env):
+    """Bound both pipes independently and reap the owned process tree on every exit."""
+    import signal
+    import subprocess
+    import threading
+    job = None
+    kernel = None
+    child = None
+    readers = []
+    streams = [bytearray(), bytearray()]
+    failed = threading.Event()
+    deadline = time.monotonic() + SIDECAR_TIMEOUT
+    try:
+        if os.name == 'nt':
+            import ctypes
+            from ctypes import wintypes
+
+            class BasicLimits(ctypes.Structure):
+                _fields_ = [('process_time', ctypes.c_int64), ('job_time', ctypes.c_int64),
+                            ('flags', wintypes.DWORD), ('min_ws', ctypes.c_size_t),
+                            ('max_ws', ctypes.c_size_t), ('active', wintypes.DWORD),
+                            ('affinity', ctypes.c_size_t), ('priority', wintypes.DWORD),
+                            ('scheduling', wintypes.DWORD)]
+
+            class Limits(ctypes.Structure):
+                _fields_ = [('basic', BasicLimits), ('io', ctypes.c_uint64 * 6),
+                            ('process_mem', ctypes.c_size_t), ('job_mem', ctypes.c_size_t),
+                            ('peak_process_mem', ctypes.c_size_t), ('peak_job_mem', ctypes.c_size_t)]
+
+            kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+            kernel.CreateJobObjectW.restype = wintypes.HANDLE
+            kernel.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+            kernel.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int,
+                                                       ctypes.c_void_p, wintypes.DWORD]
+            kernel.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+            kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+            job = kernel.CreateJobObjectW(None, None)
+            limits = Limits()
+            limits.basic.flags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            if not job or not kernel.SetInformationJobObject(job, 9, ctypes.byref(limits),
+                                                             ctypes.sizeof(limits)):
+                raise OSError('cannot create owned sidecar job')
+        child = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 creationflags=(0x4 if os.name == 'nt' else 0),
+                                 start_new_session=(os.name != 'nt'))
+        if job and not kernel.AssignProcessToJobObject(job, int(child._handle)):
+            raise OSError('cannot assign sidecar to owned job')
+        if job:
+            ntdll = ctypes.WinDLL('ntdll')
+            ntdll.NtResumeProcess.argtypes = [wintypes.HANDLE]
+            if ntdll.NtResumeProcess(int(child._handle)) != 0:
+                raise OSError('cannot resume owned sidecar')
+
+        def drain(pipe, target, limit):
+            try:
+                while True:
+                    chunk = pipe.read1(min(4096, limit - len(target) + 1))
+                    if not chunk:
+                        break
+                    if len(target) + len(chunk) > limit:
+                        failed.set()
+                        break
+                    target.extend(chunk)
+            except (OSError, ValueError):
+                failed.set()
+
+        for pipe, target, limit in zip((child.stdout, child.stderr), streams,
+                                        (SIDECAR_STDOUT_BYTES, SIDECAR_STDERR_BYTES)):
+            reader = threading.Thread(target=drain, args=(pipe, target, limit), daemon=True)
+            readers.append(reader)
+            reader.start()
+        while child.poll() is None or any(r.is_alive() for r in readers):
+            if failed.is_set():
+                raise ValueError('sidecar output limit exceeded')
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError('sidecar deadline exceeded')
+            failed.wait(min(0.02, remaining))
+        if failed.is_set():
+            raise ValueError('sidecar output limit exceeded')
+        return subprocess.CompletedProcess(argv, child.returncode,
+                                           bytes(streams[0]).decode('utf-8', errors='strict'),
+                                           bytes(streams[1]).decode('utf-8', errors='replace'))
+    finally:
+        if job:
+            kernel.CloseHandle(job)  # also kills descendants after the parent exited
+        if child is not None:
+            if os.name != 'nt':
+                try:
+                    os.killpg(child.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=5)
+            for reader in readers:
+                reader.join(timeout=1)
+            for pipe in (child.stdout, child.stderr):
+                pipe.close()
 
 
 def _captcha_config(log) -> dict:
     """`data.configs.captcha` from /client/configs — {enabled, prefix, sceneId, region}."""
+    r = None
     try:
+        from proxy_pool import _probe_body
+        deadline = time.monotonic() + 15
         r = _request(
             "GET", "https://zcode.z.ai/api/v1/client/configs",
             params={"app_version": APP_VERSION, "platform": PLATFORM},
-            timeout=15, verify=_VERIFY, log=log, tries=1,
+            headers={'Accept-Encoding': 'identity'},
+            timeout=15, verify=_VERIFY, log=log, tries=1, stream=True,
+            allow_redirects=False,
         )
-        cfg = ((r.json() or {}).get("data") or {}).get("configs", {}).get("captcha") or {}
+        if r.status_code != 200:
+            raise ValueError(f'captcha config HTTP {r.status_code}')
+        cfg = json.loads(_probe_body(r, 64 << 10, deadline)).get("data", {}).get("configs", {}).get("captcha") or {}
         if cfg.get("enabled") and cfg.get("sceneId"):
             return cfg
         log(f"  claim_start: captcha config disabled/empty ({str(cfg)[:120]})")
     except Exception as e:
         log(f"  claim_start: captcha config failed ({type(e).__name__}: {e})")
+    finally:
+        if r is not None and callable(getattr(r, 'close', None)):
+            r.close()
     return {}
 
 
@@ -120,23 +236,30 @@ def _captcha_token(log, force_direct=False):
             cmd = f'"{mint}"'
     if cmd:
         import shlex
-        import subprocess
-        cfg = _captcha_config(log)
+        from sidecar_proxy import sidecar_proxy_route
+        with direct_requests(force_direct):
+            cfg = _captcha_config(log)
+            route = _proxies() or {}
         scene = cfg.get("sceneId", "")
         region = cfg.get("region", "sgp")
         prefix = cfg.get("prefix", "")
         env = dict(os.environ, ZAI_CAPTCHA_SCENE=scene, ZAI_CAPTCHA_REGION=region,
                    ZAI_CAPTCHA_PREFIX=prefix, ZAI_APP_VERSION=APP_VERSION)
-        if force_direct:
-            for key in list(env):
-                if key.upper() in ('ZAI_PROXY', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY'):
-                    env.pop(key)
-            env['NO_PROXY'] = '*'
+        for key in list(env):
+            if key.upper() in ('ZAI_PROXY', 'ZAI_CAPTCHA_PROXY', 'HTTP_PROXY', 'HTTPS_PROXY',
+                               'ALL_PROXY', 'NO_PROXY'):
+                env.pop(key)
+        selected = route.get('https', '')
+        env['ZAI_CAPTCHA_PROXY'] = selected
+        env['NO_PROXY'] = '*'
+        if selected:
+            env['ZAI_PROXY'] = selected
         try:
             bare = cmd.strip().strip('"')
             argv = [bare] if os.path.isfile(bare) else shlex.split(cmd)
-            out = subprocess.run(argv, capture_output=True, text=True,
-                                 timeout=120, env=env)
+            with sidecar_proxy_route(selected) as sidecar_route:
+                env['ZAI_CAPTCHA_PROXY'] = sidecar_route
+                out = _run_sidecar(argv, env)
             # Exactly one `<param> <region>` record, not a best-effort scan of
             # logs. A failed child must never hand its partial token upstream.
             record = re.fullmatch(r"([^\s]+) ([A-Za-z0-9_-]+)(?:\r?\n)?",
@@ -313,7 +436,8 @@ def _run_chain(token: str, plan_id: str, log, force_direct: bool,
     last_code = None
     last_msg = ''
     fresh = False
-    unavailable = False
+    terminal_codes = []
+    route_error = None
     for pid in candidates:
         for attempt in range(1, claim_attempts + 1):
             # a token is single-use: mint a fresh one for every attempt
@@ -326,6 +450,8 @@ def _run_chain(token: str, plan_id: str, log, force_direct: bool,
             last_code = code
             last_msg = f'{pid}: {code} {msg}'
             log(f'  claim_start: claim {pid} attempt {attempt} -> {code} {msg}')
+            if _is_route_problem(code, msg):
+                route_error = (code, last_msg)
             if code == 0:
                 fresh = True
                 break
@@ -338,9 +464,9 @@ def _run_chain(token: str, plan_id: str, log, force_direct: bool,
             if code == 1001:
                 break                 # this plan is gone — try the next offer
             if code == 1005:
-                unavailable = True
                 break
             time.sleep(2)
+        terminal_codes.append(last_code)
         if fresh or res['needs_captcha']:
             break
 
@@ -376,11 +502,21 @@ def _run_chain(token: str, plan_id: str, log, force_direct: bool,
         res['error'] = ('the claim endpoint asked for the Aliyun captcha '
                         '(3007) — this account needs the in-page/browser mint')
         res['route_problem'] = False
-    if unavailable:
+    if route_error and not fresh and not res['needs_captcha']:
+        res['code'], res['error'] = route_error
+        res['route_problem'] = True
+    if (not route_error and len(terminal_codes) == len(candidates)
+            and all(c == 1005 for c in terminal_codes)):
         res['unavailable'] = True
         res['route_problem'] = False
         res['error'] = ('nothing was granted: the server answered 1005 '
                         '(quota/limit) for every offered plan')
+    if plan.get('error'):
+        res['code'] = plan.get('code', -1)
+        res['error'] = plan['error']
+        res['balance_error'] = plan.get('error_kind')
+        res['route_problem'] = plan.get('route_problem', True)
+        res.pop('unavailable', None)
     return res, zjwt
 
 

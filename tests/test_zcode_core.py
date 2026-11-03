@@ -39,7 +39,7 @@ def service(cfg):
     pool=PoolManager(cfg.pool,[Account(id='one',access_token='test-token')])
     store=Store(cfg.store.sqlite_path)
     class FakeTokens:
-        async def refresh(self, account, force=False): return False
+        async def refresh(self, account, force=False, *, expected_credentials=None): return False
     svc=ChatService(cfg,pool,FakeTokens(),FakeClient(),Registry(),store,JsonlCapture(cfg.logging.capture_dir,False))
     yield svc
     store.close()

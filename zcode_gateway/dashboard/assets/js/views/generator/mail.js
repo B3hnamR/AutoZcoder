@@ -236,19 +236,38 @@ export function createMailCard() {
     const account = fields.account.value.trim();
     if (!token && !account) { toast("Enter a token first", "warn"); return; }
     try {
-      await api.post("/admin/dash/generator/mail/cf-credentials", { cf_token: token, cf_account_id: account });
-      fields.token.value = "";
-      toast("Token saved", "ok");
+      const r = await api.post("/admin/dash/generator/mail/cf-credentials", { cf_token: token, cf_account_id: account });
+      if (!r || r.saved === false || (!r.ok && r.saved !== true)) {
+        throw new Error(r?.error || "Token was not saved.");
+      }
+      if (fields.token.value.trim() === token) fields.token.value = "";
+      const unverified = !r.ok || r.verified === false;
+      state.message = unverified
+        ? (r.error || "Token saved, but Cloudflare verification is pending. Retry verification before setup.")
+        : "Token saved";
+      toast(state.message, unverified ? "warn" : "ok");
       await refresh();
-    } catch (e) { toast("save: " + e.message, "err"); }
+    } catch (e) {
+      state.message = "Token was not saved: " + e.message;
+      messageLine.textContent = state.message;
+      messageLine.hidden = false;
+      toast(state.message, "err");
+    }
   }
 
   async function clearToken() {
     try {
-      await api.post("/admin/dash/generator/mail/cf-credentials", { cf_token: "", clear: true });
-      toast("Saved token removed", "ok");
+      const r = await api.post("/admin/dash/generator/mail/cf-credentials", { cf_token: "", clear: true });
+      if (!r?.ok) throw new Error(r?.error || "Saved token was not removed.");
+      state.message = "Saved token removed";
+      toast(state.message, "ok");
       await refresh();
-    } catch (e) { toast("remove: " + e.message, "err"); }
+    } catch (e) {
+      state.message = "Token was not removed: " + e.message;
+      messageLine.textContent = state.message;
+      messageLine.hidden = false;
+      toast(state.message, "err");
+    }
   }
 
   async function testInbox() {
@@ -311,6 +330,7 @@ export function createMailCard() {
   };
 
   const statusLine = el("div", { class: "text-sm", role: "status" });
+  const statusError = el("p", { class: "field__error", role: "alert", hidden: true });
   const messageLine = el("p", { class: "text-sm" });
   const routingBox = el("div", { class: "stack--tight" });
   const logBox = el("pre", { class: "code", hidden: true });
@@ -354,7 +374,10 @@ export function createMailCard() {
     fields.inboxSecret.placeholder = m.inbox_secret_set
       ? "Secret saved; leave empty to keep it" : "Filled automatically after setup";
     // Do not fight the user's cursor; only adopt the server value when idle.
-    if (document.activeElement !== fields.inboxUrl) fields.inboxUrl.value = m.inbox_url || "";
+    if (document.activeElement !== fields.inboxUrl && fields.inboxUrl.value === fields.inboxUrl.defaultValue) {
+      fields.inboxUrl.value = m.inbox_url || "";
+      fields.inboxUrl.defaultValue = fields.inboxUrl.value;
+    }
 
     fill(clearBtnSlot, m.cf_token_set
       ? button({ label: "Remove saved token", variant: "quiet", onClick: clearToken })
@@ -394,6 +417,7 @@ export function createMailCard() {
         el("span", { class: "field__help", text: "First setup takes 1–2 minutes. Retries reuse the saved worker." }),
       ]),
       statusLine,
+      statusError,
       messageLine,
       routingBox,
       inboxLine,
@@ -437,12 +461,16 @@ export function createMailCard() {
   async function refresh() {
     try {
       const m = await api.get("/admin/dash/generator/mail");
-      if (!body.children.length) build();
+      statusError.hidden = true;
       paint(m);
     } catch (e) {
-      fill(body, el("p", { class: "field__error", text: e.message }));
+      statusError.textContent = "Email status unavailable: " + e.message + ". Use Refresh to retry; your entries are kept.";
+      statusError.hidden = false;
+      deployBtn.disabled = state.deploying;
+      for (const f of Object.values(fields)) f.disabled = state.deploying;
     }
   }
 
+  build();
   return { node, refresh };
 }

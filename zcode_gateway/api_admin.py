@@ -130,7 +130,7 @@ async def delete_account(request: Request, account_id: str,
 async def import_jwt_account(request: Request, body: dict[str, Any] = Body(...),
                              key: str = Depends(admin_key)) -> JSONResponse:
     """Validate an account transfer or CLI JWT before persisting it."""
-    from .accounts_dir import parse_snapshot, snapshot_filename, snapshot_path, write_snapshot
+    from .accounts_dir import save_account_snapshot
     from .upstream import build_headers
     from .zcode_detect import jwt_claims
 
@@ -212,11 +212,11 @@ async def import_jwt_account(request: Request, body: dict[str, Any] = Body(...),
         # Exceptions can embed upstream content/headers. Return no raw values.
         raise HTTPException(502, "Could not validate token with Zcode; nothing imported. Retry later.") from None
 
-    if not hasattr(state, "jwt_import_lock"):
-        state.jwt_import_lock = asyncio.Lock()
+    if not hasattr(state, "account_persist_lock"):
+        state.account_persist_lock = asyncio.Lock()
     # Serialize filename allocation and pool-file writes, and use the existing
     # per-account refresh lock so importing cannot race credential adoption.
-    async with state.jwt_import_lock, state.tokens._lock_for(ident):
+    async with state.account_persist_lock, state.tokens._lock_for(ident):
         existing = await state.pool.find(ident)
         email = email or (existing.email if existing else "")
         account = Account(id=ident, email=email, access_token=token,
@@ -232,17 +232,13 @@ async def import_jwt_account(request: Request, body: dict[str, Any] = Body(...),
         try:
             if state.cfg.accounts.source == "accounts_dir":
                 folder = Path(state.cfg.accounts.dir)
-                used = {p.name: parse_snapshot(p).get("account_id") for p in folder.glob("*.txt")}
-                filename = next((name for name, owner in used.items() if owner == ident),
-                                snapshot_filename(email, ident, used))
-                previous = parse_snapshot(snapshot_path(folder, filename))
-                previous.update(account_id=ident, email=email, name=account.notes["name"],
+                fields = dict(account_id=ident, email=email, name=account.notes["name"],
                                 access_token=token, expires_at_ms=str(account.expires_at),
                                 source="Manual JWT import", imported_jwt="true")
                 if device:
-                    previous["device_mid"] = device
-                await asyncio.to_thread(write_snapshot, snapshot_path(folder, filename), previous)
-                account.notes["file"] = filename
+                    fields["device_mid"] = device
+                path = await asyncio.to_thread(save_account_snapshot, folder, fields)
+                account.notes["file"] = path.name
             else:
                 accounts = [a for a in await state.pool.all() if a.id != ident] + [account]
                 await asyncio.to_thread(persist_pool_snapshot, state.cfg, accounts)
@@ -461,7 +457,9 @@ async def reload_pool(request: Request, key: str = Depends(admin_key)) -> dict:
                 existing,
                 access_token=account.access_token,
                 refresh_token=account.refresh_token,
-                expires_at=account.expires_at)
+                expires_at=account.expires_at, email=account.email,
+                name=account.notes.get("name"), device_mid=account.notes.get("device_mid"),
+                notes=account.notes)
             updated += 1
             # re-settle plan/balance too — a re-exported snapshot after a plan
             # change (e.g. Global Build issued) must surface here, otherwise the
@@ -481,8 +479,11 @@ async def reload_pool(request: Request, key: str = Depends(admin_key)) -> dict:
 @router.post("/pool/persist")
 async def persist_pool(request: Request, key: str = Depends(admin_key)) -> dict:
     state = get_state(request)
-    accounts = await state.pool.all()
-    await asyncio.to_thread(persist_pool_snapshot, state.cfg, accounts)
+    if not hasattr(state, "account_persist_lock"):
+        state.account_persist_lock = asyncio.Lock()
+    async with state.account_persist_lock:
+        accounts = await state.pool.all()
+        await asyncio.to_thread(persist_pool_snapshot, state.cfg, accounts)
     return {"persisted": len(accounts), "path": state.cfg.accounts.pool_file}
 
 

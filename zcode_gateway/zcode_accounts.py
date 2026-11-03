@@ -8,7 +8,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .accounts_dir import parse_snapshot, snapshot_filename, snapshot_path, write_snapshot
+from .accounts_dir import parse_snapshot, save_account_snapshot, snapshot_transaction
 from .zcode_detect import jwt_claims
 from .zcode_device import read_device_mid
 
@@ -67,19 +67,20 @@ def read_credentials(path):
 
 
 def import_credentials(path, output_dir):
-    folder = Path(output_dir)
-    used = {p.name: parse_snapshot(p).get('account_id') for p in folder.glob('*.txt')}
-    known = set(used.values())
+    snapshots = read_credentials(path)
     files, new_ids, emails = [], [], []
-    for fields in read_credentials(path):
-        ident = fields['account_id']
-        name = snapshot_filename(fields['email'], ident, used)
-        used[name] = ident
-        write_snapshot(snapshot_path(folder, name), fields)
-        files.append(name)
-        if ident not in known:
-            new_ids.append(ident)
-        if fields['email']:
-            emails.append(fields['email'])
+    with snapshot_transaction(output_dir) as folder:
+        folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+        known = {parse_snapshot(p).get('account_id') for p in folder.iterdir()
+                 if p.suffix.casefold() == '.txt'}
+        for fields in snapshots:
+            ident = fields['account_id']
+            saved = save_account_snapshot(folder, fields)
+            files.append(saved.name)
+            if ident not in known:
+                new_ids.append(ident)
+                known.add(ident)
+            if fields['email']:
+                emails.append(fields['email'])
     return {'written': len(files), 'files': files, 'new_ids': new_ids,
             'emails': emails, 'updated': len(files) - len(new_ids)}

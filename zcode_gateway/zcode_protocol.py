@@ -257,6 +257,7 @@ class OpenAITranslator:
         self.model, self.id = model, 'chatcmpl-' + uuid.uuid4().hex[:24]
         self.created = int(time.time())
         self.tools = {}
+        self.empty_tool_inputs = set()
         self.usage = {}
 
     def chunk(self, delta, finish=None):
@@ -276,6 +277,8 @@ class OpenAITranslator:
                 idx = len(self.tools)
                 self.tools[event['index']] = idx
                 initial = block.get('input')
+                if initial == {}:
+                    self.empty_tool_inputs.add(event['index'])
                 return [self.chunk({'tool_calls': [{'index': idx, 'id': block['id'], 'type': 'function',
                          'function': {'name': block['name'], 'arguments': json.dumps(initial) if initial else ''}}]})]
             if block.get('text'):
@@ -290,8 +293,14 @@ class OpenAITranslator:
                 value = delta.get('thinking', '')
                 return [self.chunk({'reasoning_content': value, 'reasoning': value})]
             if delta['type'] == 'input_json_delta':
+                if delta.get('partial_json'):
+                    self.empty_tool_inputs.discard(event['index'])
                 return [self.chunk({'tool_calls': [{'index': self.tools[event['index']],
                          'function': {'arguments': delta.get('partial_json', '')}}]})]
+        if kind == 'content_block_stop' and event['index'] in self.empty_tool_inputs:
+            self.empty_tool_inputs.remove(event['index'])
+            return [self.chunk({'tool_calls': [{'index': self.tools[event['index']],
+                     'function': {'arguments': '{}'}}]})]
         if kind == 'message_delta':
             self.usage.update(event.get('usage') or {})
             stop = (event.get('delta') or {}).get('stop_reason')

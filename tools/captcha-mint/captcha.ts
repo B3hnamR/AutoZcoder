@@ -14,6 +14,8 @@
  * flags it as `verifyCode: F001`. See captcha-happy.ts.
  */
 import { shutdownCaptchaSolver } from "./captcha-solver.js";
+import { CaptchaDeadline } from "./captcha-deadline.ts";
+import { bootstrapCaptchaRoute, readBoundedBody } from "./captcha-transport.ts";
 import {
   configureCaptchaPool,
   prefillCaptchaPool,
@@ -40,6 +42,8 @@ export function detectCaptchaChallenge(resp: Response): string | null {
 
 
 async function fetchCaptchaConfig(appVersion: string): Promise<FetchedCaptchaConfig | null> {
+  // Route errors are contract failures, not a cacheable config outage.
+  bootstrapCaptchaRoute();
   if (cachedConfig.value && cachedConfig.expiresAt > Date.now()) return cachedConfig.value;
   if (Date.now() < cfgNegUntil) return null;
   try {
@@ -48,15 +52,16 @@ async function fetchCaptchaConfig(appVersion: string): Promise<FetchedCaptchaCon
     // down. 5s cap + fail-open (returns null on error).
     // Override: CAPTCHA_CONFIG_TIMEOUT_MS.
     const cfgTimeoutMs = Number(process.env.CAPTCHA_CONFIG_TIMEOUT_MS || 5_000);
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), cfgTimeoutMs);
-    let resp: Response;
+    const deadline = new CaptchaDeadline(cfgTimeoutMs);
+    let json: { data?: { configs?: { captcha?: FetchedCaptchaConfig } } };
     try {
-      resp = await fetch(`${CONFIGS_API}?app_version=${encodeURIComponent(appVersion)}&platform=win32-x64`, { signal: controller.signal });
+      json = await deadline.fetch(`${CONFIGS_API}?app_version=${encodeURIComponent(appVersion)}&platform=win32-x64`, {}, async resp => {
+        if (!resp.ok) throw new Error(`captcha config HTTP ${resp.status}`);
+        return JSON.parse((await readBoundedBody(resp, deadline.controller.signal)).toString("utf8"));
+      });
     } finally {
-      clearTimeout(timer);
+      deadline.dispose();
     }
-    const json = (await resp.json()) as { data?: { configs?: { captcha?: FetchedCaptchaConfig } } };
     const cfg = json?.data?.configs?.captcha ?? null;
     cachedConfig = { value: cfg, expiresAt: Date.now() + 60000 };
     if (!cfg) cfgNegUntil = Date.now() + 15_000;

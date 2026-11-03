@@ -63,6 +63,9 @@ def _notify(message: str) -> None:
 # window-close cleanup stops workers on CUSTOM-port installs too
 _last_gateway_origin: str | None = None
 _last_gateway_context: ssl.SSLContext | None = None
+_server = None
+_server_failed = threading.Event()
+_server_error: BaseException | None = None
 
 
 def _fix_streams() -> None:
@@ -90,18 +93,29 @@ def _gateway_context(ca_file: str) -> ssl.SSLContext:
 def _wait_for(url: str, timeout: float = 30.0, *,
               context: ssl.SSLContext | None = None) -> bool:
     """Poll the dashboard itself; /health may be local-only on a TLS SAN origin."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+    deadline = time.monotonic() + timeout
+    nonce = os.environ.get("ZCODE_GATEWAY_UPDATE_NONCE", "")
+    if nonce:
+        url = url.rsplit("/", 1)[0] + "/health"
+    while time.monotonic() < deadline:
+        if _server_failed.is_set():
+            return False
         try:
-            with urllib.request.urlopen(url, timeout=2, context=context) as r:
-                if r.status == 200:
-                    return True
+            # A different listener on the configured port is not our server.
+            if _server is not None and _server.started:
+                probe = urllib.request.Request(url, headers={"X-AutoZCoder-Update": nonce}) if nonce else url
+                with urllib.request.urlopen(probe, timeout=2, context=context) as r:
+                    if (r.status == 200 and not _server_failed.is_set()
+                            and (not nonce or r.headers.get("X-AutoZCoder-Update") == nonce)):
+                        return True
         except Exception:
-            time.sleep(0.4)
+            pass
+        _server_failed.wait(0.4)
     return False
 
 
 def _run_server() -> None:
+    global _server
     import uvicorn
     from zcode_gateway.app import create_app
     from zcode_gateway.config import load_config
@@ -113,6 +127,7 @@ def _run_server() -> None:
     first_start = time.time()
     while True:
         try:
+            _server = None
             cfg = load_config(os.environ.get("ZCODE_GATEWAY_CONFIG") or None)
             global _shutdown_admin_key
             _shutdown_admin_key = cfg.server.admin_key
@@ -121,7 +136,10 @@ def _run_server() -> None:
                 log_level="info", access_log=False, log_config=None,
                 **cfg.server.ssl_kwargs())
             server = uvicorn.Server(config)
+            _server = server
             server.run()
+            if not server.started:
+                raise RuntimeError("Gateway exited before opening its listener")
             return  # clean shutdown
         except SystemExit as exc:
             # uvicorn's startup failure (port already in use is the common
@@ -130,16 +148,29 @@ def _run_server() -> None:
             # like any other crash so the watchdog retries / reports.
             print(f"[watchdog] uvicorn exited with {exc!r} "
                   f"(port in use?)", file=sys.stderr, flush=True)
+            raise SystemExit(1) from exc
         except Exception:
-            pass
+            if _server is None or not _server.started:
+                raise
         attempts += 1
         now = time.time()
         print(f"[watchdog] gateway crashed ({_dt.datetime.now():%H:%M:%S}) "
               f"attempt {attempts}", file=sys.stderr, flush=True)
         if attempts >= 5 or now - first_start > 600:
             print("[watchdog] giving up", file=sys.stderr, flush=True)
-            raise
+            raise RuntimeError("Gateway restart limit reached")
         time.sleep(min(2 ** attempts, 15))
+
+
+def _server_worker() -> None:
+    global _server_error
+    try:
+        _run_server()
+        _server_error = RuntimeError("Gateway stopped")
+    except BaseException as exc:
+        _server_error = exc
+    finally:
+        _server_failed.set()
 
 
 def _webview2_available() -> bool:
@@ -214,6 +245,10 @@ def _offer_webview2_or_browser(url: str) -> bool:
 
 
 def main() -> None:
+    global _server, _server_error
+    _server = None
+    _server_error = None
+    _server_failed.clear()
     _fix_streams()
     import argparse
     parser = argparse.ArgumentParser(description='Zcode Gateway desktop or headless server')
@@ -226,7 +261,10 @@ def main() -> None:
     else:
         cfg_path = _bootstrap_config()
     if args.headless:
-        _run_server()
+        try:
+            _run_server()
+        except BaseException as exc:
+            raise SystemExit(1) from exc
         return
     from zcode_gateway.config import load_config
     cfg = load_config(cfg_path)
@@ -237,6 +275,8 @@ def main() -> None:
     _last_gateway_origin = origin
     _last_gateway_context = context
     if _already_running():
+        if os.environ.get("ZCODE_GATEWAY_UPDATE_NONCE"):
+            raise SystemExit(1)
         # another instance holds the mutex. If it's THIS build the dashboard is
         # already live — open it in the browser. If it's the old Tkinter build
         # (no /dash route) that returns 404, so surface a clear message instead.
@@ -252,12 +292,13 @@ def main() -> None:
                 "Close it first, then start this one.")
         return
 
-    import webview
-
-    threading.Thread(target=_run_server, daemon=True, name="gateway").start()
+    threading.Thread(target=_server_worker, daemon=True, name="gateway").start()
     browser_fallback = False
     if not _wait_for(url, context=context):
-        browser_fallback = True   # serve in the browser; keep the process (and the gateway thread) alive
+        if _server is not None:
+            _server.should_exit = True
+        _notify("Zcode Gateway could not start. Check the gateway log for details.")
+        raise SystemExit(1) from _server_error
     elif not _webview2_available():
         # native window impossible on this machine: install prompt + browser
         browser_fallback = _offer_webview2_or_browser(url)
@@ -270,10 +311,10 @@ def main() -> None:
         _notify("The dashboard is running in your browser.\n\n"
                 "Keep this process (this window / terminal) open — closing "
                 "it stops the gateway.")
-        while True:
-            time.sleep(3600)
-        return
+        _server_failed.wait()
+        raise SystemExit(1) from _server_error
 
+    import webview
     webview.create_window(
         "Zcode Gateway", url,
         width=1280, height=800, min_size=(980, 620),
@@ -319,3 +360,4 @@ if __name__ == "__main__":
     except Exception:
         import traceback
         sys.stderr.write(traceback.format_exc()[-1200:] + "\n")
+        raise SystemExit(1)

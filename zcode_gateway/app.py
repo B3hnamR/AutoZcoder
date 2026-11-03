@@ -167,6 +167,7 @@ async def lifespan(app: FastAPI):
         await catalog.aclose()
         await updater.aclose()
         await pool.aclose()
+        await service.aclose()
         store.close()
 
 

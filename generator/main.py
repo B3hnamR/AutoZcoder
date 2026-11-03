@@ -1657,7 +1657,8 @@ def _main(auto_result=None):
                     try:
                         from claim_start import claim_start as run_claim_start
                         rc = run_claim_start(token, log=logger.info,
-                                             force_direct=auto and route_policy == 'direct')
+                                             force_direct=auto and route_policy == 'direct',
+                                             **({'proxy_fallback': False} if auto else {}))
                         start_plan = bool(rc.get('claimed'))
                         start_plan_id = rc.get('plan_id') or ''
                         if start_plan and rc.get('already_claimed'):

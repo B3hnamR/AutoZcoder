@@ -76,9 +76,11 @@ MANAGER_BIN="/usr/local/bin/autozcoder"
 SERVICE="zcodegateway"
 RENEW_UNIT="autozcoder-renew"
 UNIT_FILE="/etc/systemd/system/${SERVICE}.service"
+RENEW_SERVICE_FILE="/etc/systemd/system/${RENEW_UNIT}.service"
+RENEW_TIMER_FILE="/etc/systemd/system/${RENEW_UNIT}.timer"
 UPDATE_LOCK="/run/autozcoder-update.lock"
 LOG_FILE="/var/log/autozcoder-install.log"
-ACME_HOME="${HOME:-/root}/.acme.sh"
+ACME_HOME="/root/.acme.sh"
 # absolute path of this file (empty under `curl | bash`), captured before any cd
 SELF="$(readlink -f "${BASH_SOURCE[0]:-}" 2>/dev/null || true)"
 
@@ -124,7 +126,7 @@ run_quiet() { # run_quiet "what we are doing" cmd args...
 # precedence: environment override > saved state (/etc/autozcoder.env) > default
 resolve_config() {
     SAVED_INSTALL_DIR=""; SAVED_PORT=""; SAVED_DOMAIN=""; SAVED_SERVER_IP=""
-    SAVED_SCHEME=""; SAVED_PAUSE_UNITS=""; SAVED_FROM_SOURCE=""; SAVED_RUN_AS_ROOT=""; SAVED_SKIP_SYSTEMD=""
+    SAVED_SCHEME=""; SAVED_SSL_MODE=""; SAVED_ACME_HOST="__legacy__"; SAVED_PAUSE_UNITS=""; SAVED_FROM_SOURCE=""; SAVED_RUN_AS_ROOT=""; SAVED_SKIP_SYSTEMD=""
     # shellcheck disable=SC1090
     [[ -f "$ENV_FILE" ]] && . "$ENV_FILE"
     # the service runs as an unprivileged user unless the operator opts out
@@ -134,7 +136,21 @@ resolve_config() {
     ZGW_PORT="${ZGW_PORT:-${SAVED_PORT:-8443}}"
     ZGW_DOMAIN="${ZGW_DOMAIN:-${SAVED_DOMAIN:-}}"
     ZGW_SERVER_IP="${ZGW_SERVER_IP:-${SAVED_SERVER_IP:-}}"
-    ZGW_SSL_MODE="${ZGW_SSL_MODE:-}"
+    # Older state recorded only scheme/domain. In particular, HTTP must not
+    # become public IP TLS merely because an operator runs install again.
+    if [[ -z "$SAVED_SSL_MODE" && -n "$SAVED_SCHEME" ]]; then
+        if [[ "$SAVED_SCHEME" == http ]]; then SAVED_SSL_MODE=none
+        elif [[ -n "$SAVED_DOMAIN" ]]; then SAVED_SSL_MODE=domain
+        else SAVED_SSL_MODE=ip; fi
+    fi
+    ZGW_SSL_MODE="${ZGW_SSL_MODE:-${SAVED_SSL_MODE}}"
+    if [[ "$SAVED_ACME_HOST" == __legacy__ ]]; then
+        SAVED_ACME_HOST=""
+        case "$SAVED_SSL_MODE" in
+            domain) SAVED_ACME_HOST="$SAVED_DOMAIN" ;;
+            ip) SAVED_ACME_HOST="$SAVED_SERVER_IP" ;;
+        esac
+    fi
     PAUSE_UNITS="${ZGW_PAUSE_UNITS-${SAVED_PAUSE_UNITS}}"
     ZGW_FROM_SOURCE="${ZGW_FROM_SOURCE:-${SAVED_FROM_SOURCE}}"
     CERT_DIR="${ZGW_INSTALL_DIR}/certs"
@@ -149,6 +165,8 @@ save_state() {
         printf 'SAVED_DOMAIN=%q\n' "$ZGW_DOMAIN"
         printf 'SAVED_SERVER_IP=%q\n' "${SERVER_IP:-${ZGW_SERVER_IP}}"
         printf 'SAVED_SCHEME=%q\n' "${SSL_SCHEME:-https}"
+        printf 'SAVED_SSL_MODE=%q\n' "${TLS_MODE_CHOICE:-${ZGW_SSL_MODE:-${SAVED_SSL_MODE:-ip}}}"
+        printf 'SAVED_ACME_HOST=%q\n' "${CURRENT_ACME_HOST:-}"
         printf 'SAVED_PAUSE_UNITS=%q\n' "${PAUSE_UNITS:-}"
         printf 'SAVED_FROM_SOURCE=%q\n' "${ZGW_FROM_SOURCE:-}"
         printf 'SAVED_RUN_AS_ROOT=%q\n' "${ZGW_RUN_AS_ROOT:-0}"
@@ -158,6 +176,31 @@ save_state() {
 }
 
 need_root() { [[ $EUID -eq 0 ]] || fail "run this as root (sudo autozcoder ...)"; }
+
+acquire_mutation_lock() {
+    exec {MUTATION_LOCK_FD}>"$UPDATE_LOCK"
+    flock -n "$MUTATION_LOCK_FD" || fail "another update is in progress (install/cert/update/uninstall share this lock)"
+}
+
+# Root never imports from the working directory, service HOME, a venv or
+# inherited Python settings. Each privileged interpreter gets an empty HOME.
+system_python() (
+    local home rc=0
+    home="$(update_tmpdir)" || return 1
+    cd / || return 1
+    env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME="$home" TMPDIR="$home" \
+        /usr/bin/python3 -I "$@" || rc=$?
+    rm -rf -- "$home"
+    return "$rc"
+)
+
+run_tool_user() {
+    runuser -u "$SVC_USER" -- env -i \
+        PATH="${ZGW_INSTALL_DIR}/node/bin:/usr/local/bin:/usr/bin:/bin" \
+        HOME="${ZGW_INSTALL_DIR}/home" \
+        npm_config_cache="${ZGW_INSTALL_DIR}/home/.npm" \
+        PLAYWRIGHT_BROWSERS_PATH="${ZGW_INSTALL_DIR}/pw-browsers" "$@"
+}
 
 # ------------------------------------------------------- service account
 # The gateway is internet-facing and its admin key is code execution, so it must
@@ -171,7 +214,7 @@ service_user() {
     fi
 }
 ensure_service_user() {
-    local u; u="$(service_user)"
+    local u="${1:-$(service_user)}"
     [[ "$u" == root ]] && return 0
     id -u "$u" >/dev/null 2>&1 && return 0
     local shell; shell="$(command -v nologin 2>/dev/null || echo /usr/sbin/nologin)"
@@ -185,9 +228,23 @@ fix_ownership() {
     [[ ! -L "$ZGW_INSTALL_DIR" ]] || fail "install directory must not be a symlink"
     # Runtime config/SQLite use atomic sibling writes. A sticky, root-owned
     # directory permits those without letting the service replace root binaries.
-    chown "root:${u}" "$ZGW_INSTALL_DIR" && chmod 1770 "$ZGW_INSTALL_DIR" || return 1
-    find "$ZGW_INSTALL_DIR" -mindepth 1 -maxdepth 1 ! -name ZcodeGateway ! -name certs \
+    ensure_service_user "$SVC_USER" || return 1
+    chown "root:${SVC_USER}" "$ZGW_INSTALL_DIR" && chmod 1770 "$ZGW_INSTALL_DIR" || return 1
+    find "$ZGW_INSTALL_DIR" -mindepth 1 -maxdepth 1 ! -name ZcodeGateway ! -name certs ! -name node ! -name '.tls.*' \
         -exec chown -hR "${u}:${u}" -- {} + || return 1
+    # Private Node is installer-owned executable tooling, not runtime data.
+    if [[ -e "$ZGW_INSTALL_DIR/node" || -L "$ZGW_INSTALL_DIR/node" ]]; then
+        [[ ! -L "$ZGW_INSTALL_DIR/node" ]] || fail "node directory must not be a symlink"
+        chown -hR root:root "$ZGW_INSTALL_DIR/node" || return 1
+        chmod -R go-w "$ZGW_INSTALL_DIR/node" || return 1
+    fi
+    local dir
+    for dir in genenv pw-browsers home; do
+        if [[ -d "$ZGW_INSTALL_DIR/$dir" ]]; then
+            ensure_service_user "$SVC_USER" || return 1
+            chown -hR "${SVC_USER}:${SVC_USER}" "$ZGW_INSTALL_DIR/$dir" || return 1
+        fi
+    done
     if [[ -e "$ZGW_INSTALL_DIR/ZcodeGateway" || -L "$ZGW_INSTALL_DIR/ZcodeGateway" ]]; then
         [[ ! -L "$ZGW_INSTALL_DIR/ZcodeGateway" ]] || fail "gateway executable must not be a symlink"
         chown root:root "$ZGW_INSTALL_DIR/ZcodeGateway" && chmod 755 "$ZGW_INSTALL_DIR/ZcodeGateway" || return 1
@@ -301,18 +358,24 @@ detect_server_ip() {
 
 is_domain() { [[ "$1" =~ ^([A-Za-z0-9](-*[A-Za-z0-9])*\.)+[A-Za-z]{2,}$ ]]; }
 
-install_pkgs() {
+install_pkgs() (
+    local home
+    home="$(update_tmpdir)" || return 1
+    trap 'rm -rf -- "$home"' EXIT
+    cd / || return 1
+    export PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME="$home" TMPDIR="$home"
+    local -a clean=(env -i PATH="$PATH" HOME="$HOME" TMPDIR="$TMPDIR" DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a NEEDRESTART_SUSPEND=1)
     local release=""
     [[ -f /etc/os-release ]] && { . /etc/os-release; release="${ID:-}"; }
     case "${release}" in
-        ubuntu|debian|armbian)      apt-get update -qq && apt-get install -y -qq -o Dpkg::Use-Pty=0 "$@" ;;
+        ubuntu|debian|armbian)      "${clean[@]}" apt-get update -qq && "${clean[@]}" apt-get install -y -qq -o Dpkg::Use-Pty=0 "$@" ;;
         fedora|amzn|rhel|almalinux|rocky|ol|centos)
-                                    dnf install -y -q "$@" ;;
-        arch|manjaro|parch)         pacman -Sy --noconfirm "$@" ;;
-        opensuse-*)                 zypper -q install -y "$@" ;;
-        *)                          apt-get update -qq && apt-get install -y -qq -o Dpkg::Use-Pty=0 "$@" ;;
+                                    "${clean[@]}" dnf install -y -q "$@" ;;
+        arch|manjaro|parch)         "${clean[@]}" pacman -Sy --noconfirm "$@" ;;
+        opensuse-*)                 "${clean[@]}" zypper -q install -y "$@" ;;
+        *)                          "${clean[@]}" apt-get update -qq && "${clean[@]}" apt-get install -y -qq -o Dpkg::Use-Pty=0 "$@" ;;
     esac
-}
+)
 
 host_for_display() { echo "${ZGW_DOMAIN:-${SERVER_IP:-${ZGW_SERVER_IP:-<server-ip>}}}"; }
 # the port the gateway itself listens on (https: public port; http: loopback only)
@@ -325,7 +388,7 @@ gw_health_url() {
 # All config access uses YAML, including updates: key order, indentation and
 # flow-style mappings must not decide whether an existing install is retained.
 cfg_yaml() { # cfg_yaml validate|admin|client|has|set [section key [yaml-value]]
-    python3 - "${ZGW_INSTALL_DIR}/config.yaml" "$@" <<'PY'
+    system_python - "${ZGW_INSTALL_DIR}/config.yaml" "$@" <<'PY'
 import os
 from pathlib import Path
 import sys
@@ -498,9 +561,33 @@ install_cert_files() { # install_cert_files <host>
     acme --installcert --force -d "$1" \
         --key-file       "${CERT_DIR}/privkey.pem" \
         --fullchain-file "${CERT_DIR}/fullchain.pem" \
-        --reloadcmd "$(cert_reload_cmd)" \
-        >>"$LOG_FILE" 2>&1 || true
-    [[ -s "${CERT_DIR}/fullchain.pem" && -s "${CERT_DIR}/privkey.pem" ]]
+        --reloadcmd "" \
+        >>"$LOG_FILE" 2>&1 || return 1
+    cert_pair_valid
+}
+
+cert_pair_valid() {
+    local cert_pub key_pub
+    openssl x509 -in "$CERT_DIR/fullchain.pem" -noout -checkend 0 >/dev/null 2>&1 || return 1
+    cert_pub="$(openssl x509 -in "$CERT_DIR/fullchain.pem" -pubkey -noout)" || return 1
+    key_pub="$(openssl pkey -in "$CERT_DIR/privkey.pem" -pubout)" || return 1
+    [[ -n "$cert_pub" && "$cert_pub" == "$key_pub" ]]
+}
+
+activate_acme_registration() {
+    if [[ "${TLS_TRUSTED:-0}" == 1 ]]; then
+        acme --installcert --force -d "$CURRENT_ACME_HOST" \
+            --key-file "$CERT_DIR/privkey.pem" --fullchain-file "$CERT_DIR/fullchain.pem" \
+            --reloadcmd "$(cert_reload_cmd)" >>"$LOG_FILE" 2>&1 || return 1
+    fi
+}
+
+retire_acme_registration() {
+    # Only retire the previous entry after the new gateway has passed health.
+    if [[ -n "${SAVED_ACME_HOST:-}" && "$SAVED_ACME_HOST" != "${CURRENT_ACME_HOST:-}" ]]; then
+        acme --remove -d "$SAVED_ACME_HOST" >>"$LOG_FILE" 2>&1 \
+            || warn "could not retire old ACME entry; renewal is restricted to the active host"
+    fi
 }
 
 issue_le() { # issue_le <host> <extra acme args...>
@@ -558,7 +645,7 @@ le_with_selfsigned_fallback() { # <issuer-fn>
     gen_self_signed || fail "self-signed certificate generation failed"
 }
 
-apply_tls() { # apply_tls <ip|domain|self|none>
+_apply_tls() {
     SSL_SCHEME="https"
     case "$1" in
         ip)     [[ -n "${SERVER_IP}" ]] || fail "no public IP detected (set ZGW_SERVER_IP=1.2.3.4)"
@@ -571,6 +658,46 @@ apply_tls() { # apply_tls <ip|domain|self|none>
                 warn "$TLS_NOTE" ;;
         *)      fail "unknown ssl mode '$1' (ip|domain|self|none)" ;;
     esac
+}
+
+apply_tls() { # Stage a complete pair without deleting a working certificate.
+    local live="$CERT_DIR" stage rc=0
+    stage="$(mktemp -d "${ZGW_INSTALL_DIR}/.tls.XXXXXXXX")" || return 1
+    ( CERT_DIR="$stage"; _apply_tls "$1" || exit $?;
+      [[ "$1" == none ]] || cert_pair_valid ) || rc=$?
+    # The subshell isolates fail/exit from the transaction. Derive reporting
+    # from the validated staged pair without issuing a second certificate.
+    if [[ "$rc" != 0 ]]; then rm -rf -- "$stage"; return "$rc"; fi
+    SSL_SCHEME=https; CURRENT_ACME_HOST=""; TLS_TRUSTED=0
+    if [[ "$1" == none ]]; then
+        SSL_SCHEME=http; TLS_TRUSTED=-1; TLS_NOTE="NO TLS (loopback HTTP only)"
+        rm -rf -- "$stage"
+        return 0
+    fi
+    if ( CERT_DIR="$stage"; cert_is_selfsigned ); then
+        TLS_NOTE="self-signed certificate (browser warning)"
+    else
+        TLS_TRUSTED=1; TLS_NOTE="Let's Encrypt certificate (automatic renewal)"
+        if [[ "$1" == domain ]]; then CURRENT_ACME_HOST="$ZGW_DOMAIN"
+        else CURRENT_ACME_HOST="$SERVER_IP"; fi
+    fi
+    # Callers stop the service before activation. Rename the directory, not two
+    # independent PEM files, so no reader can observe a mixed pair.
+    [[ ! -L "$live" ]] || { rm -rf -- "$stage"; return 1; }
+    if [[ -e "$live" ]]; then
+        # Linux rename-exchange publishes the pair in one filesystem operation;
+        # a failure leaves the old directory and both PEMs untouched.
+        if ! system_python - "$stage" "$live" <<'PY'
+import ctypes, os, sys
+libc = ctypes.CDLL(None, use_errno=True)
+if libc.renameat2(-100, os.fsencode(sys.argv[1]), -100, os.fsencode(sys.argv[2]), 2):
+    raise OSError(ctypes.get_errno(), "certificate directory exchange failed")
+PY
+        then rm -rf -- "$stage"; return 1; fi
+        rm -rf -- "$stage"
+    else
+        mv -T -- "$stage" "$live" || { rm -rf -- "$stage"; return 1; }
+    fi
 }
 
 # sets TLS_MODE_CHOICE (ip|domain|self|none); a global rather than command
@@ -621,19 +748,19 @@ install_renew_timer() {
     [[ "${ZGW_SKIP_SYSTEMD:-0}" == "1" ]] && return 0
     if [[ "${TLS_TRUSTED:-0}" != "1" ]]; then
         systemctl disable --now "${RENEW_UNIT}.timer" >/dev/null 2>&1 || true
-        rm -f "/etc/systemd/system/${RENEW_UNIT}.service" "/etc/systemd/system/${RENEW_UNIT}.timer"
+        rm -f "$RENEW_SERVICE_FILE" "$RENEW_TIMER_FILE"
         return 0
     fi
-    cat > "/etc/systemd/system/${RENEW_UNIT}.service" <<EOF
+    cat > "$RENEW_SERVICE_FILE" <<EOF
 [Unit]
 Description=Renew the Zcode Gateway TLS certificate (acme.sh)
 
 [Service]
 Type=oneshot
 UMask=0077
-ExecStart=${ACME_HOME}/acme.sh --cron --home ${ACME_HOME}
+ExecStart=/usr/bin/flock -n ${UPDATE_LOCK} ${ACME_HOME}/acme.sh --renew --home ${ACME_HOME} --server letsencrypt -d ${CURRENT_ACME_HOST}
 EOF
-    cat > "/etc/systemd/system/${RENEW_UNIT}.timer" <<EOF
+    cat > "$RENEW_TIMER_FILE" <<EOF
 [Unit]
 Description=Twice-daily certificate renewal check
 
@@ -712,7 +839,7 @@ release_runtime_compatible() {
 validate_gateway() {
     # Do not execute the downloaded server as root (there is no --version flag).
     local arch; arch="$(uname -m)"
-    python3 - "$1" "$arch" <<'PY'
+    system_python - "$1" "$arch" <<'PY'
 from pathlib import Path
 import sys
 p = Path(sys.argv[1])
@@ -786,6 +913,7 @@ build_from_source() { # build_from_source <repo dir>
     run_quiet "Building ZcodeGateway from source (PyInstaller, a few minutes)" _build_in "$src" \
         || fail "build failed — details: ${LOG_FILE}"
     [[ -x "$src/.local/dist/ZcodeGateway" ]] || fail "build finished but .local/dist/ZcodeGateway is missing"
+    validate_gateway "$src/.local/dist/ZcodeGateway" || fail "source build produced an incompatible executable"
     mkdir -p "${ZGW_INSTALL_DIR}"
     [[ ! -L "$ZGW_INSTALL_DIR" ]] || fail "install directory must not be a symlink"
     ensure_service_user
@@ -905,12 +1033,12 @@ cfg_set_generator() { # cfg_set_generator <key> <yaml-value>
 
 # the nine modules the generator imports (generator/requirements.txt)
 _gen_pip() { # _gen_pip <venv python>
-    "$1" -m pip install --disable-pip-version-check playwright opencv-python-headless \
+    run_tool_user "$1" -m pip install --disable-pip-version-check playwright opencv-python-headless \
         Pillow numpy requests urllib3 certifi PySocks \
-        && "$1" -m pip install --disable-pip-version-check ddddocr   # tightest pins: last
+        && run_tool_user "$1" -m pip install --disable-pip-version-check ddddocr   # tightest pins: last
 }
 _gen_verify() { # _gen_verify <venv python>
-    PLAYWRIGHT_BROWSERS_PATH="${ZGW_INSTALL_DIR}/pw-browsers" "$1" - <<'PY'
+    run_tool_user "$1" - <<'PY'
 import importlib, os, sys
 bad = []
 for m in ("playwright", "ddddocr", "cv2", "PIL", "numpy", "requests", "urllib3", "certifi", "socks"):
@@ -930,13 +1058,8 @@ PY
 }
 
 _gen_browser_smoke() {
-    local py="${ZGW_INSTALL_DIR}/genenv/bin/python" u
-    u="$(service_user)"
-    local -a runner=()
-    [[ "$u" != root ]] && runner=(runuser -u "$u" --)
-    "${runner[@]}" env HOME="${ZGW_INSTALL_DIR}/home" \
-        PLAYWRIGHT_BROWSERS_PATH="${ZGW_INSTALL_DIR}/pw-browsers" \
-        "$py" - <<'PY'
+    local py="${ZGW_INSTALL_DIR}/genenv/bin/python"
+    run_tool_user "$py" - <<'PY'
 import os, shutil, subprocess, tempfile
 from playwright.sync_api import sync_playwright
 
@@ -988,13 +1111,13 @@ PY
 # Node that is new enough is used as is; otherwise the official build is
 # unpacked into <install dir>/node (checksum verified, nothing system-wide).
 _node_major() {
-    local v; v="$(node --version 2>/dev/null || true)"
+    local v; v="$(run_tool_user node --version 2>/dev/null || true)"
     [[ "$v" =~ ^v([0-9]+) ]] && echo "${BASH_REMATCH[1]}" || echo 0
 }
 _install_node() {
-    ZGW_DIR="${ZGW_INSTALL_DIR}" python3 - <<'PY'
+    system_python - "${ZGW_INSTALL_DIR}" <<'PY' || return 1
 import hashlib, json, os, platform, shutil, sys, tarfile, tempfile, urllib.request
-dest_root = os.environ["ZGW_DIR"]
+dest_root = sys.argv[1]
 arch = {"x86_64": "x64", "amd64": "x64", "aarch64": "arm64", "arm64": "arm64"}.get(platform.machine().lower())
 if not arch:
     sys.exit("no prebuilt Node.js for " + platform.machine())
@@ -1023,24 +1146,27 @@ try:
         except TypeError:
             tf.extractall(tmp)
     target = os.path.join(dest_root, "node")
+    if os.path.islink(target):
+        sys.exit("Node.js destination must not be a symlink")
     shutil.rmtree(target, ignore_errors=True)
     os.replace(os.path.join(tmp, name[: -len(".tar.xz")]), target)
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 print("node", ver, "installed")
 PY
+    chown -hR root:root "${ZGW_INSTALL_DIR}/node" && chmod -R a+rX,go-w "${ZGW_INSTALL_DIR}/node"
 }
 # warm npx's cache so the dashboard's first deploy does not time out downloading wrangler
 _prefetch_wrangler() {
     local d rc=0; d="$(mktemp -d)"
-    ( cd "$d" && HOME="${ZGW_INSTALL_DIR}/home" PATH="${ZGW_INSTALL_DIR}/node/bin:${PATH}" \
-        npx --yes wrangler --version ) || rc=$?
+    chown "${SVC_USER}:${SVC_USER}" "$d" || { rm -rf -- "$d"; return 1; }
+    ( cd "$d" && run_tool_user npx --yes wrangler --version ) || rc=$?
     rm -rf "$d"
     return $rc
 }
 setup_node_for_mail() {
-    if (( $(_node_major) >= 22 )) && command -v npx >/dev/null 2>&1; then
-        ok "Node.js $(node --version) already present — using it for the mail worker"
+    if (( $(_node_major) >= 22 )) && run_tool_user sh -c 'command -v npx' >/dev/null 2>&1; then
+        ok "Node.js $(run_tool_user node --version) already present — using it for the mail worker"
     else
         run_quiet "Installing Node.js 22 LTS for the mail worker (official build, checksum verified)" _install_node \
             || { warn "Node.js install failed — the dashboard will retry it on the first mail-worker deploy"; return 0; }
@@ -1065,21 +1191,39 @@ setup_generator_env() {
         ubuntu|debian|armbian) xvfb_pkg=xvfb ;;
         arch|manjaro|parch) xvfb_pkg=xorg-server-xvfb ;;
     esac
-    run_quiet "Installing Xvfb for headed generator browsers on a no-display VPS" install_pkgs "$xvfb_pkg"
+    # Install browser libraries from the distribution, never via a service-owned
+    # Playwright interpreter's install-deps / --with-deps root subprocess.
+    local -a browser_libs=()
+    case "$release" in
+        ubuntu|debian|armbian)
+            local alsa=libasound2
+            apt-cache show libasound2t64 >/dev/null 2>&1 && alsa=libasound2t64
+            browser_libs=(libgl1 libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2
+                libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2
+                libgbm1 libpango-1.0-0 libcairo2 libatspi2.0-0 "$alsa" fonts-liberation) ;;
+        arch|manjaro|parch) browser_libs=(nss nspr atk at-spi2-core cups libdrm libxkbcommon libxcomposite libxdamage libxfixes libxrandr mesa pango cairo alsa-lib) ;;
+        *) browser_libs=(nss nspr atk at-spi2-atk cups-libs libdrm libxkbcommon libXcomposite libXdamage libXfixes libXrandr mesa-libgbm pango cairo alsa-lib) ;;
+    esac
+    run_quiet "Installing Xvfb and distribution Chromium libraries" install_pkgs "$xvfb_pkg" "${browser_libs[@]}"
     case "$release" in
         ubuntu|debian|armbian)
             run_quiet "Installing Python venv support" install_pkgs python3 python3-venv python3-pip libgl1 ;;
         *)  run_quiet "Installing Python and pip" install_pkgs python3 python3-pip ;;
     esac
-    [[ -x "$py" ]] || run_quiet "Creating the generator Python environment" python3 -m venv "$venv" \
+    ensure_service_user "$SVC_USER"
+    mkdir -p "$venv" "${ZGW_INSTALL_DIR}/home" "${ZGW_INSTALL_DIR}/pw-browsers"
+    # Also allows unprivileged tooling when the operator explicitly runs the
+    # gateway itself as root. Existing service-owned venvs are never run as root.
+    chown "root:${SVC_USER}" "$ZGW_INSTALL_DIR" && chmod 1770 "$ZGW_INSTALL_DIR"
+    chown -hR "${SVC_USER}:${SVC_USER}" "$venv" "${ZGW_INSTALL_DIR}/home" "${ZGW_INSTALL_DIR}/pw-browsers"
+    [[ -x "$py" ]] || run_quiet "Creating the generator Python environment" run_tool_user /usr/bin/python3 -m venv "$venv" \
         || fail "could not create the venv — details: ${LOG_FILE}"
-    run_quiet "Updating pip" "$py" -m pip install --disable-pip-version-check --upgrade pip \
+    run_quiet "Updating pip" run_tool_user "$py" -m pip install --disable-pip-version-check --upgrade pip \
         || fail "pip update failed — details: ${LOG_FILE}"
     run_quiet "Installing generator packages (playwright, ddddocr, opencv, …)" _gen_pip "$py" \
         || fail "generator packages failed to install — details: ${LOG_FILE}"
-    run_quiet "Installing Chromium + its system libraries (~250 MB)" \
-        env PLAYWRIGHT_BROWSERS_PATH="${ZGW_INSTALL_DIR}/pw-browsers" \
-        "$py" -m playwright install --with-deps chromium \
+    run_quiet "Installing Chromium as the tooling user (~250 MB)" \
+        run_tool_user "$py" -m playwright install chromium \
         || fail "Chromium install failed — details: ${LOG_FILE}"
     run_quiet "Verifying the generator environment" _gen_verify "$py" \
         || fail "generator environment check failed — details: ${LOG_FILE}"
@@ -1098,9 +1242,10 @@ setup_generator_env() {
     chk ok "mail worker tooling ready (Node.js + wrangler) — deploy it from the dashboard with a Cloudflare API token"
 }
 
-cmd_install() {
+cmd_install() (
     need_root
-    local TLS_NOTE="" TLS_TRUSTED=0 SSL_SCHEME="https" SERVER_IP=""
+    acquire_mutation_lock
+    local TLS_NOTE="" TLS_TRUSTED=0 SSL_SCHEME="https" SERVER_IP="" CURRENT_ACME_HOST=""
     ( umask 077; : > "$LOG_FILE" )
     trap 'bad "Install failed at step ${STEP:-?} (line ${LINENO}). Details: ${LOG_FILE}"' ERR
     REPORT=()
@@ -1114,6 +1259,8 @@ cmd_install() {
     ok "OS: ${PRETTY_NAME:-unknown} (${release:-unrecognized})"
     case "$(uname -m)" in
         x86_64|x64|amd64) ok "Arch: x86_64" ;;
+        aarch64|arm64) [[ -n "${ZGW_FROM_SOURCE:-}" ]] || fail "ARM64 requires ZGW_FROM_SOURCE=/path (no ARM release binary)"
+                      ok "Arch: ARM64 (source build)" ;;
         *) fail "unsupported architecture '$(uname -m)' — prebuilt binaries are x86_64 only; build from source with scripts/build/linux.sh" ;;
     esac
     check_first_install_resources
@@ -1137,7 +1284,7 @@ cmd_install() {
         opensuse-*) yaml_pkg=python3-PyYAML ;;
     esac
     run_quiet "Installing Python3 + PyYAML for safe config updates" install_pkgs "$python_pkg" "$yaml_pkg"
-    python3 -c 'import yaml' || fail "Python3/PyYAML is required to preserve existing configuration"
+    system_python -c 'import yaml' || fail "Python3/PyYAML is required to preserve existing configuration"
     # older installs fronted the gateway with nginx; the gateway now serves
     # HTTPS itself, so retire our site (nginx itself is left alone)
     if [[ -f /etc/nginx/conf.d/zcodegateway.conf ]]; then
@@ -1230,7 +1377,13 @@ EOF
         SSL_SCHEME="https"
         if cert_is_selfsigned; then TLS_TRUSTED=0; TLS_NOTE="self-signed certificate — browsers show a warning once"
         else TLS_TRUSTED=1; TLS_NOTE="Let's Encrypt certificate — renewed by ${RENEW_UNIT}.timer"; fi
+        CURRENT_ACME_HOST=""
+        if [[ "$TLS_TRUSTED" == 1 ]]; then
+            if [[ "$mode" == domain ]]; then CURRENT_ACME_HOST="$ZGW_DOMAIN"
+            else CURRENT_ACME_HOST="$SERVER_IP"; fi
+        fi
     else
+        [[ "${ZGW_SKIP_SYSTEMD:-0}" == 1 ]] || systemctl stop "$SERVICE" || true
         apply_tls "$mode"
     fi
     if [[ "${ZGW_SKIP_SYSTEMD:-0}" == "1" && "$TLS_TRUSTED" == "1" ]]; then
@@ -1265,7 +1418,7 @@ EOF
     if [[ "${ZGW_SKIP_SYSTEMD:-0}" == "1" ]]; then
         chk warn "gateway NOT STARTED (no systemd); running-service and public HTTPS checks skipped"
         if [[ "$TLS_TRUSTED" == "1" ]]; then
-            chk warn "certificate renewal timer NOT installed; arrange acme.sh --cron scheduling before the certificate expires"
+            chk warn "certificate renewal timer NOT installed; arrange acme.sh --renew -d ${CURRENT_ACME_HOST} scheduling before the certificate expires"
         fi
     else
         local i gw_ok=0 url; url="$(gw_health_url)"
@@ -1309,10 +1462,21 @@ EOF
         chk warn "could not install ${MANAGER_BIN} (offline?) — re-run the installer to get the menu"
     fi
 
+    activate_acme_registration
+    if [[ "${ZGW_SKIP_SYSTEMD:-0}" != 1 && "$TLS_TRUSTED" == 1 ]]; then
+        # Registering the renewal copy paths invokes its restart hook.
+        local activated_health=0
+        for i in $(seq 1 30); do
+            if curl -fkSs --max-time 2 "$(gw_health_url)" >/dev/null 2>&1; then activated_health=1; break; fi
+            sleep 1
+        done
+        [[ "$activated_health" == 1 ]] || fail "ACME activation health check failed"
+    fi
     save_state
+    retire_acme_registration
     trap - ERR
     final_report "$admin_key" "$client_key" "$TLS_NOTE"
-}
+)
 
 final_report() { # final_report <admin> <client> <tls-note>
     local admin="$1" client="$2" tls_note="$3" host line out port
@@ -1351,11 +1515,10 @@ final_report() { # final_report <admin> <client> <tls-note>
 
 cmd_update() (
     need_root; is_installed || fail "not installed — run: autozcoder install"
-    local stage committed=0 activated=0 stopped=0 managed=1 healthy=0 i path name lockfd
+    local stage committed=0 activated=0 stopped=0 managed=1 healthy=0 i path name
     [[ "${ZGW_SKIP_SYSTEMD:-0}" == 1 ]] && managed=0
     # Serialize root-owned transactions, including manager refresh.
-    exec {lockfd}>"$UPDATE_LOCK"
-    flock -n "$lockfd" || fail "another update is in progress"
+    acquire_mutation_lock
     stage="$(update_tmpdir)" || fail "cannot create private update staging directory"
     update_cleanup() {
         local rc=$? rollback_ok=1
@@ -1435,12 +1598,7 @@ cmd_update() (
     atomic_install "$stage/ZcodeGateway" "$ZGW_INSTALL_DIR/ZcodeGateway" 755 || fail "binary activation failed"
     fix_ownership || fail "ownership update failed"
     if [[ -x "$ZGW_INSTALL_DIR/genenv/bin/python" ]]; then
-        local -a runner=()
-        [[ "$u" == root ]] || runner=(runuser -u "$u" --)
-        "${runner[@]}" env HOME="$ZGW_INSTALL_DIR/home" \
-            PLAYWRIGHT_BROWSERS_PATH="$ZGW_INSTALL_DIR/pw-browsers" \
-            "$ZGW_INSTALL_DIR/genenv/bin/python" -c \
-            'import playwright, ddddocr, cv2, PIL, numpy, requests, urllib3, certifi, socks; from playwright.sync_api import sync_playwright; from pathlib import Path; p = sync_playwright().start(); assert Path(p.chromium.executable_path).is_file(), "Chromium missing"; p.stop()' \
+        _gen_verify "$ZGW_INSTALL_DIR/genenv/bin/python" \
             >>"$LOG_FILE" 2>&1 || fail "generator environment is incompatible; rollback requested (repair with autozcoder install)"
     fi
     if [[ -f "$stage/install-linux.sh" ]]; then
@@ -1515,28 +1673,136 @@ cmd_info() {
 
 cmd_logs() { journalctl -u "${SERVICE}" -n 100 -f --no-pager; }
 
-cmd_cert() {
+cmd_cert() (
     need_root; is_installed || fail "not installed — run: autozcoder install"
-    local TLS_NOTE="" TLS_TRUSTED=0
+    acquire_mutation_lock
+    local TLS_NOTE="" TLS_TRUSTED=0 CURRENT_ACME_HOST="" committed=0 changed=0
+    local live="$CERT_DIR" old_scheme="${SSL_SCHEME:-https}" stage name path i
+    local managed=1 was_active=0 timer_active=0 timer_enabled=0 host entry
+    [[ "${ZGW_SKIP_SYSTEMD:-0}" != 1 ]] || managed=0
     : >> "$LOG_FILE"
     SERVER_IP="$(detect_server_ip)"
-    mkdir -p "${CERT_DIR}"
     plan_port80
     choose_tls_mode
     local mode="$TLS_MODE_CHOICE"
-    rm -f "${CERT_DIR}/fullchain.pem" "${CERT_DIR}/privkey.pem"
-    apply_tls "$mode"
-    ZGW_SSL_MODE=""
-    bind_config
-    install_renew_timer
-    save_state
-    fix_ownership
-    run_quiet "Restarting the gateway with the new certificate" systemctl restart "${SERVICE}"
+    stage="$(update_tmpdir)" || fail "cannot create private certificate transaction"
+    cert_cleanup() {
+        local rc=$? rollback_ok=1
+        trap - EXIT INT TERM
+        if [[ "$committed" == 0 && "$changed" == 1 ]]; then
+            bad "TLS change failed; restoring certificate, config, state and renewal policy"
+            [[ "$managed" == 0 ]] || systemctl stop "$SERVICE" || true
+            for name in config state renew-service renew-timer; do
+                case "$name" in
+                    config) path="$ZGW_INSTALL_DIR/config.yaml" ;;
+                    state) path="$ENV_FILE" ;;
+                    renew-service) path="$RENEW_SERVICE_FILE" ;;
+                    renew-timer) path="$RENEW_TIMER_FILE" ;;
+                esac
+                if [[ -f "$stage/old-$name" ]]; then
+                    atomic_install "$stage/old-$name" "$path" "$(stat -c %a "$stage/old-$name")" || rollback_ok=0
+                    chown --reference="$stage/old-$name" "$path" || rollback_ok=0
+                else rm -f -- "$path" || rollback_ok=0; fi
+            done
+            rm -rf -- "$live" || rollback_ok=0
+            [[ ! -d "$stage/certs" ]] || cp -a -- "$stage/certs" "$live" || rollback_ok=0
+            # Issuance changes acme.sh's install paths even before activation.
+            # Restore both the old and attempted host entries, including hooks.
+            for host in "${SAVED_ACME_HOST:-}" "$new_host"; do
+                [[ -n "$host" ]] || continue
+                for entry in "$host" "${host}_ecc"; do
+                    rm -rf -- "$ACME_HOME/$entry" || rollback_ok=0
+                    [[ ! -d "$stage/acme/$entry" ]] || cp -a -- "$stage/acme/$entry" "$ACME_HOME/$entry" || rollback_ok=0
+                done
+            done
+            SSL_SCHEME="$old_scheme"
+            if [[ "$managed" == 1 ]]; then
+                systemctl daemon-reload || rollback_ok=0
+                if [[ "$timer_enabled" == 1 ]]; then systemctl enable "${RENEW_UNIT}.timer" || rollback_ok=0
+                else systemctl disable "${RENEW_UNIT}.timer" || rollback_ok=0; fi
+                if [[ "$timer_active" == 1 ]]; then systemctl start "${RENEW_UNIT}.timer" || rollback_ok=0
+                else systemctl stop "${RENEW_UNIT}.timer" || rollback_ok=0; fi
+                if [[ "$was_active" == 1 ]]; then
+                    systemctl restart "$SERVICE" || rollback_ok=0
+                    local healthy=0
+                    for i in $(seq 1 30); do
+                        if curl -fkSs --max-time 2 "$(gw_health_url)" >/dev/null 2>&1; then healthy=1; break; fi
+                        sleep 1
+                    done
+                    [[ "$healthy" == 1 ]] || rollback_ok=0
+                fi
+            fi
+            [[ "$rc" != 0 ]] || rc=1
+        fi
+        if [[ "$rollback_ok" == 1 ]]; then rm -rf -- "$stage"
+        else bad "TLS ROLLBACK FAILED: inspect ${stage} and journalctl -u ${SERVICE}"; fi
+        exit "$rc"
+    }
+    trap cert_cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    local new_host=""
+    case "$mode" in domain) new_host="$ZGW_DOMAIN" ;; ip) new_host="$SERVER_IP" ;; esac
+    for host in "${SAVED_ACME_HOST:-}" "$new_host"; do
+        [[ -z "$host" ]] && continue
+        [[ "$host" =~ ^[A-Za-z0-9][A-Za-z0-9.:-]*$ ]] || fail "invalid ACME host"
+        for entry in "$host" "${host}_ecc"; do
+            if [[ -d "$ACME_HOME/$entry" && ! -e "$stage/acme/$entry" ]]; then
+                mkdir -p "$stage/acme"
+                cp -a -- "$ACME_HOME/$entry" "$stage/acme/" || fail "cannot back up ACME policy"
+            fi
+        done
+    done
+    for name in config state renew-service renew-timer; do
+        case "$name" in
+            config) path="$ZGW_INSTALL_DIR/config.yaml" ;;
+            state) path="$ENV_FILE" ;;
+            renew-service) path="$RENEW_SERVICE_FILE" ;;
+            renew-timer) path="$RENEW_TIMER_FILE" ;;
+        esac
+        [[ ! -L "$path" ]] || fail "refusing symlink deployment file: $path"
+        [[ ! -e "$path" ]] || cp -p -- "$path" "$stage/old-$name" || fail "cannot back up $path"
+    done
+    [[ ! -L "$live" ]] || fail "certificate directory must not be a symlink"
+    [[ ! -e "$live" ]] || cp -a -- "$live" "$stage/certs" || fail "cannot back up certificates"
+    if [[ "$managed" == 1 ]]; then
+        systemctl is-active --quiet "$SERVICE" && was_active=1
+        systemctl is-active --quiet "${RENEW_UNIT}.timer" && timer_active=1
+        systemctl is-enabled --quiet "${RENEW_UNIT}.timer" && timer_enabled=1
+    fi
+    changed=1
+    [[ "$managed" == 0 ]] || systemctl stop "$SERVICE" || fail "could not stop gateway"
+    apply_tls "$mode" || fail "certificate staging/validation failed"
+    bind_config || fail "TLS config update failed"
+    fix_ownership || fail "TLS permissions update failed"
+    if [[ "$managed" == 1 ]]; then
+        run_quiet "Restarting the gateway with the new certificate" systemctl restart "$SERVICE" || fail "TLS restart failed"
+        local healthy=0
+        for i in $(seq 1 30); do
+            if curl -fkSs --max-time 2 "$(gw_health_url)" >/dev/null 2>&1; then healthy=1; break; fi
+            sleep 1
+        done
+        [[ "$healthy" == 1 ]] || fail "new TLS gateway failed its health check"
+    fi
+    activate_acme_registration || fail "ACME activation failed"
+    if [[ "$managed" == 1 ]]; then
+        healthy=0
+        for i in $(seq 1 30); do
+            if curl -fkSs --max-time 2 "$(gw_health_url)" >/dev/null 2>&1; then healthy=1; break; fi
+            sleep 1
+        done
+        [[ "$healthy" == 1 ]] || fail "ACME activation health check failed"
+    fi
+    install_renew_timer || fail "renewal policy update failed"
+    save_state || fail "TLS state update failed"
+    committed=1
+    retire_acme_registration
     ok "TLS updated: ${TLS_NOTE}"
-}
+)
 
-cmd_uninstall() {
+cmd_uninstall() (
     need_root
+    acquire_mutation_lock
     local yes=0; [[ "${1:-}" == "--yes" || "${1:-}" == "-y" ]] && yes=1
     # refuse a path that could wipe something important
     case "${ZGW_INSTALL_DIR}" in
@@ -1575,7 +1841,7 @@ cmd_uninstall() {
     # kill a manually started instance as well
     pkill -f "${ZGW_INSTALL_DIR}/ZcodeGateway" >/dev/null 2>&1 || true
 
-    local host; host="${SAVED_DOMAIN:-${SAVED_SERVER_IP:-}}"
+    local host; host="${SAVED_ACME_HOST:-}"
     if [[ -x "${ACME_HOME}/acme.sh" && -n "$host" ]]; then
         acme --remove -d "$host" >/dev/null 2>&1 || true
         rm -rf "${ACME_HOME:?}/${host:?}" "${ACME_HOME:?}/${host:?}_ecc" 2>/dev/null || true
@@ -1599,7 +1865,7 @@ cmd_uninstall() {
     ok "Zcode Gateway fully removed."
     # last: the manager removes itself (bash has already read this function)
     rm -f "$MANAGER_BIN" 2>/dev/null || true
-}
+)
 
 # ------------------------------------------------------------------- menu
 menu() {
@@ -1638,9 +1904,19 @@ menu() {
 
 usage() {
     sed -n '2,17p' "${SELF:-$0}" 2>/dev/null | sed 's/^# \{0,1\}//' || true
+    echo "Manager commands read private installation state and require root: sudo autozcoder <command>"
 }
 
 # --------------------------------------------------------------------- main
+# Help never needs private state. All other commands need it, so give the
+# actionable privilege error before trying to source the root-only file.
+case "${1:-}" in
+    -h|--help|help) usage; exit 0 ;;
+esac
+need_root
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export HOME=/root TMPDIR=/var/tmp
+unset PYTHONPATH PYTHONHOME PYTHONUSERBASE VIRTUAL_ENV NODE_OPTIONS NODE_PATH BASH_ENV ENV
 resolve_config
 SERVER_IP="${SAVED_SERVER_IP:-}"; SSL_SCHEME="${SAVED_SCHEME:-https}"
 [[ -e "$LOG_FILE" ]] || ( umask 077; : > "$LOG_FILE" ) 2>/dev/null || true

@@ -103,6 +103,9 @@ export async function mount({ root, signal }) {
   const boardBox = el("div", { class: "stack--tight" });
   const summaryBox = el("div", { class: "grid grid--metrics" });
   const savedNote = el("span", { class: "text-ok text-xs", hidden: true, text: "Saved" });
+  savedNote.setAttribute("role", "status");
+  const saveFeedback = el("span", { class: "text-warn text-xs", role: "status", hidden: true });
+  const statusError = el("div", { class: "notice notice--warn", role: "status", hidden: true });
 
   // Controls are created once so a 3s poll never steals focus mid-edit.
   const controls = {};
@@ -118,12 +121,24 @@ export async function mount({ root, signal }) {
 
   let saveTimer = null;
   let saveQueue = Promise.resolve();
+  let feedbackTimer = null;
+  let revision = 0;
+  let savedRevision = 0;
+  let destroyed = false;
   function saveOptions() {
+    revision++;
+    clearTimeout(feedbackTimer);
+    savedNote.hidden = true;
+    saveFeedback.hidden = false;
+    saveFeedback.className = "text-warn text-xs";
+    saveFeedback.textContent = "Unsaved changes";
     clearTimeout(saveTimer);
     saveTimer = setTimeout(() => persistOptions().catch(() => {}), 600);
   }
   function persistOptions() {
     clearTimeout(saveTimer);
+    saveTimer = null;
+    const snapshotRevision = revision;
     const body = {
       captcha: controls.captcha.value,
       captcha_strategy: controls.strategy.value,
@@ -138,13 +153,47 @@ export async function mount({ root, signal }) {
     };
     const aiKey = controls.aiKey.value.trim();
     if (aiKey) body.custom_ai_key = aiKey;
-    const saved = saveQueue.catch(() => {}).then(() => api.post("/admin/dash/generator/options", body));
-    saveQueue = saved;
-    return saved.then(() => {
-      savedNote.hidden = false;
-      setTimeout(() => { savedNote.hidden = true; }, 1600);
-    }).catch(e => { toast("Options were not saved: " + e.message, "err"); throw e; });
+    // Capture controls before queueing: navigation can detach them while an
+    // earlier save is still in flight. The flush intentionally outlives signal.
+    const saved = saveQueue.then(async () => {
+      const result = await api.post("/admin/dash/generator/options", body);
+      if (result?.ok === false || result?.error) throw new Error(result.error || "Save rejected");
+      savedRevision = Math.max(savedRevision, snapshotRevision);
+      if (snapshotRevision === revision) {
+        savedNote.hidden = false;
+        saveFeedback.hidden = true;
+        feedbackTimer = setTimeout(() => { savedNote.hidden = true; }, 1600);
+      }
+    }).catch(e => {
+      if (snapshotRevision === revision) {
+        clearTimeout(feedbackTimer);
+        savedNote.hidden = true;
+        saveFeedback.hidden = false;
+        saveFeedback.className = "text-err text-xs";
+        saveFeedback.textContent = "Options not saved. Edit to retry.";
+      }
+      toast("Options were not saved: " + e.message, "err");
+      throw e;
+    });
+    saveQueue = saved.catch(() => {});
+    return saved;
   }
+
+  function destroy() {
+    if (destroyed) return;
+    destroyed = true;
+    clearTimeout(feedbackTimer);
+    window.removeEventListener("beforeunload", warnUnsaved);
+    if (saveTimer !== null) persistOptions().catch(() => {});
+    auto.destroy();
+  }
+  signal.addEventListener("abort", destroy, { once: true });
+  function warnUnsaved(event) {
+    if (revision <= savedRevision) return;
+    event.preventDefault();
+    event.returnValue = "";
+  }
+  window.addEventListener("beforeunload", warnUnsaved);
 
   function buildOptions(o) {
     const select = (opts, value) => el("select", {
@@ -361,6 +410,7 @@ export async function mount({ root, signal }) {
     });
 
     fill(root, el("div", { class: "stack" }, [
+      statusError,
       isHeadless()
         ? el("div", { class: "notice notice--info" }, [
             el("b", { text: "Headless host. " }),
@@ -375,7 +425,7 @@ export async function mount({ root, signal }) {
       batch.node,
       card({
         title: "Options",
-        actions: savedNote,
+        actions: el("span", {}, [savedNote, saveFeedback]),
         body: optionsBox,
       }),
       el("div", { class: "cols" }, [aiCard, mail.node]),
@@ -390,23 +440,26 @@ export async function mount({ root, signal }) {
   }
 
   const load = async () => {
+    if (signal.aborted || destroyed) return;
     let st;
     try {
       st = await api.get("/admin/dash/generator/status", { signal });
     } catch (e) {
-      if (signal.aborted) return;
+      if (signal.aborted || destroyed || e.name === "AbortError") return;
       // Only an actual missing-scripts response warrants the locator. A brief
       // restart/network failure must not erase the current worker board.
       if (e.status === 404) {
         fill(root, locateCard(e.message, () => load()));
         status = null;
-      } else if (!status) {
-        fill(root, el("div", { class: "notice notice--warn", role: "status",
-          text: "Gateway temporarily unavailable: " + e.message + ". Use Refresh to retry; generator files have not necessarily disappeared." }));
+      } else {
+        statusError.textContent = "Gateway temporarily unavailable: " + e.message + ". Use Refresh to retry; generator files have not necessarily disappeared.";
+        statusError.hidden = false;
+        if (!status) fill(root, statusError);
       }
       return;
     }
-
+    if (signal.aborted || destroyed) return;
+    statusError.hidden = true;
     const firstPaint = !status;
     status = st;
     if (firstPaint) {
@@ -421,5 +474,5 @@ export async function mount({ root, signal }) {
   };
 
   await load();
-  return { refresh: load, destroy: () => { clearTimeout(saveTimer); auto.destroy(); } };
+  return { refresh: load, destroy };
 }

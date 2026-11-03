@@ -103,8 +103,15 @@ class Account:
     # assigned dynamically by the upstream error handler — declared here so
     # the dataclass has a stable field instead of per-instance attributes
     auth_strikes: int = 0
+    credential_generation: int = 0
+    quota_check_generation: int = 0
 
     # ------------------------------------------------------------------ #
+
+    def credential_key(self) -> tuple:
+        """Identify the credentials used by an in-flight upstream request."""
+        return (self.credential_generation, self.access_token, self.refresh_token,
+                self.expires_at, self.notes.get('device_mid'))
 
     def is_model_capped(self, model: str, now: float | None = None) -> bool:
         now = now or time.time()
@@ -244,8 +251,10 @@ def load_from_providers_json(path: str) -> list[Account]:
     """Read ZCode's credentials.json or the supplied tokens.json extract."""
     from .zcode_accounts import read_credentials
     return [Account(id=f["account_id"], email=f["email"], access_token=f["access_token"],
+                    refresh_token=f.get("refresh_token", ""),
                     expires_at=int(f["expires_at_ms"]), source="providers_json",
-                    notes={"name": f["name"]}) for f in read_credentials(path)]
+                    notes={"name": f["name"], "device_mid": f.get("device_mid", "")})
+            for f in read_credentials(path)]
 
 
 def load_from_pool_file(path: str) -> list[Account]:
@@ -310,9 +319,14 @@ class Router:
                 and not (a.state is AccountState.COOLING and now < a.cooldown_until)
                 and a.access_token]
         if self.cfg.strategy == "quota_aware" and model and pool:
-            pool = sorted(pool, key=lambda a: -(a.notes.get("quotas", {}).get(model, {}).get("remaining", 0)))
-            best = pool[0].notes.get("quotas", {}).get(model, {}).get("remaining", 0)
-            pool = [a for a in pool if a.notes.get("quotas", {}).get(model, {}).get("remaining", 0) == best]
+            available = [a for a in pool if a.in_flight < self.cfg.max_in_flight_per_account]
+            # Keep saturated candidates only when there is no free slot, so
+            # acquire() can still distinguish saturation from ineligibility.
+            if available:
+                best = max(a.notes.get("quotas", {}).get(model, {}).get("remaining", 0)
+                           for a in available)
+                pool = [a for a in available
+                        if a.notes.get("quotas", {}).get(model, {}).get("remaining", 0) == best]
         if self.cfg.strategy == "quota_aware" and require_paid:
             thr = self.cfg.min_balance_micro
             filtered = [a for a in pool
@@ -629,7 +643,8 @@ class PoolManager:
 
     async def cap_model(self, account: Account, model: str,
                         seconds: float, reason: str = "inference_cap",
-                        message: str = "", *, quota_only: bool = False) -> None:
+                        message: str = "", *, quota_only: bool = False,
+                        expected_credentials: tuple | None = None) -> None:
         """Record a per-model daily cap. Deliberately does NOT cool the account:
         other models on the same account remain usable.
 
@@ -637,6 +652,9 @@ class PoolManager:
         release time is stored so tools and clients can see when the model frees up.
         """
         async with self._lock:
+            if expected_credentials is not None and (self._accounts.get(account.id) is not account
+                    or account.credential_key() != expected_credentials):
+                return
             release_at = time.time() + max(seconds, 1.0)
             # no-op short-circuit: re-parking the same model with the same
             # release window happens on every balance poll while a cap is
@@ -662,9 +680,13 @@ class PoolManager:
             # (debounced, written off the lock — see _schedule_caps_save)
             self._schedule_caps_save()
 
-    async def clear_quota_cap(self, account: Account, model: str) -> None:
+    async def clear_quota_cap(self, account: Account, model: str, *,
+                              expected_credentials: tuple | None = None) -> None:
         """Billing resolves quota/window parks, not risk or rate-limit parks."""
         async with self._lock:
+            if expected_credentials is not None and (self._accounts.get(account.id) is not account
+                    or account.credential_key() != expected_credentials):
+                return
             if not _quota_cap(account.model_cap_info.get(model, {})):
                 return
             account.model_caps.pop(model, None)
@@ -761,17 +783,24 @@ class PoolManager:
 
     # -- state transitions ----------------------------------------------- #
 
-    async def on_success(self, account: Account) -> None:
+    async def on_success(self, account: Account, *, expected_credentials: tuple | None = None) -> None:
         async with self._lock:
+            if expected_credentials is not None and (self._accounts.get(account.id) is not account
+                    or account.credential_key() != expected_credentials):
+                return
             account.error_count = 0
             account.last_error = ""
             account.auth_strikes = 0
             if account.state is AccountState.COOLING:
                 account.state = AccountState.READY
 
-    async def restore(self, account: Account, *, plan_recovered: bool = False) -> bool:
+    async def restore(self, account: Account, *, plan_recovered: bool = False,
+                      expected_credentials: tuple | None = None) -> bool:
         """A retired account's balance recovered: back into rotation."""
         async with self._lock:
+            if expected_credentials is not None and (self._accounts.get(account.id) is not account
+                    or account.credential_key() != expected_credentials):
+                return False
             if account.state is AccountState.DEAD:
                 if not plan_recovered or account.death_reason != 'plan_lost':
                     return False
@@ -789,8 +818,11 @@ class PoolManager:
             return True
 
     async def cool(self, account: Account, seconds: int | None = None,
-                   reason: str = "") -> None:
+                   reason: str = "", *, expected_credentials: tuple | None = None) -> None:
         async with self._lock:
+            if expected_credentials is not None and (self._accounts.get(account.id) is not account
+                    or account.credential_key() != expected_credentials):
+                return
             if account.state is AccountState.DEAD:
                 return
             account.state = AccountState.COOLING
@@ -802,10 +834,14 @@ class PoolManager:
                  "message": "", "state": "cooling"})
 
     async def retire(self, account: Account, reason: str = "insufficient_credits",
-                     paid_only: bool = True) -> None:
+                      paid_only: bool = True, *,
+                      expected_credentials: tuple | None = None) -> None:
         """402. Credit exhaustion is per model-class: by default only the paid
         lane is retired, because zcode-free/* models do not consume credits."""
         async with self._lock:
+            if expected_credentials is not None and (self._accounts.get(account.id) is not account
+                    or account.credential_key() != expected_credentials):
+                return
             if account.state is AccountState.DEAD:
                 return
             account.last_error = reason
@@ -816,8 +852,12 @@ class PoolManager:
             else:
                 account.state = AccountState.EXHAUSTED
 
-    async def kill(self, account: Account, reason: str = "", *, cause: str = "") -> bool:
+    async def kill(self, account: Account, reason: str = "", *, cause: str = "",
+                   expected_credentials: tuple | None = None) -> bool:
         async with self._lock:
+            if expected_credentials is not None and (self._accounts.get(account.id) is not account
+                    or account.credential_key() != expected_credentials):
+                return False
             if cause == 'plan_lost' and account.state is AccountState.DEAD:
                 return False
             account.state = AccountState.DEAD
@@ -833,7 +873,8 @@ class PoolManager:
         return True
 
     async def kill_after_strikes(self, account: Account, reason: str = "",
-                                 strikes: int = 3) -> None:
+                                 strikes: int = 3, *,
+                                 expected_credentials: tuple | None = None) -> None:
         """Kill only after N consecutive auth failures; earlier ones just cool.
 
         A single transient upstream 401 blip used to permanently kill accounts
@@ -841,6 +882,9 @@ class PoolManager:
         login). Those accounts now cool for the normal cooldown window and get
         re-tried; only repeated failures escalate to DEAD."""
         async with self._lock:
+            if expected_credentials is not None and (self._accounts.get(account.id) is not account
+                    or account.credential_key() != expected_credentials):
+                return
             n = getattr(account, 'auth_strikes', 0) + 1
             if account.state is AccountState.DEAD:
                 account.death_reason = reason or 'authentication_error'
@@ -865,6 +909,11 @@ class PoolManager:
                 account.error_history.append(
                     {"ts": time.time(), "status": 401, "code": f"auth_strike_{n}",
                      "message": reason, "state": "cooling"})
+
+    async def auth_failed(self, account: Account, reason: str = "", *,
+                          expected_credentials: tuple | None = None) -> None:
+        await self.kill_after_strikes(account, reason,
+                                      expected_credentials=expected_credentials)
 
     async def enable(self, account_id: str) -> bool:
         async with self._lock:
@@ -896,6 +945,7 @@ class PoolManager:
             existing.access_token = account.access_token
             existing.refresh_token = account.refresh_token
             existing.expires_at = account.expires_at
+            existing.credential_generation += 1
             existing.email = account.email or existing.email
             existing.state = account.state if account.state is not AccountState.DEAD else existing.state
             if existing.state is not AccountState.DEAD:

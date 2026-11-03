@@ -11,7 +11,7 @@ The public bootstrap remains at the repository root as
 [`install-linux.sh`](../../install-linux.sh); existing install URLs stay valid.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/B3hnamR/AutoZcoder/v2.0.0/install-linux.sh | sudo bash -s -- install
+curl -fsSL https://raw.githubusercontent.com/B3hnamR/AutoZcoder/v2.0.1/install-linux.sh | sudo bash -s -- install
 ```
 
 Defaults to **HTTPS on the server's bare IP** (Let's Encrypt shortlived IP
@@ -21,20 +21,26 @@ certificate (browser warning); check the final report. Ports **80/tcp**
 (certificate issue/renewal) and **8443/tcp** must be reachable. The installer
 ends with a status report (also saved to `/opt/zcodegateway/install-report.txt`).
 
-It also installs the `autozcoder` manager command:
+It also installs the `autozcoder` manager command. All commands except help
+require root:
 
 | Command | What it does |
 |---|---|
-| `autozcoder` | interactive menu (status, start, stop, restart, logs, keys, TLS, update, uninstall) |
-| `autozcoder start` / `stop` / `restart` | control the gateway service |
-| `autozcoder status` | service, certificate expiry, dashboard URL |
-| `autozcoder info` | dashboard URL + admin/client keys |
-| `autozcoder cert` | re-issue or switch the certificate (IP / domain / self-signed / none) |
+| `sudo autozcoder` | interactive menu (status, start, stop, restart, logs, keys, TLS, update, uninstall) |
+| `sudo autozcoder start` / `stop` / `restart` | control the gateway service |
+| `sudo autozcoder status` | service, certificate expiry, dashboard URL |
+| `sudo autozcoder info` | dashboard URL + admin/client keys |
+| `sudo autozcoder cert` | transactional certificate/mode change (IP / domain / self-signed / none); restores prior TLS/config/renewal state on failure |
 | `sudo autozcoder update` | transactional, SHA-256 verified update; startup/health failure rolls back deployment files; config and runtime data kept |
-| `autozcoder uninstall` | fully deletes service, certificates, files (`--yes` to skip the prompt) |
+| `sudo autozcoder uninstall` | fully deletes service, certificates, files (`--yes` to skip the prompt) |
 
 Non-interactive overrides: `ZGW_SSL_MODE=ip|domain|self|none`, `ZGW_DOMAIN`,
 `ZGW_PORT`, `ZGW_SERVER_IP`, `ZGW_OPEN_FIREWALL=1`.
+
+The selected TLS mode persists across reinstalls, including self-signed and
+loopback HTTP (`none`). Certificate changes validate a staged certificate/key
+pair before activation and, with systemd, check gateway health before committing.
+Install, certificate changes, updates, uninstall and timer renewal share a lock.
 
 Published Linux binaries target x86_64 and glibc 2.35 or newer (Ubuntu 22.04
 build baseline). Older glibc and musl/Alpine require a compatible source build;
@@ -78,8 +84,8 @@ HOME=/opt/zcodegateway/home PLAYWRIGHT_BROWSERS_PATH=/opt/zcodegateway/pw-browse
 ```
 
 Service control and log commands require systemd. Without it, arrange certificate
-renewal yourself (run `/root/.acme.sh/acme.sh --cron --home /root/.acme.sh` twice
-daily, adjusting the home for the installing user), and restart your supervisor
+renewal yourself (run `/root/.acme.sh/acme.sh --renew --home /root/.acme.sh --server letsencrypt -d <active-IP-or-domain>`
+as root twice daily for a Let's Encrypt certificate), and restart your supervisor
 after renewed certificate files are installed. The installer does not create a
 renewal timer in this mode. Reused certificates must have over 24 hours remaining;
 expired and nearly expired certificates go through issuance again.
@@ -220,6 +226,10 @@ Keep the executable and install-directory owner as root. The sticky, group-writa
 install directory permits atomic config/database writes without allowing the
 service user to replace the root-owned executable. Give only runtime subfolders
 to the service user; protect TLS keys as root-owned, service-group-readable files.
+
+The automated installer also keeps its private Node installation root-owned.
+Generator-environment, browser and npm maintenance runs as an unprivileged tooling
+user, including when `ZGW_RUN_AS_ROOT=1` is selected for the gateway itself.
 
 ```ini
 [Unit]

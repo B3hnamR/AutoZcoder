@@ -16,13 +16,16 @@
  */
 import { GlobalWindow as Window, PropertySymbol } from "happy-dom";
 import WindowBrowserContext from "happy-dom/lib/window/WindowBrowserContext.js";
-import { ProxyAgent, setGlobalDispatcher } from "undici";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { Worker } from "node:worker_threads";
 import { CaptchaDeadline } from "./captcha-deadline.ts";
+import { bootstrapCaptchaRoute, readBoundedBody } from "./captcha-transport.ts";
+import { serializeCookies, storeCookieStrings } from "./captcha-cookies.ts";
+import { CaptchaLease } from "./captcha-lease.ts";
+import { SYNC_WORKER_SRC } from "./captcha-sync-worker.ts";
 
 // -- Blocking fetch for sync XHR (self-contained builds) --------------------
 // happy-dom implements sync XHR by spawning `process.argv[0] -e <script>`,
@@ -44,62 +47,18 @@ const SYNC_FETCH_TIMEOUT_MS = Number(process.env.CAPTCHA_SYNC_FETCH_TIMEOUT_MS |
 // [6..]=payload bytes (statusText, headersJson, setCookieJson, body)
 let _syncFetchWorker: Worker | null = null;
 
-const SYNC_WORKER_SRC = `
-  const { parentPort } = require("node:worker_threads");
-  const enc = new TextEncoder();
-  parentPort.on("message", (m) => {
-    (async () => {
-      const i32 = new Int32Array(m.sab);
-      const u8 = new Uint8Array(m.sab);
-      // Fixed-size header (bytes), NOT i32.length * 4 -- that is the whole SAB.
-      const payloadAt = 64;
-      const fail = (msg) => {
-        const b = enc.encode(msg).subarray(0, u8.length - payloadAt);
-        u8.set(b, payloadAt);
-        i32[5] = b.length; i32[1] = 0; i32[2] = 0; i32[3] = 0; i32[4] = 0;
-        i32[0] = 2; Atomics.notify(i32, 0);
-      };
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), Math.max(0, m.deadlineAt - Date.now()));
-      try {
-        if (Date.now() >= m.deadlineAt) throw new Error("sync fetch timeout");
-        const res = await fetch(m.url, { ...m.init, signal: controller.signal });
-        const body = Buffer.from(await res.arrayBuffer());
-        const headers = {};
-        for (const [k, v] of res.headers) headers[k] = v;
-        const setCookie = typeof res.headers.getSetCookie === "function" ? res.headers.getSetCookie() : [];
-        const statusText = enc.encode(res.statusText || "");
-        const headersJson = enc.encode(JSON.stringify(headers));
-        const setCookieJson = enc.encode(JSON.stringify(setCookie));
-        if (statusText.length + headersJson.length + setCookieJson.length + body.length > u8.length - payloadAt) {
-          throw new Error("sync fetch response exceeds shared buffer");
-        }
-        let off = payloadAt;
-        u8.set(statusText, off); i32[2] = statusText.length; off += statusText.length;
-        u8.set(headersJson, off); i32[3] = headersJson.length; off += headersJson.length;
-        u8.set(setCookieJson, off); i32[4] = setCookieJson.length; off += setCookieJson.length;
-        u8.set(body, off); i32[5] = body.length;
-        i32[1] = res.status;
-        i32[0] = 1; Atomics.notify(i32, 0);
-      } catch (err) {
-        fail(String((err && err.message) || err));
-      } finally {
-        clearTimeout(timer);
-        controller.abort();
-      }
-    })();
-  });
-`;
-
 function ensureSyncFetchWorker(): Worker {
   if (_syncFetchWorker) return _syncFetchWorker;
-  _syncFetchWorker = new Worker(SYNC_WORKER_SRC, { eval: true });
+  _syncFetchWorker = new Worker(SYNC_WORKER_SRC, { eval: true, workerData: {
+    nativeProxy: typeof Bun !== "undefined", undiciURL: import.meta.resolve("undici"),
+  } });
   const worker = _syncFetchWorker;
   worker.on("error", () => { if (_syncFetchWorker === worker) shutdownSyncFetchWorker(); });
   return _syncFetchWorker;
 }
 
-function syncFetchBlocking(url: string, init: Record<string, unknown>, timeoutMs = SYNC_FETCH_TIMEOUT_MS): {
+function syncFetchBlocking(url: string, init: Record<string, unknown>, timeoutMs = SYNC_FETCH_TIMEOUT_MS,
+  proxyUrl = bootstrapCaptchaRoute().proxyUrl): {
   status: number; statusText: string; headers: Record<string, string>;
   setCookie: string[]; body: Buffer;
 } | { error: string } {
@@ -110,7 +69,7 @@ function syncFetchBlocking(url: string, init: Record<string, unknown>, timeoutMs
     const sab = new SharedArrayBuffer(SYNC_FETCH_HEADER_BYTES + SYNC_FETCH_BUF_BYTES);
     const i32 = new Int32Array(sab);
     const u8 = new Uint8Array(sab);
-    worker.postMessage({ sab, url, init, deadlineAt });
+    worker.postMessage({ sab, url, init, deadlineAt, proxyUrl });
     const waitResult = Atomics.wait(i32, 0, 0, Math.max(0, deadlineAt - Date.now()));
     if (waitResult === "timed-out") {
       shutdownSyncFetchWorker();
@@ -162,13 +121,6 @@ const COOKIE_CACHE_TTL_MS = 5 * 60 * 1000;
 const _DEBUG = /^(1|true|yes)$/i.test(
   process.env.CAPTCHA_DEBUG || process.env.CAPTCHA_DEBUG_BODIES || "",
 );
-
-const proxyUrl = process.env.HTTP_PROXY || process.env.HTTPS_PROXY;
-if (proxyUrl) {
-  try {
-    setGlobalDispatcher(new ProxyAgent(proxyUrl));
-  } catch (_) {}
-}
 
 // -- Globals shared across solves --------------------------------------------
 // Ring buffer: the stall detector reads only the newest entry and failure
@@ -279,7 +231,7 @@ function getCachedBody(url) {
 async function fetchAndStore(url, deadline) {
   try {
     const buf = await deadline.fetch(url, { headers: { "user-agent": fp.userAgent } },
-      async (res) => Buffer.from(await res.arrayBuffer()));
+      (res) => readBoundedBody(res, deadline.controller.signal));
     if (buf.length > 0) {
       rememberCdnBody(url, buf);
       try {
@@ -326,53 +278,20 @@ function injectRequestHeaders(request) {
   } catch (_) {}
 }
 
-function cookieHeader(request, window, browserFrame) {
+function cookieHeader(request, window) {
   try {
-    const ctx = browserFrame.page.context;
-    const u = new URL(request.url);
     if (request.credentials === "omit") return null;
-    const cookies = ctx.cookieContainer.getCookies(u, false);
-    if (cookies.length > 0) {
-      return cookies.map((c) => `${c.name}=${c.value}`).join("; ");
-    }
+    const frame = new WindowBrowserContext(window).getBrowserFrame();
+    return serializeCookies(frame.page.context.cookieContainer, request.url) || null;
   } catch (_) {}
   return null;
 }
 
-function storeSetCookies(res, url) {
+function storeSetCookies(res, url, window) {
   try {
     const list = typeof res.headers.getSetCookie === "function" ? res.headers.getSetCookie() : [];
-    if (list.length) {
-      const cookieContainer = global.__cookieContainer;
-      if (cookieContainer) {
-        for (const raw of list) {
-          const u = new URL(url);
-          const parts = raw.split(";");
-          const pair = parts[0].split("=");
-          const cookie = {
-            name: pair[0].trim(),
-            value: pair.slice(1).join("=").trim(),
-            url: u.origin,
-            domain: u.hostname,
-            path: "/",
-          };
-          for (const p of parts.slice(1)) {
-            const kv = p.trim().split(/=(.*)/s);
-            const k = (kv[0] || "").toLowerCase();
-            if (k === "domain" && kv[1]) cookie.domain = kv[1];
-            if (k === "path" && kv[1]) cookie.path = kv[1];
-            if (k === "expires") cookie.expires = new Date(kv[1]).getTime();
-            if (k === "max-age") cookie.maxAge = parseInt(kv[1], 10);
-            if (k === "httponly") cookie.httpOnly = true;
-            if (k === "secure") cookie.secure = true;
-            if (k === "samesite") cookie.sameSite = kv[1];
-          }
-          try {
-            cookieContainer.addCookies([cookie]);
-          } catch (_) {}
-        }
-      }
-    }
+    const frame = new WindowBrowserContext(window).getBrowserFrame();
+    storeCookieStrings(frame.page.context.cookieContainer, url, list);
   } catch (_) {}
 }
 
@@ -395,6 +314,18 @@ export function installBufferedRequest(w) {
         : init);
     }
   };
+}
+
+export function primeWindowCookies(w, cookies) {
+  const frame = new WindowBrowserContext(w).getBrowserFrame();
+  const container = frame.page.context.cookieContainer;
+  storeCookieStrings(container, "https://zcode.z.ai/", cookies);
+  const visitorId = crypto.randomUUID();
+  storeCookieStrings(container, "https://zcode.z.ai/", [
+    `zcode_visitor_id=${visitorId}; Path=/`,
+    `zcode_device_mid=${crypto.randomUUID()}; Path=/`,
+    `visitor_id=${visitorId}; Path=/; HttpOnly`,
+  ]);
 }
 
 function syncResponse(w, url, status, statusText, headers, body) {
@@ -441,14 +372,14 @@ function makeInterceptor(bypassPeCache = false, getDeadline = () => null, blocki
           });
         }
       }
-      // Passthrough via global fetch (undici; honors global ProxyAgent).
+       // Passthrough via the solve's explicit route, never ambient proxy state.
       try {
         const init = { method: request.method, headers: {} };
         request.headers.forEach((value, key) => {
           init.headers[key] = value;
         });
         const bs = new URL(url);
-        const cookie = cookieHeader(request, w, global.__browserFrame);
+        const cookie = cookieHeader(request, w);
         if (cookie) init.headers.cookie = cookie;
         if (request.body) {
           const ab = await deadline.run(() => request.arrayBuffer());
@@ -457,9 +388,9 @@ function makeInterceptor(bypassPeCache = false, getDeadline = () => null, blocki
           }
         }
         const { res, buf } = await deadline.fetch(url, init, async (res) => ({
-          res, buf: Buffer.from(await res.arrayBuffer()),
+          res, buf: await readBoundedBody(res, deadline.controller.signal),
         }));
-        storeSetCookies(res, url);
+        storeSetCookies(res, url, w);
         if (_DEBUG && /captcha-open|verify\.|device\.saf|cloudauth-device|upload\./i.test(url) && buf.length && buf.length < 4096) {
           try {
             process.stderr.write(`[xhr-body] ${request.method} ${bs.hostname}${bs.pathname}-> ${res.status} ${buf.toString("utf8").slice(0, 1200)}\n`);
@@ -526,7 +457,7 @@ function makeInterceptor(bypassPeCache = false, getDeadline = () => null, blocki
       request.headers.forEach((value, key) => {
         init.headers[key] = value;
       });
-      const cookie = cookieHeader(request, w, global.__browserFrame);
+       const cookie = cookieHeader(request, w);
       if (cookie) init.headers.cookie = cookie;
       const bodyBuffer = request[PropertySymbol.bodyBuffer];
       if (bodyBuffer !== null && bodyBuffer !== undefined) {
@@ -535,39 +466,13 @@ function makeInterceptor(bypassPeCache = false, getDeadline = () => null, blocki
         throw new Error("sync request body is not buffered");
       }
       const res = blockingFetch(url, init as any,
-        Math.min(SYNC_FETCH_TIMEOUT_MS, deadline?.remaining() ?? SYNC_FETCH_TIMEOUT_MS)) as any;
+        Math.min(SYNC_FETCH_TIMEOUT_MS, deadline?.remaining() ?? SYNC_FETCH_TIMEOUT_MS),
+        (deadline?.route ?? bootstrapCaptchaRoute()).proxyUrl) as any;
       if (res.error) {
         return failed(res.error);
       }
       deadline?.remaining();
-      try {
-        for (const raw of res.setCookie || []) {
-          const cookieContainer = global.__cookieContainer;
-          if (!cookieContainer) break;
-          const u = new URL(url);
-          const parts = raw.split(";");
-          const pair = parts[0].split("=");
-          const cookie: any = {
-            name: pair[0].trim(),
-            value: pair.slice(1).join("=").trim(),
-            url: u.origin,
-            domain: u.hostname,
-            path: "/",
-          };
-          for (const p of parts.slice(1)) {
-            const kv = p.trim().split(/=(.*)/s);
-            const k = (kv[0] || "").toLowerCase();
-            if (k === "domain" && kv[1]) cookie.domain = kv[1];
-            if (k === "path" && kv[1]) cookie.path = kv[1];
-            if (k === "expires") cookie.expires = new Date(kv[1]).getTime();
-            if (k === "max-age") cookie.maxAge = parseInt(kv[1], 10);
-            if (k === "httponly") cookie.httpOnly = true;
-            if (k === "secure") cookie.secure = true;
-            if (k === "samesite") cookie.sameSite = kv[1];
-          }
-          try { cookieContainer.addCookies([cookie]); } catch (_) {}
-        }
-      } catch (_) {}
+       storeSetCookies({ headers: { getSetCookie: () => res.setCookie || [] } }, url, w);
       const hdrs: Record<string, string> = {};
       for (const [k, v] of Object.entries(res.headers || {})) hdrs[k] = String(v);
       // Sync interceptor contract: PLAIN OBJECT with Buffer body (happy-dom's
@@ -759,7 +664,7 @@ function installEvalInstrumentation(w) {
             try {
               const { res, fresh } = await w.__capDeadline.fetch(filename,
                 { headers: { "user-agent": fp.userAgent } }, async (res) => ({
-                  res, fresh: Buffer.from(await res.arrayBuffer()),
+                  res, fresh: await readBoundedBody(res, w.__capDeadline.controller.signal),
                 }));
               process.stderr.write(
                 `[EVAL-CACHE-COMPARE] cachedLen=${src.length} freshLen=${fresh.length} freshSha1=${crypto.createHash("sha1").update(fresh).digest("hex")} http=${res.status}\n`,
@@ -1886,49 +1791,9 @@ async function createDom(region, prefix, deadline = new CaptchaDeadline()) {
   // Reach into the frame for cookie container + frame ref (host side helpers).
   // WindowBrowserContext imported at module scope
   const browserFrame = new WindowBrowserContext(w).getBrowserFrame();
-  global.__browserFrame = browserFrame;
-  global.__cookieContainer = browserFrame.page.context.cookieContainer;
 
   // Cookie priming
-  for (const raw of cookies) {
-    try {
-      const u = new URL("https://zcode.z.ai/");
-      const parts = raw.split(";");
-      const pair = parts[0].split("=");
-      const cookie = {
-        name: pair[0].trim(),
-        value: pair.slice(1).join("=").trim(),
-        url: u.origin,
-        domain: u.hostname,
-        path: "/",
-      };
-      for (const p of parts.slice(1)) {
-        const kv = p.trim().split(/=(.*)/s);
-        const k = (kv[0] || "").toLowerCase();
-        if (k === "domain" && kv[1]) cookie.domain = kv[1];
-        if (k === "path" && kv[1]) cookie.path = kv[1];
-        if (k === "expires") cookie.expires = new Date(kv[1]).getTime();
-        if (k === "max-age") cookie.maxAge = parseInt(kv[1], 10);
-        if (k === "httponly") cookie.httpOnly = true;
-        if (k === "secure") cookie.secure = true;
-        if (k === "samesite") cookie.sameSite = kv[1];
-      }
-      browserFrame.page.context.cookieContainer.addCookies([cookie]);
-    } catch (_) {}
-  }
-
-  const visitorId = crypto.randomUUID();
-  const deviceMid = crypto.randomUUID();
-  const pre = [
-    { name: "zcode_visitor_id", value: visitorId, domain: "zcode.z.ai" },
-    { name: "zcode_device_mid", value: deviceMid, domain: "zcode.z.ai" },
-    { name: "visitor_id", value: visitorId, domain: "zcode.z.ai", httpOnly: true },
-  ];
-  for (const c of pre) {
-    try {
-      browserFrame.page.context.cookieContainer.addCookies([{ ...c, url: "https://zcode.z.ai", path: "/" }]);
-    } catch (_) {}
-  }
+  primeWindowCookies(w, cookies);
 
   // Apply polyfills + masking BEFORE the SDK script runs.
   // Bun compatibility: happy-dom's VM realm isolation doesn't apply under
@@ -1969,7 +1834,7 @@ async function createDom(region, prefix, deadline = new CaptchaDeadline()) {
           try {
             const { res, fresh } = await w.__capDeadline.fetch(url,
               { headers: { "user-agent": fp.userAgent } }, async (res) => ({
-                res, fresh: Buffer.from(await res.arrayBuffer()),
+                res, fresh: await readBoundedBody(res, w.__capDeadline.controller.signal),
               }));
             process.stderr.write(
               `[${kind}-CACHE-COMPARE] cachedLen=${s.length} freshLen=${fresh.length} freshSha1=${crypto.createHash("sha1").update(fresh).digest("hex")} http=${res.status}\n`,
@@ -2297,10 +2162,6 @@ function destroyDom(win) {
     if (closing?.catch) closing.catch(() => {});
   } catch (_) {}
   try {
-    global.__cookieContainer = null;
-    global.__browserFrame = null;
-  } catch (_) {}
-  try {
     if (win.__capGlobalAliasInstalled) {
       win.__capGlobalAliasInstalled = false;
       removeGlobalWindowAlias(globalThis, win);
@@ -2381,12 +2242,17 @@ function takeReusableWindow() {
   if (!p.window) return null;
   if (p.solves >= REUSE_MAX_SOLVES) { discardReusableWindow(); return null; }
   if (Date.now() - p.lastUsedAt > REUSE_MAX_IDLE_MS) { discardReusableWindow(); return null; }
-  return { window: p.window, browserFrame: p.browserFrame, reused: true };
+  const lease = { window: p.window, browserFrame: p.browserFrame, solves: p.solves };
+  p.window = null;
+  p.browserFrame = null;
+  p.solves = 0;
+  return lease;
 }
-function stageReusableWindow(window, browserFrame) {
+function stageReusableWindow(window, browserFrame, solves = 1) {
+  if (_reusePool.window && _reusePool.window !== window) discardReusableWindow();
   _reusePool.window = window;
   _reusePool.browserFrame = browserFrame;
-  _reusePool.solves = 0;
+  _reusePool.solves = solves;
   _reusePool.lastUsedAt = Date.now();
 }
 function discardReusableWindow() {
@@ -2397,10 +2263,6 @@ function discardReusableWindow() {
   p.window = null;
   p.browserFrame = null;
   p.solves = 0;
-}
-function noteWindowSolved() {
-  _reusePool.solves += 1;
-  _reusePool.lastUsedAt = Date.now();
 }
 
 // -- Guest error capture (read side) ----------------------------------------
@@ -2428,14 +2290,15 @@ function guestErrorSummary(w, max = 4) {
 
 let domFactoryForTest = null;
 export function __setDomFactoryForTest(factory) { domFactoryForTest = factory; }
+export function __clearReusableWindowForTest() { discardReusableWindow(); }
+const inProcessLease = new CaptchaLease();
 
 async function solveTraceless(opts) {
   const scene = opts.scene || "11xygtvd";
   const region = opts.region || "sgp";
   const prefix = opts.prefix || "no8xfe";
-  // Overall solve deadline. On the in-process fallback path a hung solve
-  // stalls the main event loop — fail fast and let the pool's retry ladder
-  // handle it; the worker path terminates on the same env knob.
+  // Overall asynchronous/I/O deadline. In-process synchronous guest CPU cannot
+  // be preempted; only an available worker entry permits hard termination.
   // Override: CAPTCHA_SOLVE_TIMEOUT_MS.
   const timeoutMs = opts.timeoutMs ?? Number(process.env.CAPTCHA_SOLVE_TIMEOUT_MS || 20_000);
   const deadline = new CaptchaDeadline(timeoutMs, opts.deadlineAt);
@@ -2447,13 +2310,16 @@ async function solveTraceless(opts) {
   let browserFrame;
   let reused = false;
   let keepWindow = false;
+  let release;
   try {
+    release = await inProcessLease.acquire(deadline);
     deadline.remaining();
     if (wantReuse) {
       dom = takeReusableWindow();
       if (dom) reused = true;
     }
     if (!dom) {
+      // Keep ownership through setup teardown even if a factory responds late.
       dom = await (domFactoryForTest ?? createDom)(region, prefix, deadline);
     }
     ({ window: w, browserFrame } = dom);
@@ -2561,8 +2427,7 @@ async function solveTraceless(opts) {
     deadline.remaining();
     const out = extractVerifyParam(param);
     if (wantReuse) {
-      if (reused) noteWindowSolved();
-      else stageReusableWindow(w, browserFrame);
+      stageReusableWindow(w, browserFrame, reused ? dom.solves + 1 : 1);
       keepWindow = true;
     }
     return out;
@@ -2582,9 +2447,9 @@ async function solveTraceless(opts) {
     // solve -- a ~48% CPU cut. On failure it is destroyed: a stalled window must
     // not poison later solves, and the retry rolls a fresh pe anyway.
     if (!keepWindow && w) {
-      if (_reusePool.window === w) _reusePool.window = null;
       destroyDom(w);
     }
+    release?.();
   }
 }
 

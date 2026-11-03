@@ -5,7 +5,7 @@ import time
 from pathlib import Path
 from urllib.parse import urlparse, quote
 import httpx
-from .accounts_dir import snapshot_filename, snapshot_path, parse_snapshot, write_snapshot
+from .accounts_dir import save_account_snapshot, write_snapshot
 from .config import Fingerprint
 from .pool import Account
 from .upstream import build_headers
@@ -17,7 +17,7 @@ class DeviceLogin:
         self._own_client = client is None
         self.client = client or httpx.AsyncClient(timeout=httpx.Timeout(30, connect=10))
         self.base_url, self.fingerprint = base_url.rstrip('/'), fingerprint or Fingerprint()
-        self.state, self.error = 'idle', None
+        self.state, self.error = 'starting', None
         self.user_code, self.verification_url, self.account_email, self.snapshot_path = None, None, None, None
         self._ready, self._cancel = asyncio.Event(), asyncio.Event()
         self._poll_token, self._flow_id = None, None
@@ -87,14 +87,23 @@ class DeviceLogin:
         account = Account(id=ident, email=user.get('email', ''), access_token=token,
                           expires_at=int(claims.get('exp') or 0)*1000, source='device-login',
                           notes={'name': user.get('name', ''), 'device_mid': self.fingerprint.device_mid})
-        used = {p.name: parse_snapshot(p).get('account_id') for p in self.accounts_dir.glob('*.txt')}
-        name = snapshot_filename(account.email, ident, used)
-        self.snapshot_path = snapshot_path(self.accounts_dir, name)
-        await asyncio.to_thread(write_snapshot, self.snapshot_path,
+        fields = {}
+
+        def write_saved(path, merged):
+            write_snapshot(path, merged)
+            fields.update(merged)
+
+        self.snapshot_path = await asyncio.to_thread(save_account_snapshot, self.accounts_dir,
             {'account_id': ident, 'email': account.email, 'name': user.get('name', ''),
              'access_token': token, 'expires_at_ms': str(account.expires_at),
-             'device_mid': self.fingerprint.device_mid, 'source': 'ZCode CLI OAuth'})
-        account.notes['file'] = name
+             'device_mid': self.fingerprint.device_mid, 'source': 'ZCode CLI OAuth'},
+            writer=write_saved)
+        account.email = fields.get('email', account.email)
+        account.refresh_token = fields.get('refresh_token', '')
+        account.notes.update({key: fields.get(key, '') for key in (
+            'captured_at', 'name', 'balance_usd', 'plan', 'workos_user_id', 'device_mid')})
+        account.notes['imported_jwt'] = fields.get('imported_jwt') == 'true'
+        account.notes['file'] = self.snapshot_path.name
         self.account_email = account.email
         return account
 

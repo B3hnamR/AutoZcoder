@@ -20,6 +20,7 @@ def _shell(tmp_path, body, *, installer=True):
     script = (ROOT / ("install-linux.sh" if installer else "scripts/build/linux.sh")).read_text(encoding="utf-8")
     if installer:
         script = script.split("# --------------------------------------------------------------------- main", 1)[0]
+        script += '\nUPDATE_LOCK="$PWD/mutation.lock"\nupdate_tmpdir() { mktemp -d "$PWD/stage.XXXXXXXX"; }\n'
     else:
         script = script.split("# 2. python + deps", 1)[0]
     env = {
@@ -525,6 +526,7 @@ chown() { :; }; chmod() { :; }; fix_ownership() { :; }
 update_tmpdir() { mktemp -d "$PWD/stage.XXXXXXXX"; }
 stage_release() { printf new > "$1/ZcodeGateway"; printf manager > "$1/install-linux.sh"; }
 systemctl() { :; }; curl() { return 0; }; sleep() { :; }
+runuser() { return 42; }
 gw_health_url() { echo https://127.0.0.1:8443/health; }
 cmd_update
 ''')

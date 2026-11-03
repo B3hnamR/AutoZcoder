@@ -125,7 +125,7 @@ def test_direct_overrides_inherited_proxy_and_pool(worker, monkeypatch, capsys):
     assert 'ZAI_PROXY' not in os.environ
     worker.ns['pick_verified_proxy'].assert_not_called()
     worker.claim.claim_start.assert_called_once_with(
-        'PRIVATE_TOKEN', log=worker.ns['logger'].info, force_direct=True)
+        'PRIVATE_TOKEN', log=worker.ns['logger'].info, force_direct=True, proxy_fallback=False)
 
 
 def test_proxy_picks_route_before_mail_and_uses_claim_route(worker, monkeypatch, capsys):
@@ -139,7 +139,7 @@ def test_proxy_picks_route_before_mail_and_uses_claim_route(worker, monkeypatch,
     assert observed == ['socks5://proxy.test:1080']
     assert os.environ['ZAI_PROXY'] == 'socks5://proxy.test:1080'
     worker.claim.claim_start.assert_called_once_with(
-        'PRIVATE_TOKEN', log=worker.ns['logger'].info, force_direct=False)
+        'PRIVATE_TOKEN', log=worker.ns['logger'].info, force_direct=False, proxy_fallback=False)
 
 
 def test_proxy_plancheck_failure_does_not_retry_direct(worker, monkeypatch, capsys):

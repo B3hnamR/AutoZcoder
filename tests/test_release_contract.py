@@ -141,8 +141,10 @@ def test_builds_only_upload_explicit_release_assets_after_smoke():
 @pytest.mark.parametrize("mutation", [None, "branch", "tag", "numeric", "string"])
 def test_version_gate_checks_tag_and_all_executable_metadata(tmp_path, monkeypatch, mutation):
     monkeypatch.chdir(tmp_path)
-    for name in ("zcode_gateway", "scripts/packaging"):
+    for name in ("zcode_gateway", "scripts/packaging", "docs/releases"):
         (tmp_path / name).mkdir(parents=True)
+    (tmp_path / "docs/releases/2.0.0.md").write_text("Maintained release notes\n")
+    (tmp_path / "docs/releases/2.0.1.md").write_text("Future release notes\n")
     (tmp_path / "zcode_gateway/__init__.py").write_text('__version__ = "2.0.0"\n')
     metadata = """VSVersionInfo(
         ffi=FixedFileInfo(filevers=(2, 0, 0, 0), prodvers=(2, 0, 0, 0)),
@@ -160,6 +162,30 @@ def test_version_gate_checks_tag_and_all_executable_metadata(tmp_path, monkeypat
         execute(script)
     else:
         with pytest.raises(SystemExit):
+            execute(script)
+
+
+@pytest.mark.parametrize("version", ["2.0.0", "2.0.1", "3.4.5"])
+@pytest.mark.parametrize("notes_state", ["file", "missing", "directory", "wrong-version"])
+def test_version_gate_requires_matching_notes_before_metadata(tmp_path, monkeypatch, version, notes_state):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("RELEASE_REF_TYPE", "tag")
+    monkeypatch.setenv("RELEASE_TAG", f"v{version}")
+    notes = tmp_path / "docs/releases" / f"{version}.md"
+    notes.parent.mkdir(parents=True)
+    if notes_state == "file":
+        notes.write_text("Maintained release notes\n")
+    elif notes_state == "directory":
+        notes.mkdir()
+    elif notes_state == "wrong-version":
+        (notes.parent / "0.0.0.md").write_text("Unrelated notes\n")
+    script = python_blocks(step("validate", "Require a version tag matching app and executable metadata")["run"])[0]
+    # No metadata exists: only a matching notes file may advance to reading it.
+    if notes_state == "file":
+        with pytest.raises(FileNotFoundError, match="__init__"):
+            execute(script)
+    else:
+        with pytest.raises(SystemExit, match=rf"Release notes file is required: .*{version}\.md"):
             execute(script)
 
 
@@ -204,12 +230,31 @@ def test_publish_orders_draft_upload_remote_verification_then_visibility():
     assert downloads == ["release-windows", "release-linux"]
     draft = step("publish", required[1])["run"]
     assert "gh api --paginate" in draft
-    assert "--verify-tag --draft --generate-notes" in draft
+    assert '--verify-tag --draft --notes-file "$notes_file"' in draft
     assert "Refusing to overwrite existing public release" in draft
-    assert "glibc 2.35" in draft
     assert "gh release delete" not in draft
     assert "gh release download" in step("publish", required[3])["run"]
     assert steps[-1]["run"] == 'gh release edit "$RELEASE_TAG" --draft=false'
+
+
+def test_publish_uses_exact_maintained_notes_for_new_and_resumed_drafts():
+    steps = JOBS["publish"]["steps"]
+    draft = step("publish", "Create or resume a draft without modifying a public release")
+    checkout = next(item for item in steps if item.get("uses", "").startswith("actions/checkout@"))
+    assert steps.index(checkout) < steps.index(draft)
+    run = draft["run"]
+    assert 'notes_file="docs/releases/${RELEASE_TAG#v}.md"' in run
+    assert run.index('test -f "$notes_file"') < run.index("gh api")
+    shared_update = 'gh release edit "$RELEASE_TAG" --notes-file "$notes_file"'
+    assert run.count(shared_update) == 1
+    assert run.index("esac") < run.index(shared_update)
+    workflow_runs = "\n".join(item.get("run", "") for job in JOBS.values() for item in job["steps"])
+    assert workflow_runs.count("--notes-file") == 2
+    assert "--generate-notes" not in workflow_runs
+    assert "--json body" not in run
+    assert "release-notes.txt" not in run
+    assert "printf" not in run
+    assert ">>" not in run
 
 
 @pytest.mark.parametrize("mutation", [None, "public", "missing", "changed"])

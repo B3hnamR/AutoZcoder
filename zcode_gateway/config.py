@@ -371,6 +371,10 @@ class Config(BaseModel):
         self.accounts.pool_file = fix(self.accounts.pool_file)
         self.logging.capture_dir = fix(self.logging.capture_dir)
         self.store.sqlite_path = fix(self.store.sqlite_path)
+        if self.server.tls_cert:
+            self.server.tls_cert = fix(self.server.tls_cert)
+        if self.server.tls_key:
+            self.server.tls_key = fix(self.server.tls_key)
         # the folder is the base for relative paths; `_config_file` (set by
         # load_config) is the exact file the dashboard Settings tab writes back
         # to — cwd-relative fallbacks edited the wrong config.yaml when the exe

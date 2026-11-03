@@ -26,7 +26,8 @@ def test_proxy_source_override_is_optional_not_machine_specific():
 def test_sidecar_regressions_are_ci_and_release_gates():
     import json
     package=json.loads((ROOT/'tools/captcha-mint/package.json').read_text())
-    assert package['scripts']['test']=='bun test audit.test.ts'
+    assert package['scripts']['test'].startswith('bun test ')
+    assert 'audit.test.ts' in package['scripts']['test']
     for workflow in ['ci.yml','release.yml']:
         text=(ROOT/'.github/workflows'/workflow).read_text()
         assert 'bun run test' in text

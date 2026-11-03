@@ -11,6 +11,7 @@ from collections import deque
 from dataclasses import dataclass
 
 import httpx
+import anyio
 from .aggregate import aggregate_openai_stream
 from .pool import Account
 from .breaker import EdgeBlockBreaker
@@ -51,6 +52,7 @@ class StreamHandle:
     # re-opens the same request on a fresh upstream stream (set by open_stream);
     # used to retry a stream that died before any content reached the client
     reopen: object = None
+    credentials: tuple | None = None
 
 @dataclass
 class CallResult:
@@ -84,23 +86,27 @@ def _sse_event(name, data):
 
 async def upstream_events(resp):
     pending = b''
-    async for chunk in resp.aiter_bytes():
-        pending += chunk
-        frames, pending = _split_sse_frames(pending)
-        if len(pending) > 4 * 1024 * 1024:
-            raise UpstreamFailure(502, 'invalid_stream', 'upstream SSE frame exceeded 4 MB')
-        for frame in frames:
-            for event in iter_sse_events(frame.decode('utf-8', 'replace')):
+    try:
+        async for chunk in resp.aiter_bytes():
+            pending += chunk
+            frames, pending = _split_sse_frames(pending)
+            if len(pending) > 4 * 1024 * 1024:
+                raise UpstreamFailure(502, 'invalid_stream', 'upstream SSE frame exceeded 4 MB')
+            for frame in frames:
+                for event in iter_sse_events(frame.decode('utf-8')):
+                    if isinstance(event, dict): yield event
+        if pending.strip():
+            for event in iter_sse_events(pending.decode('utf-8')):
                 if isinstance(event, dict): yield event
-    if pending.strip():
-        for event in iter_sse_events(pending.decode('utf-8', 'replace')):
-            if isinstance(event, dict): yield event
+    except ValueError as exc:
+        raise UpstreamFailure(502, 'invalid_stream', 'ZCode returned malformed SSE data') from exc
 
 
 class ChatService:
     def __init__(self, cfg, pool, tokens, client, registry, store, capture):
         self.cfg, self.pool, self.tokens, self.client = cfg, pool, tokens, client
         self.registry, self.store, self.capture = registry, store, capture
+        self._pending_records = set()
         # IP-wide CDN edge-block breaker: shared by every account (one egress
         # IP, one block). Replaces the old behaviour where an HTML 403 was
         # mislabelled ENTITLEMENT_ERROR and parked accounts one by one until
@@ -139,23 +145,19 @@ class ChatService:
     async def _close(self, handle):
         if handle.closed: return
         handle.closed = True
-        try:
-            if handle.events is not None: await handle.events.aclose()
-        finally:
+        # AnyIO level cancellation interrupts every unshielded checkpoint,
+        # including response closure and a contended pool release.
+        with anyio.CancelScope(shield=True):
             try:
-                await handle.resp.aclose()
+                if handle.events is not None: await handle.events.aclose()
             finally:
-                # Shield the release: on a client disconnect Starlette cancels
-                # the scope this runs in, and an await on the pool lock here
-                # would leak the in-flight slot FOREVER (cap reached after a
-                # few disconnects). Counter hygiene must not be cancellable.
                 try:
-                    await asyncio.shield(self.pool.release(handle.account))
-                except asyncio.CancelledError:
-                    # the shield's outer await was cancelled even though the
-                    # release itself completed — re-raise after the fact
-                    raise
-    async def _apply_error(self, account, model, status, code, message, headers=None):
+                    await handle.resp.aclose()
+                finally:
+                    await self.pool.release(handle.account)
+    async def _apply_error(self, account, model, status, code, message, headers=None, *, expected_credentials=None):
+        if expected_credentials is not None and account.credential_key() != expected_credentials:
+            return
         if is_model_overload(status, code):
             # A busy model is not evidence of a bad account or spent quota.
             # Keep this account available for other models and delayed retries.
@@ -168,14 +170,16 @@ class ChatService:
         except Exception:
             pass
         if status == 401 or code == 'authentication_error':
-            await self.pool.kill_after_strikes(account, 'ZCode token revoked; sign in again')
+            await self.pool.kill_after_strikes(account, 'ZCode token revoked; sign in again',
+                                               expected_credentials=expected_credentials)
         elif status == 405 or is_block_code(code, status):
             # 405/3012 "unusual activity": not a quota and not a bad account.
             # Park only this model on this account and let the caller rotate to
             # the next account; the account keeps serving every other model.
             await self.pool.cap_model(account, model,
                                       self.cfg.pool.blocked_model_cooldown_seconds,
-                                      reason='UNUSUAL_ACTIVITY', message=message)
+                                      reason='UNUSUAL_ACTIVITY', message=message,
+                                      expected_credentials=expected_credentials)
         elif code in ('11113', '1005') or status == 402:
             # 1005 is the SAME "exceed quota limit" rejection under an HTTP
             # 502 (captured live 2026-10-21: 10x/10min on a plan-less
@@ -197,7 +201,7 @@ class ChatService:
             if remaining > 0:
                 await self.pool.cap_model(account, model, 600,
                                           reason='11113' if code == '11113' else '1005',
-                                          message=message)
+                                          message=message, expected_credentials=expected_credentials)
                 return
             seconds = max(1, quota.get('resets_at', 0) - time.time()) if quota else 0
             if seconds <= 1:
@@ -209,7 +213,7 @@ class ChatService:
                 account.quota_strikes = getattr(account, 'quota_strikes', 0) + 1
                 if account.quota_strikes >= 3:
                     await self.pool.retire(account, 'repeated quota rejection with no visible buckets',
-                                           paid_only=False)
+                                           paid_only=False, expected_credentials=expected_credentials)
                     try:
                         self.pool.notify('quota',
                                          f"account {account.id} EXHAUSTED — repeated "
@@ -221,7 +225,7 @@ class ChatService:
                 seconds = 900      # park the model past the churn window
             await self.pool.cap_model(account, model, seconds,
                                       reason='11113' if code == '11113' else '1005',
-                                      message=message)
+                                      message=message, expected_credentials=expected_credentials)
         elif status == 429 or code == 'rate_limit_error':
             # reuse the shared parser: handles retry-after-ms, seconds and
             # HTTP-dates (a millisecond hint used to fall through to the
@@ -230,17 +234,20 @@ class ChatService:
             hinted = retry_after_seconds(headers or {})
             seconds = min(3600, max(1, hinted if hinted is not None
                                     else self.cfg.pool.cooldown_seconds))
-            await self.pool.cap_model(account, model, seconds, reason='RATE_LIMITED', message=message)
+            await self.pool.cap_model(account, model, seconds, reason='RATE_LIMITED', message=message,
+                                      expected_credentials=expected_credentials)
         elif status == 403:
-            await self.pool.cap_model(account, model, 300, reason='ENTITLEMENT_ERROR', message=message)
+            await self.pool.cap_model(account, model, 300, reason='ENTITLEMENT_ERROR', message=message,
+                                      expected_credentials=expected_credentials)
         elif status == 451:
             # Geo/legal block tied to this account's egress context: park the
             # model on THIS account only and let the caller rotate to another
             # account (different IP) — the account itself stays healthy.
             await self.pool.cap_model(account, model, 600,
-                                      reason='GEO_BLOCKED', message=message or 'HTTP 451')
+                                      reason='GEO_BLOCKED', message=message or 'HTTP 451',
+                                      expected_credentials=expected_credentials)
         elif status >= 500:
-            await self.pool.cool(account, reason='upstream_error')
+            await self.pool.cool(account, reason='upstream_error', expected_credentials=expected_credentials)
 
     # A stream that dies BEFORE any content reached the client (only
     # message_start/ping so far) is re-opened this many times, transparently:
@@ -346,7 +353,7 @@ class ChatService:
                 if exc.code not in ('11113', '1005', 'rate_limit_error', 'RATE_LIMITED', 'MODEL_CAPPED', 'MODEL_PARKED',
                                     'INFERENCE_CAP_ERROR', 'ENTITLEMENT_ERROR',
                                     'UNUSUAL_ACTIVITY', '3012', '405', 'HTTP_405',
-                                    'HTTP_451', 'http_451'):
+                                    'GEO_BLOCKED', 'HTTP_451', 'http_451'):
                     raise
                 if candidate == candidates[-1]:
                     exc.details['attempted_models'] = attempted
@@ -406,6 +413,7 @@ class ChatService:
                     raise UpstreamFailure(reason['status'], reason['code'], reason['message'],
                                           reason.get('release_at'), reason.get('release_in_s'))
                 raise NoAccountsAvailable()
+            credentials = account.credential_key()
             headers = build_headers(account.access_token, self.cfg.upstream.fingerprint,
                                     device_mid=account.notes.get('device_mid'), include_device_mid=False)
             if generated_identity:
@@ -415,15 +423,20 @@ class ChatService:
                         'account_uuid': '', 'session_id': headers['x-session-id']}, separators=(',', ':'))}
             resp, handle, transferred = None, None, False
             try:
-                if account.expires_in() <= 0 and not await self.tokens.refresh(account):
+                if account.expires_in() <= 0 and not await self.tokens.refresh(
+                        account, expected_credentials=credentials):
                     # Expired token: strike-and-cool (like upstream 401s), not
                     # an instant permanent kill — an expired token whose file
                     # simply hasn't rotated yet used to DEAD the account with
                     # no recovery path (enable() -> next request kills again).
-                    await self.pool.kill_after_strikes(account, 'ZCode token expired; sign in again')
+                    await self.pool.kill_after_strikes(account, 'ZCode token expired; sign in again',
+                                                       expected_credentials=credentials)
                     last = UpstreamFailure(401, 'authentication_error', 'ZCode token expired; sign in again')
                     tried.add(account.id)
                     continue
+                # Refresh may have adopted a new token; bind effects to the
+                # credentials actually sent, not the mutable account later.
+                credentials = account.credential_key()
                 headers = build_headers(account.access_token, self.cfg.upstream.fingerprint,
                                         task_id=headers['x-session-id'], device_mid=account.notes.get('device_mid'),
                                         include_device_mid=False)
@@ -434,9 +447,11 @@ class ChatService:
                     status, code, message = resp.status_code, str(info['code']), info['message']
                     if status == 200:
                         status = 429 if code in ('11113', '1005') else 502
-                    if status == 401 and await self.tokens.refresh(account, force=True):
+                    if status == 401 and await self.tokens.refresh(
+                            account, force=True, expected_credentials=credentials):
                         # Retry a newly imported token once, without a second pool reservation.
                         await resp.aclose()
+                        credentials = account.credential_key()
                         headers = build_headers(account.access_token, self.cfg.upstream.fingerprint,
                                                 task_id=headers['x-session-id'], device_mid=account.notes.get('device_mid'),
                                                 include_device_mid=False)
@@ -462,7 +477,8 @@ class ChatService:
                                 'upstream edge block (IP-wide): requests '
                                 'rejected for every account; retry shortly',
                                 retry_after=35)
-                        await self._apply_error(account, model, status, code, message, resp.headers)
+                        await self._apply_error(account, model, status, code, message, resp.headers,
+                                                expected_credentials=credentials)
                         last = UpstreamFailure(429 if code == '11113' else status, code, message,
                                                retry_after=retry_after_seconds(resp.headers))
                         self._record(account, headers, body, last.status, resp.headers,
@@ -473,7 +489,8 @@ class ChatService:
                             raise last
                         tried.add(account.id)
                         continue
-                handle = StreamHandle(account, headers, body, resp, variant, time.time())
+                handle = StreamHandle(account, headers, body, resp, variant, time.time(),
+                                      credentials=credentials)
                 handle.events = upstream_events(resp)
                 # a clean stream through the CDN is evidence any prior edge
                 # block has lifted
@@ -495,7 +512,8 @@ class ChatService:
                         info = first.get('error') or first
                         code, message = str(info.get('code') or info.get('type') or 'api_error'), info.get('message', 'ZCode stream failed')
                         status = 529 if is_model_overload(502, code) else (429 if code in ('11113', 'rate_limit_error') else (405 if is_block_code(code) else 502))
-                        await self._apply_error(account, model, status, code, message)
+                        await self._apply_error(account, model, status, code, message,
+                                                expected_credentials=credentials)
                         last = UpstreamFailure(status, code, message)
                         if is_model_overload(status, code): raise last
                         tried.add(account.id)
@@ -535,17 +553,18 @@ class ChatService:
                         f'could not reach ZCode through {relay} '
                         '(relays cooled ~60s): ' + str(exc)
                     ) from exc
-                await self.pool.cool(account, reason='transport_error')
+                await self.pool.cool(account, reason='transport_error', expected_credentials=credentials)
                 last = UpstreamFailure(502, 'transport_error', 'could not reach ZCode')
                 tried.add(account.id)
             finally:
-                if handle is not None:
-                    await self._close(handle)
-                elif resp is not None:
-                    try: await resp.aclose()
-                    finally: await self.pool.release(account)
-                elif not transferred:
-                    await self.pool.release(account)
+                with anyio.CancelScope(shield=True):
+                    if handle is not None:
+                        await self._close(handle)
+                    elif resp is not None:
+                        try: await resp.aclose()
+                        finally: await self.pool.release(account)
+                    elif not transferred:
+                        await self.pool.release(account)
             if attempt + 1 < self.cfg.upstream.max_attempts:
                 await asyncio.sleep(0.1 * (attempt + 1))
         raise last or NoAccountsAvailable()
@@ -605,7 +624,8 @@ class ChatService:
                             info = event.get('error') or event
                             code, message = str(info.get('code') or info.get('type') or 'api_error'), info.get('message', 'ZCode stream failed')
                             status = 529 if is_model_overload(502, code) else (429 if code in ('11113', 'rate_limit_error') else 502)
-                            await self._apply_error(handle.account, model, status, code, message)
+                            await self._apply_error(handle.account, model, status, code, message,
+                                                    expected_credentials=handle.credentials)
                             self._log_stream_failure(handle, UpstreamFailure(status, code, message),
                                                      committed=committed, events=seen, retry=False)
                             yield _sse_event('error', event) if anthropic else sse_frame(openai_error(status, code, message))
@@ -615,7 +635,7 @@ class ChatService:
                         if kind == 'message_stop':
                             stopped = True
                             if not anthropic: yield b'data: [DONE]\n\n'
-                            await self.pool.on_success(handle.account)
+                            await self.pool.on_success(handle.account, expected_credentials=handle.credentials)
                             break
                     if not stopped:
                         raise UpstreamFailure(502, 'truncated_stream', 'ZCode stream ended before message_stop')
@@ -672,7 +692,8 @@ class ChatService:
                         code = str(info.get('code') or info.get('type') or 'api_error')
                         status = 529 if is_model_overload(502, code) else (429 if code in ('11113', 'rate_limit_error') else (405 if is_block_code(code) else 502))
                         message = info.get('message', 'ZCode stream failed')
-                        await self._apply_error(handle.account, model, status, code, message)
+                        await self._apply_error(handle.account, model, status, code, message,
+                                                expected_credentials=handle.credentials)
                         raise UpstreamFailure(status, code, message)
                     accumulator.feed(event)
                     if dialect != 'anthropic': chunks.extend(sse_frame(c) for c in translator.feed(event))
@@ -681,7 +702,7 @@ class ChatService:
                     raise UpstreamFailure(502, 'truncated_stream', 'ZCode stream ended before message_stop')
                 message = accumulator.finish()
                 raw = json.dumps(message, ensure_ascii=False).encode() if dialect == 'anthropic' else b''.join(chunks)
-                await self.pool.on_success(handle.account)
+                await self.pool.on_success(handle.account, expected_credentials=handle.credentials)
                 self._record(handle.account, handle.headers, handle.body, 200, handle.resp.headers,
                              json.dumps(message, ensure_ascii=False), (time.time() - handle.started) * 1000,
                              client_key, dialect, model, message['usage'])
@@ -727,9 +748,17 @@ class ChatService:
         except RuntimeError:
             loop = None
         if loop is not None:
-            loop.run_in_executor(None, self._write_record, rec, cap)
+            future = loop.run_in_executor(None, self._write_record, rec, cap)
+            self._pending_records.add(future)
+            future.add_done_callback(self._pending_records.discard)
         else:
             self._write_record(rec, cap)
+
+    async def aclose(self):
+        """Drain usage/capture writes after producers stop, before store.close()."""
+        with anyio.CancelScope(shield=True):
+            while self._pending_records:
+                await asyncio.shield(asyncio.gather(*self._pending_records))
 
     def _write_record(self, rec, cap):
         try:

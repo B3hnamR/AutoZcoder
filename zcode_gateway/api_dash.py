@@ -15,6 +15,7 @@ import sys
 import threading
 import tempfile
 import time
+import math
 from functools import wraps
 from pathlib import Path
 from typing import Any
@@ -354,6 +355,8 @@ async def dash_settings_put(request: Request, body: dict = Body(...),
         cast = _EDITABLE[dotted]
         try:
             if cast is bool and isinstance(val, str):
+                if val.lower() not in ("1", "true", "yes", "on", "0", "false", "no", "off"):
+                    raise ValueError()
                 val = val.lower() in ("1", "true", "yes", "on")
             else:
                 val = cast(val)
@@ -363,7 +366,7 @@ async def dash_settings_put(request: Request, body: dict = Body(...),
         # range validation: a 0 or negative written straight into config.yaml
         # can deadlock the pool or break startup (pydantic ge=1 catches it
         # only at next boot — fail here instead)
-        if cast is int and val < 0:
+        if cast in (int, float) and (val < 0 or not math.isfinite(val)):
             raise HTTPException(status_code=400,
                                 detail=f"{dotted}: must be >= 0")
         if dotted == "models.default_effort" and val not in ("low", "high", "max"):
@@ -407,12 +410,14 @@ async def dash_settings_put(request: Request, body: dict = Body(...),
             cur[parts[-1]] = val
             changed.append(dotted)
 
-    # Validate bounded overload controls before persisting a restart-breaking value.
-    if any(k.startswith('upstream.overload_') for k in values):
-        try:
-            type(state.cfg.upstream).model_validate(raw.get('upstream', {}))
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from None
+    # Use the same full schema as startup before committing any changed file.
+    # Report field names/reasons only: ValidationError strings can echo secrets.
+    try:
+        type(state.cfg).model_validate(raw)
+    except ValueError as exc:
+        errors = exc.errors(include_input=False) if hasattr(exc, "errors") else []
+        detail = "; ".join(".".join(map(str, error["loc"])) + ": " + error["msg"] for error in errors)
+        raise HTTPException(400, "Configuration validation failed: " + (detail or "invalid setting")) from None
     if changed:
         await asyncio.to_thread(_atomic_write_yaml, cfg_path, raw)
     return {"changed": changed, "restart_required": bool(changed)}
@@ -464,7 +469,8 @@ async def login_start(request: Request, key: str = Depends(admin_key)) -> dict:
                             detail="login writes account snapshots; set "
                                    "accounts.source=accounts_dir first")
     existing = _device_login(request)
-    if existing and existing.state in ("awaiting_user", "registering"):
+    if existing and ((getattr(existing, "_task", None) and not existing._task.done())
+                     or existing.state in ("awaiting_user", "registering")):
         return existing.status()          # one flow at a time; idempotent start
     from .device_auth import DeviceLogin
 
@@ -473,7 +479,9 @@ async def login_start(request: Request, key: str = Depends(admin_key)) -> dict:
         a login that replaced an exhausted account must not read 'available'."""
         await state.pool.upsert(account)
         try:
-            await state.tokens.check_account(account)
+            canonical = await state.pool.find(account.id)
+            if canonical is not None:
+                await state.tokens.check_account(canonical)
         except Exception:
             log.warning("post-login account check failed for %s", account.id)
 
@@ -956,6 +964,33 @@ async def generator_locate_set(request: Request, body: dict = Body(default={}),
     return {"ok": True, "path": str(root), "found": True, "applied": "live"}
 
 
+def _qualifying_start_balance(raw: dict, now: float) -> bool:
+    """Require spendable quota belonging to an active current Start Plan."""
+    from .quota import parse_balance
+    def accepted(plan_id):
+        return str(plan_id or "").startswith("zcode-v3-start-plan-") and plan_id not in (
+            "zcode-v3-start-plan-1024", "zcode-v3-start-plan-500m")
+    current = [plan for plan in raw.get("plans", []) if isinstance(plan, dict)
+               and accepted(plan.get("plan_id")) and plan.get("status") == "active"]
+    for plan in current:
+        scoped = {"plans": [plan], "balances": [bucket for bucket in raw.get("balances", [])
+                  if isinstance(bucket, dict) and bucket.get("user_plan_id") == plan.get("user_plan_id")
+                  and plan.get("user_plan_id")]}
+        # A qualification needs a real current balance, not a fallback grant.
+        scoped["plans"] = [{**plan, "entitlements": []}]
+        plans, quotas = parse_balance(scoped, now)
+        if not plans:
+            continue
+        parsed = plans[0]
+        if (parsed.get("starts_at") or 0) > now or (parsed.get("ends_at") and parsed["ends_at"] <= now):
+            continue
+        if any(float(bucket.get("remaining") or 0) > 0 and (bucket.get("starts_at") or 0) <= now
+               and (not bucket.get("resets_at") or bucket["resets_at"] > now)
+               for bucket in quotas.values()):
+            return True
+    return False
+
+
 def _generator(request: Request):
     """The GeneratorManager for this app state, created lazily."""
     state = get_state(request)
@@ -1080,10 +1115,18 @@ def _generator(request: Request):
                                    plans[0] if plans else "")
                 if auto and cancelled():
                     return cancelled_result()
+                receipt = {}
+                if auto:
+                    if not _qualifying_start_balance(plan_info.get("raw") or {}, time.time()):
+                        return {"qualified": False, "category": "no_plan", "error": "No currently spendable Start Plan balance"}
+                    run_id, attempt_id = info.get("auto_run_id"), info.get("auto_attempt_id")
+                    if not run_id or not attempt_id:
+                        return {"qualified": False, "category": "registration_error", "error": "Registration receipt identity missing"}
+                    receipt = {"auto_run_id": run_id, "auto_attempt_id": attempt_id, "auto_qualified": "true"}
                 account = mint_and_register(
                     state.cfg.accounts.dir, email, zjwt,
                     state.cfg.upstream.fingerprint.device_mid,
-                    plan=chosen_plan)
+                    plan=chosen_plan, **({"receipt": receipt} if auto else {}))
                 if account:
                     log.info("generator: %s joined the pool (plan=%s)", email, chosen_plan)
                     fut = asyncio.run_coroutine_threadsafe(
@@ -1096,6 +1139,17 @@ def _generator(request: Request):
                                     "error": "Saved account needs a fresh successful plan/quota check"}
                         if cancelled():
                             return {"qualified": False, "category": "stopped", "error": "Account saved during stop; excluded from run goal"}
+                        run_id, attempt_id = info.get("auto_run_id"), info.get("auto_attempt_id")
+                        if not run_id or not attempt_id:
+                            return {"qualified": False, "category": "registration_error", "error": "Registration receipt identity missing"}
+                        from .accounts_dir import save_account_snapshot
+                        # Publish the qualification receipt only after a valid
+                        # Start-plan-owned balance and canonical pool insertion.
+                        save_account_snapshot(Path(state.cfg.accounts.dir), {
+                            "account_id": account.id, "auto_run_id": run_id,
+                            "auto_attempt_id": attempt_id, "auto_qualified": "true",
+                        })
+                        mgr.record_auto_registration(run_id, attempt_id, account.id)
                     # quota/plan refresh is network-bound and best-effort: fire and
                     # forget, so a slow upstream can never fail the registration
                     if not auto:
@@ -1142,16 +1196,7 @@ def _generator(request: Request):
             account.notes.pop("quota_check_error", None)
             account.balance_checked_at = account.plan_checked_at = now
             account.has_plan = account.plan_active(now)
-            valid_plan = any(str(p.get("plan_id", "")).startswith("zcode-v3-start-plan-")
-                             and p.get("plan_id") != "zcode-v3-start-plan-1024"
-                             and p.get("status") == "active"
-                             and (not p.get("starts_at") or p["starts_at"] <= now)
-                             and (not p.get("ends_at") or p["ends_at"] > now)
-                             for p in plans)
-            quota = any(float(q.get("remaining") or 0) > 0 and (q.get("starts_at") or 0) <= now
-                        and (not q.get("resets_at") or q["resets_at"] > now)
-                        for q in quotas.values())
-            return valid_plan and quota
+            return _qualifying_start_balance(raw, now)
 
         from .generator import GeneratorManager, claim_result_landed
         gc = state.cfg.generator
@@ -1185,11 +1230,17 @@ def _generator(request: Request):
             try:
                 fut = asyncio.run_coroutine_threadsafe(_revive_by_email(email),
                                                        main_loop)
-                fut.result(timeout=60)
+                found = fut.result(timeout=60)
+                if not found:
+                    for info in mgr.pending_accounts():
+                        if str(info.get("email", "")).strip().lower() == email:
+                            with mgr._registration_lock:
+                                register_account(info)
+                            break
             except Exception:
                 log.exception("claim settle failed for %s", email)
 
-        async def _revive_by_email(email: str) -> None:
+        async def _revive_by_email(email: str) -> bool:
             for acc in await state.pool.all():
                 if (acc.email or "").strip().lower() != email:
                     continue
@@ -1208,8 +1259,8 @@ def _generator(request: Request):
                 except Exception:
                     pass
                 log.info("claim settle: %s revived after successful claim", email)
-                return
-            log.info("claim settle: %s not in pool (import/refresh later)", email)
+                return True
+            return False
 
         mgr._claim_settle = _claim_settle
         mgr._revive_by_email = _revive_by_email
@@ -1252,6 +1303,19 @@ def _generator(request: Request):
                             proxy_types=GeneratorManager.normalize_proxy_types(
                                 gc.proxy_types, legacy_socks_only=gc.socks_only))
         state.generator = mgr
+        # Reconcile receipts after an interrupted registration-before-progress
+        # write. Never count arbitrary snapshots without a qualification mark.
+        try:
+            from .accounts_dir import parse_snapshot
+            receipts = {}
+            for path in Path(state.cfg.accounts.dir).glob("*.txt"):
+                fields = parse_snapshot(path)
+                if fields.get("auto_qualified") == "true" and fields.get("auto_run_id") == mgr.auto_generate.status().get("id"):
+                    if fields.get("auto_attempt_id") and fields.get("account_id"):
+                        receipts[fields["auto_attempt_id"]] = fields["account_id"]
+            mgr.auto_generate.reconcile_registrations(receipts)
+        except (OSError, ValueError):
+            log.exception("Auto Generate receipt recovery failed")
 
         # catch-up: signups that never reached the pool (gateway was closed, or
         # a registration step errored) are registered now instead of being lost

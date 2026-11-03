@@ -92,6 +92,9 @@ def test_gui_tls_context_retains_certificate_and_hostname_verification(monkeypat
 
 
 def test_gui_readiness_uses_full_tls_origin_and_scoped_context(monkeypatch):
+    monkeypatch.setattr(gui_main, "_server", SimpleNamespace(started=True))
+    monkeypatch.setattr(gui_main, "_server_failed", gui_main.threading.Event())
+    monkeypatch.delenv("ZCODE_GATEWAY_UPDATE_NONCE", raising=False)
     context = object()
     calls = []
 
@@ -105,10 +108,13 @@ def test_gui_readiness_uses_full_tls_origin_and_scoped_context(monkeypatch):
 
 
 def test_gui_readiness_does_not_retry_without_tls_verification(monkeypatch):
+    monkeypatch.setattr(gui_main, "_server", SimpleNamespace(started=True))
+    monkeypatch.setattr(gui_main, "_server_failed", gui_main.threading.Event())
+    monkeypatch.delenv("ZCODE_GATEWAY_UPDATE_NONCE", raising=False)
     calls = []
     clock = iter([0, 0, 2])
-    monkeypatch.setattr(gui_main.time, "time", lambda: next(clock))
-    monkeypatch.setattr(gui_main.time, "sleep", lambda _: None)
+    monkeypatch.setattr(gui_main.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(gui_main._server_failed, "wait", lambda _: None)
     context = object()
 
     def urlopen(url, **kwargs):

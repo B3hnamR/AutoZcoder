@@ -339,21 +339,49 @@ def _active_ids(data: dict) -> list:
             if p.get("status") == "active" and p.get("plan_id")]
 
 
+def _plan_error(message, kind, *, code=-1, route_problem=True):
+    return {"code": code, "msg": message, "error": message, "error_kind": kind,
+            "route_problem": route_problem, "plans": [], "starter": False,
+            "start_plans": [], "entitlements": [], "raw": {}}
+
+
 def get_plan(zcode_jwt, log=print):
     """Read balance + entitlements. <=63M-token plans may appear only in
     `plans[].entitlements[]` (with `effective_at`) until they go live."""
     try:
         r = _request("GET", BALANCE, headers=build_headers(zcode_jwt), timeout=30,
                      verify=_VERIFY, log=log)
-    except requests.RequestException as e:
+    except Exception as e:
         log(f"  plan: balance failed ({type(e).__name__})")
-        return None
+        return _plan_error(f"balance transport failed ({type(e).__name__})", "transport")
+    if not 200 <= r.status_code < 300:
+        return _plan_error(f"balance HTTP {r.status_code}", "http")
     try:
         j = r.json()
     except Exception:
-        log(f"  plan: balance non-json {r.status_code} {r.text[:150]}")
-        return None
-    data = j.get("data") or {}
+        return _plan_error("balance non-json response", "non_json")
+    if not isinstance(j, dict) or type(j.get("code")) is not int:
+        return _plan_error("balance malformed envelope", "malformed")
+    if j["code"] != 0:
+        return _plan_error(f"balance business failure (code={j['code']})", "business",
+                           code=j["code"], route_problem=j["code"] in (3012, 405, -1))
+    data = j.get("data")
+    if not isinstance(data, dict):
+        return _plan_error("balance malformed data", "malformed")
+    for key in ("plans", "balances"):
+        items = data.get(key, [])
+        if not isinstance(items, list) or any(not isinstance(p, dict) for p in items):
+            return _plan_error(f"balance malformed {key}", "malformed")
+        if any(p.get("plan_id") is not None and not isinstance(p["plan_id"], str)
+               for p in items):
+            return _plan_error(f"balance malformed {key} plan_id", "malformed")
+    for p in data.get("plans", []):
+        ents = p.get("entitlements", [])
+        if not isinstance(ents, list) or any(
+                not isinstance(e, dict) or
+                (e.get("plan_id") is not None and not isinstance(e["plan_id"], str))
+                for e in ents):
+            return _plan_error("balance malformed entitlements", "malformed")
     ids = _active_ids(data)
     entitlements = []
     for p in (data.get("plans") or []):
@@ -566,12 +594,17 @@ def claim_plan(zcode_jwt, plan_id, verify_param="", region="", log=print) -> dic
         r = _request("POST", CLAIM, headers=h,
                      json={"plan_id": plan_id}, timeout=30,
                      verify=_VERIFY, log=log, tries=1)
-    except requests.RequestException as e:
-        return {"code": -1, "msg": f"request failed: {type(e).__name__}"}
+    except Exception as e:
+        return {"code": -1, "msg": f"request failed: {type(e).__name__}", "error_kind": "transport"}
+    if not 200 <= r.status_code < 300:
+        return {"code": -1, "msg": f"claim HTTP {r.status_code}", "error_kind": "http"}
     try:
-        return r.json()
+        j = r.json()
     except Exception:
-        return {"code": -1, "msg": f"non-json {r.status_code} {r.text[:150]}"}
+        return {"code": -1, "msg": f"non-json {r.status_code}", "error_kind": "non_json"}
+    if not isinstance(j, dict) or type(j.get("code")) is not int:
+        return {"code": -1, "msg": "malformed claim envelope", "error_kind": "malformed"}
+    return j
 
 
 def check_account_plan(chat_token, log=print):

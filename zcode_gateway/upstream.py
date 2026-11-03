@@ -512,11 +512,14 @@ def iter_sse_events(chunk_text):
                  for line in frame.splitlines() if line.startswith('data:')]
         if not lines: continue
         data = '\n'.join(lines)
+        if not data.strip(): continue
         if data == '[DONE]':
             events.append(data)
             continue
-        try: events.append(json.loads(data))
-        except json.JSONDecodeError: pass
+        event = json.loads(data)
+        if not isinstance(event, dict):
+            raise ValueError('SSE data must be a JSON object')
+        events.append(event)
     return events
 
 
