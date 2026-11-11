@@ -1,4 +1,4 @@
-# ZCode 3.14.4 protocol notes
+# ZCode protocol notes (3.16.x captures, 3.18.0 client default)
 
 Evidence: six retained model captures and OAuth/billing flows, plus the installed
 ZCode client's `resources/glm/zcode.cjs` bundle and `resources/app.asar` archive.
@@ -27,15 +27,21 @@ providers. Only GLM-5.3 and GLM-5.3-Flash were validated in the supplied capture
 The installed client's `Xdn`/OAuth broker implementation generates a 32-byte
 random hex poll token **before** `POST /oauth/cli/init`. It sends that value as
 Bearer authorization, with JSON `{ "provider": "zai" }`. The response returns
-`flow_id`, `poll_token`, `authorize_url`, `expires_at`, `poll_interval_sec`.
-Polling `/oauth/cli/poll/{flow_id}` uses the returned poll token as Bearer auth.
-Poll states include pending, failed and ready. The ready response contains the
-coding-plan JWT and user identity. No WorkOS exchange, short user code or
-secondary business token exchange is needed.
+`flow_id`, `authorize_url`, `expires_at`, `poll_interval_sec`, and sometimes a
+`poll_token` echo.
 
-The captured coding-plan JWT has no `exp` and no refresh token. ZcodeGate stores
-expiry zero as long-lived. A 401 may recover only by loading a changed credential
-from its source; otherwise the account is marked dead and needs login/import.
+The echoed `poll_token` is optional. The client keeps the token it generated;
+requiring the server to echo it back broke login when the field disappeared.
+Polling `/oauth/cli/poll/{flow_id}` uses that same self-generated token as
+Bearer auth. Poll states include pending, failed and ready. The ready response
+contains the coding-plan JWT and user identity. No WorkOS exchange, short user
+code or secondary business token exchange is needed.
+
+The captured coding-plan JWT has no `exp`, so ZcodeGate stores expiry zero as
+long-lived. The login poll may still return a `refresh_token` for some
+providers; when it does, the snapshot keeps it, but nothing silently refreshes
+a coding-plan JWT. A 401 may recover only by loading a changed credential from
+its source; otherwise the account is marked dead and needs login/import.
 
 ## Credential encryption: correction to the audit prose
 
@@ -49,8 +55,12 @@ and verifies a known AES-GCM vector and tamper rejection in tests.
 
 ## Quotas
 
-The observed working URL is `/zcode-plan/billing/balance?app_version=3.14.4`
+The observed working URL is `/zcode-plan/billing/balance?app_version=<version>`
 (the slash form, not `billing_balance`). The device/client headers are required.
+Version-gated endpoints (billing preview, marketing touch, balance) read the
+same value as `x-zcode-app-version`; it must stay at or above the current
+client build (3.18.0 at time of writing). 3.16.1 is the floor below which the
+preview answers an empty list, and marketing offers need 3.17.1 or newer.
 A successful business envelope has `code: 0` and data with plans and balances.
 Buckets are aggregated by GLM model only for active, unexpired plans.
 `available_units` takes precedence over remaining_units, with daily period_end
