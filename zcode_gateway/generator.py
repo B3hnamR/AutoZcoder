@@ -3340,7 +3340,7 @@ class GeneratorManager:
             self.set_options(**kw)
 
     def set_options(self, **kw):
-        if "captcha" in kw and kw["captcha"] in ("manual", "ai", "classic", "auto"):
+        if "captcha" in kw and kw["captcha"] in ("manual", "ai", "classic", "auto", "mint"):
             self.captcha = kw["captcha"]
         if "captcha_strategy" in kw and kw["captcha_strategy"] in ("ai", "classic", "auto"):
             self.captcha_strategy = kw["captcha_strategy"]
@@ -3941,6 +3941,10 @@ class GeneratorManager:
         }
         if self.captcha != "manual":
             env["ZAI_CAPTCHA_STRATEGY"] = self.captcha_strategy
+        # Signup captcha without a drag: the child mints the Aliyun param with
+        # the bundled captcha-mint sidecar and submits the signup itself.
+        if self.captcha == "mint":
+            env["ZAI_CAPTCHA_MINT"] = "1"
         env["ZAI_CUSTOM_AI"] = "1" if self.custom_ai_url else "0"
         env["ZAI_GATEWAY_KEY"] = self._client_key_for_children
         env["ZAI_GATEWAY_AI_MODEL"] = "GLM-5.3-Flash"

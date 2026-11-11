@@ -541,6 +541,32 @@ def _signup_payload(name, email, password, captcha_param):
     }
 
 
+def _mint_captcha(log):
+    """Mint an Aliyun verify param headlessly, without dragging the slider.
+
+    Reuses the claim path's minter (`ZAI_CAPTCHA_CMD` -> bundled captcha-mint)
+    so signup and claim share one proven token source: the SDK's traceless
+    verification runs in happy-dom and prints `<param> <region>`. Returns ''
+    when no minter is configured or the solver fails; the caller then falls
+    back to the in-page slider.
+    """
+    try:
+        from claim_start import _captcha_token
+    except Exception as e:
+        log(f"  mint: claim_start import failed ({type(e).__name__}: {e})")
+        return ''
+    try:
+        param, _region = _captcha_token(log)
+    except Exception as e:
+        log(f"  mint: solver crashed ({type(e).__name__}: {e})")
+        return ''
+    if param:
+        log(f"  mint: verify param ready (len={len(param)})")
+    else:
+        log("  mint: no token (no sidecar configured or solver failed)")
+    return param or ''
+
+
 def fetch_captcha_config():
     """Live Aliyun scene/prefix/region from `/api/v1/client/configs`.
 
@@ -975,6 +1001,11 @@ def signup(email, password, mail=None):
                 _manual_env = env_flag('ZAI_MANUAL')
                 manual = (CONFIG.get('manual_captcha') if _manual_env is None
                           else _manual_env)
+                # Mint mode: get the Aliyun verify param from the bundled
+                # traceless minter instead of dragging the slider. The param is
+                # scene-wide, not session-bound, so the signup POST we send
+                # ourselves carries it (see _signup_payload below).
+                mint = env_flag('ZAI_CAPTCHA_MINT') and not manual
 
                 # strategy: ai | classic | auto (manual handled above).
                 # Mirror into CONFIG so CaptchaSolver/DistanceCalculator see it.
@@ -983,9 +1014,9 @@ def signup(email, password, mail=None):
                     CONFIG['captcha_strategy'] = _strategy
                 strategy = CONFIG.get('captcha_strategy', 'auto')
                 if not manual:
-                    logger.info(f"Captcha strategy: {strategy}")
+                    logger.info(f"Captcha strategy: {'mint' if mint else strategy}")
 
-                if not slider_ok and not manual:
+                if not slider_ok and not manual and not mint:
                     # The widget never rendered (page shows "Please complete the
                     # verification first"). In practice this is an IP/edge block: Aliyun
                     # refuses to serve the challenge. Grinding 15 attempts is pointless
@@ -997,10 +1028,19 @@ def signup(email, password, mail=None):
                     return 'CAPTCHA_NOT_LOADED'
 
                 solver = CaptchaSolver(logger, CONFIG)
+                minted_param = ''
                 if manual:
                     # Human solves it in the visible window; we just wait for the pass
                     # and then continue the API flow automatically.
                     result = 'MANUAL_OK' if solver.wait_for_manual_solve(page) else None
+                elif mint:
+                    minted_param = _mint_captcha(logger)
+                    if minted_param:
+                        result = minted_param
+                    else:
+                        logger.warning("mint: no verify param — falling back to the "
+                                       "in-page slider solver")
+                        result = solver.solve(page)
                 else:
                     result = solver.solve(page)
 
@@ -1048,7 +1088,9 @@ def signup(email, password, mail=None):
                 # Preference: the app's own request body > our hook's rebuilt
                 # token > the element value. A rebuilt token is only as good as
                 # the scene it was built for, so it never beats the real one.
-                captcha_param = captured['verify_param']
+                # A minted token is different: the app never slides in mint
+                # mode, so it is the only token there is.
+                captcha_param = minted_param or captured['verify_param']
                 if not captcha_param:
                     try:
                         captcha_param = page.evaluate(
@@ -1066,7 +1108,9 @@ def signup(email, password, mail=None):
                 # produced two signup POSTs for one email (observed live), which
                 # trips the per-email rate limit and can half-create the account.
                 # Always give the app its window first; only POST if it never fires.
-                if not _signup_fired():
+                # A minted param means we never slid, so the app is not going to
+                # post: skip the wait and submit immediately.
+                if not _signup_fired() and not minted_param:
                     deadline = time.time() + 20
                     logger.info("Waiting up to 20s for the app's own signup POST")
                     while time.time() < deadline:

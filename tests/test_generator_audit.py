@@ -507,3 +507,18 @@ def test_custom_ai_emitted_body_omits_gateway_only_fields(monkeypatch):
     assert result is not None
     assert "reasoning_effort" not in captured
     assert captured["max_tokens"] == 2048
+
+def test_mint_captcha_mode_reaches_the_child(manager):
+    manager.set_options(captcha="mint")
+    assert manager.captcha == "mint"
+    restored = gen.GeneratorManager(manager.gen_dir, data_dir=manager.data_dir)
+    assert restored.captcha == "mint"
+    env = manager._worker_env("g1")
+    assert env["ZAI_MANUAL"] == "0"
+    assert env["ZAI_CAPTCHA_MINT"] == "1"
+    # Only mint mode carries the flag: the other modes must not silently switch
+    # the claim minter on or off.
+    manager.set_options(captcha="auto")
+    assert "ZAI_CAPTCHA_MINT" not in manager._worker_env("g2")
+    manager.set_options(captcha="manual")
+    assert manager._worker_env("g3")["ZAI_MANUAL"] == "1"

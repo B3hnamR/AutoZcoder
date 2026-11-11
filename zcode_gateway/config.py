@@ -311,6 +311,10 @@ class GeneratorConfig(BaseModel):
     python_exe: str = ""               # python that can run ZCODEAUTO scripts ('' = auto-detect)
     # 'manual' = you solve the captcha yourself in a visible browser.
     # A visible browser is mandatory then (headless is forced off).
+    # 'mint' = no slider: the bundled captcha-mint sidecar mints the Aliyun
+    # verify param (traceless, the same source claims use) and the generator
+    # sends the signup POST itself; falls back to the drag solver if minting
+    # fails.
     captcha: str = Field(default_factory=lambda: "ai" if sys.platform.startswith("linux") else "manual")
     headless: bool = False             # only applies when captcha == 'auto'
     claim: bool = False                # legacy: invite Global Build (100M) claim after signup

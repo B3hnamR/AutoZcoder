@@ -224,6 +224,7 @@ export async function mount({ root, signal }) {
       field("captcha", "Captcha", select([
         ["auto", "auto — CV + AI vote"], ["ai", "ai — AI judge only"],
         ["classic", "classic — CV solver"],
+        ["mint", "mint — headless token (no drag)"],
         ...(can("manual_captcha") ? [["manual", "manual — I solve"]] : []),
       ], can("manual_captcha") || o.captcha !== "manual" ? o.captcha : "auto"),
         can("manual_captcha") ? null : "Manual solving needs a display; this host has none."),
@@ -271,11 +272,17 @@ export async function mount({ root, signal }) {
         + "Off means a signup is kept only if the provider granted a plan by itself."),
     ]);
     controls.captcha.addEventListener("change", () => {
-      if (controls.captcha.value !== "manual") controls.strategy.value = controls.captcha.value;
+      // Only the drag solvers carry a strategy; manual and mint do not.
+      const value = controls.captcha.value;
+      if (value === "auto" || value === "ai" || value === "classic") {
+        controls.strategy.value = value;
+      }
       saveOptions();
     });
     controls.strategy.addEventListener("change", () => {
-      if (controls.captcha.value !== "manual") controls.captcha.value = controls.strategy.value;
+      if (["auto", "ai", "classic"].includes(controls.captcha.value)) {
+        controls.captcha.value = controls.strategy.value;
+      }
       saveOptions();
     });
   }
