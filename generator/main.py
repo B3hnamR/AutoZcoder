@@ -1519,6 +1519,14 @@ def _main(auto_result=None):
         auto_result.update(_auto_result('pool_empty'))
         return auto_result
 
+    # A proxy pinned in config.yaml lives only in CURRENT_PROXY; the API helpers
+    # (plan_check/claim_start/captcha config) read ZAI_PROXY. Without this the
+    # browser signs up through the proxy and every following claim goes direct
+    # from the home IP — two identities for one account.
+    if CURRENT_PROXY and not os.environ.get('ZAI_PROXY'):
+        set_proxy(CURRENT_PROXY)
+        logger.info(f"Using pinned proxy: {_redact_proxy(CURRENT_PROXY)}")
+
     mail = CatchAllMail(logger_instance=logger)
     if not mail.create_account():
         print("Failed to create mail account")
