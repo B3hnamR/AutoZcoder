@@ -1061,16 +1061,20 @@ def signup(email, password, mail=None):
                 if not captcha_param and isinstance(result, str) and len(result) > 40:
                     captcha_param = result
 
-                # A vanished widget is not proof the app submitted: the SPA posts
-                # ~15s after the slide, and a failed slide can also blank the DOM.
-                # Wait for a real signal (signup POST or a token) before deciding.
-                if not _signup_fired() and not captcha_param:
+                # A token in hand is not permission to submit: the SPA posts its
+                # own signup ~15s after the slide. Posting while we have a token
+                # produced two signup POSTs for one email (observed live), which
+                # trips the per-email rate limit and can half-create the account.
+                # Always give the app its window first; only POST if it never fires.
+                if not _signup_fired():
                     deadline = time.time() + 20
-                    logger.info("No signup signal yet — waiting up to 20s for the app")
+                    logger.info("Waiting up to 20s for the app's own signup POST")
                     while time.time() < deadline:
-                        if _signup_fired() or captured['verify_param']:
+                        if _signup_fired():
                             break
-                        time.sleep(0.5)
+                        if not captcha_param:
+                            captcha_param = captured['verify_param']
+                        time.sleep(0.25)
                     captcha_param = captcha_param or captured['verify_param']
 
                 global LAST_CAPTCHA_PARAM
