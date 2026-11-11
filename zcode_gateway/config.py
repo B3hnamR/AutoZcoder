@@ -175,13 +175,13 @@ class ServerConfig(BaseModel):
 
 class Fingerprint(BaseModel):
     user_agent: str = (
-        "ZCode/3.16.3 ai-sdk/provider-utils/4.0.27 runtime/node.js/24"
+        "ZCode/3.18.0 ai-sdk/provider-utils/4.0.27 runtime/node.js/24"
     )
     # The billing preview gift list (and the plan shown on /billing/balance)
     # is version-gated: 3.14.3..3.16.0 answer [], 3.16.1+ name the plan. A
     # 3.14.x fingerprint therefore reads as "this account has no plan" even
-    # when the Start Plan is active. 3.16.3 is the build this repo tracks.
-    client_version: str = "3.16.3"
+    # when the Start Plan is active. 3.18.0 is the build this repo tracks.
+    client_version: str = "3.18.0"
     core_version: str = "0.0.83"
     platform: str = "win32-x64"
     device_mid: str = Field(default_factory=default_device_mid)

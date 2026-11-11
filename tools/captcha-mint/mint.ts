@@ -14,7 +14,7 @@ import { runCaptchaSolve } from "./captcha-solver.ts";
 import { CaptchaDeadline } from "./captcha-deadline.ts";
 import { bootstrapCaptchaRoute, readBoundedBody } from "./captcha-transport.ts";
 
-const appVersion = (process.env.ZAI_APP_VERSION || "3.16.3").trim();
+const appVersion = (process.env.ZAI_APP_VERSION || "3.18.0").trim();
 
 export async function readConfig(deadline: CaptchaDeadline): Promise<{ scene: string; region: string; prefix: string }> {
   deadline.remaining();
