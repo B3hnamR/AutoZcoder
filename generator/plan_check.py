@@ -593,6 +593,12 @@ def preview_plans(zcode_jwt, log=print, *, strict=False) -> list:
         if code not in (0, 200):
             raise PreviewError(f"preview business failure (code={code})", kind="business",
                                code=code, route_problem=code in (3012, 405, -1))
+        # `data: null` is how upstream answers "nothing is offered to this
+        # account" — a valid empty list, not a broken envelope. Treating it as
+        # malformed marked every already-entitled account as a route problem.
+        if j.get("data") is None:
+            log(f"  plan: preview {r.status_code} code={code} plans=[] (no offers)")
+            return []
         if not isinstance(j.get("data"), (dict, list)):
             raise PreviewError("preview malformed data", kind="malformed")
     except PreviewError as e:

@@ -448,7 +448,6 @@ def test_strict_preview_accepts_valid_empty_data(monkeypatch, data):
     ("transport", "transport", True),
     ("list_envelope", "malformed", True),
     ("missing_code", "malformed", True),
-    ("missing_data", "malformed", True),
 ])
 def test_preview_failures_are_not_empty_offers(monkeypatch, failure, kind, route_problem):
     secret = "sensitive-account-or-proxy-detail"
@@ -466,7 +465,6 @@ def test_preview_failures_are_not_empty_offers(monkeypatch, failure, kind, route
             "blocked": {"code": 3012, "msg": secret, "data": {}},
             "list_envelope": [],
             "missing_code": {"data": []},
-            "missing_data": {"code": 0},
         }[failure]
         return _Resp(payload, status=502 if failure == "http" else 200)
 
@@ -668,3 +666,25 @@ def test_direct_captcha_sidecar_does_not_inherit_proxy_settings(monkeypatch):
     assert seen["ZAI_CAPTCHA_PROXY"] == ""
     assert "no_proxy" not in seen
     assert os.environ["ZAI_PROXY"] == "http://proxy:8080"
+
+def test_preview_null_data_is_an_empty_offer_list(monkeypatch):
+    """`data: null` means "nothing offered", not a broken envelope.
+
+    Live: an account with a plan already active answers 200/code 0/data null.
+    Marking that malformed made the claim pass report a route problem for an
+    account that simply had nothing to claim.
+    """
+    _install_fake(monkeypatch, preview_payload={"code": 0, "data": None},
+                  balance_payloads=[EMPTY])
+    assert plan_check.preview_plans("jwt", log=lambda *a, **k: None) == []
+    assert plan_check.preview_plans("jwt", log=lambda *a, **k: None, strict=True) == []
+
+
+def test_claim_pass_reports_nothing_claimable_for_a_null_preview(monkeypatch):
+    _fake_login(monkeypatch)
+    _install_fake(monkeypatch, preview_payload={"code": 0, "data": None},
+                  balance_payloads=[EMPTY])
+    res = cs.claim_start("chat-token", log=lambda *a, **k: None, proxy_fallback=False)
+    assert res["claimed"] is False
+    assert res["route_problem"] is False
+    assert "no claimable plan" in (res.get("error") or "")
