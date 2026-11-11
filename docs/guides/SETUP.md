@@ -1,8 +1,10 @@
 # Zcode Gateway — Account Generator setup
 
-The gateway can create z.ai accounts and claim the referral **Global Build**
-(100M GLM-5.3-Flash) automatically. This file covers the parts that need **you**
-(once), and the portable layout.
+The gateway can create z.ai accounts and claim the **Start Plan** from the
+billing preview automatically. (The referral Global Build and the 500M giveaway
+are withdrawn campaigns; the generator can still run them, but they are off by
+default and claim nothing on a current account.) This file covers the parts that
+need **you** (once), and the portable layout.
 
 For repository layout, source dependencies and build commands, see the
 [README](../../README.md). Commands below assume the repository root unless
@@ -45,7 +47,9 @@ generator:
   zcodeauto_dir: ""         # '' = auto-detect; or the generator folder (has main.py)
   python_exe: ""            # blank = auto-detect; else full path to a python that
                             # has the generator deps (playwright/ddddocr/...)
-  invite_code: ""           # your referral code ('' = off; empty by default)
+  invite_code: "MT9GNDQ8"   # referral code used by the legacy invite branch
+                            # ('' = off). The default is NOT empty; set '' unless
+                            # you want legacy invite claims.
   proxy_types: "socks"      # pool scheme filter: all | socks | socks5 | socks4 | http
 ```
 
@@ -108,7 +112,7 @@ the latency cap) and keeps the good ones.
 
 | option | meaning |
 |---|---|
-| **socks pool** | socks4/5 only — residential-style IPs that pass the Starter gate |
+| **socks pool** | socks4/5 only — residential-style IPs, lowest risk score |
 | **full pool** | any verified proxy (http + socks) |
 | **my network (no proxy)** | run from this machine's own IP |
 | **pinned proxy** | one fixed `http://ip:port` or `socks5://ip:port` |
@@ -117,31 +121,43 @@ Buttons: **Scrape + Verify** (fresh pull + verify), **Verify raw**,
 **Recheck pool**, **Stop**. **Custom proxies** lets you paste or upload your own
 `ip:port` list; **Proxy sources** is the editable scrape list.
 
-> Note: free datacenter proxies rarely earn the Starter plan — residential
-> connections do. If Starter yield is 0, use your own network or a residential
-> proxy you trust.
+> Note: free datacenter proxies get risk-scored hard. A signup from one often
+> completes but the Start Plan claim is refused (3007/3012), and shared exits
+> poison each other. If Start Plan yield is 0, use your own network or a
+> residential proxy you trust.
 
 ---
 
 ## 4. Run
 
 In **Generator**: choose how many browsers, captcha mode
-(**auto** = solver, **manual** = you solve the slider), IP source, retries, and
-whether to claim the 100M referral. Press **START**. Each worker shows its proxy,
-captcha mode, live log and result; successful accounts
-(Starter + Global Build) join the pool automatically.
+(**auto** = solver, **manual** = you solve the slider), IP source and retries.
+Press **START**. Each worker shows its proxy, captcha mode, live log and result;
+accounts that end up with a live Start Plan balance join the pool automatically.
 
-The pipeline per account: signup → Starter check → device login (+telemetry) →
-invite bind → client message → **100M Global Build issues**.
+The pipeline per account: signup → plan check → device login (+telemetry) →
+Start Plan claim from the billing preview. The legacy invite and 500M branches
+run only when explicitly enabled and are no longer the default.
+
+The signup and claim requests send a ZCode client version that the provider
+version-gates. The shipped default is `3.18.0`; older builds (below `3.17.1`)
+get no marketing offers at all, which looks like "no plan available". Override
+it without a code change with `ZAI_APP_VERSION=3.18.0` (generator) and the
+`upstream.fingerprint.client_version` setting (gateway).
 
 ---
 
 ## Troubleshooting
 
 - **“px is not defined” / blank Generator tab** — stale build; use the latest exe.
-- **“exceed quota limit”** — the Global Build is a *night-only* grant; outside
-  its window the account shows the plan but the model is parked. It frees up
-  automatically when the window opens.
+- **“exceed quota limit”** — the active plan's window is closed or the model is
+  parked upstream; the gateway shows the reset time under capped models. It
+  frees up automatically when the window opens.
+- **Account created but no plan** — run one account with `ZAI_MANUAL=1` and
+  `ZAI_APP_VERSION=3.18.0` to separate a captcha problem from a version/claim
+  problem. The log line `captcha_verify_param: MISSING` means the signup
+  request never carried a token; `plan check ... starter=False` means the
+  account is fine and the claim was refused.
 - **Test inbox fails** — check the worker URL ends in `/inbox`, the secret
   matches `wrangler secret put INBOX_SECRET`, and the catch-all is enabled.
 - **Generator unavailable** — use **Generator → Locate generator** to pick the
