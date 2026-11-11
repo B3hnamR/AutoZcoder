@@ -52,9 +52,25 @@ export function createClaimBatch({ signal, compact = false } = {}) {
     try { paint(await api.get("/admin/claims/claim_all_status", { signal })); }
     catch (e) { if (!signal?.aborted) status.textContent = "Batch status unavailable; refresh to retry."; }
   }
-  const node = el("div", { class: "row row--tight" }, compact ? [mode, start, stop, status] : [
-    el("strong", { text: "Pending Start Plan claims" }), mode, start, stop, status,
-  ]);
+  // Campaign cards (Global/Weekend Build) are upstream drops, so the window is
+  // read from the delivery, not from a clock. The one stable rule is the name:
+  // Weekend Build is a Beijing-weekend campaign, and Beijing is 4:30 ahead of
+  // Tehran all year (Iran dropped DST in 2022).
+  const hint = el("p", { class: "field__help", text:
+    "Global/Weekend Build cards are drops, not a schedule: a card exists only while the "
+    + "marketing feed lists it. Weekend Build covers the Beijing weekend — it opens Friday "
+    + "19:30 Tehran (Saturday 00:00 Beijing) and closes Sunday 19:30 Tehran (Monday 00:00 "
+    + "Beijing). Global Build windows are short and quota-limited: one was live 18:45-18:59 "
+    + "Tehran and gone after. An empty feed means the card is closed right now, not that the "
+    + "account is broken — there is no fixed Tehran time to wait for, so claim the moment it "
+    + "appears." });
+  const node = compact ? el("div", { class: "row row--tight" }, [mode, start, stop, status])
+    : el("div", { class: "stack--tight" }, [
+      el("div", { class: "row row--tight" }, [
+        el("strong", { text: "Pending Start Plan claims" }), mode, start, stop, status,
+      ]),
+      hint,
+    ]);
   refresh();
   return { node, refresh };
 }
