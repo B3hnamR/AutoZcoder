@@ -274,7 +274,8 @@ def test_finish_failure_never_enters_success_or_signup_retry(worker, monkeypatch
 
 @pytest.fixture
 def signup_flow(worker, monkeypatch):
-    names = {'signup', '_save_recovery_account', 'jwt_payload', 'token_email', 'is_guest_token'}
+    names = {'signup', '_save_recovery_account', 'jwt_payload', 'token_email', 'is_guest_token',
+             '_captcha_verify_hook', '_signup_payload'}
     tree = ast.parse(SOURCE.read_text(encoding='utf-8'))
     module = ast.Module(body=[node for node in tree.body
                              if isinstance(node, ast.FunctionDef) and node.name in names],
@@ -306,7 +307,7 @@ def signup_flow(worker, monkeypatch):
     def on_response(event, callback):
         callback(types.SimpleNamespace(
             url='https://chat.z.ai/api/v1/auths/signup', status=200,
-            request=types.SimpleNamespace(method='POST'),
+            request=types.SimpleNamespace(method='POST', headers={}, post_data_json={}),
             text=lambda: '{"success":true}', headers={}))
 
     page.evaluate.side_effect = evaluate
@@ -324,7 +325,11 @@ def signup_flow(worker, monkeypatch):
         'SELECTORS': {name: name for name in (
             'continue_with_email', 'email_input', 'password_input', 'signup_button',
             'name_input', 'create_account_button', 'captcha_start', 'slider')},
-        'BROWSER_ARGS': [], 'CAPTCHA_VERIFY_HOOK': '', 'AVATAR_DATA_URI': 'fixture',
+        'BROWSER_ARGS': [], 'AVATAR_DATA_URI': 'fixture',
+        # The live scene fetch is a network call; the fixture pins it so the
+        # signup flow exercises capture, not /client/configs.
+        'fetch_captcha_config': Mock(return_value={'sceneId': 'scene-fixture',
+                                                   'region': 'sgp', 'prefix': 'p'}),
         'CaptchaSolver': Mock(return_value=Mock(solve=Mock(return_value='SOLVED'))),
         'take_screenshot': Mock(), '_rm_profile': Mock(), 'notify_gateway': Mock(),
         '_enter_signup_form': Mock(return_value=page.locator.return_value),
