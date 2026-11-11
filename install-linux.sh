@@ -52,6 +52,8 @@
 #   ZGW_FROM_SOURCE=/path     build the binary from a checkout of this repo
 #                             (scripts/build/linux.sh) instead of downloading a release
 #   ZGW_SKIP_GENERATOR=1      skip the generator environment (venv + Chromium, ~250 MB)
+#   PLAYWRIGHT_DOWNLOAD_HOST=… Chromium download mirror when Playwright's CDN is
+#                             geo-blocked (e.g. https://cdn.npmmirror.com/binaries/playwright)
 #   ZGW_ALLOW_LOW_RESOURCES=1 accept the first-install CPU/RAM warning explicitly
 #   ZGW_PAUSE_UNITS="a b"     systemd units that hold port 80; they are stopped
 #                             for a few seconds while Let's Encrypt validates
@@ -195,11 +197,18 @@ system_python() (
 )
 
 run_tool_user() {
+    # Playwright's CDN geo-blocks some VPS regions (403 AccessDenied).
+    # Forward an explicit mirror so an operator can install Chromium anyway;
+    # the rest of the environment stays clean (env -i) on purpose.
+    local extra=()
+    [[ -n "${PLAYWRIGHT_DOWNLOAD_HOST:-}" ]] && \
+        extra+=(PLAYWRIGHT_DOWNLOAD_HOST="${PLAYWRIGHT_DOWNLOAD_HOST}")
     runuser -u "$SVC_USER" -- env -i \
         PATH="${ZGW_INSTALL_DIR}/node/bin:/usr/local/bin:/usr/bin:/bin" \
         HOME="${ZGW_INSTALL_DIR}/home" \
         npm_config_cache="${ZGW_INSTALL_DIR}/home/.npm" \
-        PLAYWRIGHT_BROWSERS_PATH="${ZGW_INSTALL_DIR}/pw-browsers" "$@"
+        PLAYWRIGHT_BROWSERS_PATH="${ZGW_INSTALL_DIR}/pw-browsers" \
+        "${extra[@]}" "$@"
 }
 
 # ------------------------------------------------------- service account
