@@ -128,13 +128,15 @@ python3 -m venv .venv
 .venv/bin/python -m zcode_gateway.main --config config.yaml
 ```
 
-Requirements: Python 3.9+ (3.13 recommended). The first run works on a
-minimal server image — no Tk/GUI packages are needed.
+Requirements: Python 3.10+ (3.13 recommended). The gateway uses PEP 604 union
+syntax at runtime, so 3.9 is not supported. The first run works on a minimal
+server image — no Tk/GUI packages are needed.
 
 The captcha-mint sidecar (only needed for headless Start-Plan claims) is
 compiled for Linux by the release build; from source, build it with
-`bun install && bun build --compile mint.ts --outfile captcha-mint` inside
-`tools/captcha-mint/`.
+`bun install && bun build --compile --target=bun-linux-x64 --outfile captcha-mint mint.ts`
+inside `tools/captcha-mint/` (use `bun-linux-arm64` on ARM). `scripts/build/linux.sh`
+does exactly this and rejects a `.exe` fallback.
 
 For a packaged source build, run `bash scripts/build/linux.sh` from the repository
 root ([build script](../../scripts/build/linux.sh)) on Linux with Python3,
