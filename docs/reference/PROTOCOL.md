@@ -79,7 +79,10 @@ ids rotate per drop, so `-1024` / `-500m` are history, not a pattern. A held
 Start Plan does not block cards — the buckets are independent, which is why the
 claim pass still walks the marketing feed for an account that already has
 `-0817`. A preview that answers `data: null` carries no offers; treat the two
-sources independently and claim whatever the other one returns.
+sources independently and claim whatever the other one returns. Marketing
+deliveries are impression-deduped per account: the first `seq=0` page returns
+the card and the next call returns an empty list, so discovery and claim must
+happen in one pass (never pre-fetch for display and claim later).
 
 ## Failure behavior
 
