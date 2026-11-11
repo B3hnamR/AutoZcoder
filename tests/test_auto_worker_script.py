@@ -696,3 +696,20 @@ def test_mint_helper_delegates_to_the_claim_sidecar(monkeypatch):
     stub._captcha_token = boom
     assert namespace['_mint_captcha'](logs.append) == ''
     assert any('solver crashed' in line for line in logs)
+
+def test_mint_helper_accepts_a_logger_object(monkeypatch):
+    """main.py passes its Logger, not a callable; that used to raise TypeError."""
+    tree = ast.parse(SOURCE.read_text(encoding='utf-8'))
+    node = next(n for n in tree.body
+                if isinstance(n, ast.FunctionDef) and n.name == '_mint_captcha')
+    namespace = {}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(SOURCE), 'exec'), namespace)
+
+    stub = types.ModuleType('claim_start')
+    seen = []
+    stub._captcha_token = lambda log, **kw: (seen.append(log), ('P' * 280, 'sgp'))[1]
+    monkeypatch.setitem(sys.modules, 'claim_start', stub)
+
+    logger = logging.getLogger('mint-logger-test')
+    assert namespace['_mint_captcha'](logger) == 'P' * 280
+    assert seen and callable(seen[0])

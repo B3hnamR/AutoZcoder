@@ -549,21 +549,27 @@ def _mint_captcha(log):
     verification runs in happy-dom and prints `<param> <region>`. Returns ''
     when no minter is configured or the solver fails; the caller then falls
     back to the in-page slider.
+
+    `log` is either a callable or a logging.Logger: callers pass both, and
+    calling a Logger raised `'Logger' object is not callable` mid-signup.
     """
+    emit = log if callable(log) else getattr(log, "info", None)
+    if emit is None:
+        emit = lambda _message: None
     try:
         from claim_start import _captcha_token
     except Exception as e:
-        log(f"  mint: claim_start import failed ({type(e).__name__}: {e})")
+        emit(f"  mint: claim_start import failed ({type(e).__name__}: {e})")
         return ''
     try:
-        param, _region = _captcha_token(log)
+        param, _region = _captcha_token(emit)
     except Exception as e:
-        log(f"  mint: solver crashed ({type(e).__name__}: {e})")
+        emit(f"  mint: solver crashed ({type(e).__name__}: {e})")
         return ''
     if param:
-        log(f"  mint: verify param ready (len={len(param)})")
+        emit(f"  mint: verify param ready (len={len(param)})")
     else:
-        log("  mint: no token (no sidecar configured or solver failed)")
+        emit("  mint: no token (no sidecar configured or solver failed)")
     return param or ''
 
 
