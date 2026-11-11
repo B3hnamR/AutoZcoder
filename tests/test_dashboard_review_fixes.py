@@ -88,6 +88,22 @@ def mount(page, name):
     page.evaluate("name => mountView(name)", name)
 
 
+def test_accounts_empty_pool_does_not_show_a_filter_message(dashboard):
+    """An empty pool shows its own empty state, not "No accounts match that filter"."""
+    page, overrides, _, _ = dashboard
+    mount(page, "accounts")
+    page.get_by_text("No accounts yet").wait_for()
+    assert not page.locator("[data-nomatch]").is_visible()
+
+    overrides["/admin/accounts"] = lambda route: route.fulfill(
+        json={"accounts": [{"id": "a1", "email": "a@b.test", "state": "ready"}]})
+    page.evaluate("view.refresh()")
+    page.get_by_text("a@b.test").wait_for()
+    assert not page.locator("[data-nomatch]").is_visible()
+    page.locator("input[type=search]").fill("zzz-no-hit")
+    assert page.locator("[data-nomatch]").is_visible()
+
+
 @pytest.mark.parametrize("status", [0, 401, 500, 503])
 def test_proxy_only_404_shows_locator_and_recovers(dashboard, status):
     page, overrides, _, _ = dashboard

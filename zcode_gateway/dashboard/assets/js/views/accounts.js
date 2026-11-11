@@ -292,14 +292,17 @@ async function loginWithZcode(reload, signal) {
 
 function applyFilter(root) {
   const q = query.trim().toLowerCase();
-  let shown = 0;
+  let shown = 0, total = 0;
   for (const tr of $$("tbody tr[data-search]", root)) {
+    total++;
     const hit = !q || tr.dataset.search.includes(q);
     tr.hidden = !hit;
     if (hit) shown++;
   }
   const none = root.querySelector("[data-nomatch]");
-  if (none) none.hidden = shown > 0;
+  // Only a filtered-out non-empty table has "no matches"; an empty pool shows
+  // its own "No accounts yet" panel, not a filter message underneath it.
+  if (none) none.hidden = !(total > 0 && shown === 0);
 }
 
 function render(root, accounts, pool, reload, batch, signal, campaign = {}) {
@@ -460,3 +463,4 @@ export async function mount({ root, signal }) {
   await load();
   return { refresh: load };
 }
+

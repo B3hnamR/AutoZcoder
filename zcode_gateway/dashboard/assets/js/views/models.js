@@ -20,14 +20,15 @@ function releaseText(info) {
 
 function applyFilter(root) {
   const q = query.trim().toLowerCase();
-  let shown = 0;
+  let shown = 0, total = 0;
   for (const item of $$(".model-entry", root)) {
+    total++;
     const hit = !q || item.dataset.search.includes(q);
     item.hidden = !hit;
     if (hit) shown++;
   }
   const none = root.querySelector("[data-nomatch]");
-  if (none) none.hidden = shown > 0;
+  if (none) none.hidden = !(total > 0 && shown === 0);
 }
 
 function accountBreakdown(model, quotas) {
@@ -248,3 +249,4 @@ export async function mount({ root, signal }) {
   await load();
   return { refresh: load };
 }
+
