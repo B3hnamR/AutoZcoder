@@ -159,7 +159,7 @@ async function claimStart(id, mode) {
   try {
     const r = await api.post("/admin/accounts/" + encodeURIComponent(id) + "/claim_start", { mode });
     if (r?.error) toast(r.error, "err");
-    else toast("Start Plan claim queued (" + mode + ") — watch it in Generator", "ok");
+    else toast("Claim queued (" + mode + ") — watch it in Generator", "ok");
   } catch (e) { toast("claim_start: " + e.message, "err"); }
 }
 
@@ -302,11 +302,23 @@ function applyFilter(root) {
   if (none) none.hidden = shown > 0;
 }
 
-function render(root, accounts, pool, reload, batch, signal) {
+function render(root, accounts, pool, reload, batch, signal, campaign = {}) {
   const rows = accounts.map((a) => Object.assign(a, {
     __searchText: [a.email, a.id, a.state, a.source, ...(a.capped_models || [])]
       .filter(Boolean).join(" ").toLowerCase(),
   }));
+  // Weekend Build is a drop, not a permanent offer. Before the window opens
+  // the per-account claim would only burn the marketing impression and come
+  // back empty, so the buttons stay locked until Beijing Saturday 00:00.
+  const campaignOpen = !campaign.gate || campaign.active;
+  const campaignNote = campaign.active
+    ? "Weekend Build is open — closes " + relative(parseTime(campaign.ends_at))
+    : campaign.gate
+      ? "Weekend Build opens " + relative(parseTime(campaign.next_starts_at))
+      : null;
+  const claimTitle = (mode) => campaignOpen
+    ? "Claim Start Plan / Weekend Build card (" + mode + ")"
+    : "Locked until the Weekend Build window opens";
 
   const counts = pool.by_state || {};
   const summary = el("div", { class: "grid grid--metrics" }, [
@@ -398,8 +410,10 @@ function render(root, accounts, pool, reload, batch, signal) {
         button({ icon: "copy", title: "Copy account for sharing", onClick: () => copyAccountForSharing(a.id) }),
         button({ icon: "refresh", title: "Reload token", onClick: () => accountAction("refresh", a.id, reload) }),
         button({ icon: "chart", title: "Check quotas", onClick: () => accountAction("balance", a.id, reload) }),
-        button({ icon: "bolt", title: "Claim Start Plan (proxy)", onClick: () => claimStart(a.id, "proxy") }),
-        button({ icon: "terminal", title: "Claim Start Plan (direct)", onClick: () => claimStart(a.id, "direct") }),
+        button({ icon: "bolt", title: claimTitle("proxy"), disabled: !campaignOpen,
+                 onClick: () => claimStart(a.id, "proxy") }),
+        button({ icon: "terminal", title: claimTitle("direct"), disabled: !campaignOpen,
+                 onClick: () => claimStart(a.id, "direct") }),
         button({ icon: "check", title: "Enable", onClick: () => accountAction("enable", a.id, reload) }),
         button({ icon: "eyeOff", title: "Remove", variant: "danger", onClick: () => removeAccount(a, reload) }),
       ]),
@@ -410,6 +424,7 @@ function render(root, accounts, pool, reload, batch, signal) {
     title: "Pool",
     desc: rows.length
       ? "Quota resets and plan expiry use your local timezone."
+        + (campaignNote ? " " + campaignNote : "")
       : null,
     body: [body, el("div", {
       class: "empty__text", "data-nomatch": "", hidden: true,
@@ -427,9 +442,10 @@ export async function mount({ root, signal }) {
   const batch = createClaimBatch({ signal, compact: true });
   const load = async () => {
     if (signal.aborted) return;
-    const [accs, pool] = await Promise.all([
+    const [accs, pool, campaign] = await Promise.all([
       api.get("/admin/accounts", { signal }),
       api.get("/admin/pool/state", { signal }),
+      api.get("/admin/accounts/campaign_window", { signal }).catch(() => ({ gate: false })),
     ]);
     if (signal.aborted) return;
     // Do not rebuild while the user is typing in the filter box.
@@ -437,7 +453,7 @@ export async function mount({ root, signal }) {
     if (active && active.type === "search" && root.contains(active)) {
       return;
     }
-    render(root, accs.accounts || [], pool || {}, load, batch, signal);
+    render(root, accs.accounts || [], pool || {}, load, batch, signal, campaign || {});
     batch.refresh();
   };
 

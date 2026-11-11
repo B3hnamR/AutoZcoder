@@ -364,6 +364,11 @@ class ClaimsConfig(BaseModel):
     daily_time: str = "19:02"
     daily_utc_offset_hours: float = Field(default=8.0, ge=-12.0, le=14.0)
     daily_mode: str = "direct"        # direct | proxy, same as the button
+    # Weekend Build drop: Saturday 00:00 -> Monday 00:00 Beijing. The
+    # dashboard enables the per-account claim buttons only inside it; set
+    # campaign_gate = false to keep them live all week.
+    campaign_utc_offset_hours: float = Field(default=8.0, ge=-12.0, le=14.0)
+    campaign_gate: bool = True
 
 
 class Config(BaseModel):

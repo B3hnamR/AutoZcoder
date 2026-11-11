@@ -52,6 +52,16 @@ async def list_accounts(request: Request, key: str = Depends(admin_key)) -> dict
     return {"accounts": [a.to_public() for a in accounts]}
 
 
+@router.get("/accounts/campaign_window")
+async def campaign_window(request: Request, key: str = Depends(admin_key)) -> dict:
+    """Whether the Weekend Build drop is open, for the account action buttons."""
+    from .campaign_window import weekend_window
+    claims = getattr(get_state(request).cfg, "claims", None)
+    return {**weekend_window(
+        utc_offset_hours=float(getattr(claims, "campaign_utc_offset_hours", 8.0))),
+        "gate": bool(getattr(claims, "campaign_gate", True))}
+
+
 @router.post("/accounts")
 async def add_account(
     request: Request,

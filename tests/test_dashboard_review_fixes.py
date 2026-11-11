@@ -21,6 +21,7 @@ def dashboard():
         overrides = {}
         defaults = {
             "/admin/accounts": {"accounts": []},
+            "/admin/accounts/campaign_window": {"active": False, "gate": False},
             "/admin/pool/state": {},
             "/admin/claims/claim_all_status": {},
             "/admin/dash/proxy/socks_ready": {},
