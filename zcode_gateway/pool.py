@@ -15,6 +15,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Iterable
 
+from .affinity import AffinityMap
 from .config import AccountsConfig, PoolConfig
 
 # grant-window clock-skew grace: a starts_at less than this far in the future
@@ -395,6 +396,9 @@ class PoolManager:
         self._accounts: dict[str, Account] = {a.id: a for a in accounts}
         self._lock = asyncio.Lock()
         self._router = Router(cfg)
+        # conversation -> account, so multi-turn chats keep their context (and
+        # the upstream prompt cache); inert when the TTL is 0
+        self._affinity = AffinityMap(cfg.conversation_affinity_seconds)
         # incremented on every release()/reacquire(); acquire() waiters sleep on
         # a generation mismatch instead of polling on a fixed timer
         self._slot_gen = 0
@@ -582,6 +586,7 @@ class PoolManager:
                       model: str | None = None,
                       wait_seconds: float | None = None,
                       only_id: str | None = None,
+                      affinity_key: str = "",
                       ) -> Account | None:
         """Pick an account, optionally waiting for an in-flight slot.
 
@@ -592,6 +597,11 @@ class PoolManager:
 
         `only_id` pins the choice to a single account (per-request routing,
         e.g. a generator claim that must run on the account being claimed).
+
+        `affinity_key` is the conversation id (see affinity.py): when the chat
+        is already bound to an account that is still a valid candidate, that
+        account wins, so later turns see the earlier ones and the upstream
+        prompt cache stays warm. A fresh binding is recorded on every pick.
         """
         if wait_seconds is None:
             wait_seconds = self.cfg.acquire_wait_seconds
@@ -602,12 +612,21 @@ class PoolManager:
                 if only_id:
                     accounts = [a for a in accounts if a.id == only_id]
                 excl = exclude or set()
-                acc = self._router.acquire(accounts, excl, require_paid, model)
+                candidates = self._router.candidates(accounts, excl, require_paid, model)
+                acc = None
+                if candidates and affinity_key and not only_id:
+                    acc = self._affine_candidate(candidates, affinity_key)
+                if acc is None:
+                    acc = self._router.pick(candidates)
                 if acc is not None:
+                    acc.in_flight += 1
+                    acc.last_used = time.time()
+                    if affinity_key and not only_id:
+                        self._affinity.bind(affinity_key, acc.id)
                     return acc
                 # wait only if a slot may free up: eligible accounts exist but
                 # all are at the in-flight cap
-                if (not self._router.candidates(accounts, excl, require_paid, model)
+                if (not candidates
                         or time.monotonic() >= deadline):
                     return None
                 gen = self._slot_gen
@@ -979,8 +998,34 @@ class PoolManager:
             "ready": sum(1 for a in accounts if a.is_ready()),
             "ready_paid": sum(1 for a in accounts if a.is_ready(require_paid=True)),
             "paid_exhausted": sum(1 for a in accounts if a.paid_exhausted),
+            "affinity": self.affinity_snapshot(),
             "detail": [a.to_public() for a in accounts],
         }
 
     async def ready_count(self, require_paid: bool = False) -> int:
         return sum(1 for a in await self.all() if a.is_ready(require_paid=require_paid))
+
+    # -- conversation affinity ------------------------------------------- #
+
+    def _affine_candidate(self, candidates: list[Account], affinity_key: str) -> Account | None:
+        """The bound account, when it is still an eligible candidate.
+
+        `candidates()` already applied readiness, model eligibility, exclusions
+        and the quota floor, so a stale binding (cooled, capped, removed) simply
+        fails here and the normal strategy picks a fresh account.
+        """
+        if not affinity_key:
+            return None
+        bound = self._affinity.get(affinity_key)
+        if not bound:
+            return None
+        cap = self.cfg.max_in_flight_per_account
+        for account in candidates:
+            if account.id == bound and (cap <= 0 or account.in_flight < cap):
+                return account
+        return None
+
+    def affinity_snapshot(self) -> dict:
+        return {"enabled": self._affinity.enabled(),
+                "ttl_seconds": self._affinity.ttl,
+                "bound_conversations": len(self._affinity)}

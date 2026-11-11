@@ -237,6 +237,10 @@ class PoolConfig(BaseModel):
     # account for this long, then rotate. Per model, so other models on the
     # same account stay usable. 15 minutes by default.
     blocked_model_cooldown_seconds: int = 900
+    # Keep a conversation on the account that served its first turn, so later
+    # turns still see the earlier ones and the upstream prompt cache stays
+    # warm. Keyed by the client's session id; 0 disables it.
+    conversation_affinity_seconds: int = Field(default=600, ge=0)
 
 
 class AccountsConfig(BaseModel):

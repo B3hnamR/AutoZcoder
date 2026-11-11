@@ -13,6 +13,7 @@ from dataclasses import dataclass
 import httpx
 import anyio
 from .aggregate import aggregate_openai_stream
+from .affinity import affinity_key_from_payload
 from .pool import Account
 from .breaker import EdgeBlockBreaker
 from .model_retry import is_model_overload, overload_delay, retry_after_seconds, wait_for_retry
@@ -403,9 +404,11 @@ class ChatService:
             or payload.get("account")
             or payload.get("account_id")
         )
+        affinity_key = affinity_key_from_payload(payload)
         tried, last = set(), None
         for attempt in range(max(1, self.cfg.upstream.max_attempts)):
-            account = await self.pool.acquire(tried, model=model, only_id=target_account)
+            account = await self.pool.acquire(tried, model=model, only_id=target_account,
+                                              affinity_key=affinity_key)
             if account is None:
                 if last: raise last
                 reason = await self.pool.unavailable_reason(model)
