@@ -45,13 +45,17 @@ class _Resp:
 
 
 def _install_fake(monkeypatch, *, preview_payload, balance_payloads,
-                  claim_codes=None):
+                  claim_codes=None, marketing_payload=None):
     """Route plan_check's HTTP calls to canned envelopes, in order."""
     claim_codes = list(claim_codes or [])
     balances = list(balance_payloads)
-    calls = {"preview": 0, "claim": [], "events": 0, "balance": 0}
+    marketing = marketing_payload or {"code": 0, "data": {"deliveries": []}}
+    calls = {"preview": 0, "claim": [], "events": 0, "balance": 0, "marketing": 0}
 
     def fake_get(url, **kw):
+        if "/marketing/touch" in url:
+            calls["marketing"] += 1
+            return _Resp(marketing)
         if "/billing/preview" in url:
             calls["preview"] += 1
             return _Resp(preview_payload)
@@ -142,6 +146,62 @@ def test_preview_dedupes_and_survives_flat_items(monkeypatch):
     assert [p["plan_id"] for p in got] == ["zcode-v3-start-plan-referral"]
 
 
+# --- dual inventory: billing preview + marketing deliveries ----------------
+
+def _delivery(campaign, plan_id, name="", slot="banner", action="claim_zcode_plan"):
+    content = {"buttons": [{"action": {"type": action, "args": {"plan_id": plan_id}}}]}
+    if name:
+        content["hero"] = {"args": {"zcode_plan": {"plan_id": plan_id, "name": name}}}
+    return {"campaign_id": campaign, slot: content}
+
+
+def _marketing(*deliveries):
+    return {"code": 0, "data": {"deliveries": list(deliveries)}}
+
+
+def test_marketing_feed_keeps_only_claim_buttons(monkeypatch):
+    _install_fake(monkeypatch, preview_payload=EMPTY, balance_payloads=[EMPTY],
+                  marketing_payload=_marketing(
+                      _delivery("c1", "zcode-v3-start-plan-gb1", "ZCODE GLOBAL BUILD"),
+                      _delivery("c2", "zcode-v3-start-plan-nope", slot="banner",
+                                action="open_url")))
+    got = plan_check.marketing_plans("jwt", log=lambda *a, **k: None)
+    assert [(p["plan_id"], p["name"], p["campaign_id"], p["source"]) for p in got] == [
+        ("zcode-v3-start-plan-gb1", "ZCODE GLOBAL BUILD", "c1", "marketing")]
+
+
+def test_marketing_feed_dedupes_across_slots(monkeypatch):
+    same = _delivery("c1", "zcode-v3-start-plan-gb1", "ZCODE GLOBAL BUILD")
+    same["popup"] = same["banner"]
+    _install_fake(monkeypatch, preview_payload=EMPTY, balance_payloads=[EMPTY],
+                  marketing_payload=_marketing(same))
+    got = plan_check.marketing_plans("jwt", log=lambda *a, **k: None)
+    assert [p["plan_id"] for p in got] == ["zcode-v3-start-plan-gb1"]
+
+
+def test_campaign_name_allowlist_normalizes_case_and_whitespace():
+    assert plan_check.is_campaign_plan_name("zcode  global\nbuild")
+    assert plan_check.is_campaign_plan_name(" ZCode Weekend Build ")
+    assert not plan_check.is_campaign_plan_name("ZCODE START PLAN")
+    assert not plan_check.is_campaign_plan_name("")
+
+
+def test_claimable_plans_merges_both_inventories(monkeypatch):
+    _install_fake(
+        monkeypatch,
+        preview_payload={"code": 0, "data": {"plans": [
+            {"plan_id": "zcode-v3-start-plan-referral", "name": "Start Plan"}]}},
+        marketing_payload=_marketing(
+            _delivery("c1", "zcode-v3-start-plan-gb1", "ZCODE GLOBAL BUILD")),
+        balance_payloads=[EMPTY])
+    both = plan_check.claimable_plans("jwt", log=lambda *a, **k: None)
+    assert [p["plan_id"] for p in both] == [
+        "zcode-v3-start-plan-referral", "zcode-v3-start-plan-gb1"]
+    daily = plan_check.claimable_plans("jwt", log=lambda *a, **k: None,
+                                       daily_only=True)
+    assert [p["plan_id"] for p in daily] == ["zcode-v3-start-plan-gb1"]
+
+
 # --- the chain -------------------------------------------------------------
 
 def _fake_login(monkeypatch, zjwt="ZJWT"):
@@ -163,6 +223,61 @@ def test_claim_chain_claims_and_verifies(monkeypatch):
     assert res["plan_id"] == "zcode-v3-start-plan-referral"
     assert calls["events"] >= 1          # preview needs the activity ping
     assert calls["claim"] == ["zcode-v3-start-plan-referral"]
+
+
+def test_claim_chain_claims_the_campaign_card_too(monkeypatch):
+    """The Start Plan and a Global/Weekend card are separate buckets."""
+    _fake_login(monkeypatch)
+    calls = _install_fake(
+        monkeypatch,
+        preview_payload={"code": 0, "data": {"plans": [
+            {"plan_id": "zcode-v3-start-plan-0817"}]}},
+        marketing_payload=_marketing(
+            _delivery("c1", "zcode-v3-start-plan-1001", "ZCODE WEEKEND BUILD")),
+        balance_payloads=[EMPTY, _balance(
+            ["zcode-v3-start-plan-0817", "zcode-v3-start-plan-1001"])],
+        claim_codes=[0, 0])
+    res = cs.claim_start("chat-token", log=lambda *a, **k: None,
+                         proxy_fallback=False)
+    assert calls["claim"] == ["zcode-v3-start-plan-0817",
+                              "zcode-v3-start-plan-1001"]
+    assert res["granted"] == calls["claim"]
+    assert res["claimed"] is True
+
+
+def test_active_start_plan_still_claims_campaign_cards(monkeypatch):
+    """An account already holding 0817 is skipped but still checked for cards."""
+    _fake_login(monkeypatch)
+    calls = _install_fake(
+        monkeypatch,
+        preview_payload={"code": 0, "data": {"plans": [
+            {"plan_id": "zcode-v3-start-plan-0817"}]}},
+        marketing_payload=_marketing(
+            _delivery("c1", "zcode-v3-start-plan-1001", "ZCODE GLOBAL BUILD")),
+        balance_payloads=[
+            _balance(["zcode-v3-start-plan-0817"]),
+            _balance(["zcode-v3-start-plan-0817", "zcode-v3-start-plan-1001"])],
+        claim_codes=[0])
+    res = cs.claim_start("chat-token", log=lambda *a, **k: None,
+                         proxy_fallback=False)
+    assert calls["claim"] == ["zcode-v3-start-plan-1001"]   # 0817 already held
+    assert res["claimed"] is True
+    assert res["already_claimed"] is False
+
+
+def test_billing_failure_falls_back_to_the_marketing_card(monkeypatch):
+    _fake_login(monkeypatch)
+    calls = _install_fake(
+        monkeypatch,
+        preview_payload={"code": 5000, "msg": "boom"},
+        marketing_payload=_marketing(
+            _delivery("c1", "zcode-v3-start-plan-gb1", "ZCODE GLOBAL BUILD")),
+        balance_payloads=[EMPTY, _balance(["zcode-v3-start-plan-gb1"])],
+        claim_codes=[0])
+    res = cs.claim_start("chat-token", log=lambda *a, **k: None,
+                         proxy_fallback=False)
+    assert calls["claim"] == ["zcode-v3-start-plan-gb1"]
+    assert res["claimed"] is True
 
 
 def test_claim_chain_skips_when_already_active(monkeypatch):
@@ -398,7 +513,7 @@ def test_direct_mode_never_uses_pool_fallback(monkeypatch, fallback, failure):
             raise plan_check.PreviewError("preview transport failed", kind="transport")
         return [{"plan_id": "zcode-v3-start-plan-referral"}]
 
-    monkeypatch.setattr(cs, "preview_plans", preview)
+    monkeypatch.setattr(cs, "claimable_plans", preview)
     monkeypatch.setattr(cs, "_captcha_token", lambda *a, **k: ("", ""))
     monkeypatch.setattr(cs, "claim_plan", lambda *a, **k: {"code": -1, "msg": "request failed"})
     result = cs.claim_start("chat", force_direct=True, proxy_fallback=fallback, log=lambda m: None)
@@ -446,7 +561,7 @@ def test_full_chain_uses_trusted_session_and_requested_route(monkeypatch, force_
     monkeypatch.setattr(cs, "_captcha_token", captcha)
     result = cs.claim_start("chat", force_direct=force_direct, proxy_fallback=False, log=lambda m: None)
     assert result["claimed"] is True
-    assert len(seen) == 14  # OAuth, login telemetry, zai login, balances, activity, preview, config, claim
+    assert len(seen) == 15  # OAuth, login telemetry, zai login, balances, activity, preview, marketing, config, claim
     expected = {} if force_direct else {"http": "http://signup-proxy:8080", "https": "http://signup-proxy:8080"}
     assert all(proxies == expected for _, proxies in seen)
     assert ic._FORCE_DIRECT is False

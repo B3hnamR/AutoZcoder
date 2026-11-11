@@ -67,6 +67,20 @@ Buckets are aggregated by GLM model only for active, unexpired plans.
 kept separately from the plan's ends_at. A depleted model does not park the
 other model. No stale captured trial dates or token balances are hard-coded.
 
+## Plan claim inventory
+
+`GET /zcode-plan/billing/preview` and `GET /marketing/touch?seq=0` are separate
+inventories. Start Plan variants (`zcode-v3-start-plan-*`) appear in the
+preview; Global/Weekend Build cards appear only as marketing `deliveries`, as a
+`banner` or `popup` button whose `action.type` is `claim_zcode_plan`. The card's
+`plan_id` is in `action.args`, and its display name (when present) in
+`<slot>.background|hero.args.zcode_plan`. The name is the stable key: campaign
+ids rotate per drop, so `-1024` / `-500m` are history, not a pattern. A held
+Start Plan does not block cards — the buckets are independent, which is why the
+claim pass still walks the marketing feed for an account that already has
+`-0817`. A preview that answers `data: null` carries no offers; treat the two
+sources independently and claim whatever the other one returns.
+
 ## Failure behavior
 
 401 requires credentials; 402/code 11113 parks the affected model until its

@@ -71,7 +71,7 @@ def test_transport_and_non_json_balance_errors(monkeypatch):
 def test_all_offers_must_actually_return_1005(monkeypatch, codes, unavailable, route):
     monkeypatch.setattr(cs, 'get_plan', lambda *a, **k: {})
     monkeypatch.setattr(cs, 'report_app_activity', lambda *a, **k: True)
-    monkeypatch.setattr(cs, 'preview_plans', lambda *a, **k: [
+    monkeypatch.setattr(cs, 'claimable_plans', lambda *a, **k: [
         {'plan_id': 'zcode-offer-a'}, {'plan_id': 'zcode-offer-b'}])
     monkeypatch.setattr(cs, '_captcha_token', lambda *a, **k: ('', ''))
     values = iter(codes)

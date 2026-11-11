@@ -66,6 +66,8 @@ PREVIEW = (f"https://zcode.z.ai/api/v1/zcode-plan/billing/preview"
 CLAIM = "https://zcode.z.ai/api/v1/zcode-plan/billing/claim"
 EVENT = "https://zcode.z.ai/api/v1/event/report"
 TOUCH = "https://zcode.z.ai/api/v1/marketing/touch"
+# `seq=0` is what the desktop client sends for the first page of deliveries.
+TOUCH_FEED = f"{TOUCH}?seq=0"
 
 try:
     import certifi
@@ -215,6 +217,22 @@ def is_start_plan(plan_id: str, include_campaign: bool = False) -> bool:
 
 def is_campaign_plan(plan_id: str) -> bool:
     return (plan_id or "").strip() in CAMPAIGN_PLAN_IDS
+
+
+# Campaign cards rotate their plan_id on every drop, so the upstream *name* is
+# the only stable key: discover the current id from the delivery, then claim
+# that id. Filtering on a name seen in the wild beats pinning `-1024`/`-500m`,
+# which expire.
+CAMPAIGN_PLAN_NAMES = ("ZCODE GLOBAL BUILD", "ZCODE WEEKEND BUILD")
+
+
+def normalize_plan_name(name) -> str:
+    """Collapse case and whitespace so a wrapped/oddly spaced name still matches."""
+    return " ".join(str(name or "").upper().split())
+
+
+def is_campaign_plan_name(name) -> bool:
+    return normalize_plan_name(name) in CAMPAIGN_PLAN_NAMES
 
 
 # The 16 static headers the upstream fingerprints (upstream.py STATIC_HEADERS).
@@ -592,6 +610,109 @@ def preview_plans(zcode_jwt, log=print, *, strict=False) -> list:
         plans.append(p)
     log(f"  plan: preview {r.status_code} code={j.get('code')} plans={[p['plan_id'] for p in plans]}")
     return plans
+
+
+def _card_plan_name(content: dict, plan_id: str) -> str:
+    """Card title from the delivery's own `zcode_plan` metadata, else the id."""
+    for key in ("background", "hero"):
+        details = ((content.get(key) or {}).get("args") or {}).get("zcode_plan")
+        if isinstance(details, dict) and details.get("plan_id") == plan_id:
+            return str(details.get("name") or plan_id)
+    return plan_id
+
+
+def marketing_plans(zcode_jwt, log=print) -> list:
+    """Claimable cards from GET /marketing/touch, deduped by plan_id.
+
+    This is a separate inventory from the billing preview: the Start Plan only
+    appears in the preview, while Global/Weekend Build only appear as marketing
+    deliveries (banner/popup buttons whose action is `claim_zcode_plan`). A
+    failed feed raises PreviewError instead of reading as "no cards".
+    """
+    try:
+        r = _request("GET", TOUCH_FEED, headers=build_headers(zcode_jwt),
+                     timeout=30, verify=_VERIFY, log=log, tries=2)
+    except Exception as e:
+        raise PreviewError(f"marketing transport failed ({type(e).__name__})",
+                           kind="transport") from e
+    if not 200 <= r.status_code < 300:
+        raise PreviewError(f"marketing HTTP {r.status_code}", kind="http",
+                           route_problem=(r.status_code in (403, 405, 408, 429)
+                                          or r.status_code >= 500))
+    try:
+        j = r.json()
+    except Exception as e:
+        raise PreviewError("marketing non-json response", kind="non_json") from e
+    if not isinstance(j, dict) or type(j.get("code")) is not int:
+        raise PreviewError("marketing malformed envelope", kind="malformed")
+    if j["code"] not in (0, 200):
+        raise PreviewError(f"marketing business failure (code={j['code']})",
+                           kind="business", code=j["code"],
+                           route_problem=j["code"] in (3012, 405, -1))
+    data = j.get("data") if isinstance(j.get("data"), dict) else {}
+    deliveries = data.get("deliveries")
+    if not isinstance(deliveries, list):
+        raise PreviewError("marketing response has no deliveries", kind="malformed")
+    plans, seen = [], set()
+    for delivery in deliveries:
+        if not isinstance(delivery, dict):
+            continue
+        campaign = str(delivery.get("campaign_id") or "")
+        for slot in ("banner", "popup"):
+            content = delivery.get(slot)
+            if not isinstance(content, dict):
+                continue
+            for button in content.get("buttons") or []:
+                action = (button or {}).get("action") or {}
+                if action.get("type") != "claim_zcode_plan":
+                    continue
+                pid = str((action.get("args") or {}).get("plan_id") or "").strip()
+                if not pid or pid in seen:
+                    continue
+                # reward copy alone is not an offer: the button's plan_id is
+                seen.add(pid)
+                plans.append({"plan_id": pid, "name": _card_plan_name(content, pid),
+                              "campaign_id": campaign, "source": "marketing",
+                              "claimable": True})
+    log(f"  plan: marketing plans={[p['plan_id'] for p in plans]}")
+    return plans
+
+
+def claimable_plans(zcode_jwt, log=print, *, daily_only=False, strict=False,
+                    include_billing=True) -> list:
+    """Every claimable plan from both inventories, deduped by plan_id.
+
+    One source failing is a warning while the other still has offers; strict
+    callers get a PreviewError only when nothing is claimable *and* a source
+    actually failed. `daily_only` narrows to the rotating campaign cards, whose
+    names are stable while their ids are not. `include_billing=False` is for
+    accounts that already hold a Start Plan: only the marketing feed matters.
+    """
+    errors, offers, seen = [], [], set()
+    sources = []
+    if include_billing:
+        sources.append(("billing",
+                        lambda: preview_plans(zcode_jwt, log=log, strict=True)))
+    sources.append(("marketing", lambda: marketing_plans(zcode_jwt, log=log)))
+    for label, load in sources:
+        try:
+            found = load()
+        except PreviewError as e:
+            log(f"  plan: {label} unavailable ({e})")
+            errors.append(e)
+            continue
+        for plan in found:
+            pid = str(plan.get("plan_id") or "").strip()
+            if not pid or pid in seen:
+                continue
+            seen.add(pid)
+            offers.append(plan)
+    if daily_only:
+        offers = [p for p in offers if is_campaign_plan_name(p.get("name"))]
+    log(f"  plan: claimable plans={[p['plan_id'] for p in offers]}")
+    if strict and not offers and errors:
+        raise errors[0]
+    return offers
 
 
 def claim_plan(zcode_jwt, plan_id, verify_param="", region="", log=print) -> dict:

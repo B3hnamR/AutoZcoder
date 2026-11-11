@@ -12,9 +12,15 @@ Start Plan. It is offered in the billing preview instead, and must be granted:
      (the preview answers an empty list until the account reported activity)
   3. GET  /api/v1/zcode-plan/billing/preview?app_version=3.18.0
      (also version-gated: <3.16.1 answers [])
-  4. POST /api/v1/zcode-plan/billing/claim {"plan_id": ...}
+     GET  /api/v1/marketing/touch?seq=0
+     (campaign cards only exist here: Global/Weekend Build, rotating ids)
+  4. POST /api/v1/zcode-plan/billing/claim {"plan_id": ...} for every offer
      (0 = claimed, 1003 = already claimed -> idempotent success)
-  5. GET  /api/v1/zcode-plan/billing/balance -> an active start-plan id
+  5. GET  /api/v1/zcode-plan/billing/balance -> an active start/campaign id
+
+An account that already holds a Start Plan still goes through step 3/4 for the
+campaign cards: the buckets are independent, and a card claimed later is worth
+keeping. `--plan` / ZAI_START_PLAN_ID forces one specific id.
 
 If what the account is offered turns out to be `zcode-v3-start-plan-referral`,
 the account must first be bound to an invite (browser + Aliyun captcha); this
@@ -50,11 +56,11 @@ from plan_check import (          # noqa: E402
     _proxies,
     _request,
     claim_plan,
+    claimable_plans,
     direct_requests,
     get_plan,
     is_start_plan,
     per_account_device_mid,
-    preview_plans,
     report_app_activity,
 )
 
@@ -393,17 +399,26 @@ def _run_chain(token: str, plan_id: str, log, force_direct: bool,
     plan = get_plan(zjwt, log=log)
     if plan:
         res['plans'] = plan.get('plans') or []
+    entitled_ids = set(res['plans']) | {
+        e.get('plan_id') for e in ((plan or {}).get('entitlements') or [])
+        if e.get('plan_id')
+    }
     if plan and plan.get('starter'):
-        log(f"  claim_start: start plan already active ({plan.get('start_plans')}) — nothing to do")
+        # A live Start Plan says nothing about the rotating campaign buckets:
+        # keep going so an already-entitled account can still pick up cards.
+        log(f"  claim_start: start plan already active ({plan.get('start_plans')}) "
+            "— still checking campaign cards")
         res['already_claimed'] = True
         res['claimed'] = True
-        return res, zjwt
 
     # the preview stays empty without recent app telemetry
     report_app_activity(zjwt, log=log)
 
     try:
-        offer = preview_plans(zjwt, log=log, strict=True)
+        # a held Start Plan makes the billing preview pointless: every id it
+        # lists is already entitled and would only answer 1003
+        offer = claimable_plans(zjwt, log=log, strict=True,
+                                include_billing=not bool(plan and plan.get('starter')))
     except PreviewError as e:
         res['error'] = str(e)
         res['preview_error'] = e.kind
@@ -418,7 +433,8 @@ def _run_chain(token: str, plan_id: str, log, force_direct: bool,
         candidates.append(plan_id)
     for p in offer:
         pid = p.get('plan_id')
-        if pid and pid not in candidates:
+        # an entitlement already in hand would only answer 1003
+        if pid and pid not in candidates and pid not in entitled_ids:
             candidates.append(pid)
     if dry_run:
         log(f"  claim_start: dry run — would claim {candidates}")
@@ -436,9 +452,12 @@ def _run_chain(token: str, plan_id: str, log, force_direct: bool,
     last_code = None
     last_msg = ''
     fresh = False
+    granted = []
     terminal_codes = []
     route_error = None
     for pid in candidates:
+        if res['needs_captcha']:
+            break
         for attempt in range(1, claim_attempts + 1):
             # a token is single-use: mint a fresh one for every attempt
             vparam, vregion = _captcha_token(log, force_direct=force_direct)
@@ -454,9 +473,11 @@ def _run_chain(token: str, plan_id: str, log, force_direct: bool,
                 route_error = (code, last_msg)
             if code == 0:
                 fresh = True
+                granted.append(pid)
                 break
             if code == 1003 or 'already' in str(msg).lower():
                 fresh = True          # idempotent success; balance proves it
+                granted.append(pid)
                 break
             if code == 3007:
                 res['needs_captcha'] = True
@@ -467,19 +488,22 @@ def _run_chain(token: str, plan_id: str, log, force_direct: bool,
                 break
             time.sleep(2)
         terminal_codes.append(last_code)
-        if fresh or res['needs_captcha']:
-            break
 
     plan = get_plan(zjwt, log=log) or {}
     res['plans'] = plan.get('plans') or []
     entitled_ids = set(res['plans']) | {
         e.get('plan_id') for e in (plan.get('entitlements') or []) if e.get('plan_id')
     }
-    entitled = any(is_start_plan(pid) for pid in entitled_ids)
+    # campaign cards are entitlements too, even when the id is not one of the
+    # historical -1024/-500m buckets
+    entitled = any(is_start_plan(pid, include_campaign=True) for pid in entitled_ids)
     # `fresh` alone is not proof: 1003 means "already claimed", but the plan
     # may still be pre-effective (entitlement with effective_at), so the
     # balance/entitlement list is what decides.
-    res['claimed'] = bool(plan.get('starter')) or (fresh and entitled)
+    res['granted'] = granted
+    res['campaign_plans'] = plan.get('campaign') or []
+    res['claimed'] = (bool(plan.get('starter')) or bool(res['campaign_plans'])
+                      or (fresh and entitled))
     res['already_claimed'] = bool(plan.get('starter')) and not fresh
     res['start_plans'] = plan.get('start_plans') or []
     res['entitlements'] = plan.get('entitlements') or []

@@ -315,8 +315,10 @@ class GeneratorConfig(BaseModel):
     headless: bool = False             # only applies when captcha == 'auto'
     claim: bool = False                # legacy: invite Global Build (100M) claim after signup
     claim500: bool = False             # legacy: 1024 Dev Day 500M giveaway (withdrawn)
-    # Start Plan: the signup grant was removed, so the plan is claimed from the
-    # billing preview after signup. This is the default path now.
+    # Start Plan + campaign cards: the signup grant was removed, so the plan is
+    # claimed from the billing preview after signup, and the marketing feed is
+    # also walked for Global/Weekend Build cards (their ids rotate per drop).
+    # This is the default path now.
     claim_start: bool = True
     invite_code: str = "MT9GNDQ8"      # referral code to claim ('' = off)
     # Which proxy schemes the generator may pick from the pool:

@@ -1746,13 +1746,15 @@ def _main(auto_result=None):
                 with open(ACC_FILE, 'a') as f:
                     f.write(f"{email}:{password}:{token}\n")
 
-                # Start Plan claim (billing preview -> billing/claim).
+                # Start Plan claim (billing preview + marketing feed -> billing/claim).
                 # The signup grant was removed: a fresh account is NOT given a
                 # plan, it is only *offered* one, and the offer is invisible to
-                # clients older than app_version 3.16.1. This runs for EVERY
-                # created account — gating it on `starter` (the old behaviour)
-                # made it unreachable once the signup grant disappeared.
-                # ZAI_CLAIM_START=0 disables it.
+                # clients older than app_version 3.16.1. The same pass also
+                # picks up Global/Weekend Build cards from /marketing/touch, so
+                # an account that already holds a Start Plan is still worth
+                # running. It runs for EVERY created account — gating it on
+                # `starter` (the old behaviour) made it unreachable once the
+                # signup grant disappeared. ZAI_CLAIM_START=0 disables it.
                 claim_start_on = os.environ.get('ZAI_CLAIM_START', '1').strip().lower() \
                     not in ('0', 'false', 'no', 'off')
                 # Legacy campaigns (withdrawn 2026-10): 100M invite Global Build
