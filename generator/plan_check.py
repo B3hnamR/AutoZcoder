@@ -238,13 +238,38 @@ def per_account_device_mid(token: str) -> str:
     return str(_u.uuid5(_u.NAMESPACE_URL, 'zcode-device:' + token))
 
 
+_TZ_CACHE = None
+
+
+def client_timezone() -> str:
+    """Timezone the client claims.
+
+    A fixed personal zone shipped to every account (the old `Asia/Tehran`)
+    correlates every signup, claim and message to one operator regardless of
+    the exit IP. Prefer an explicit override, then the exit IP's own zone, then
+    UTC — the gateway fingerprint's neutral default.
+    """
+    global _TZ_CACHE
+    if _TZ_CACHE:
+        return _TZ_CACHE
+    tz = (os.environ.get("ZAI_CLIENT_TIMEZONE") or "").strip()
+    if not tz:
+        try:
+            from fingerprint import exit_ip_geo
+            _, tz = exit_ip_geo(os.environ.get("ZAI_PROXY") or None)
+        except Exception:
+            tz = ""
+    _TZ_CACHE = (tz or "UTC").strip() or "UTC"
+    return _TZ_CACHE
+
+
 def build_headers(access_token=None, device_mid=None, include_api_key=True):
     h = dict(STATIC_HEADERS)
     h.update({
         "user-agent": f"ZCode/{APP_VERSION} ai-sdk/provider-utils/4.0.27 runtime/node.js/24",
         "x-device-mid": device_mid or per_account_device_mid(access_token),
         "x-client-language": "en-US",
-        "x-client-timezone": "Asia/Tehran",
+        "x-client-timezone": client_timezone(),
         "x-os-category": "windows",
         "x-os-version": "10.0.26200",
         "x-platform": "win32-x64",
