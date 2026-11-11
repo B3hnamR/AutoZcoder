@@ -109,6 +109,9 @@ export async function mount({ root, signal }) {
 
   // Controls are created once so a 3s poll never steals focus mid-edit.
   const controls = {};
+  // Option-backed switch: kept outside `controls` because the field wrapper is
+  // a <label>, not an input.
+  let claimStartOn = true;
 
   function field(key, label, node, help) {
     controls[key] = node;
@@ -148,6 +151,7 @@ export async function mount({ root, signal }) {
       pin_proxy: controls.pin.value.trim(),
       browser_display: controls.display.value,
       retries: parseInt(controls.retries.value, 10) || 0,
+      claim_start: claimStartOn,
       custom_ai_url: controls.aiUrl.value.trim(),
       custom_ai_model: controls.aiModel.value.trim(),
     };
@@ -200,6 +204,17 @@ export async function mount({ root, signal }) {
       class: "select", on: { change: () => { syncVisibility(); saveOptions(); } },
     }, opts.map(([v, label]) => el("option", { value: v, text: label, selected: String(value) === String(v) })));
 
+    claimStartOn = o.claim_start !== false;
+    const claimToggle = el("input", {
+      class: "switch__input", type: "checkbox", checked: claimStartOn,
+    });
+    const claimState = el("span", { class: "text-sm muted", text: claimStartOn ? "On" : "Off" });
+    claimToggle.addEventListener("change", () => {
+      claimStartOn = claimToggle.checked;
+      claimState.textContent = claimStartOn ? "On" : "Off";
+      saveOptions();
+    });
+
     fill(optionsBox, [
       field("count", "Browsers", el("input", {
         class: "input", type: "number", value: 1, min: 1, max: 8,
@@ -250,6 +265,10 @@ export async function mount({ root, signal }) {
       field("retries", "Retries", el("input", {
         class: "input", type: "number", value: o.retries ?? 5, min: 0, max: 10, on: { input: saveOptions },
       })),
+      field("claim", "After signup", el("label", { class: "switch" }, [
+        claimToggle, el("span", { class: "switch__track" }), claimState,
+      ]), "Claims the Start Plan and any Global/Weekend Build card on offer. "
+        + "Off means a signup is kept only if the provider granted a plan by itself."),
     ]);
     controls.captcha.addEventListener("change", () => {
       if (controls.captcha.value !== "manual") controls.strategy.value = controls.captcha.value;
