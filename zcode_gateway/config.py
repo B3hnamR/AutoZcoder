@@ -353,6 +353,19 @@ class GeneratorConfig(BaseModel):
         return self
 
 
+class ClaimsConfig(BaseModel):
+    """Optional unattended daily claim-all run.
+
+    Fixed UTC offset, because Windows has no IANA database (`zoneinfo` would
+    raise). 8 = Asia/Shanghai, 3.5 = Tehran. Cards go live on Beijing time,
+    so the offset matters more than the machine's local clock.
+    """
+    daily_enabled: bool = False
+    daily_time: str = "19:02"
+    daily_utc_offset_hours: float = Field(default=8.0, ge=-12.0, le=14.0)
+    daily_mode: str = "direct"        # direct | proxy, same as the button
+
+
 class Config(BaseModel):
     server: ServerConfig = Field(default_factory=ServerConfig)
     upstream: UpstreamConfig = Field(default_factory=UpstreamConfig)
@@ -361,6 +374,7 @@ class Config(BaseModel):
     models: ModelsConfig = Field(default_factory=ModelsConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     generator: GeneratorConfig = Field(default_factory=GeneratorConfig)
+    claims: ClaimsConfig = Field(default_factory=ClaimsConfig)
     store: StoreConfig = Field(default_factory=StoreConfig)
     update: UpdateConfig = Field(default_factory=UpdateConfig)
 

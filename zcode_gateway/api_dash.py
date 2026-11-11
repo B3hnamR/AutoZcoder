@@ -564,6 +564,9 @@ async def dash_shutdown(request: Request, key: str = Depends(admin_key)) -> dict
     def finish():
         manager = getattr(state, "generator", None)
         if manager is not None:
+            _scheduler = getattr(state, "claim_scheduler", None)
+            if _scheduler is not None:
+                _scheduler.stop()
             manager.shutdown()
         os._exit(0)
     threading.Timer(1.0, finish).start()
@@ -663,6 +666,9 @@ async def update_apply(request: Request, key: str = Depends(admin_key)) -> dict:
     def finish():
         manager = getattr(state, "generator", None)
         if manager is not None:
+            _scheduler = getattr(state, "claim_scheduler", None)
+            if _scheduler is not None:
+                _scheduler.stop()
             manager.shutdown()
         os._exit(0)
     threading.Timer(1.0, finish).start()
@@ -1214,6 +1220,19 @@ def _generator(request: Request):
                                captcha_tickets=getattr(gc, "captcha_tickets", 0),
                                captcha_ticket_ttl=getattr(
                                    gc, "captcha_ticket_ttl_seconds", 75))
+        from .claim_schedule import ClaimScheduler
+        cc = getattr(state.cfg, "claims", None)
+        claim_mode = ("proxy" if str(getattr(cc, "daily_mode", "direct")).lower() == "proxy"
+                      else "direct")
+        scheduler = ClaimScheduler(
+            run=lambda: mgr.start_claim_all(mode=claim_mode),
+            enabled=bool(getattr(cc, "daily_enabled", False)),
+            daily_time=getattr(cc, "daily_time", "19:02"),
+            utc_offset_hours=float(getattr(cc, "daily_utc_offset_hours", 8.0)),
+            state_path=data_dir / "claim_schedule.json")
+        scheduler.start()
+        mgr.claim_scheduler = scheduler
+        state.claim_scheduler = scheduler
         existing_setup = getattr(state, "_env_setup", None)
         if existing_setup is not None:
             mgr.env_setup = existing_setup
@@ -1858,3 +1877,5 @@ async def delete_relay_endpoint(request: Request, relay_id: str,
     if not ok:
         raise HTTPException(status_code=404, detail="Relay not found")
     return {"ok": True, "deleted": relay_id}
+
+

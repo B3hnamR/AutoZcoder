@@ -653,6 +653,25 @@ async def claim_all_status(request: Request, key: str = Depends(admin_key)) -> d
     return {**mgr.claim_all_status(), "claims": mgr.claims_public()}
 
 
+@router.get("/claims/schedule")
+async def claim_schedule_status(request: Request, key: str = Depends(admin_key)) -> dict:
+    from .api_dash import _generator
+    mgr = _generator(request)
+    scheduler = getattr(mgr, "claim_scheduler", None)
+    return scheduler.status() if scheduler is not None else {"enabled": False}
+
+
+@router.post("/claims/schedule/run")
+async def claim_schedule_run(request: Request, key: str = Depends(admin_key)) -> dict:
+    """Claim now, without waiting for the daily time."""
+    from .api_dash import _generator
+    mgr = _generator(request)
+    scheduler = getattr(mgr, "claim_scheduler", None)
+    if scheduler is None:
+        raise HTTPException(status_code=404, detail="claim scheduler unavailable")
+    return scheduler.run_now()
+
+
 @router.post("/claims/claim_all_stop")
 async def claim_all_stop(request: Request, key: str = Depends(admin_key)) -> dict:
     mgr = getattr(get_state(request), "generator", None)
