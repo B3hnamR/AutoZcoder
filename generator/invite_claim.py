@@ -656,8 +656,9 @@ def device_login(chat_token, log=print, force_direct: bool = False):
     import requests
     import secrets
     import re as _re
+    import urllib.parse as _urlparse
     import uuid as _uuid
-    CLIENT_ID = 'client_P8X5CMWmlaRO9gyO-KSqtg'
+    CLIENT_ID = 'client_P8X5CMWmlaRO9gyO-KSqtg'   # fallback only; the flow carries its own
     INIT = 'https://zcode.z.ai/api/v1/oauth/cli/init'
     AUTHORIZE = 'https://chat.z.ai/api/oauth/authorize'
     CALLBACK = 'https://zcode.z.ai/api/v1/oauth/cli/callback/zai'
@@ -688,8 +689,14 @@ def device_login(chat_token, log=print, force_direct: bool = False):
     except Exception:
         d = {}
     flow_id, poll_token = d.get('flow_id'), d.get('poll_token') or poll_token
-    m = _re.search(r'state=([^&]+)', d.get('authorize_url', ''))
-    state = m.group(1) if m else ''
+    # The authorize URL is authoritative for client_id/redirect_uri/state: a
+    # rotated client id in a hardcoded body fails the whole login silently.
+    authorize_url = str(d.get('authorize_url') or '')
+    query = _urlparse.parse_qs(_urlparse.urlsplit(authorize_url).query)
+    state = (query.get('state') or [''])[0]
+    client_id = (query.get('client_id') or [CLIENT_ID])[0]
+    redirect_uri = (query.get('redirect_uri') or [CALLBACK])[0]
+    response_type = (query.get('response_type') or ['code'])[0]
     if not flow_id:
         log(f'  invite: device init failed {r.status_code} {r.text[:120]}')
         return None, False
@@ -699,9 +706,9 @@ def device_login(chat_token, log=print, force_direct: bool = False):
         'content-type': 'application/x-www-form-urlencoded',
         'x-region': 'overseas', 'origin': 'https://chat.z.ai',
         'user-agent': 'Mozilla/5.0',
-    }, data={'client_id': CLIENT_ID,
-             'redirect_uri': CALLBACK,
-             'state': state, 'response_type': 'code',
+    }, data={'client_id': client_id,
+             'redirect_uri': redirect_uri,
+             'state': state, 'response_type': response_type,
              'action': 'approve'}, timeout=30, verify=_VERIFY)
     try:
         rj = r.json()
@@ -719,7 +726,7 @@ def device_login(chat_token, log=print, force_direct: bool = False):
     cb_ok = False
     for _try in range(3):
         try:
-            cr = _oauth_request('GET', CALLBACK + f'?code={m.group(1)}&state={state}',
+            cr = _oauth_request('GET', redirect_uri + f'?code={m.group(1)}&state={state}',
                               headers=cb, timeout=30, verify=_VERIFY)
             cb_ok = cr.status_code < 500
         except requests.RequestException as e:
