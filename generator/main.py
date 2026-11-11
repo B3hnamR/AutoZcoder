@@ -466,21 +466,36 @@ def kill_stale_browsers():
 # `captcha_verify_param`:
 #   {"Result":{"securityToken":"...","VerifyCode":"T001","VerifyResult":true,"certifyId":"..."}}
 # and the app's field decodes to base64({certifyId, sceneId, isSign:true, securityToken}).
-# `#aliyunCaptcha-verify-param` is EMPTY in this mode, so build it from the network.
-CAPTCHA_VERIFY_HOOK = r"""
+# `#aliyunCaptcha-verify-param` is EMPTY in this mode.
+#
+# This hook is a FALLBACK. The authoritative token is the one the app itself
+# puts into `POST /api/v1/auths/signup`, which signup() reads from the
+# intercepted request body. The scene id is fetched per run from
+# `/api/v1/client/configs` (see fetch_captcha_config); it is never hardcoded,
+# because a rotated scene produces a token the server rejects.
+#
+# Accept both response casings and both success codes: the SDK answers either
+# `Result`/`VerifyResult: true` or `result`/`VerifyCode: "T006"` depending on
+# whether the challenge ran interactive or traceless.
+def _captcha_verify_hook(scene: str) -> str:
+    return r"""
 (function () {
-  var SCENE = '36qgs6xb';
+  var SCENE = __SCENE__;
+  var PASS_CODES = ['T001', 'T006'];
   function b64(s) { try { return btoa(unescape(encodeURIComponent(s))); } catch (e) { return null; } }
   function capture(txt) {
     try {
       if (!txt || txt.indexOf('securityToken') === -1) return;
       var j = JSON.parse(txt);
-      var r = j && j.Result;
+      var r = j && (j.Result || j.result);
+      if (!r || !r.securityToken) return;
+      var code = r.VerifyCode || r.verifyCode || '';
       // Only a VERDICT of true is success material. Aliyun can return a
       // securityToken on failed verifies too — stashing that produced
       // false "success:hook" signals after a failed slide.
-      if (r && r.securityToken && (r.VerifyResult === true || r.VerifyCode === 'T001')) {
+      if (r.VerifyResult === true || PASS_CODES.indexOf(code) !== -1) {
         window.__verifyResp = r;
+        if (!SCENE || !r.certifyId) return;
         window.__verifyParam = b64(JSON.stringify({
           certifyId: r.certifyId, sceneId: SCENE, isSign: true, securityToken: r.securityToken
         }));
@@ -507,7 +522,39 @@ CAPTCHA_VERIFY_HOOK = r"""
     return os.apply(this, arguments);
   };
 })();
-"""
+""".replace('__SCENE__', json.dumps(scene or ''))
+
+
+def _signup_payload(name, email, password, captcha_param):
+    """JSON body for POST /api/v1/auths/signup, matching the web client.
+
+    The avatar must be the same data URI that finish_signup uses; the relative
+    `/user.png` path the client never sends is not accepted everywhere.
+    """
+    return {
+        'name': name,
+        'email': email,
+        'password': password,
+        'profile_image_url': AVATAR_DATA_URI,
+        'sso_redirect': None,
+        'captcha_verify_param': captcha_param,
+    }
+
+
+def fetch_captcha_config():
+    """Live Aliyun scene/prefix/region from `/api/v1/client/configs`.
+
+    Reuses claim_start's transport so the request leaves through the same exit
+    IP as the signup. Returns {} when unavailable; the caller then trusts only
+    the app's own captured parameter.
+    """
+    try:
+        from claim_start import _captcha_config
+        return _captcha_config(logger.info) or {}
+    except Exception as e:
+        logger.warning(f"captcha config unavailable ({type(e).__name__}) — "
+                       f"relying on the app's own verify param")
+        return {}
 
 
 class MailTM:
@@ -739,6 +786,14 @@ def signup(email, password, mail=None):
                         f"{ident['hardware_concurrency']}c/{ident['device_memory']}G · "
                         f"cc={ident['country']} · tz={ident['timezone_id']} · locale={ident['locale']}")
 
+            # The Aliyun scene is server-issued and rotates. Read it through the
+            # same route as the browser before the page loads, so the fallback
+            # token is built for the scene the widget will actually use.
+            captcha_cfg = fetch_captcha_config()
+            captcha_scene = str(captcha_cfg.get('sceneId') or '')
+            logger.info(f"    [captcha] scene={captcha_scene or 'unavailable'} "
+                        f"region={captcha_cfg.get('region') or '?'}")
+
             account_profile = _account_profile(email)
             try:
                 shutil.rmtree(account_profile, ignore_errors=True)
@@ -760,12 +815,15 @@ def signup(email, password, mail=None):
             page = context.new_page()
             page.add_init_script(fingerprint.base_script(ident))
             page.add_init_script(fingerprint.noise_script(ident))
-            page.add_init_script(CAPTCHA_VERIFY_HOOK)
+            page.add_init_script(_captcha_verify_hook(captcha_scene))
 
             # Capture the REAL auth token from the signup response's set-cookie.
             # Reading localStorage.token is wrong: it still holds the guest session
             # JWT minted on page load, which produced a false "account created".
-            captured = {'token': None, 'status': None, 'body': None, 'calls': []}
+            # Also keep the request body of the app's own signup POST: the
+            # `captcha_verify_param` in it is the authoritative, single-use token.
+            captured = {'token': None, 'status': None, 'body': None, 'calls': [],
+                        'verify_param': None, 'device_id': None}
 
             def _capture_auth(resp):
                 try:
@@ -776,6 +834,12 @@ def signup(email, password, mail=None):
                             method = resp.request.method
                         except Exception:
                             method = '?'
+                        try:
+                            did = (resp.request.headers or {}).get('x-device-id')
+                            if did and not captured['device_id']:
+                                captured['device_id'] = did
+                        except Exception:
+                            pass
                         captured['calls'].append((method, path, resp.status))
                         logger.info(f"    [auth] {method} {path} -> {resp.status}")
                         # The app auto-submits /auths/signup the moment the captcha passes.
@@ -786,6 +850,15 @@ def signup(email, password, mail=None):
                                 page.evaluate("window.__signupFired = true")
                             except Exception:
                                 pass
+                            try:
+                                body = resp.request.post_data_json or {}
+                            except Exception:
+                                body = {}
+                            token = str((body or {}).get('captcha_verify_param') or '')
+                            if token:
+                                captured['verify_param'] = token
+                                logger.info("    [captcha] captured the app's "
+                                            "captcha_verify_param")
                     if re.search(r'/api/v1/auths/(finish_)?signup', url):
                         captured['status'] = resp.status
                         try:
@@ -968,28 +1041,50 @@ def signup(email, password, mail=None):
                 #                                    sso_redirect,captcha_verify_param}
                 #   POST /api/v1/auths/verify_email  {username,email,token}
                 #   POST /api/v1/auths/finish_signup {username,email,token,password,...}
-                captcha_param = None
-                try:
-                    captcha_param = page.evaluate(
-                        "() => window.__verifyParam"
-                        " || window.__captchaParam"
-                        " || (document.querySelector('#aliyunCaptcha-verify-param')||{}).value"
-                        " || null;")
-                except Exception:
-                    pass
+                def _signup_fired():
+                    return any(m == 'POST' and p.endswith('/auths/signup')
+                               for (m, p, s) in captured['calls'])
+
+                # Preference: the app's own request body > our hook's rebuilt
+                # token > the element value. A rebuilt token is only as good as
+                # the scene it was built for, so it never beats the real one.
+                captcha_param = captured['verify_param']
+                if not captcha_param:
+                    try:
+                        captcha_param = page.evaluate(
+                            "() => window.__verifyParam"
+                            " || window.__captchaParam"
+                            " || (document.querySelector('#aliyunCaptcha-verify-param')||{}).value"
+                            " || null;")
+                    except Exception:
+                        pass
                 if not captcha_param and isinstance(result, str) and len(result) > 40:
                     captcha_param = result
+
+                # A vanished widget is not proof the app submitted: the SPA posts
+                # ~15s after the slide, and a failed slide can also blank the DOM.
+                # Wait for a real signal (signup POST or a token) before deciding.
+                if not _signup_fired() and not captcha_param:
+                    deadline = time.time() + 20
+                    logger.info("No signup signal yet — waiting up to 20s for the app")
+                    while time.time() < deadline:
+                        if _signup_fired() or captured['verify_param']:
+                            break
+                        time.sleep(0.5)
+                    captcha_param = captcha_param or captured['verify_param']
+
                 global LAST_CAPTCHA_PARAM
                 LAST_CAPTCHA_PARAM = captcha_param
                 logger.info(f"captcha_verify_param: {'captured' if captcha_param else 'MISSING'}")
 
-                def _page_post(path, payload):
+                def _page_post(path, payload, extra_headers=None):
                     return page.evaluate("""
                         async (a) => {
                             try {
                                 const r = await fetch(a.path, {
                                     method: 'POST',
-                                    headers: {'Content-Type': 'application/json'},
+                                    headers: Object.assign(
+                                        {'Content-Type': 'application/json'}, a.headers || {}),
                                     body: JSON.stringify(a.body),
                                 });
                                 let t = '';
@@ -997,12 +1092,19 @@ def signup(email, password, mail=None):
                                 return { status: r.status, body: t };
                             } catch (e) { return { status: -1, body: String(e) }; }
                         }
-                    """, {'path': path, 'body': payload})
+                    """, {'path': path, 'body': payload, 'headers': extra_headers or {}})
+
+                # The app's own requests carry a device id; a bare fetch does not.
+                # Reuse the value the app already sent on this session.
+                device_id = captured['device_id']
+                signup_headers = {'x-region': os.environ.get('ZAI_X_REGION', 'overseas')}
+                if device_id:
+                    signup_headers['x-device-id'] = device_id
+                finish_headers = dict(signup_headers)
 
                 username = name
                 signup_status = None
-                app_fired = any(m == 'POST' and p.endswith('/auths/signup')
-                                for (m, p, s) in captured['calls'])
+                app_fired = _signup_fired()
                 if app_fired:
                     # The app already submitted on captcha pass. Re-POSTing would double
                     # submit and trip the 45s per-email rate limit.
@@ -1010,14 +1112,9 @@ def signup(email, password, mail=None):
                     logger.info(f"App already submitted signup (status={signup_status}) "
                                 f"— not re-POSTing")
                 elif captcha_param:
-                    r = _page_post('/api/v1/auths/signup', {
-                        'name': name,
-                        'email': email,
-                        'password': password,
-                        'profile_image_url': '/user.png',
-                        'sso_redirect': None,
-                        'captcha_verify_param': captcha_param,
-                    })
+                    r = _page_post('/api/v1/auths/signup',
+                                   _signup_payload(name, email, password, captcha_param),
+                                   signup_headers)
                     signup_status = r['status']
                     logger.info(f"signup: status={r['status']} body={str(r['body'])[:300]}")
                 else:
@@ -1086,8 +1183,11 @@ def signup(email, password, mail=None):
                 verify_status = None
                 finish_rate_limited = None   # (retry_after_s, scope) when IP-blocked
                 if verify_token:
+                    # verify_email deliberately omits x-device-id, matching the
+                    # app: the token, not the device, authorizes this step.
                     r = _page_post('/api/v1/auths/verify_email',
-                                   {'username': username, 'email': email, 'token': verify_token})
+                                   {'username': username, 'email': email, 'token': verify_token},
+                                   {'x-region': os.environ.get('ZAI_X_REGION', 'overseas')})
                     verify_status = r['status']
                     logger.info(f"verify_email: status={r['status']} body={str(r['body'])[:200]}")
                     # finish_signup returns the session token in its body:
@@ -1097,7 +1197,8 @@ def signup(email, password, mail=None):
                                    {'username': username, 'email': email, 'token': verify_token,
                                     'password': password,
                                     'profile_image_url': AVATAR_DATA_URI,
-                                     'sso_redirect': None})
+                                    'sso_redirect': None},
+                                   finish_headers)
                     finish_status = r['status']
                     logger.info(f"finish_signup: status={r['status']} body={str(r['body'])[:200]}")
                     try:
