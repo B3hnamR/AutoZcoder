@@ -329,6 +329,11 @@ class GeneratorConfig(BaseModel):
     # This is the default path now.
     claim_start: bool = True
     invite_code: str = "MT9GNDQ8"      # referral code to claim ('' = off)
+    # Prefetch Aliyun captcha tickets for claims, so the signup POST does not
+    # wait 10-30 s for a mint while the browser idles. Tokens die 90 s after
+    # minting, so only keep a couple; 0 disables the background minter.
+    captcha_tickets: int = Field(default=0, ge=0, le=8)
+    captcha_ticket_ttl_seconds: int = Field(default=75, ge=0, le=90)
     # Which proxy schemes the generator may pick from the pool:
     #   all | socks | socks5 | socks4 | http  (or a comma list: "socks5,http")
     # 'socks' = socks4+5 (default: residential-style passes the Starter gate).

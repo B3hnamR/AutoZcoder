@@ -1210,7 +1210,10 @@ def _generator(request: Request):
                     else gen_dir / "output")
         mgr = GeneratorManager(gen_dir, on_account=register_account,
                                python_exe=getattr(gc, "python_exe", ""),
-                               data_dir=data_dir)
+                               data_dir=data_dir,
+                               captcha_tickets=getattr(gc, "captcha_tickets", 0),
+                               captcha_ticket_ttl=getattr(
+                                   gc, "captcha_ticket_ttl_seconds", 75))
         existing_setup = getattr(state, "_env_setup", None)
         if existing_setup is not None:
             mgr.env_setup = existing_setup

@@ -25,6 +25,7 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
+from .captcha_tickets import CaptchaTicketPool
 
 
 def _gen_dir_under(path: Path) -> Path | None:
@@ -1606,13 +1607,15 @@ class ClaimJob:
 
     def __init__(self, name: str, email: str, mode: str, proxy: str,
                  gen_dir: Path, python_exe: str, invite_code: str,
-                 data_dir: Path | None = None, kind: str = "start", child_env=None):
+                 data_dir: Path | None = None, kind: str = "start", child_env=None,
+                 ticket_pool: "CaptchaTicketPool | None" = None):
         self.name, self.email, self.mode, self.proxy = name, email, mode, proxy
         self.kind = kind if kind in ("100m", "500m", "start") else "start"
         self.gen_dir = Path(gen_dir)
         self.data_dir = Path(data_dir) if data_dir else self.gen_dir / "output"
         self.python_exe = python_exe
         self.child_env = child_env or {}
+        self.ticket_pool = ticket_pool
         self.argv = self._build_argv()
         self.invite_code = invite_code
         self.proc: subprocess.Popen | None = None
@@ -1649,6 +1652,14 @@ class ClaimJob:
         """Fix the route once it has been resolved (the job is queued before)."""
         self.mode, self.proxy = mode, proxy
         self.argv = self._build_argv()
+        # Route resolution can take minutes, so a ticket is claimed here —
+        # right before the child starts — instead of when the job was queued.
+        if self.ticket_pool is not None and "ZAI_CAPTCHA_PARAM" not in self.child_env:
+            ticket = self.ticket_pool.take()
+            if ticket is not None:
+                self.child_env = dict(self.child_env,
+                                      ZAI_CAPTCHA_PARAM=ticket.param,
+                                      ZAI_CAPTCHA_REGION=ticket.region)
 
     def fail(self, message: str) -> None:
         with self._lock:
@@ -1785,7 +1796,8 @@ class GeneratorManager:
     """Owns worker processes + pipeline options. One manager per gateway."""
 
     def __init__(self, gen_dir: str | Path, on_account=None, python_exe: str = "",
-                 data_dir: str | Path = None):
+                 data_dir: str | Path = None, captcha_tickets: int = 0,
+                 captcha_ticket_ttl: int = 75):
         self.gen_dir = Path(gen_dir)
         self.on_account = on_account        # callback(dict) -> pool registration
         self.python_exe = resolve_python(python_exe)
@@ -1810,6 +1822,12 @@ class GeneratorManager:
         self.claims: dict[str, ClaimJob] = {}
         self.checker = ProxyChecker(self.gen_dir, self.python_exe,
                                     data_dir=self.data_dir)
+        # Prefetched claim tickets (0 = off): the minter thread lives as long
+        # as this manager, so it is stopped with the gateway.
+        self._captcha_tickets = CaptchaTicketPool(
+            size=captcha_tickets, ttl_seconds=captcha_ticket_ttl)
+        if self._captcha_tickets.enabled:
+            self._captcha_tickets.start()
         self._seq = 0
         self._lock = threading.Lock()
         self._registration_lock = threading.Lock()
@@ -4058,6 +4076,10 @@ class GeneratorManager:
         """Stop owned work permanently; queued routes cannot spawn after this."""
         if getattr(self, "auto_generate", None):
             self.auto_generate.shutdown()
+        try:
+            self._captcha_tickets.stop()
+        except Exception:
+            pass
         with self._lock:
             self._closed.set()
             self._claim_all_cancel.set()
@@ -4145,7 +4167,7 @@ class GeneratorManager:
             name += "x"
         job = ClaimJob(name, email, mode, "", self.gen_dir, self.python_exe,
                        self._invite_code, data_dir=self.data_dir, kind=kind,
-                       child_env=self._child_env())
+                       child_env=self._child_env(), ticket_pool=self._captcha_tickets)
         job._internal_token = self.internal_token
         job.on_exit = self._claim_done
         job.lines.append("looking for a verified proxy…" if mode == "proxy"
