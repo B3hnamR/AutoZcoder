@@ -173,3 +173,21 @@ def test_captcha_config_body_is_streamed_and_capped(monkeypatch):
     monkeypatch.setattr(proxy_pool, '_probe_body', body)
     assert cs._captcha_config(lambda *_: None)['sceneId'] == 'offline'
     assert seen['stream'] is True and seen['allow_redirects'] is False and seen['closed']
+
+def test_captcha_token_scene_override_skips_client_config(monkeypatch):
+    """Signup uses a different Aliyun scene; the override must reach the sidecar."""
+    monkeypatch.setenv('ZAI_CAPTCHA_CMD', 'offline-sidecar')
+
+    def fails(*_):
+        raise AssertionError('the signup scene override must skip /client/configs')
+
+    monkeypatch.setattr(cs, '_captcha_config', fails)
+    seen = {}
+    monkeypatch.setattr(cs, '_run_sidecar', lambda argv, env:
+                        seen.update(env) or
+                        subprocess.CompletedProcess(argv, 0, 'V' * 40 + ' sgp\n', ''))
+    assert cs._captcha_token(lambda *_: None, scene='36qgs6xb', region='sgp',
+                             prefix='no8xfe') == ('V' * 40, 'sgp')
+    assert seen['ZAI_CAPTCHA_SCENE'] == '36qgs6xb'
+    assert seen['ZAI_CAPTCHA_PREFIX'] == 'no8xfe'
+    assert seen['ZAI_CAPTCHA_REGION'] == 'sgp'

@@ -214,6 +214,15 @@ def is_guest_token(token: str) -> bool:
 AVATAR_DATA_URI = ("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwC"
                    "AAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
 
+# chat.z.ai's signup widget is a DIFFERENT Aliyun scene from the ZCode-plan
+# claim/billing scene (`11xygtvd`): a token minted for the claim scene is
+# rejected here with "The captcha verification failed." (confirmed in the
+# signup HAR: InitCaptchaV3 SceneId=36qgs6xb, prefix no8xfe). The scene is
+# baked into the front-end bundle, so it is a default with an env override.
+SIGNUP_CAPTCHA_SCENE = os.environ.get('ZAI_SIGNUP_CAPTCHA_SCENE', '36qgs6xb')
+SIGNUP_CAPTCHA_PREFIX = os.environ.get('ZAI_SIGNUP_CAPTCHA_PREFIX', 'no8xfe')
+SIGNUP_CAPTCHA_REGION = os.environ.get('ZAI_SIGNUP_CAPTCHA_REGION', 'sgp')
+
 # Per-process output suffix so parallel runs (ZAI_OUT_SUFFIX=1,2,3) don't clobber.
 # Sorted layout (v1.0.5): results/ (accounts+plans+starter), profiles/ (chromium),
 # screenshots/ (debug png), logs/ (worker solve logs) — all under OUTPUT_DIR.
@@ -495,9 +504,11 @@ def _captcha_verify_hook(scene: str) -> str:
       // false "success:hook" signals after a failed slide.
       if (r.VerifyResult === true || PASS_CODES.indexOf(code) !== -1) {
         window.__verifyResp = r;
-        if (!SCENE || !r.certifyId) return;
+        var scene = (window.__aliyunCaptchaOptions &&
+                     window.__aliyunCaptchaOptions.SceneId) || SCENE;
+        if (!scene || !r.certifyId) return;
         window.__verifyParam = b64(JSON.stringify({
-          certifyId: r.certifyId, sceneId: SCENE, isSign: true, securityToken: r.securityToken
+          certifyId: r.certifyId, sceneId: scene, isSign: true, securityToken: r.securityToken
         }));
       }
     } catch (e) {}
@@ -525,6 +536,42 @@ def _captcha_verify_hook(scene: str) -> str:
 """.replace('__SCENE__', json.dumps(scene or ''))
 
 
+def _captcha_options_hook() -> str:
+    """Record the widget's real init options, so a rotated scene is not stale.
+
+    The signup scene lives inside the front-end bundle; wrapping the global
+    `initAliyunCaptcha` captures the exact SceneId/prefix the widget will use.
+    Falls back to the constants when the app imports the SDK directly.
+    """
+    return r"""
+(function () {
+  var current = window.initAliyunCaptcha;
+  function wrap(fn) {
+    return function (opts) {
+      try {
+        if (opts && (opts.SceneId || opts.sceneId)) {
+          window.__aliyunCaptchaOptions = {
+            SceneId: opts.SceneId || opts.sceneId,
+            prefix: opts.prefix || opts.Prefix || ''
+          };
+        }
+      } catch (e) {}
+      return fn.apply(this, arguments);
+    };
+  }
+  try {
+    Object.defineProperty(window, 'initAliyunCaptcha', {
+      configurable: true,
+      get: function () { return current; },
+      set: function (fn) {
+        current = typeof fn === 'function' ? wrap(fn) : fn;
+      }
+    });
+  } catch (e) {}
+})();
+"""
+
+
 def _signup_payload(name, email, password, captcha_param):
     """JSON body for POST /api/v1/auths/signup, matching the web client.
 
@@ -541,7 +588,7 @@ def _signup_payload(name, email, password, captcha_param):
     }
 
 
-def _mint_captcha(log):
+def _mint_captcha(log, scene='', region='', prefix='', tries=2):
     """Mint an Aliyun verify param headlessly, without dragging the slider.
 
     Reuses the claim path's minter (`ZAI_CAPTCHA_CMD` -> bundled captcha-mint)
@@ -549,6 +596,11 @@ def _mint_captcha(log):
     verification runs in happy-dom and prints `<param> <region>`. Returns ''
     when no minter is configured or the solver fails; the caller then falls
     back to the in-page slider.
+
+    `scene`/`region`/`prefix` must be the SIGNUP scene, not the billing one —
+    a param minted for another scene is rejected by /auths/signup. The signup
+    scene serves an INPAINTING slider on some risk scores, which the traceless
+    minter cannot solve; `tries` retries because the served type varies.
 
     `log` is either a callable or a logging.Logger: callers pass both, and
     calling a Logger raised `'Logger' object is not callable` mid-signup.
@@ -561,16 +613,21 @@ def _mint_captcha(log):
     except Exception as e:
         emit(f"  mint: claim_start import failed ({type(e).__name__}: {e})")
         return ''
-    try:
-        param, _region = _captcha_token(emit)
-    except Exception as e:
-        emit(f"  mint: solver crashed ({type(e).__name__}: {e})")
-        return ''
-    if param:
-        emit(f"  mint: verify param ready (len={len(param)})")
-    else:
-        emit("  mint: no token (no sidecar configured or solver failed)")
-    return param or ''
+    for attempt in range(1, max(1, int(tries)) + 1):
+        try:
+            param, _region = _captcha_token(emit, scene=scene, region=region,
+                                            prefix=prefix)
+        except Exception as e:
+            emit(f"  mint: solver crashed ({type(e).__name__}: {e})")
+            return ''
+        if param:
+            emit(f"  mint: verify param ready (len={len(param)}"
+                 f"{f', try {attempt}' if attempt > 1 else ''})")
+            return param
+        if attempt < tries:
+            emit(f"  mint: no traceless challenge (try {attempt}/{tries}) — retrying")
+    emit("  mint: no token (no sidecar configured or solver failed)")
+    return ''
 
 
 def fetch_captcha_config():
@@ -818,13 +875,14 @@ def signup(email, password, mail=None):
                         f"{ident['hardware_concurrency']}c/{ident['device_memory']}G · "
                         f"cc={ident['country']} · tz={ident['timezone_id']} · locale={ident['locale']}")
 
-            # The Aliyun scene is server-issued and rotates. Read it through the
-            # same route as the browser before the page loads, so the fallback
-            # token is built for the scene the widget will actually use.
-            captcha_cfg = fetch_captcha_config()
-            captcha_scene = str(captcha_cfg.get('sceneId') or '')
-            logger.info(f"    [captcha] scene={captcha_scene or 'unavailable'} "
-                        f"region={captcha_cfg.get('region') or '?'}")
+            # chat.z.ai's signup widget runs its OWN Aliyun scene, not the
+            # ZCode billing scene the claim mints for (`11xygtvd`): a token for
+            # the wrong scene is rejected with "captcha verification failed".
+            # The app's init options are captured at runtime when the SDK was
+            # invoked through the global; the constant is the fallback.
+            captcha_scene = SIGNUP_CAPTCHA_SCENE
+            logger.info(f"    [captcha] signup scene={captcha_scene} "
+                        f"region={SIGNUP_CAPTCHA_REGION} prefix={SIGNUP_CAPTCHA_PREFIX}")
 
             account_profile = _account_profile(email)
             try:
@@ -847,6 +905,7 @@ def signup(email, password, mail=None):
             page = context.new_page()
             page.add_init_script(fingerprint.base_script(ident))
             page.add_init_script(fingerprint.noise_script(ident))
+            page.add_init_script(_captcha_options_hook())
             page.add_init_script(_captcha_verify_hook(captcha_scene))
 
             # Capture the REAL auth token from the signup response's set-cookie.
@@ -1040,7 +1099,20 @@ def signup(email, password, mail=None):
                     # and then continue the API flow automatically.
                     result = 'MANUAL_OK' if solver.wait_for_manual_solve(page) else None
                 elif mint:
-                    minted_param = _mint_captcha(logger)
+                    # Mint for the scene the widget actually initialised with;
+                    # the constant covers the case where the app imported the
+                    # SDK directly and the wrapper never saw the options.
+                    opts = {}
+                    try:
+                        opts = page.evaluate(
+                            "() => window.__aliyunCaptchaOptions || null") or {}
+                    except Exception:
+                        opts = {}
+                    minted_param = _mint_captcha(
+                        logger,
+                        scene=str(opts.get('SceneId') or SIGNUP_CAPTCHA_SCENE),
+                        region=SIGNUP_CAPTCHA_REGION,
+                        prefix=str(opts.get('prefix') or SIGNUP_CAPTCHA_PREFIX))
                     if minted_param:
                         result = minted_param
                     else:

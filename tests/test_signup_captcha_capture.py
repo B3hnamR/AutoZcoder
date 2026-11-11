@@ -62,7 +62,9 @@ def test_hook_never_fabricates_a_token_without_a_scene():
     hook = _load_main_helpers("_captcha_verify_hook")["_captcha_verify_hook"]("")
 
     assert 'var SCENE = "";' in hook
-    assert "if (!SCENE || !r.certifyId) return;" in hook
+    assert "if (!scene || !r.certifyId) return;" in hook
+    # The widget's own init options win over the baked-in default.
+    assert "__aliyunCaptchaOptions" in hook
 
 
 def test_signup_payload_matches_the_client_body():

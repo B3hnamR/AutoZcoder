@@ -223,13 +223,16 @@ def _find_mint_exe() -> str:
     return ""
 
 
-def _captcha_token(log, force_direct=False):
+def _captcha_token(log, force_direct=False, scene=None, region=None, prefix=None):
     """Mint an Aliyun captcha verify param for the claim.
 
     Priority:
       1. ZAI_CAPTCHA_PARAM (+ ZAI_CAPTCHA_REGION) — a pre-solved token.
       2. ZAI_CAPTCHA_CMD — a sidecar that prints `<param> <region>` on stdout
          (e.g. the Bun/happy-dom solver in zcode-api: captcha-happy.ts).
+    `scene`/`region`/`prefix` override the ZCode client config; the signup
+    page uses a different Aliyun scene, and a token minted for the wrong one
+    is rejected with "The captcha verification failed".
     Returns ('', '') when neither is available; the claim then answers 3007.
     """
     param = (os.environ.get("ZAI_CAPTCHA_PARAM") or "").strip()
@@ -244,11 +247,15 @@ def _captcha_token(log, force_direct=False):
         import shlex
         from sidecar_proxy import sidecar_proxy_route
         with direct_requests(force_direct):
-            cfg = _captcha_config(log)
-            route = _proxies() or {}
-        scene = cfg.get("sceneId", "")
-        region = cfg.get("region", "sgp")
-        prefix = cfg.get("prefix", "")
+            if scene or prefix:
+                route = _proxies() or {}
+                cfg = {}
+            else:
+                cfg = _captcha_config(log)
+                route = _proxies() or {}
+        scene = scene or cfg.get("sceneId", "")
+        region = region or cfg.get("region", "sgp")
+        prefix = prefix or cfg.get("prefix", "")
         env = dict(os.environ, ZAI_CAPTCHA_SCENE=scene, ZAI_CAPTCHA_REGION=region,
                    ZAI_CAPTCHA_PREFIX=prefix, ZAI_APP_VERSION=APP_VERSION)
         for key in list(env):

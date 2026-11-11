@@ -275,7 +275,7 @@ def test_finish_failure_never_enters_success_or_signup_retry(worker, monkeypatch
 @pytest.fixture
 def signup_flow(worker, monkeypatch):
     names = {'signup', '_save_recovery_account', 'jwt_payload', 'token_email', 'is_guest_token',
-             '_captcha_verify_hook', '_signup_payload'}
+             '_captcha_verify_hook', '_captcha_options_hook', '_signup_payload'}
     tree = ast.parse(SOURCE.read_text(encoding='utf-8'))
     module = ast.Module(body=[node for node in tree.body
                              if isinstance(node, ast.FunctionDef) and node.name in names],
@@ -330,6 +330,9 @@ def signup_flow(worker, monkeypatch):
         # signup flow exercises capture, not /client/configs.
         'fetch_captcha_config': Mock(return_value={'sceneId': 'scene-fixture',
                                                    'region': 'sgp', 'prefix': 'p'}),
+        'SIGNUP_CAPTCHA_SCENE': 'scene-fixture',
+        'SIGNUP_CAPTCHA_PREFIX': 'p',
+        'SIGNUP_CAPTCHA_REGION': 'sgp',
         'CaptchaSolver': Mock(return_value=Mock(solve=Mock(return_value='SOLVED'))),
         'take_screenshot': Mock(), '_rm_profile': Mock(), 'notify_gateway': Mock(),
         '_enter_signup_form': Mock(return_value=page.locator.return_value),
