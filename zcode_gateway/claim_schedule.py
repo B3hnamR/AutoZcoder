@@ -26,7 +26,7 @@ __all__ = ["ClaimScheduler", "parse_hhmm"]
 
 log = logging.getLogger(__name__)
 
-DEFAULT_TIME = "19:02"          # matches zcode2api's polling default
+DEFAULT_TIME = "19:02"          # polling default; the real window comes from the drop
 DEFAULT_UTC_OFFSET = 8.0        # Asia/Shanghai
 
 
@@ -180,3 +180,4 @@ class ClaimScheduler:
             os.replace(tmp, self.state_path)
         except OSError as exc:
             log.debug("could not persist claim schedule: %s", exc)
+
