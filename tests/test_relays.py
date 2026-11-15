@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import httpx
 import pytest
 
 from zcode_gateway.relay_deploy import (
@@ -15,7 +17,7 @@ from zcode_gateway.relay_deploy import (
     ping_relay,
 )
 from zcode_gateway.relay_manager import RelayManager
-from zcode_gateway.upstream import UpstreamClient, UpstreamConfig
+from zcode_gateway.upstream import RelayTransportError, UpstreamClient, UpstreamConfig
 
 
 def test_relay_manager_defaults(tmp_path: Path):
@@ -249,3 +251,113 @@ def test_all_relays_failed_still_routes(tmp_path: Path):
     mgr.mark_relay_failed("https://cf2.workers.dev")
     assert mgr.get_relay_for_model("GLM-5.3") in {
         "https://cf1.workers.dev", "https://cf2.workers.dev"}
+
+
+# --------------------------------------------------------------------------- #
+# retry rotation inside one UpstreamClient.send call
+# --------------------------------------------------------------------------- #
+
+def _upstream_client(mgr: RelayManager):
+    client = UpstreamClient.__new__(UpstreamClient)      # no real httpx pool
+    client.cfg = UpstreamConfig(base_url="https://zcode.z.ai/api/v1",
+                                chat_path="/zcode-plan/anthropic/v1/messages")
+    client.pacing, client.relay_manager = None, mgr
+    return client
+
+
+def _record_failures(client):
+    """Replace the transport: record each target URL, fail every send."""
+    calls: list[str] = []
+
+    def build_request(method, url, **kwargs):
+        calls.append(url)
+        return object()
+
+    async def refuse(request, stream):
+        raise httpx.ConnectError("connection refused")
+
+    client._client = SimpleNamespace(build_request=build_request, send=refuse)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_a_failed_relay_is_never_retried_within_one_call(tmp_path: Path):
+    """cf2 is cooling down, so every pick lands on the active relay cf1. Once
+    cf1 has failed, the retry must not hammer it a second time."""
+    mgr = RelayManager(data_dir=tmp_path)
+    mgr.add_relay("cf1", "https://cf1.workers.dev", "cloudflare")
+    mgr.add_relay("cf2", "https://cf2.workers.dev", "cloudflare")
+    mgr.update_options(enabled=True, strategy="single")
+    mgr.mark_relay_failed("https://cf2.workers.dev")
+    client = _upstream_client(mgr)
+    calls = _record_failures(client)
+
+    with pytest.raises(RelayTransportError):
+        await client.send({"authorization": "Bearer t"}, {"model": "GLM-5.3"}, True)
+    assert calls == ["https://cf1.workers.dev"]
+
+
+@pytest.mark.asyncio
+async def test_relay_rotation_still_tries_the_next_relay(tmp_path: Path):
+    """A relay that has NOT been tried is still rotated to."""
+    mgr = RelayManager(data_dir=tmp_path)
+    mgr.add_relay("cf1", "https://cf1.workers.dev", "cloudflare")
+    mgr.add_relay("cf2", "https://cf2.workers.dev", "cloudflare")
+    mgr.update_options(enabled=True, strategy="round_robin")
+    client = _upstream_client(mgr)
+    calls = _record_failures(client)
+
+    with pytest.raises(RelayTransportError):
+        await client.send({"authorization": "Bearer t"}, {"model": "GLM-5.3"}, True)
+    assert calls == ["https://cf1.workers.dev", "https://cf2.workers.dev"]
+
+
+# --------------------------------------------------------------------------- #
+# relays.json must survive a read failure
+# --------------------------------------------------------------------------- #
+
+def test_unreadable_relays_file_is_not_saved_over_as_defaults(tmp_path: Path, monkeypatch):
+    """A transient read error used to cache DEFAULT settings, so the next save
+    wrote defaults over a perfectly good relays.json."""
+    mgr = RelayManager(data_dir=tmp_path)
+    entry = mgr.add_relay("cf", "https://cf.workers.dev", "cloudflare")
+    fresh = RelayManager(data_dir=tmp_path)                  # nothing cached yet
+    real_read = Path.read_text
+    reads = []
+
+    def flaky_read(self, *args, **kwargs):
+        reads.append(self.name)
+        if len(reads) == 1:
+            raise PermissionError("relays.json is locked")
+        return real_read(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", flaky_read)
+    assert fresh.get_settings()["relays"] == []              # defaults for this read only
+    fresh.update_options(enabled=True)
+    on_disk = json.loads(real_read(tmp_path / "relays.json", encoding="utf-8"))
+    assert [r["id"] for r in on_disk["relays"]] == [entry["id"]]
+    assert fresh.get_settings()["enabled"] is True
+
+
+def test_corrupt_relays_file_is_reread_once_repaired(tmp_path: Path):
+    """Garbage must not be cached as authoritative defaults: a repaired file
+    has to be picked up without restarting the gateway."""
+    (tmp_path / "relays.json").write_text("{ truncated", encoding="utf-8")
+    mgr = RelayManager(data_dir=tmp_path)
+    assert mgr.get_settings()["relays"] == []
+    (tmp_path / "relays.json").write_text(json.dumps({
+        "enabled": True, "models": ["GLM-5.3"],
+        "relays": [{"id": "relay-1", "url": "https://cf.workers.dev"}]}), encoding="utf-8")
+    assert mgr.get_settings()["relays"][0]["id"] == "relay-1"
+
+
+# --------------------------------------------------------------------------- #
+# option shapes from the dashboard
+# --------------------------------------------------------------------------- #
+
+def test_update_options_accepts_a_single_model_string(tmp_path: Path):
+    mgr = RelayManager(data_dir=tmp_path)
+    mgr.add_relay("cf", "https://cf.workers.dev", "cloudflare")
+    mgr.update_options(models="GLM-5.3", enabled=True)
+    assert mgr.get_settings()["models"] == ["GLM-5.3"]
+    assert mgr.get_relay_for_model("GLM-5.3") == "https://cf.workers.dev"
