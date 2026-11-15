@@ -163,7 +163,10 @@ class TokenManager:
             account.last_error = ''
             account.state = AccountState.READY
             account.death_reason = ''
+            # a replaced credential gets a fresh strike budget: banked quota
+            # strikes would re-retire it on the first future rejection
             account.auth_strikes = 0
+            account.quota_strikes = 0
             account.notes.pop('quota_check_error', None)
 
     async def apply_credentials(self, account, **credentials):

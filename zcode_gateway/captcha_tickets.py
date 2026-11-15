@@ -141,8 +141,10 @@ class CaptchaTicketPool:
         with self._lock:
             live = [t for t in self._tickets
                     if now - t.minted_at <= self.ttl - SAFETY_MARGIN]
-            self._tickets.clear()
-            ticket = live[-1] if live else None
+            # Only the handed-out ticket and the stale ones leave the pool: the
+            # other live tickets were already paid for and are still usable.
+            ticket = live.pop() if live else None
+            self._tickets[:] = live
         self._wake.set()
         return ticket
 
