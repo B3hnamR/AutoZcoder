@@ -57,7 +57,10 @@ class NotificationCenter:
                     now = time.time()
                     for e in reversed(self._events):
                         if now - e["ts"] > window:
-                            break
+                            # a matching entry bumped in place keeps its old
+                            # deque position, so ts is not monotonic: skip the
+                            # stale entry and keep scanning
+                            continue
                         if (e["category"], e["message"]) == key:
                             e["count"] += 1
                             e["ts"] = now

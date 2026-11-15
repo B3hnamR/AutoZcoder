@@ -842,7 +842,10 @@ class PoolManager:
             if expected_credentials is not None and (self._accounts.get(account.id) is not account
                     or account.credential_key() != expected_credentials):
                 return
-            if account.state is AccountState.DEAD:
+            # EXHAUSTED is quota-drained retirement, not a transient error: a
+            # COOLING downgrade puts the account back in rotation once the
+            # cooldown lapses, so it is as sticky as DEAD here.
+            if account.state in (AccountState.DEAD, AccountState.EXHAUSTED):
                 return
             account.state = AccountState.COOLING
             account.cooldown_until = time.time() + (seconds or self.cfg.cooldown_seconds)
@@ -909,6 +912,12 @@ class PoolManager:
                 account.death_reason = reason or 'authentication_error'
                 account.last_error = reason
                 return
+            if account.state is AccountState.EXHAUSTED:
+                # Sticky like DEAD: the account is retired for quota, not for
+                # this request's auth failure, and cooling it would re-enter
+                # rotation when the cooldown lapsed.
+                account.last_error = reason
+                return
             account.auth_strikes = n
             if n >= strikes:
                 account.state = AccountState.DEAD
@@ -945,6 +954,10 @@ class PoolManager:
             acc.cooldown_until = 0.0
             acc.error_count = 0
             acc.last_error = ""
+            # an explicit re-enable is a fresh strike budget: banked strikes
+            # would otherwise retire the account on its first future failure
+            acc.auth_strikes = 0
+            acc.quota_strikes = 0
             return True
 
     async def upsert(self, account: Account) -> None:
@@ -966,15 +979,16 @@ class PoolManager:
             existing.expires_at = account.expires_at
             existing.credential_generation += 1
             existing.email = account.email or existing.email
-            existing.state = account.state if account.state is not AccountState.DEAD else existing.state
-            if existing.state is not AccountState.DEAD:
-                existing.death_reason = ''
             existing.paid_exhausted = account.paid_exhausted
             if account.notes:
                 existing.notes.update(account.notes)
-            # a re-login is a fresh credential: clear auth strikes but keep
-            # model caps (they persist on disk and are model-scoped facts)
+            # a re-login is a fresh credential: clear both strike budgets but
+            # keep model caps (they persist on disk and are model-scoped facts).
+            # Without the quota reset, an account that recovered from
+            # quota-strike EXHAUSTION re-retired on its first future rejection
+            # with the old strikes already banked.
             existing.auth_strikes = 0
+            existing.quota_strikes = 0
 
     async def remove(self, account_id: str) -> bool:
         async with self._lock:

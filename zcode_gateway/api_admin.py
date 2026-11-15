@@ -121,6 +121,9 @@ async def add_account(
         source="admin",
     )
     await state.pool.upsert(account)
+    # re-adding an account is an explicit revive with fresh credentials; upsert
+    # keeps a parked state, so revival is requested here instead of implied
+    await state.pool.enable(account.id)
     return {"added": account.to_public()}
 
 
@@ -255,6 +258,8 @@ async def import_jwt_account(request: Request, body: dict[str, Any] = Body(...),
         except (OSError, ValueError):
             raise HTTPException(500, "Could not save account snapshot; nothing added to pool") from None
         await state.pool.upsert(account)
+        # an explicit import of fresh credentials revives a parked account
+        await state.pool.enable(ident)
         current = await state.pool.find(ident)
         current.balance_checked_at = account.balance_checked_at
         current.plan_checked_at = account.plan_checked_at
@@ -615,7 +620,7 @@ async def claim_stop(request: Request, body: dict = Body(...),
     mgr = _generator(request)
     if mgr is None:
         raise HTTPException(status_code=404, detail="generator manager unavailable")
-    ok = mgr.stop_claim(name)
+    ok = await asyncio.to_thread(mgr.stop_claim, name)
     if not ok:
         raise HTTPException(status_code=404, detail="no such claim")
     return {"stopped": name}
@@ -629,7 +634,7 @@ async def claim_remove(request: Request, body: dict = Body(...),
     mgr = _generator(request)
     if mgr is None:
         raise HTTPException(status_code=404, detail="generator manager unavailable")
-    ok = mgr.remove_claim(name)
+    ok = await asyncio.to_thread(mgr.remove_claim, name)
     if not ok:
         raise HTTPException(status_code=404, detail="no such claim")
     return {"removed": name}
@@ -711,6 +716,15 @@ async def proxy_auto_verify(request: Request, body: dict = Body(...),
     mgr = _generator(request)
     enabled = bool(body.get("enabled"))
     interval = body.get("interval_min")
+    if interval not in (None, ""):
+        try:
+            interval = int(interval)
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=400,
+                detail="interval_min must be a whole number of minutes") from None
+    else:
+        interval = None
     return mgr.checker.set_auto_verify(enabled, interval)
 
 

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import copy
+import logging
 import os
 import random
 import threading
@@ -30,6 +31,8 @@ from .relay_deploy import (
     deploy_vercel,
     ping_relay,
 )
+
+log = logging.getLogger("zcode_gateway.relay_manager")
 
 STRATEGIES = ("single", "round_robin", "random")
 FAIL_COOLDOWN_S = 60.0          # a failed relay sits out one minute
@@ -131,13 +134,17 @@ class RelayManager:
             if self.path.exists():
                 try:
                     data = json.loads(self.path.read_text(encoding="utf-8"))
-                    if isinstance(data, dict):
-                        settings = self._default_settings()
-                        settings.update(data)
-                        self._cache = settings
-                        return copy.deepcopy(settings)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # Never cache defaults for an unreadable file: a later save
+                    # would write them over the user's relays for good.
+                    log.warning("relays.json could not be read (%s) — serving "
+                                "defaults for this read only", exc)
+                    return self._default_settings()
+                if isinstance(data, dict):
+                    settings = self._default_settings()
+                    settings.update(data)
+                    self._cache = settings
+                    return copy.deepcopy(settings)
             settings = self._default_settings()
             self._cache = settings
             return copy.deepcopy(settings)
@@ -378,6 +385,8 @@ class RelayManager:
         with self._lock:
             st = self.get_settings()
             if models is not None:
+                if isinstance(models, str):       # a single model name, not a list
+                    models = [models]
                 st["models"] = list(dict.fromkeys(models))
             if enabled is not None:
                 st["enabled"] = bool(enabled)

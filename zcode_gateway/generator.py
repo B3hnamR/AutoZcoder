@@ -3770,7 +3770,8 @@ class GeneratorManager:
 
     def _pool_has_candidates(self) -> bool:
         try:
-            return any(line.strip() and not line.startswith("#") for line in self.pool_file.read_text().splitlines())
+            return any(line.strip() and not line.startswith("#") for line in self.pool_file.read_text(
+                encoding="utf-8", errors="ignore").splitlines())
         except OSError:
             return False
 

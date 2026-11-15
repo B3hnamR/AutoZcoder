@@ -96,42 +96,51 @@ def main():
     log = lambda m: print(m, flush=True)
 
     got = 0
+    failed = 0
     for n, (email, _password, token) in enumerate(rows, 1):
         log(f"[{n}/{len(rows)}] {email}")
-        zjwt = get_zcode_jwt(token, log=lambda *a, **k: None)
-        if not zjwt:
-            log('  login failed')
-            record = {'email': email, 'plans': None, 'error': 'login'}
-        else:
-            plan = get_plan(zjwt, log=lambda *a, **k: None) or {}
-            ids = plan.get('plans') or []
-            if not ids and escalate:
-                log('  no plan — escalating to the full desktop device_login')
-                try:
-                    from invite_claim import device_login
-                    zjwt2, _ = device_login(token, log=lambda *a, **k: None)
-                    if zjwt2:
-                        zjwt = zjwt2
-                        time.sleep(2)
-                        plan = get_plan(zjwt, log=lambda *a, **k: None) or {}
-                        ids = plan.get('plans') or []
-                except Exception as e:
-                    log(f'  escalate failed ({type(e).__name__}: {e})')
-            has_start = any(is_start_plan(p) for p in ids)
-            got += 1 if has_start else 0
-            record = {'email': email, 'plans': ids, 'starter': has_start,
-                      'referral': plan.get('referral'),
-                      'campaign': plan.get('campaign'),
-                      'entitlements': plan.get('entitlements'),
-                      'ts': int(time.time())}
-            if has_start:
-                with open(startplan_path, 'a', encoding='utf-8') as f:
-                    f.write(f"{email}:{_password}:{token}\n")
-            log(f"  -> {ids}")
+        try:
+            zjwt = get_zcode_jwt(token, log=lambda *a, **k: None)
+            if not zjwt:
+                log('  login failed')
+                record = {'email': email, 'plans': None, 'error': 'login'}
+            else:
+                plan = get_plan(zjwt, log=lambda *a, **k: None) or {}
+                ids = plan.get('plans') or []
+                if not ids and escalate:
+                    log('  no plan — escalating to the full desktop device_login')
+                    try:
+                        from invite_claim import device_login
+                        zjwt2, _ = device_login(token, log=lambda *a, **k: None)
+                        if zjwt2:
+                            zjwt = zjwt2
+                            time.sleep(2)
+                            plan = get_plan(zjwt, log=lambda *a, **k: None) or {}
+                            ids = plan.get('plans') or []
+                    except Exception as e:
+                        log(f'  escalate failed ({type(e).__name__}: {e})')
+                has_start = any(is_start_plan(p) for p in ids)
+                got += 1 if has_start else 0
+                record = {'email': email, 'plans': ids, 'starter': has_start,
+                          'referral': plan.get('referral'),
+                          'campaign': plan.get('campaign'),
+                          'entitlements': plan.get('entitlements'),
+                          'ts': int(time.time())}
+                if has_start:
+                    with open(startplan_path, 'a', encoding='utf-8') as f:
+                        f.write(f"{email}:{_password}:{token}\n")
+                log(f"  -> {ids}")
+        except Exception as e:
+            failed += 1
+            log(f'  failed ({type(e).__name__}: {e})')
+            record = {'email': email, 'plans': None,
+                      'error': f'{type(e).__name__}: {e}'}
         with open(plans_path, 'a', encoding='utf-8') as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     log(f"\n{got}/{len(rows)} accounts currently hold a Start Plan")
+    if failed:
+        log(f"{failed} account(s) failed — see the error field in {plans_path}")
     log(f"ledger: {plans_path}")
     return 0
 

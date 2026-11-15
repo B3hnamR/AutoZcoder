@@ -20,6 +20,7 @@ import re
 import sys
 
 from plan_check import get_zcode_jwt, get_plan, is_start_plan, DEVICE_MID
+import plan_check
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 # destination for exported snapshots; override per machine (or copy the
@@ -99,48 +100,54 @@ def main():
     print(f"candidate accounts: {len(accounts)}")
     os.makedirs(GATEWAY_ACCOUNTS, exist_ok=True)
     exported = 0
+    failed = 0
     for email, chat_token in accounts:
         print(f"\n=== {email} ===")
-        zjwt = get_zcode_jwt(chat_token, log=lambda *a: print('   ', *a))
-        if not zjwt:
-            print("    no zcodeJWT — skip")
-            continue
-        plan = get_plan(zjwt)
-        if not plan:
-            print("    no plan data — skip")
-            continue
-        starter = plan.get('starter')
-        referral = plan.get('referral')
-        print(f"    plans={plan.get('plans')} starter={starter} referral={referral}")
-        if not (starter or referral or export_all):
-            continue
-        payload = jwt_payload(zjwt)
-        ident = payload.get('user_id') or payload.get('sub') or email
-        plans_list = plan.get('plans') or []
-        chosen_plan = next((p for p in plans_list if is_start_plan(p)),
-                           plans_list[0] if plans_list else '')
-        fields = {
-            'captured_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            'source': 'ZCODEAUTO chat.z.ai signup (OAuth CLI)',
-            'account_id': ident,
-            'email': email,
-            'name': '',
-            'device_mid': DEVICE_MID,
-            'plan': chosen_plan,
-            'access_token': zjwt,
-        }
-        if payload.get('exp'):
-            fields['expires_at'] = str(payload['exp'])
-            fields['expires_at_ms'] = str(int(payload['exp']) * 1000)
-        else:
-            fields['expires_at_ms'] = '0'
-        # drop empty values so the file matches ZcodeGate's own output exactly
-        fields = {k: v for k, v in fields.items() if v != ''}
-        dest = os.path.join(GATEWAY_ACCOUNTS, safe_name(email))
-        write_snapshot(dest, fields)
-        exported += 1
-        print(f"    -> wrote {dest}")
-    print(f"\nexported {exported} account(s) to {GATEWAY_ACCOUNTS}")
+        try:
+            zjwt = get_zcode_jwt(chat_token, log=lambda *a: print('   ', *a))
+            if not zjwt:
+                print("    no zcodeJWT — skip")
+                continue
+            plan = get_plan(zjwt)
+            if not plan:
+                print("    no plan data — skip")
+                continue
+            starter = plan.get('starter')
+            referral = plan.get('referral')
+            print(f"    plans={plan.get('plans')} starter={starter} referral={referral}")
+            if not (starter or referral or export_all):
+                continue
+            payload = jwt_payload(zjwt)
+            ident = payload.get('user_id') or payload.get('sub') or email
+            plans_list = plan.get('plans') or []
+            chosen_plan = next((p for p in plans_list if is_start_plan(p)),
+                               plans_list[0] if plans_list else '')
+            fields = {
+                'captured_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                'source': 'ZCODEAUTO chat.z.ai signup (OAuth CLI)',
+                'account_id': ident,
+                'email': email,
+                'name': '',
+                'device_mid': plan_check.per_account_device_mid(zjwt) or DEVICE_MID,
+                'plan': chosen_plan,
+                'access_token': zjwt,
+            }
+            if payload.get('exp'):
+                fields['expires_at'] = str(payload['exp'])
+                fields['expires_at_ms'] = str(int(payload['exp']) * 1000)
+            else:
+                fields['expires_at_ms'] = '0'
+            # drop empty values so the file matches ZcodeGate's own output exactly
+            fields = {k: v for k, v in fields.items() if v != ''}
+            dest = os.path.join(GATEWAY_ACCOUNTS, safe_name(email))
+            write_snapshot(dest, fields)
+            exported += 1
+            print(f"    -> wrote {dest}")
+        except Exception as e:
+            failed += 1
+            print(f"    failed ({type(e).__name__}: {e}) — skip")
+    print(f"\nexported {exported} account(s) to {GATEWAY_ACCOUNTS}"
+          + (f" ({failed} failed)" if failed else ""))
 
 
 if __name__ == '__main__':

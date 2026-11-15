@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import os
-import hmac
 
 from fastapi import APIRouter, Request, Response
 from fastapi.responses import JSONResponse
 
+from .deps import _compare
 from .peer import peer_is_local
 
 router = APIRouter(tags=["ops"])
@@ -31,7 +31,7 @@ async def health(request: Request, response: Response) -> dict:
     nonce = os.environ.get("ZCODE_GATEWAY_UPDATE_NONCE", "")
     supplied = request.headers.get("X-AutoZCoder-Update", "")
     valid_nonce = bool(nonce and len(nonce) <= 128 and all(c in "0123456789abcdef" for c in nonce))
-    update_probe = valid_nonce and hmac.compare_digest(nonce, supplied)
+    update_probe = valid_nonce and _compare(nonce, supplied)
     if not _ops_exposed(request) and not update_probe:
         return JSONResponse(status_code=404, content={"detail": "Not Found"})
     state = request.app.state.app_state
