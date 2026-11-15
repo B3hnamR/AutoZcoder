@@ -80,8 +80,13 @@ _warned_private = False
 def valid_endpoint(host: str, port: int) -> bool:
     if not (0 < port < 65536):
         return False
+    octets = host.split(".")
+    # getaddrinfo/inet_aton read a leading zero as octal ("0177" == 127), so a
+    # dotted quad like 0177.0.0.1 would slip past the loopback check below
+    if any(len(o) > 1 and o.startswith("0") for o in octets):
+        return False
     try:
-        parts = [int(o) for o in host.split(".")]
+        parts = [int(o) for o in octets]
     except ValueError:
         return False
     if len(parts) != 4 or any(p > 255 for p in parts):

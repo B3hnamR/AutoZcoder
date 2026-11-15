@@ -31,6 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from invite_claim import (        # noqa: E402
     _VERIFY,
+    client_timezone,
     device_login,
     per_account_device_mid,
     _proxies,
@@ -51,7 +52,6 @@ CLAIM_HEADERS_BASE = {
     'http-referer': 'https://zcode.z.ai',
     'user-agent': 'ZCode/3.18.0',
     'x-client-language': 'en-US',
-    'x-client-timezone': 'Asia/Tehran',
     'x-os-category': 'windows',
     'x-os-version': 'Windows 11 Pro',
     'x-platform': 'win32-x64',
@@ -111,6 +111,7 @@ def _headers(zjwt: str) -> dict:
     h = dict(CLAIM_HEADERS_BASE)
     h['authorization'] = 'Bearer ' + zjwt
     h['x-device-mid'] = per_account_device_mid(zjwt)
+    h['x-client-timezone'] = client_timezone()
     h['x-request-id'] = str(__import__('uuid').uuid4())
     return h
 

@@ -496,7 +496,7 @@ def _plan_events(zjwt):
             pass
     mid = per_account_device_mid(zjwt)
     base = {
-        "client_timezone": "Asia/Tehran",
+        "client_timezone": client_timezone(),
         "client_language": "en-US",
         "event_text": "",
         "user_id": jwt_user_id(zjwt),
