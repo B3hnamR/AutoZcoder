@@ -61,14 +61,20 @@ def test_load_config_records_the_configs_folder(tmp_path, monkeypatch):
     assert Path(cfg._root) == conf.parent.resolve()
 
 
-def test_load_config_upgrades_the_shipped_3180_fingerprint(tmp_path, monkeypatch):
+@pytest.mark.parametrize("version", ["3.14.4", "3.17.2", "3.18.0"])
+def test_load_config_upgrades_a_shipped_stale_fingerprint(
+        tmp_path, monkeypatch, version):
+    """The version alone is part of the 3012 gate: a matching harness text
+    still 3012s on a 3.14.4 pin, so shipped builds are re-pinned, not only
+    the exact 3.18.0 pair."""
     monkeypatch.chdir(tmp_path)
     conf = tmp_path / "config.yaml"
     conf.write_text(
         "upstream:\n"
         "  fingerprint:\n"
-        "    client_version: 3.18.0\n"
-        "    user_agent: ZCode/3.18.0 ai-sdk/provider-utils/4.0.27 runtime/node.js/24\n",
+        f"    client_version: {version}\n"
+        "    user_agent: "
+        f"ZCode/{version} ai-sdk/provider-utils/4.0.27 runtime/node.js/24\n",
         encoding="utf-8",
     )
 

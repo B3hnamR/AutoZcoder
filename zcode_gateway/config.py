@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import ssl
 import sys
 from urllib.parse import urlsplit
@@ -447,13 +448,23 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return out
 
 
+_SHIPPED_UA_SUFFIX = " ai-sdk/provider-utils/4.0.27 runtime/node.js/24"
+_SHIPPED_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
+
+
 def _upgrade_shipped_fingerprint(data: dict[str, Any]) -> None:
-    """Upgrade only the old fingerprint that AutoZCoder itself shipped.
+    """Re-pin a stale fingerprint that AutoZCoder itself shipped.
 
     Existing config files contain a fully materialized fingerprint, so merely
     changing ``Fingerprint`` defaults leaves upgraded installations pinned to
-    a client version the upstream no longer accepts (405/code 3012).  Custom
-    fingerprints are deliberately left alone.
+    a client version the upstream no longer accepts (405/code 3012, "This
+    client is not supported").
+
+    The version alone is part of the gate: measured live, a matching harness
+    text still 3012s on the 3.14.4 pin and passes on 3.18.x. Every shipped
+    build used ``ZCode/<version>`` plus this exact SDK suffix, so that shape is
+    recognized and re-pointed at the current client. A UA the operator wrote
+    themselves keeps both its version and its UA.
     """
     upstream = data.get("upstream")
     if not isinstance(upstream, dict):
@@ -461,11 +472,16 @@ def _upgrade_shipped_fingerprint(data: dict[str, Any]) -> None:
     fingerprint = upstream.get("fingerprint")
     if not isinstance(fingerprint, dict):
         return
-    if (fingerprint.get("client_version") == "3.18.0" and
-            fingerprint.get("user_agent") ==
-            "ZCode/3.18.0 ai-sdk/provider-utils/4.0.27 runtime/node.js/24"):
-        fingerprint["client_version"] = CURRENT_ZCODE_CLIENT_VERSION
-        fingerprint["user_agent"] = CURRENT_ZCODE_USER_AGENT
+    version = fingerprint.get("client_version")
+    user_agent = fingerprint.get("user_agent")
+    if not isinstance(version, str) or not _SHIPPED_VERSION_RE.match(version):
+        return
+    if user_agent != f"ZCode/{version}{_SHIPPED_UA_SUFFIX}":
+        return
+    if version == CURRENT_ZCODE_CLIENT_VERSION and user_agent == CURRENT_ZCODE_USER_AGENT:
+        return
+    fingerprint["client_version"] = CURRENT_ZCODE_CLIENT_VERSION
+    fingerprint["user_agent"] = CURRENT_ZCODE_USER_AGENT
 
 
 def load_config(path: str | os.PathLike | None = None) -> Config:
