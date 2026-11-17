@@ -73,12 +73,14 @@ class EdgeBlockBreaker:
         if not _looks_like_edge_block(body):
             return False
         now = time.time()
+        # Expire stale episodes before deciding whether to notify again.
+        new_episode = not self.is_blocked()
         self.blocked_at = now
         self.consecutive += 1
         log.warning(
             "edge block detected (HTML 403, #%d) — failing fast %ds, probing",
             self.consecutive, BLOCK_RETRY_AFTER_S)
-        if self.on_block is not None:
+        if self.on_block is not None and new_episode:
             try:
                 self.on_block(self.consecutive)
             except Exception:

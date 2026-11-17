@@ -478,6 +478,7 @@ async def login_start(request: Request, key: str = Depends(admin_key)) -> dict:
         """New account: join the pool, then settle balance/paid-lane/plan now —
         a login that replaced an exhausted account must not read 'available'."""
         await state.pool.upsert(account)
+        await state.pool.enable(account.id)
         try:
             canonical = await state.pool.find(account.id)
             if canonical is not None:
@@ -703,7 +704,15 @@ async def _check_update_idle(state) -> None:
         raise HTTPException(409, "Stop Auto Generate before applying an update")
     if getattr(manager, "_claim_all_running", False):
         raise HTTPException(409, "Stop the claim batch before applying an update")
-    if any(not worker.done.is_set() for worker in manager.workers.values()) or any(job.alive() for job in manager.claims.values()) or manager.checker.alive():
+    lock = getattr(manager, "_lock", None)
+    if lock is not None:
+        with lock:
+            workers = list(manager.workers.values())
+            claims = list(manager.claims.values())
+    else:
+        workers = list(manager.workers.values())
+        claims = list(manager.claims.values())
+    if any(not worker.done.is_set() for worker in workers) or any(job.alive() for job in claims) or manager.checker.alive():
         raise HTTPException(409, "Generator, claim or proxy-check jobs are active; stop them before applying an update")
 
 
@@ -962,10 +971,17 @@ async def generator_locate_set(request: Request, body: dict = Body(default={}),
     # rebuild the manager so the change takes effect immediately
     old = getattr(state, "generator", None)
     if old is not None:
+        def _teardown_old() -> None:
+            scheduler = getattr(state, "claim_scheduler", None)
+            if scheduler is not None:
+                scheduler.stop()
+            old.shutdown()
         try:
-            old.stop_all()
+            await asyncio.to_thread(_teardown_old)
         except Exception:
-            pass
+            log.warning("generator: could not fully stop the previous manager",
+                        exc_info=True)
+        state.claim_scheduler = None
     state.generator = None
     return {"ok": True, "path": str(root), "found": True, "applied": "live"}
 
@@ -1608,12 +1624,12 @@ async def setup_status(request: Request, key: str = Depends(admin_key)) -> dict:
 async def generator_stop(request: Request, body: dict = Body(...),
                          key: str = Depends(admin_key)) -> dict:
     name = body.get("name", "")
-    return {"stopped": _generator(request).stop_worker(name)}
+    return {"stopped": await asyncio.to_thread(_generator(request).stop_worker, name)}
 
 
 @router.post("/admin/dash/generator/stopall")
 async def generator_stopall(request: Request, key: str = Depends(admin_key)) -> dict:
-    _generator(request).stop_all()
+    await asyncio.to_thread(_generator(request).stop_all)
     return {"ok": True}
 
 
@@ -1630,7 +1646,7 @@ async def generator_shutdown(request: Request, key: str = Depends(admin_key)) ->
 async def generator_worker_remove(request: Request, body: dict = Body(...),
                                   key: str = Depends(admin_key)) -> dict:
     name = str(body.get("name") or "")
-    ok = _generator(request).remove_worker(name)
+    ok = await asyncio.to_thread(_generator(request).remove_worker, name)
     if not ok:
         raise HTTPException(status_code=404, detail="no such worker")
     return {"removed": name}
@@ -1669,7 +1685,7 @@ async def generator_send_claim_message(request: Request, body: dict = Body(...),
 
 @router.get("/admin/dash/generator/proxies")
 async def generator_proxies(request: Request, key: str = Depends(admin_key)) -> dict:
-    return _generator(request).checker.status()
+    return await asyncio.to_thread(_generator(request).checker.status)
 
 
 @router.post("/admin/dash/generator/proxies/run")
@@ -1691,7 +1707,8 @@ async def generator_proxies_run(request: Request, body: dict = Body(default={}),
         v = body.get(name)
         return None if v is None else bool(v)
 
-    return checker.run(
+    return await asyncio.to_thread(
+        checker.run,
         action,
         timeout=_num("timeout", int),
         concurrency=_num("concurrency", int),
@@ -1707,7 +1724,7 @@ async def generator_proxies_run(request: Request, body: dict = Body(default={}),
 
 @router.post("/admin/dash/generator/proxies/stop")
 async def generator_proxies_stop(request: Request, key: str = Depends(admin_key)) -> dict:
-    _generator(request).checker.stop()
+    await asyncio.to_thread(_generator(request).checker.stop)
     return {"ok": True}
 
 
@@ -1752,14 +1769,14 @@ async def generator_proxies_maintain(request: Request, body: dict = Body(...),
     action = str(body.get("action") or "").strip()
     if action not in ("prune", "clear-bad", "clear-used", "clear-dead"):
         raise HTTPException(status_code=400, detail="unknown maintenance action")
-    return _generator(request).checker.run(action)
+    return await asyncio.to_thread(_generator(request).checker.run, action)
 
 
 @router.post("/admin/dash/generator/proxies/countries")
 async def generator_proxies_countries(request: Request, key: str = Depends(admin_key)) -> dict:
     """Look up the country of every pool proxy that has none (online, nothing is
     downloaded). Runs in the proxy checker so its log and progress show up."""
-    return _generator(request).checker.run("countries")
+    return await asyncio.to_thread(_generator(request).checker.run, "countries")
 
 
 # ---- Edge Relays (Cloudflare, Vercel, Deno, Netlify) ------------------------ #

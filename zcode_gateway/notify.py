@@ -57,7 +57,8 @@ class NotificationCenter:
                     now = time.time()
                     for e in reversed(self._events):
                         if now - e["ts"] > window:
-                            break
+                            # Dedupe bumps timestamps without reordering entries.
+                            continue
                         if (e["category"], e["message"]) == key:
                             e["count"] += 1
                             e["ts"] = now

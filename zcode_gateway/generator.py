@@ -3770,7 +3770,8 @@ class GeneratorManager:
 
     def _pool_has_candidates(self) -> bool:
         try:
-            return any(line.strip() and not line.startswith("#") for line in self.pool_file.read_text().splitlines())
+            return any(line.strip() and not line.startswith("#") for line in self.pool_file.read_text(
+                encoding="utf-8", errors="ignore").splitlines())
         except OSError:
             return False
 
@@ -4057,7 +4058,8 @@ class GeneratorManager:
                 log.exception("pool registration failed for %s", new.get("email"))
 
     def stop_worker(self, name: str) -> bool:
-        w = self.workers.get(name)
+        with self._lock:
+            w = self.workers.get(name)
         if w and w.alive():
             w.stop()
             return True
@@ -4115,12 +4117,15 @@ class GeneratorManager:
 
     def remove_worker(self, name: str) -> bool:
         """Drop one worker card (running ones are killed first)."""
-        w = self.workers.get(name)
+        with self._lock:
+            w = self.workers.get(name)
         if not w:
             return False
         if not w.done.is_set():
             w.stop()
-        self.workers.pop(name, None)
+        with self._lock:
+            if self.workers.get(name) is w:
+                self.workers.pop(name, None)
         return True
 
     def remove_finished_workers(self) -> int:
@@ -4426,19 +4431,23 @@ class GeneratorManager:
             pass
 
     def stop_claim(self, name: str) -> bool:
-        j = self.claims.get(name)
+        with self._lock:
+            j = self.claims.get(name)
         if j and j.alive():
             j.stop()
             return True
         return False
 
     def remove_claim(self, name: str) -> bool:
-        j = self.claims.get(name)
+        with self._lock:
+            j = self.claims.get(name)
         if not j:
             return False
         if j.alive():
             j.stop()
-        self.claims.pop(name, None)
+        with self._lock:
+            if self.claims.get(name) is j:
+                self.claims.pop(name, None)
         return True
 
     def clear_finished_claims(self) -> int:

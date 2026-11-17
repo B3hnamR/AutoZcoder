@@ -34,6 +34,7 @@ async def run(args):
         if args.infer:
             with tempfile.TemporaryDirectory() as folder:
                 store = Store(str(Path(folder) / 'smoke.db'))
+                service = None
                 try:
                     service = ChatService(cfg, pool, tokens, client, Registry(), store, JsonlCapture(folder, False))
                     model = 'GLM-5.3-Flash'
@@ -43,6 +44,8 @@ async def run(args):
                     message = json.loads(result.raw)
                     print('Live inference OK:', message['stop_reason'], json.dumps(message['usage']))
                 finally:
+                    if service is not None:
+                        await service.aclose()
                     store.close()
         return 0
     except Exception as exc:

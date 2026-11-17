@@ -10,6 +10,7 @@ import json
 import time
 import uuid
 from typing import Any, Iterable
+from .upstream import split_sse_lines
 
 # --------------------------------------------------------------------------- #
 # request: anthropic -> openai
@@ -476,7 +477,7 @@ def extract_stream_error(text: str) -> dict | None:
     """
     import json as _json
 
-    for line in (text or "").splitlines():
+    for line in split_sse_lines(text):
         line = line.strip()
         if not line.startswith("data:"):
             continue
@@ -503,7 +504,7 @@ def stream_had_content(text: str) -> bool:
     """True if the stream carried any assistant text or tool call."""
     import json as _json
 
-    for line in (text or "").splitlines():
+    for line in split_sse_lines(text):
         line = line.strip()
         if not line.startswith("data:") or "[DONE]" in line:
             continue

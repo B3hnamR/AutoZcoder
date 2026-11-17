@@ -225,11 +225,10 @@ class DistanceCalculator:
         Returns None (and logs) when ddddocr is missing instead of raising
         out of calculate().
         """
-        if self.ocr is None and self._ocr_factory is not None:
-            self.ocr = self._ocr_factory()
         if self.ocr is None:
             try:
-                return self._get_ocr()
+                self.ocr = (self._ocr_factory() if self._ocr_factory is not None
+                            else self._get_ocr())
             except RuntimeError as e:
                 self.logger.warning(str(e))
                 return None

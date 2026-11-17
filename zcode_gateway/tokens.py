@@ -164,6 +164,7 @@ class TokenManager:
             account.state = AccountState.READY
             account.death_reason = ''
             account.auth_strikes = 0
+            account.quota_strikes = 0
             account.notes.pop('quota_check_error', None)
 
     async def apply_credentials(self, account, **credentials):

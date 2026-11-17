@@ -754,10 +754,12 @@ class ChatService:
                    duration_ms=duration, prompt_tokens=converted['prompt_tokens'],
                    completion_tokens=converted['completion_tokens'], total_tokens=converted['total_tokens'],
                    error_code=None if status == 200 else f'http_{status}')
-        cap = dict(request_headers=dict(headers), request_body=copy.deepcopy(body), status=status,
-                   response_headers=dict(response_headers), response_body=response,
-                   duration_ms=duration, account_id=account.id, dialect=dialect,
-                   model=model, variant='anthropic')
+        cap = None
+        if getattr(self.capture, 'enabled', True):
+            cap = dict(request_headers=dict(headers), request_body=copy.deepcopy(body), status=status,
+                       response_headers=dict(response_headers), response_body=response,
+                       duration_ms=duration, account_id=account.id, dialect=dialect,
+                       model=model, variant='anthropic')
         # Disk I/O off the event loop: SQLite/JSONL writes (and AV scans on
         # those files) used to stall every concurrent stream while they ran.
         try:
@@ -780,6 +782,7 @@ class ChatService:
     def _write_record(self, rec, cap):
         try:
             self.store.record(**rec)
-            self.capture.write(**cap)
+            if cap is not None:
+                self.capture.write(**cap)
         except Exception:
             log.debug("store/capture write failed", exc_info=True)

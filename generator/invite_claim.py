@@ -25,7 +25,7 @@ sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
 from utils import BROWSER_ARGS
-from plan_check import APP_VERSION, _request, direct_requests
+from plan_check import APP_VERSION, _request, client_timezone, direct_requests
 
 # NOTE: playwright is imported lazily inside claim_invite(). The referral
 # helpers below (referral_summary / send_one_message) are imported by the
@@ -518,6 +518,21 @@ def _proxies():
     return {'http': raw, 'https': raw}
 
 
+def _pw_proxy(proxy_url):
+    """Keep portless proxies out of Chromium and pass credentials separately."""
+    if not proxy_url:
+        return None
+    from urllib.parse import urlparse
+    u = urlparse(proxy_url)
+    if not u.hostname or not u.port:
+        return None
+    d = {'server': f"{u.scheme or 'http'}://{u.hostname}:{u.port}"}
+    if u.username:
+        d['username'] = u.username
+        d['password'] = u.password or ''
+    return d
+
+
 def _direct_proxy_while(fn):
     """Run `fn` with direct mode when force_direct=True; always restore."""
     import functools
@@ -555,7 +570,6 @@ APP_HEADERS = {  # exact cli/init header set captured from the desktop app
     'http-referer': 'https://zcode.z.ai',
     'user-agent': 'ZCode/' + APP_VERSION,
     'x-client-language': 'en-US',
-    'x-client-timezone': 'Asia/Tehran',
     'x-device-mid': '58aca3b3-3239-4cb7-9c70-df3e5488fb99',
     'x-os-category': 'windows',
     'x-os-version': '10.0.26200',
@@ -593,12 +607,15 @@ def report_login_device(zjwt: str, user_id: str = None, device_mid: str = None, 
     mid = device_mid or per_account_device_mid(zjwt)
     h = dict(APP_HEADERS)
     h['authorization'] = 'Bearer ' + zjwt
+    h['x-client-timezone'] = client_timezone()
+    if mid:
+        h['x-device-mid'] = mid
     endpoint = 'https://zcode.z.ai/api/v1/event/report'
 
     # 1. app_login_ck
     body_ck = {
         'event_id': str(_uuid.uuid4()),
-        'client_timezone': 'Asia/Tehran',
+        'client_timezone': client_timezone(),
         'client_language': 'en-US',
         'element_name': 'app_login_ck',
         'event_region': 'app',
@@ -624,7 +641,7 @@ def report_login_device(zjwt: str, user_id: str = None, device_mid: str = None, 
     # 2. app_login_success (the critical event that credits login_device)
     body_success = {
         'event_id': str(_uuid.uuid4()),
-        'client_timezone': 'Asia/Tehran',
+        'client_timezone': client_timezone(),
         'client_language': 'en-US',
         'element_name': 'app_login_success',
         'event_region': 'app_profile',
@@ -683,6 +700,10 @@ def device_login(chat_token, log=print, force_direct: bool = False):
     poll_token = secrets.token_hex(32)
     h = dict(APP_HEADERS)
     h['authorization'] = 'Bearer ' + poll_token
+    h['x-client-timezone'] = client_timezone()
+    mid = per_account_device_mid(chat_token)
+    if mid:
+        h['x-device-mid'] = mid
     # zcode.z.ai answers 502 in bursts; init is idempotent (it just opens a
     # new flow), so a few quick retries beat aborting the whole login
     r = None
@@ -864,19 +885,13 @@ def claim_invite(chat_token: str, invite_code: str = 'MT9GNDQ8', log=print,
             viewport={'width': 1280, 'height': 820}, user_agent=UA,
             locale='en-US', timezone_id='America/New_York')
         _px = _proxies()
-        if _px and _px.get('https'):
-            # embedded credentials (http://user:pass@host:port) must be split
-            # into separate fields — Chromium drops them from 'server' alone
-            # and then shows an auth popup (net::ERR_INVALID_AUTH_CREDENTIALS)
-            from urllib.parse import urlparse
-            _u = urlparse(_px['https'])
-            _pd = {'server': f"{_u.scheme or 'http'}://{_u.hostname}:{_u.port}"}
-            if _u.username:
-                _pd['username'] = _u.username
-                _pd['password'] = _u.password or ''
+        _pd = _pw_proxy((_px or {}).get('https'))
+        if _pd:
             launch_kwargs['proxy'] = _pd
         elif force_direct:
             log('  invite: direct mode — claiming on the real IP')
+        elif _px and _px.get('https'):
+            log('  invite: proxy has no host:port - launching direct')
 
         import fingerprint as _fp
         _px_url = (_px or {}).get('https')

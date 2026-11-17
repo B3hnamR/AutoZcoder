@@ -80,8 +80,12 @@ _warned_private = False
 def valid_endpoint(host: str, port: int) -> bool:
     if not (0 < port < 65536):
         return False
+    octets = host.split(".")
+    # Some resolvers interpret leading-zero octets as octal (0177 is 127).
+    if any(len(o) > 1 and o.startswith("0") for o in octets):
+        return False
     try:
-        parts = [int(o) for o in host.split(".")]
+        parts = [int(o) for o in octets]
     except ValueError:
         return False
     if len(parts) != 4 or any(p > 255 for p in parts):

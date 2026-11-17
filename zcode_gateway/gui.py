@@ -19,6 +19,7 @@ import queue
 import secrets
 import shutil
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
@@ -346,6 +347,20 @@ def find_config() -> Path | None:
         return None
 
 
+def _write_config_atomic(path: Path, text: str) -> None:
+    """Keep the live config intact if writing its replacement fails."""
+    fd, name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    tmp = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 def _normalize_config(cfg_path: Path | None) -> None:
     """First-run repair: point the config at a real accounts folder.
 
@@ -388,8 +403,7 @@ def _normalize_config(cfg_path: Path | None) -> None:
         except OSError:
             pass
     try:
-        cfg_path.write_text(yaml.safe_dump(data, sort_keys=False),
-                            encoding="utf-8")
+        _write_config_atomic(cfg_path, yaml.safe_dump(data, sort_keys=False))
     except OSError:
         pass
 
@@ -421,6 +435,8 @@ class ServerController:
     def __init__(self) -> None:
         self._server = None
         self._thread: threading.Thread | None = None
+        self._config_ready = threading.Event()
+        self._stop_requested = threading.Event()
         self.host = "127.0.0.1"
         self.port = 8788
         self.error: str | None = None
@@ -439,6 +455,8 @@ class ServerController:
         if self.running:
             return
         self.error = None
+        self._config_ready.clear()
+        self._stop_requested.clear()
 
         def run() -> None:
             try:
@@ -446,8 +464,11 @@ class ServerController:
                 from zcode_gateway.app import create_app
                 from zcode_gateway.config import load_config
 
+                if self._stop_requested.is_set():
+                    return
                 cfg = load_config(str(cfg_path) if cfg_path else None)
                 self.host, self.port = cfg.server.host, cfg.server.port
+                self._config_ready.set()
 
                 # If the configured accounts folder is not there (e.g. a default
                 # config next to a copied exe), fall back to the folder we found.
@@ -468,6 +489,8 @@ class ServerController:
                     self.accounts_loaded = 0
 
                 app = create_app(cfg)
+                if self._stop_requested.is_set():
+                    return
                 # log_config=None stops uvicorn installing its own stdout-based
                 # handlers. In a --windowed frozen build sys.stdout can still be
                 # None, and uvicorn's default config would then raise on a
@@ -485,6 +508,7 @@ class ServerController:
         self._thread.start()
 
     def stop(self, wait: float = 5.0) -> None:
+        self._stop_requested.set()
         server = self._server
         if server is not None:
             server.should_exit = True
@@ -513,6 +537,9 @@ class ServerController:
         while time.time() < deadline:
             if self.error:
                 return False
+            if not self._config_ready.is_set():
+                time.sleep(0.05)
+                continue
             try:
                 with urllib.request.urlopen(self.base_url + "/health", timeout=1):
                     return True
@@ -1186,8 +1213,7 @@ class App(tk.Tk):
                 import yaml
                 data = yaml.safe_load(self.cfg_path.read_text(encoding="utf-8")) or {}
                 (data.setdefault("accounts", {}))["source"] = "accounts_dir"
-                self.cfg_path.write_text(yaml.safe_dump(data, sort_keys=False),
-                                         encoding="utf-8")
+                _write_config_atomic(self.cfg_path, yaml.safe_dump(data, sort_keys=False))
                 self.restart_server(f"Imported {result['written']} account(s); gateway restarted with accounts_dir")
             except Exception as exc:
                 self.toast(f"could not update config: {exc}", "err")
@@ -1356,8 +1382,7 @@ class App(tk.Tk):
             keys = server.get("client_keys")
             if isinstance(keys, list) and keys and isinstance(keys[0], dict):
                 keys[0]["key"] = f"gw-{secrets.token_hex(8)}"
-            self.cfg_path.write_text(yaml.safe_dump(data, sort_keys=False),
-                                     encoding="utf-8")
+            _write_config_atomic(self.cfg_path, yaml.safe_dump(data, sort_keys=False))
             self.accounts_dir = self._configured_accounts_dir()
         except Exception as exc:
             return self.toast(f"could not update config: {exc}", "err")
@@ -1522,8 +1547,7 @@ class App(tk.Tk):
             fallback = data.setdefault("models", {}).setdefault("auto_free_fallback", {})
             fallback["enabled"] = bool(self.free_fallback_enabled.get())
             fallback["chain"] = fallback_chain
-            self.cfg_path.write_text(yaml.safe_dump(data, sort_keys=False),
-                                     encoding="utf-8")
+            _write_config_atomic(self.cfg_path, yaml.safe_dump(data, sort_keys=False))
         except Exception as exc:
             return self.toast(str(exc), "err")
 
@@ -1705,6 +1729,8 @@ class App(tk.Tk):
 
     def stop_everything(self) -> None:
         self._lifecycle += 1
+        self._restart_pending = False
+        self._restart_message = None
         self._stopping = True
         for var in getattr(self, "server_urls", {}).values():
             var.set("")
@@ -1720,24 +1746,29 @@ class App(tk.Tk):
     def restart_server(self, success_message: str | None = None) -> None:
         if self._restart_pending:
             return
+        self.stop_everything()
         self._restart_pending = True
         self._restart_message = success_message
-        self.stop_everything()
+        generation = self._lifecycle
         self._stopping = True
         def wait_and_start() -> None:
             if self.server.wait_stopped():
-                self.after(0, self._start_after_restart)
+                self.after(0, self._start_after_restart, generation)
             else:
-                self.after(0, self._restart_failed)
+                self.after(0, self._restart_failed, generation)
         threading.Thread(target=wait_and_start, daemon=True).start()
 
-    def _start_after_restart(self) -> None:
+    def _start_after_restart(self, generation: int | None = None) -> None:
+        if generation is not None and generation != self._lifecycle:
+            return
         if not self._restart_pending:
             return
         self._stopping = False
         self.start_everything()
 
-    def _restart_failed(self) -> None:
+    def _restart_failed(self, generation: int | None = None) -> None:
+        if generation is not None and generation != self._lifecycle:
+            return
         self._restart_pending = False
         self._restart_message = None
         self.toast("gateway did not stop cleanly; restart aborted", "err")

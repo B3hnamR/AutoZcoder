@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import copy
+import logging
 import os
 import random
 import threading
@@ -30,6 +31,8 @@ from .relay_deploy import (
     deploy_vercel,
     ping_relay,
 )
+
+log = logging.getLogger("zcode_gateway.relay_manager")
 
 STRATEGIES = ("single", "round_robin", "random")
 FAIL_COOLDOWN_S = 60.0          # a failed relay sits out one minute
@@ -137,7 +140,10 @@ class RelayManager:
                         self._cache = settings
                         return copy.deepcopy(settings)
                 except Exception:
-                    pass
+                    # Do not cache a transient read failure as authoritative defaults.
+                    log.warning("relays.json could not be read; serving temporary defaults",
+                                exc_info=True)
+                    return self._default_settings()
             settings = self._default_settings()
             self._cache = settings
             return copy.deepcopy(settings)
@@ -378,6 +384,8 @@ class RelayManager:
         with self._lock:
             st = self.get_settings()
             if models is not None:
+                if isinstance(models, str):
+                    models = [models]
                 st["models"] = list(dict.fromkeys(models))
             if enabled is not None:
                 st["enabled"] = bool(enabled)

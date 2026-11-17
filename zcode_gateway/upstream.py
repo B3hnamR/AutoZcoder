@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -387,10 +388,8 @@ class UpstreamClient:
                 relay_url = ((relay_entry or {}).get("url") or "").strip() or None
                 relay_secret = (relay_entry or {}).get("secret") or ""
                 if relay_url and relay_url in tried_relay_urls:
-                    # already tried this one this call — stop rotating
-                    relay_url = None if len(tried_relay_urls) >= self.relay_manager.get_relay_count() else relay_url
-                    if relay_url is None:
-                        break
+                    # Never retry a relay that already failed this call.
+                    break
 
             try:
                 if relay_url:
@@ -517,13 +516,21 @@ class UpstreamBlockThroughRelay(TransportError):
 # --------------------------------------------------------------------------- #
 
 
+_SSE_LINE_BREAK = re.compile(r"\r\n|\r|\n")
+
+
+def split_sse_lines(text: str) -> list[str]:
+    """Split wire line endings, not Unicode separators inside JSON strings."""
+    return _SSE_LINE_BREAK.split(text or "")
+
+
 def iter_sse_events(chunk_text):
     events = []
     for frame in __import__('re').split(r'\r\n\r\n|\n\n|\r\r', chunk_text):
         # SSE spec: strip the field name and EXACTLY one optional leading
         # space — lstrip(' ') ate multi-space-prefixed payloads
         lines = [line[5:][1:] if line[5:].startswith(' ') else line[5:]
-                 for line in frame.splitlines() if line.startswith('data:')]
+                 for line in split_sse_lines(frame) if line.startswith('data:')]
         if not lines: continue
         data = '\n'.join(lines)
         if not data.strip(): continue

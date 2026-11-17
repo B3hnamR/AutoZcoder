@@ -141,8 +141,8 @@ class CaptchaTicketPool:
         with self._lock:
             live = [t for t in self._tickets
                     if now - t.minted_at <= self.ttl - SAFETY_MARGIN]
-            self._tickets.clear()
-            ticket = live[-1] if live else None
+            ticket = live.pop() if live else None
+            self._tickets[:] = live
         self._wake.set()
         return ticket
 
