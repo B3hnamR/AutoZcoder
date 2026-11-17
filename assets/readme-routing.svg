@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="220" viewBox="0 0 1200 220" fill="none" role="img" aria-labelledby="title desc">
+  <title id="title">One client key, a pool of ZCode accounts</title>
+  <desc id="desc">OpenAI and Anthropic clients connect to AutoZCoder. The gateway routes requests through its account pool to the ZCode coding-plan API.</desc>
+  <rect width="1200" height="220" rx="16" fill="#0f1115"/>
+  <g font-family="Segoe UI, Arial, sans-serif">
+    <g fill="#a6adbd" font-size="14" letter-spacing="2">
+      <text x="40" y="39">01 / CONNECT</text>
+      <text x="448" y="39">02 / ROUTE</text>
+      <text x="902" y="39">03 / INFER</text>
+    </g>
+    <rect x="40" y="67" width="278" height="106" rx="10" fill="#191d26" stroke="#303544"/>
+    <text x="64" y="110" fill="#e8eaf0" font-size="24" font-weight="600">Your coding clients</text>
+    <text x="64" y="145" fill="#a6adbd" font-size="17">OpenAI / Anthropic APIs</text>
+    <path d="M330 120H430L422 114M430 120L422 126" stroke="#8b7cf7" stroke-width="2"/>
+    <rect x="448" y="67" width="312" height="106" rx="10" fill="#242136" stroke="#8b7cf7"/>
+    <text x="472" y="110" fill="#f3f2f9" font-size="24" font-weight="600">AutoZCoder</text>
+    <text x="472" y="145" fill="#c2b9f8" font-size="17">Client key / account pool</text>
+    <path d="M772 120H884L876 114M884 120L876 126" stroke="#8b7cf7" stroke-width="2"/>
+    <rect x="902" y="67" width="258" height="106" rx="10" fill="#191d26" stroke="#303544"/>
+    <text x="926" y="110" fill="#e8eaf0" font-size="24" font-weight="600">ZCode</text>
+    <text x="926" y="145" fill="#a6adbd" font-size="17">GLM-5.3 / 5.3-Flash</text>
+  </g>
+</svg>

@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/readme-hero.svg" width="1200" alt="AutoZCoder. Your ZCode accounts. One gateway. OpenAI and Anthropic APIs on Windows and Linux.">
+</p>
+
 # AutoZCoder
 
 A self-hosted gateway for the **ZCode coding-plan API** (GLM-5.3 / GLM-5.3-Flash),
@@ -7,43 +11,58 @@ It exposes OpenAI- and Anthropic-compatible endpoints locally, pools multiple
 ZCode accounts behind one key, and can create new accounts for you on demand.
 Runs on **Windows (desktop exe)** and **Linux (headless VPS)**.
 
-**Version 2.0.1** | [Release notes](docs/releases/2.0.1.md) | [Latest published downloads](https://github.com/B3hnamR/AutoZcoder/releases/latest)
-| [Windows exe](https://github.com/B3hnamR/AutoZcoder/releases/latest/download/ZcodeGateway.exe)
-| [Linux installation](#run-on-a-linux-vps)
+**[Download latest](https://github.com/B3hnamR/AutoZcoder/releases/latest)** · [Release notes · 2.0.12](docs/releases/2.0.12.md) · [MIT license](LICENSE)
+
+[Quick start](#quick-start) · [Connect a client](#connect-a-client) · [Accounts](#adding-accounts) · [Features](#features) · [Documentation](#documentation) · [Security](#security-notes)
 
 > Unofficial, independent project. Not affiliated with ZCode or z.ai.
 
 ---
 
-## What's inside
+## One gateway, your workflow
 
-| Path | What it is |
-|---|---|
-| `zcode_gateway/` | The gateway: FastAPI app, account pool, admin/dashboard API, Windows desktop shell, web dashboard |
-| `zcode_gateway/dashboard/` | The dashboard SPA (served at `/dash`) |
-| `generator/` | The account generator: signup, captcha solving, invite claim, proxy pool |
-| `mail-worker/` | Cloudflare Email Worker that receives signup verification mail |
-| `tests/` | Offline test suite; run `python -m pytest tests -q` (Windows and Linux CI) |
-| `scripts/accounts/` | Account import utility |
-| `scripts/smoke/` | Explicit live checks and the isolated frozen-binary smoke utility |
-| `scripts/build/`, `scripts/packaging/` | Windows/Linux build entry points and packaging inputs |
-| `tools/captcha-mint/` | Stable JavaScript/TypeScript captcha-mint subsystem |
-| `requirements/` | Windows, server and development dependency sets |
-| `docs/` | Setup/deployment guides, protocol reference and troubleshooting |
-| `.local/` | Ignored local runtime data, build output and scratch files |
-| `.venv/` | Standard local Python virtual environment (ignored) |
+**Connect familiar clients.** OpenAI Chat Completions and native Anthropic Messages,
+with streaming, tools and reasoning support.
+
+**Manage the pool.** Route across accounts, track model quotas and plan expiry,
+and inspect usage in the web dashboard at `/dash`.
+
+**Generate when needed.** Optional browser-based account generation, proxy tooling
+and a Cloudflare mail worker live alongside the gateway, not in your client.
+
+<p>
+  <img src="assets/readme-routing.svg" width="1200" alt="OpenAI and Anthropic clients connect to AutoZCoder with a client key. Its account pool routes requests to the ZCode coding-plan API.">
+</p>
 
 ---
 
 ## Quick start
 
+Choose where the gateway runs. Then [add an account](#adding-accounts) and
+[connect your client](#connect-a-client). Account generation is optional.
+
+| Platform | Start here | Requirements |
+| :--- | :--- | :--- |
+| **Windows desktop** | [Download ZcodeGateway.exe](https://github.com/B3hnamR/AutoZcoder/releases/latest/download/ZcodeGateway.exe) | Portable app; no Python needed for the gateway |
+| **Linux VPS** | [Install over SSH](#run-on-a-linux-vps) | x86_64, systemd, glibc 2.35+ |
+| **From source** | [Run locally](#run-from-source) | Python 3.10+; 3.13 recommended |
+
+> [!IMPORTANT]
+> Keep the admin key private: it grants code-execution authority as the gateway's
+> OS user. Use a **client key** for coding clients. Read [Security](SECURITY.md)
+> before exposing the gateway beyond loopback.
+
 ### Run the packaged app (Windows)
 
 Double-click `ZcodeGateway.exe` from the latest release. On first launch it
 writes its own `config.yaml`, `accounts/`, `logs/` and `gateway.db` **beside
-the executable** (portable — move the folder anywhere). Default port **8788**.
+the executable** (portable; move the folder anywhere). If that folder is not
+writable, data falls back to `%LOCALAPPDATA%/ZcodeGateway`. Default port **8788**.
 
 Dashboard: <http://127.0.0.1:8788/dash>
+
+<details>
+<summary><strong>Updating the Windows app</strong></summary>
 
 In **Settings → Check for updates now**, packaged Windows builds offer
 **Download update**, then a separate **Restart to apply** action. Downloading
@@ -51,6 +70,8 @@ does not stop work; applying requires generator jobs, claims, proxy scans and
 client requests to be idle. The helper retains a backup and requires a health
 response matching a per-launch nonce within 60 seconds, rolling back on startup
 failure or timeout. This confirms startup, not successful inference or generation.
+
+</details>
 
 ### Run on a Linux VPS
 
@@ -76,8 +97,11 @@ or self-signed. No nginx is installed. Use **2 reliable vCPUs and 4 GB RAM**
 for comfortable one-browser generation. Small servers receive a confirmation
 warning; gateway-only operation can use less.
 
+<details>
+<summary><strong>Manage, update and back up your Linux installation</strong></summary>
+
 ```bash
-sudo autozcoder          # interactive manager
+sudo autozcoder           # interactive manager
 sudo autozcoder status   # service and dashboard status
 sudo autozcoder logs     # service logs
 sudo autozcoder update   # verified update with deployment rollback
@@ -92,7 +116,11 @@ maintenance; `sudo autozcoder info` displays secrets. For manual/source installs
 ARM systems, firewall/TLS choices, updates and uninstall precautions, see the
 **[VPS deployment guide](docs/guides/VPS-DEPLOY.md)**.
 
+</details>
+
 ### Run from source
+
+From a checkout of this repository, on Windows:
 
 ```powershell
 python -m venv .venv
@@ -100,15 +128,37 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m zcode_gateway.main
 ```
 
-Run these commands from the repository root. On Linux, use
-`requirements/server.txt` and `.venv/bin/python` instead. The standard virtual
+On Linux, from the repository root:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements/server.txt
+.venv/bin/python -m zcode_gateway.main
+```
+
+The standard virtual
 environment is `.venv/`; `.local/` is reserved for ignored local runtime data,
 build products and scratch files, not Python packages. Packaged installs retain
 their portable data layout beside the executable; this repository reorganization
 does not move or migrate existing runtime files.
 
-Point any OpenAI/Anthropic client at `http://127.0.0.1:8788/v1` with the client
-key from the **Server** tab.
+### Connect a client
+
+First [add an account](#adding-accounts). Copy a **client key** from the
+**Server** tab, not the admin key.
+
+| Setting | Local default |
+| :--- | :--- |
+| API base URL | `http://127.0.0.1:8788/v1` |
+| OpenAI endpoints | `/v1/chat/completions`, `/v1/completions`, `/v1/models` |
+| Anthropic endpoint | `/v1/messages` |
+| Models | `GLM-5.3`, `GLM-5.3-Flash` |
+
+For a VPS, use your HTTPS server address instead of loopback. Clients differ
+in whether they append `/v1`; configure the base URL so the final request uses
+the endpoint above. See the [protocol reference](docs/reference/PROTOCOL.md).
+
+Example OpenAI Chat Completions request body:
 
 ```json
 {
@@ -153,6 +203,9 @@ or `generator.zcodeauto_dir` in `config.yaml`.
 
 ### Version 2 workflow
 
+<details>
+<summary><strong>Goals, browser slots and session controls</strong></summary>
+
 - **Auto Generate** supports a goal of new, qualified Start Plan successes or
   a fixed attempt budget. Duplicates and no-plan results do not count toward
   the goal; a mandatory maximum-attempt budget can end a run before its goal.
@@ -167,6 +220,8 @@ or `generator.zcodeauto_dir` in `config.yaml`.
   survive restarts, but interrupted sessions require explicit continuation.
 - The dashboard brings together plan/model quota details, batch claims,
   account import/sharing, and **Analytics** with period filters and CSV export.
+
+</details>
 
 ## Email for signups (optional)
 
@@ -188,6 +243,9 @@ message to an address on the domain to verify end-to-end delivery.
 ---
 
 ## Build and test
+
+<details>
+<summary><strong>Build from source and run the offline test suite</strong></summary>
 
 ```powershell
 python -m venv .venv
@@ -225,6 +283,8 @@ Account import: `python scripts/accounts/import_account.py <source>` (use
 network-isolated sandbox working directory; it writes dummy state there, not
 beside its script.
 
+</details>
+
 ---
 
 ## Features
@@ -244,6 +304,9 @@ beside its script.
 - One-click Cloudflare worker deploy with automatic Node.js install.
 
 ### Proxy pool (generator)
+
+<details>
+<summary><strong>Verification, scoring, supported formats and CLI</strong></summary>
 
 The generator's proxy tooling verifies every candidate against `chat.z.ai`
 itself: the auth page must load with a valid certificate **and** the Aliyun
@@ -274,6 +337,8 @@ captcha host must be reachable. Around that gate:
 
 CLI: `python generator/proxy_pool.py{ fetch | verify | recheck | pick | countries | stats | prune | clear-bad | clear-used | clear-dead }`.
 
+</details>
+
 ## Security notes
 
 - Packaged Windows data normally lives beside the executable (or in
@@ -300,6 +365,9 @@ CLI: `python generator/proxy_pool.py{ fetch | verify | recheck | pick | countrie
   (included in [requirements/server.txt](requirements/server.txt)).
 
 ## Layout
+
+<details>
+<summary><strong>Repository map and runtime data locations</strong></summary>
 
 Source-checkout launches keep private configuration, accounts, logs, database
 and generator output under `.local/runtime/`; packaged installations retain
@@ -332,12 +400,23 @@ AutoZCoder/
 `-- install-linux.sh      public bootstrap (stable root URL)
 ```
 
-Documentation: [Setup](docs/guides/SETUP.md),
-[VPS deployment](docs/guides/VPS-DEPLOY.md),
-[Protocol](docs/reference/PROTOCOL.md),
-[Model overload](docs/troubleshooting/DIAGNOSIS-1305.md),
-[Agent initialization](docs/troubleshooting/DIAGNOSIS-3012.md),
-[Unusual activity](docs/troubleshooting/UNUSUAL-ACTIVITY.md),
-[Security](SECURITY.md).
+</details>
 
-MIT — see [LICENSE](LICENSE).
+## Documentation
+
+| Guide | What you will find |
+| :--- | :--- |
+| [Account generator setup](docs/guides/SETUP.md) | Generator dependencies, domain email and proxies |
+| [VPS deployment](docs/guides/VPS-DEPLOY.md) | Linux installation, TLS, service management and recovery |
+| [Protocol reference](docs/reference/PROTOCOL.md) | Request formats and API behavior |
+| [Model overload](docs/troubleshooting/DIAGNOSIS-1305.md) | Diagnose upstream `529 / 1305` responses |
+| [Agent initialization](docs/troubleshooting/DIAGNOSIS-3012.md) | Background on `3012` initialization failures |
+| [Unusual activity](docs/troubleshooting/UNUSUAL-ACTIVITY.md) | Distinguish activity limits from unsupported-client responses |
+| [Security](SECURITY.md) | Trust boundaries, credentials and public deployments |
+| [Release history](docs/releases/) | Changes and validation notes, including [2.0.1](docs/releases/2.0.1.md) |
+
+---
+
+**AutoZCoder** · Self-hosted. Independently maintained. [MIT licensed](LICENSE).
+
+[Back to top](#autozcoder) · [Latest release](https://github.com/B3hnamR/AutoZcoder/releases/latest)
