@@ -61,6 +61,40 @@ def test_load_config_records_the_configs_folder(tmp_path, monkeypatch):
     assert Path(cfg._root) == conf.parent.resolve()
 
 
+def test_load_config_upgrades_the_shipped_3180_fingerprint(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    conf = tmp_path / "config.yaml"
+    conf.write_text(
+        "upstream:\n"
+        "  fingerprint:\n"
+        "    client_version: 3.18.0\n"
+        "    user_agent: ZCode/3.18.0 ai-sdk/provider-utils/4.0.27 runtime/node.js/24\n",
+        encoding="utf-8",
+    )
+
+    fingerprint = load_config(conf).upstream.fingerprint
+
+    assert fingerprint.client_version == "3.18.2"
+    assert fingerprint.user_agent.startswith("ZCode/3.18.2 ")
+
+
+def test_load_config_preserves_custom_fingerprint(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    conf = tmp_path / "config.yaml"
+    conf.write_text(
+        "upstream:\n"
+        "  fingerprint:\n"
+        "    client_version: custom\n"
+        "    user_agent: custom-agent\n",
+        encoding="utf-8",
+    )
+
+    fingerprint = load_config(conf).upstream.fingerprint
+
+    assert fingerprint.client_version == "custom"
+    assert fingerprint.user_agent == "custom-agent"
+
+
 def test_dashboard_config_path_uses_the_loaded_root(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     conf = tmp_path / "custom" / "config.yaml"

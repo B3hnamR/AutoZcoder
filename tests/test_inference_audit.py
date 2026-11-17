@@ -3,6 +3,7 @@ import asyncio
 import copy
 import json
 import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -482,3 +483,27 @@ async def test_level_cancellation_during_open_releases_reservation():
         await entered.wait()
         group.cancel_scope.cancel()
     assert (await service.pool.find("one")).in_flight == 0
+
+
+@pytest.mark.asyncio
+async def test_unsupported_client_parks_briefly_and_names_the_cause():
+    """A harness fingerprint mismatch hits every account, so a 900s
+    "unusual activity" park per account misreads a build problem as 15
+    minutes of pool trouble."""
+    service, _ = service_for([])
+    account = await service.pool.find("one")
+    await service._apply_error(
+        account, MODEL, 405, "3012",
+        "This client is not supported. Please use the official ZCode client.")
+    info = account.model_cap_info[MODEL]
+    assert info["code"] == "CLIENT_NOT_SUPPORTED"
+    assert account.model_caps[MODEL] - time.time() < 200
+
+
+@pytest.mark.asyncio
+async def test_genuine_unusual_activity_still_parks_for_the_full_window():
+    service, _ = service_for([])
+    account = await service.pool.find("one")
+    await service._apply_error(account, MODEL, 405, "3012",
+                               "request has been blocked due to unusual activity.")
+    assert account.model_cap_info[MODEL]["code"] == "UNUSUAL_ACTIVITY"

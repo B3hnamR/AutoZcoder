@@ -10,7 +10,7 @@ Start Plan. It is offered in the billing preview instead, and must be granted:
   1. chat token -> device_login (OAuth CLI -> zcodeJWT)   [invite_claim.py]
   2. POST /api/v1/event/report  app_launch + app_daily_active
      (the preview answers an empty list until the account reported activity)
-  3. GET  /api/v1/zcode-plan/billing/preview?app_version=3.18.0
+  3. GET  /api/v1/zcode-plan/billing/preview?app_version=3.18.2
      (also version-gated: <3.16.1 answers [])
      GET  /api/v1/marketing/touch?seq=0
      (campaign cards only exist here: Global/Weekend Build, rotating ids)

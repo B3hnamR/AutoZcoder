@@ -50,7 +50,7 @@ AUTHORIZE = "https://chat.z.ai/api/oauth/authorize"
 # The gift/preview list is version-gated: 3.14.3..3.16.0 answer [], 3.16.1+
 # name the plan, and marketing offers need 3.17.1+. Track the current desktop
 # build; a stale pin silently empties the preview and reads as "no plan".
-APP_VERSION = (os.environ.get("ZAI_APP_VERSION") or "3.18.0").strip() or "3.18.0"
+APP_VERSION = (os.environ.get("ZAI_APP_VERSION") or "3.18.2").strip() or "3.18.2"
 BRIDGE_REDIRECT = (
     "https://zcode.z.ai/app/oauth/login?redirect=zcode%3A%2F%2Foauth%2Fcallback"
     f"&app_version={APP_VERSION}"
@@ -238,10 +238,11 @@ def is_campaign_plan_name(name) -> bool:
 # The 16 static headers the upstream fingerprints (upstream.py STATIC_HEADERS).
 STATIC_HEADERS = {
     "accept": "*/*",
+    "accept-language": "*",
     "content-type": "application/json",
     "http-referer": "https://zcode.z.ai",
+    "sec-fetch-mode": "cors",
     "anthropic-version": "2023-06-01",
-    "anthropic-beta": "mid-conversation-system-2026-04-07",
 }
 # Stable PER-ACCOUNT device id: every account using one shared hardcoded
 # x-device-mid is a direct cross-account correlation signal for risk control.

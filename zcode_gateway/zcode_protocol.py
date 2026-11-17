@@ -80,14 +80,16 @@ def _strip_image_blocks_system(system) -> None:
 
 def build_body(payload: dict, default_max_tokens=128000, model_caps=None,
                default_effort='high', harness=True) -> dict:
-    """Native requests preserve blocks, caching, signatures and metadata exactly.
+    """Build the current ZCode wire body from native or OpenAI requests.
 
     `model_caps` (optional): the registry's per-model capability dict — when
     present, image blocks are stripped for non-vision models (the request
     proceeds text-only instead of a guaranteed upstream 400) and max_tokens is
     clamped to the model's real output cap.
     `harness` (default True): inject the full captured ZCode harness block;
-    False injects the identity line only (upstream.bootstrap_harness: false)."""
+    False injects the identity line only (upstream.bootstrap_harness: false).
+    With the harness enabled, caller system text is folded into the official
+    third system block because an extra block triggers upstream code 3012."""
     vision = None
     if isinstance(model_caps, dict):
         vision = bool(model_caps.get('vision'))

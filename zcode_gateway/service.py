@@ -20,7 +20,7 @@ from .model_retry import is_model_overload, overload_delay, retry_after_seconds,
 from .zcode_protocol import MessageAccumulator, OpenAITranslator, usage_openai
 from .upstream import (build_headers, build_upstream_body, iter_sse_events, sse_frame,
                        parse_upstream_error, anthropic_error, openai_error, TransportError,
-                       is_block_code)
+                       is_block_code, client_not_supported, CLIENT_NOT_SUPPORTED_PARK_S)
 from .registry import model_caps
 
 log = logging.getLogger('zcode_gateway.service')
@@ -177,10 +177,24 @@ class ChatService:
             # 405/3012 "unusual activity": not a quota and not a bad account.
             # Park only this model on this account and let the caller rotate to
             # the next account; the account keeps serving every other model.
-            await self.pool.cap_model(account, model,
-                                      self.cfg.pool.blocked_model_cooldown_seconds,
-                                      reason='UNUSUAL_ACTIVITY', message=message,
-                                      expected_credentials=expected_credentials)
+            #
+            # One variant is not per-account at all: the upstream fingerprints
+            # the bootstrap system text and answers "This client is not
+            # supported. Please use the official ZCode client." when it does
+            # not match. Every account then fails identically, so a 900s park
+            # per account only spreads a pool-wide outage over 15 minutes of
+            # misleading state. Park briefly and name the real cause instead.
+            if client_not_supported(message):
+                await self.pool.cap_model(account, model,
+                                          CLIENT_NOT_SUPPORTED_PARK_S,
+                                          reason='CLIENT_NOT_SUPPORTED',
+                                          message=message,
+                                          expected_credentials=expected_credentials)
+            else:
+                await self.pool.cap_model(account, model,
+                                          self.cfg.pool.blocked_model_cooldown_seconds,
+                                          reason='UNUSUAL_ACTIVITY', message=message,
+                                          expected_credentials=expected_credentials)
         elif code in ('11113', '1005') or status == 402:
             # 1005 is the SAME "exceed quota limit" rejection under an HTTP
             # 502 (captured live 2026-10-21: 10x/10min on a plan-less

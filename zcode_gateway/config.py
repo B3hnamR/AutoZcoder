@@ -173,15 +173,22 @@ class ServerConfig(BaseModel):
                    for k in self.client_keys)
 
 
+CURRENT_ZCODE_CLIENT_VERSION = "3.18.2"
+CURRENT_ZCODE_USER_AGENT = (
+    f"ZCode/{CURRENT_ZCODE_CLIENT_VERSION} "
+    "ai-sdk/provider-utils/4.0.27 runtime/node.js/24"
+)
+
+
 class Fingerprint(BaseModel):
     user_agent: str = (
-        "ZCode/3.18.0 ai-sdk/provider-utils/4.0.27 runtime/node.js/24"
+        CURRENT_ZCODE_USER_AGENT
     )
     # The billing preview gift list (and the plan shown on /billing/balance)
     # is version-gated: 3.14.3..3.16.0 answer [], 3.16.1+ name the plan. A
     # 3.14.x fingerprint therefore reads as "this account has no plan" even
-    # when the Start Plan is active. 3.18.0 is the build this repo tracks.
-    client_version: str = "3.18.0"
+    # when the Start Plan is active. 3.18.2 is the build this repo tracks.
+    client_version: str = CURRENT_ZCODE_CLIENT_VERSION
     core_version: str = "0.0.83"
     platform: str = "win32-x64"
     device_mid: str = Field(default_factory=default_device_mid)
@@ -440,6 +447,27 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return out
 
 
+def _upgrade_shipped_fingerprint(data: dict[str, Any]) -> None:
+    """Upgrade only the old fingerprint that AutoZCoder itself shipped.
+
+    Existing config files contain a fully materialized fingerprint, so merely
+    changing ``Fingerprint`` defaults leaves upgraded installations pinned to
+    a client version the upstream no longer accepts (405/code 3012).  Custom
+    fingerprints are deliberately left alone.
+    """
+    upstream = data.get("upstream")
+    if not isinstance(upstream, dict):
+        return
+    fingerprint = upstream.get("fingerprint")
+    if not isinstance(fingerprint, dict):
+        return
+    if (fingerprint.get("client_version") == "3.18.0" and
+            fingerprint.get("user_agent") ==
+            "ZCode/3.18.0 ai-sdk/provider-utils/4.0.27 runtime/node.js/24"):
+        fingerprint["client_version"] = CURRENT_ZCODE_CLIENT_VERSION
+        fingerprint["user_agent"] = CURRENT_ZCODE_USER_AGENT
+
+
 def load_config(path: str | os.PathLike | None = None) -> Config:
     """Load config.yaml (if present) merged over defaults, then env overrides."""
     data: dict[str, Any] = {}
@@ -460,6 +488,7 @@ def load_config(path: str | os.PathLike | None = None) -> Config:
             with open(c, encoding="utf-8") as fh:
                 loaded = yaml.safe_load(fh) or {}
             data = _deep_merge(data, loaded)
+            _upgrade_shipped_fingerprint(data)
             config_file = Path(c).resolve()
             base = config_file.parent
             break

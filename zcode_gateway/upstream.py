@@ -25,26 +25,26 @@ log = logging.getLogger("zcode_gateway.upstream")
 # headers
 # --------------------------------------------------------------------------- #
 
-# The 16 static headers observed on every captured call. `authorization` and
-# `x-task-id` are filled per request; `host` and `content-length` are set by httpx.
-STATIC_HEADERS = {"accept": "*/*", "content-type": "application/json",
+# Static headers emitted by the current official client's undici transport.
+# `authorization`, request IDs, `host`, and `content-length` are filled later.
+STATIC_HEADERS = {"accept": "*/*", "accept-language": "*",
+                  "content-type": "application/json",
                   "http-referer": "https://zcode.z.ai",
-                  "anthropic-version": "2023-06-01",
-                  "anthropic-beta": "mid-conversation-system-2026-04-07"}
+                  "sec-fetch-mode": "cors",
+                  "anthropic-version": "2023-06-01"}
 REQUIRED_HEADER_NAMES = set(STATIC_HEADERS) | {"authorization", "x-api-key", "x-device-mid",
-    "user-agent", "x-zcode-app-version", "x-zcode-agent"}
+    "user-agent", "x-zcode-app-version", "x-zcode-agent", "x-zcode-query-source"}
 VARIANTS = ("anthropic",)
 
 def new_task_id():
     return str(uuid.uuid4())
 
 def merge_anthropic_beta(base: str, extra: str | None) -> str:
-    """Comma-merge the captured static beta with a client-supplied one.
+    """Comma-merge the default beta set with a client-supplied one.
 
     A client sending its own `anthropic-beta` used to be silently overridden
-    by the static captured value; when Z.ai rotates the beta, clients that
-    already know the new one had no way to pass it through. Order-stable,
-    dedupes, keeps our captured beta first.
+    by a static captured value; current requests send no beta until a feature
+    needs one. Order-stable and deduplicated.
     """
     parts = [p.strip() for p in (base or '').split(',') if p.strip()]
     for p in (extra or '').split(','):
@@ -67,6 +67,7 @@ def build_headers(access_token, fp, task_id=None, *, device_mid=None, include_de
         "x-os-category": fp.os_category, "x-os-version": fp.os_version,
         "x-platform": fp.platform, "x-release-channel": "production",
         "x-title": "Z Code@electron", "x-zcode-agent": "glm",
+        "x-zcode-query-source": "main_turn",
         "x-zcode-app-version": fp.client_version, "x-zcode-session-type": "main",
         "x-query-id": new_task_id(), "x-request-id": new_task_id(),
         "x-zcode-trace-id": new_task_id(), "x-session-id": task_id or new_task_id()})
@@ -140,6 +141,19 @@ def is_block_code(code: str, status: int = 0) -> bool:
         return True
     c = str(code or "").upper()
     return c in BLOCKED_CODES or "3012" in c or "405" in c
+
+
+# The bootstrap system text (identity line + harness body) is fingerprinted
+# byte-for-byte upstream: one wrong space answers 405/3012 "This client is not
+# supported. Please use the official ZCode client." with the SAME outcome on
+# every account, so it is a build problem and not an account problem.
+CLIENT_NOT_SUPPORTED_MARKERS = ("official zcode client", "client is not supported")
+CLIENT_NOT_SUPPORTED_PARK_S = 120.0
+
+
+def client_not_supported(message: str | None) -> bool:
+    text = (message or "").lower()
+    return any(marker in text for marker in CLIENT_NOT_SUPPORTED_MARKERS)
 
 
 def _error_code(body: str | bytes | None) -> str:

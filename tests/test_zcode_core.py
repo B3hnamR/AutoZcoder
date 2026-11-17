@@ -61,7 +61,7 @@ def test_native_blocks_preserved():
         'thinking':{'type':'enabled'},'output_config':{'effort':'high'},'metadata':{'user_id':'opaque'}}
     body=build_body({'model':'GLM-5.3','_anthropic':native})
     assert body['messages']==native['messages']
-    assert body['system'][2:]==native['system']
+    assert body['system'][2]['text'].endswith(native['system'][0]['text'])
     assert body['metadata']==native['metadata']
     assert native['model']=='glm-5.3'
 
@@ -74,7 +74,7 @@ def test_tools_images_and_stop():
         {'role':'tool','tool_call_id':'other','content':'two'}],
         'tools':[{'type':'function','function':{'name':'read','parameters':{'type':'object'}}}],
         'tool_choice':'required','parallel_tool_calls':False,'stop':'END'})
-    assert body['system'][2]['text']=='system'
+    assert body['system'][2]['text'].endswith('\n\nsystem')
     assert body['messages'][0]['content'][0]['source']['type']=='base64'
     assert body['messages'][1]['content'][0]['input']=={'path':'a'}
     assert len(body['messages'][2]['content'])==2
@@ -85,11 +85,14 @@ def test_zcode_headers():
     headers=build_headers('Bearer fake-token',Fingerprint(device_mid='test-device'))
     assert headers['authorization']=='Bearer fake-token'
     assert headers['x-api-key']=='fake-token'
-    assert headers['anthropic-beta']=='mid-conversation-system-2026-04-07'
+    assert 'anthropic-beta' not in headers
     assert headers['x-device-mid']=='test-device'
     assert headers['http-referer']=='https://zcode.z.ai'
+    assert headers['accept-language']=='*'
+    assert headers['sec-fetch-mode']=='cors'
     assert 'x-device-mid' not in build_headers('fake-token',Fingerprint(device_mid='test-device'),include_device_mid=False)
-    assert headers['x-zcode-app-version']=='3.18.0'
+    assert headers['x-zcode-app-version']=='3.18.2'
+    assert headers['x-zcode-query-source']=='main_turn'
     assert 'x-core-version' not in headers
 
 def test_multiline_sse():

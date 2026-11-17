@@ -267,12 +267,21 @@ def _deleted_captcha_service_stub():
     return None
 
 
-ZCODE_IDENTITY = 'You are ZCode, an interactive coding agent'
-ZCODE_HARNESS = '''You are an interactive ZCode agent that helps users with software engineering tasks.
+ZCODE_IDENTITY = 'You are ZCode, an interactive agent'
+ZCODE_HARNESS = '''
+You are an agent working with the user toward their goals, using your own judgment along the way.
+
+IMPORTANT: Assist with authorized security testing, defensive security, CTF challenges, and educational contexts. Refuse requests for destructive techniques, DoS attacks, mass targeting, supply chain compromise, or detection evasion for malicious purposes. Dual-use security tools (C2 frameworks, credential testing, exploit development) require clear authorization context: pentesting engagements, CTF competitions, security research, or defensive use cases.
 
 # Harness
-- Text you output outside of tool use is displayed to the user as Github-flavored markdown in a terminal.
-- Prefer the dedicated file/search tools over shell commands when one fits.'''
+ - Text you output outside of tool use is displayed to the user as Github-flavored markdown in a terminal.
+ - Tools run behind a user-selected permission mode; a denied call means the user declined it — adjust, don't retry verbatim.
+ - `<system-reminder>` tags in messages and tool results are injected by the harness, not the user. Hooks may intercept tool calls; treat hook output as user feedback.
+ - Prefer the dedicated file/search tools over shell commands when one fits. Independent tool calls can run in parallel in one response.
+ - Reference code as `file_path:line_number` — it's clickable.'''
+ZCODE_OUTPUT_STYLE = '''
+
+Write code that reads like the surrounding code: match its comment density, naming, and idiom.'''
 
 
 _LAST_CAPTCHA_REGION = None
@@ -327,7 +336,10 @@ def send_message_in_page(page, zcode_jwt, log=print, captcha_param=None,
         'stream': True,
         'messages': [{'role': 'user', 'content': [{'type': 'text', 'text': 'hi'}]}],
         'system': [{'type': 'text', 'text': ZCODE_IDENTITY},
-                   {'type': 'text', 'text': ZCODE_HARNESS}],
+                   {'type': 'text', 'text': ZCODE_HARNESS,
+                    'cache_control': {'type': 'ephemeral'}},
+                   {'type': 'text', 'text': ZCODE_OUTPUT_STYLE,
+                    'cache_control': {'type': 'ephemeral'}}],
         'thinking': {'type': 'enabled'},
         'output_config': {'effort': 'low'},
         'metadata': {'user_id': _json.dumps(
@@ -342,6 +354,7 @@ def send_message_in_page(page, zcode_jwt, log=print, captcha_param=None,
                    'authorization': 'Bearer ' + a.jwt,
                    'x-api-key': a.jwt,
                    'x-zcode-agent': 'glm',
+                   'x-zcode-query-source': 'main_turn',
                    'x-zcode-app-version': APP_VERSION,
                    'x-zcode-session-type': 'main',
                    'x-client-language': 'en-US',
@@ -394,7 +407,7 @@ _SEND_PAGE = [None]     # live claim page for in-page captcha retries
 def send_one_message(zcode_jwt, log=print, retries=2):
     """Complete the send_message task via the ZCode client chat API.
 
-    Uses the exact wire contract from the gateway (GLM-5.3-Flash, anthropic-beta,
+    Uses the exact wire contract from the gateway (GLM-5.3-Flash,
     electron headers, stream=True) which passes upstream risk control with 200."""
     import requests
     gateway_url = os.environ.get("ZAI_GATEWAY_URL") or "http://127.0.0.1:8788"
@@ -431,14 +444,17 @@ def send_one_message(zcode_jwt, log=print, retries=2):
         from plan_check import build_headers
         h = build_headers(zcode_jwt)
         h.pop('x-device-mid', None)
-        h['anthropic-beta'] = 'mid-conversation-system-2026-04-07'
+        h['x-zcode-query-source'] = 'main_turn'
         body = {
             'model': 'GLM-5.3-Flash',
             'max_tokens': 10,
             'stream': True,
             'messages': [{'role': 'user', 'content': [{'type': 'text', 'text': 'hi'}]}],
             'system': [{'type': 'text', 'text': ZCODE_IDENTITY},
-                       {'type': 'text', 'text': ZCODE_HARNESS}],
+                       {'type': 'text', 'text': ZCODE_HARNESS,
+                        'cache_control': {'type': 'ephemeral'}},
+                       {'type': 'text', 'text': ZCODE_OUTPUT_STYLE,
+                        'cache_control': {'type': 'ephemeral'}}],
             'thinking': {'type': 'enabled'},
             'output_config': {'effort': 'max'},
         }

@@ -3,6 +3,30 @@
 Observed 2026-10-15 against the coding-plan Messages endpoint. A per-account,
 per-model abuse rejection that is distinct from the earlier bootstrap 3012.
 
+## Two variants, same code
+
+Since 2026-11-17 the bootstrap gate is back and is **global**, not per-model:
+the system text is fingerprinted byte-for-byte and a mismatch answers
+
+```json
+{"error": {"message": "This client is not supported. Please use the official ZCode client.",
+           "type": "api_error", "param": null, "code": "3012"}}
+```
+
+Measured on 16 healthy accounts: both GLM-5.3 and GLM-5.3-Flash 3012 on the
+stale text and 200 on the current one. Removing one leading space from a
+harness bullet is enough to fail; the client version, `anthropic-beta`,
+`cache_control` markers and `x-zcode-query-source` are not part of the match.
+
+The gateway tells them apart: `CLIENT_NOT_SUPPORTED` parks the model 120 s
+(a build problem fails on every account, so a 900 s park per account only
+spreads one outage over 15 misleading minutes) and keeps the upstream message,
+`UNUSUAL_ACTIVITY` keeps the full 900 s per-model park below.
+
+`zcode_bootstrap.py` must stay byte-identical to the strings in the installed
+client bundle (`resources/glm/zcode.cjs`: `hBa`/`gBa`, `cBo`, `kDn`, `k3a`).
+Re-copy them whenever the client ships a new harness.
+
 ## Wire shape
 
 ```json
