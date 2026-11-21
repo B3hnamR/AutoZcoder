@@ -22,8 +22,12 @@ upstream:
 pool:
   strategy: drain_first
   cooldown_seconds: 30
-  max_in_flight_per_account: 4
-  acquire_wait_seconds: 5
+  # ZCode admits one concurrent request per account for GLM-5.3 (3008/3009
+  # above it). Keep this at 1 and let acquire_wait_seconds queue the rest.
+  max_in_flight_per_account: 1
+  acquire_wait_seconds: 120
+  concurrency_hold_seconds: 10
+  concurrency_hold_max_seconds: 60
   balance_poll_seconds: 60
   blocked_model_cooldown_seconds: 900
 accounts:

@@ -31,6 +31,7 @@ def cfg(tmp_path):
     config.logging.capture=False
     config.pool.balance_poll_seconds=0
     config.pool.acquire_wait_seconds=0
+    config.pool.concurrency_hold_seconds=0
     config.server.admin_key='test-admin'
     config.server.client_keys=[ClientKey(key='test-client')]
     return config
@@ -331,6 +332,7 @@ def test_quota_aware_uses_requested_model(cfg):
 
 def test_drain_first_reuses_one_account_until_it_is_capped(cfg):
     cfg.pool.strategy='drain_first'
+    cfg.pool.max_in_flight_per_account=4
     one=Account(id='one',access_token='a',notes={'quotas':{'GLM-5.3':{'remaining':5}}})
     two=Account(id='two',access_token='b',notes={'quotas':{'GLM-5.3':{'remaining':100}}})
     router=Router(cfg.pool)
@@ -589,6 +591,79 @@ async def test_persistent_concurrency_is_bounded_429_without_parking(service, mo
     assert account.state is AccountState.READY and account.in_flight==0
     assert not account.model_caps
     assert all(r.closed for r in service.client.responses)
+
+
+@pytest.mark.asyncio
+async def test_concurrency_refusals_do_not_kill_burst_of_sessions(cfg):
+    cfg.pool.concurrency_hold_seconds=30
+    cfg.pool.acquire_wait_seconds=2
+    cfg.upstream.concurrency_base_delay_seconds=0
+    cfg.upstream.max_attempts=3
+    accounts=[Account(id=f'a{i}',access_token=f't{i}') for i in range(5)]
+    pool=PoolManager(cfg.pool,accounts)
+    store=Store(cfg.store.sqlite_path)
+    class FakeTokens:
+        async def refresh(self, account, force=False, *, expected_credentials=None): return False
+    svc=ChatService(cfg,pool,FakeTokens(),FakeClient(),Registry(),store,JsonlCapture(cfg.logging.capture_dir,False))
+    class AccountAwareClient:
+        def __init__(self): self.calls=[]
+        async def send(self, headers, body, stream):
+            token=headers['authorization'].rsplit(' ',1)[-1]
+            self.calls.append(token)
+            if token in ('t0','t1','t2'): return concurrency_response(3008)
+            return FakeResponse(sample_sse())
+    try:
+        svc.client=AccountAwareClient()
+        results=await asyncio.gather(*(
+            svc.complete({'messages':[{'role':'user','content':'hi'}]}, model='GLM-5.3')
+            for _ in range(6)))
+        assert [r.status for r in results]==[200]*6
+        assert all(a.in_flight==0 for a in accounts)
+        assert all(a.state is AccountState.READY for a in accounts)
+        assert all(a.concurrency_strikes>=1 and a.is_concurrency_held() for a in accounts[:3])
+        assert all(a.concurrency_strikes==0 and not a.is_concurrency_held() for a in accounts[3:])
+        assert not any(a.model_caps for a in accounts)
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_concurrency_refusal_benches_account_and_routes_elsewhere(cfg):
+    cfg.pool.concurrency_hold_seconds=30
+    one=Account(id='one',access_token='t-one')
+    two=Account(id='two',access_token='t-two')
+    pool=PoolManager(cfg.pool,[one,two])
+    store=Store(cfg.store.sqlite_path)
+    class FakeTokens:
+        async def refresh(self, account, force=False, *, expected_credentials=None): return False
+    svc=ChatService(cfg,pool,FakeTokens(),FakeClient(),Registry(),store,JsonlCapture(cfg.logging.capture_dir,False))
+    try:
+        svc.client=FakeClient(responses=[concurrency_response(3008),FakeResponse(sample_sse())])
+        result=await svc.complete({'messages':[{'role':'user','content':'hi'}]}, model='GLM-5.3')
+        assert result.status==200 and len(svc.client.calls)==2
+        assert [call[0]['authorization'] for call in svc.client.calls]==['Bearer t-one','Bearer t-two']
+        assert one.state is AccountState.READY and one.in_flight==0
+        assert one.concurrency_strikes==1 and one.is_concurrency_held()
+        assert two.concurrency_strikes==0 and not two.is_concurrency_held()
+        assert two.in_flight==0 and not one.model_caps and not one.error_history
+        assert all(r.closed for r in svc.client.responses)
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_midstream_concurrency_error_benches_account(service):
+    events=sample_events()
+    events.insert(1, {'type':'error','error':{'code':3008,'message':'user concurrency limit exceeded'}})
+    service.cfg.pool.concurrency_hold_seconds=30
+    service.client=FakeClient(b''.join(frame(e) for e in events))
+    with pytest.raises(UpstreamFailure) as err:
+        await service.complete({'messages':[{'role':'user','content':'hi'}]}, model='GLM-5.3')
+    assert err.value.status==429 and err.value.code=='3008'
+    account=(await service.pool.all())[0]
+    assert account.state is AccountState.READY and account.in_flight==0
+    assert account.concurrency_strikes==1 and account.is_concurrency_held()
+    assert not account.model_caps
 
 
 @pytest.mark.asyncio

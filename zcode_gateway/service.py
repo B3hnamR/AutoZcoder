@@ -181,10 +181,16 @@ class ChatService:
     async def _apply_error(self, account, model, status, code, message, headers=None, *, expected_credentials=None):
         if expected_credentials is not None and account.credential_key() != expected_credentials:
             return
-        if is_model_overload(status, code) or is_concurrency_code(code):
-            # A busy model or a concurrency cap is not evidence of a bad
-            # account or spent quota. Keep this account available for other
-            # models and the retry loop.
+        if is_concurrency_code(code):
+            # Upstream still counts a slot as busy for this account: bench it
+            # briefly so the retry rotates instead of immediately re-hitting
+            # the same saturated slot. No error history, no cooling/parking.
+            await self.pool.on_concurrency_refusal(
+                account, expected_credentials=expected_credentials)
+            return
+        if is_model_overload(status, code):
+            # A busy model is not evidence of a bad account or spent quota.
+            # Keep this account available for other models and the retry loop.
             return
         # autopsy trail: keep the last errors for the dashboard "why" view
         try:

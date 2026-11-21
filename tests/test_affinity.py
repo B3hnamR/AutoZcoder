@@ -82,6 +82,22 @@ async def test_acquire_binds_on_first_pick_then_sticks():
 
 
 @pytest.mark.asyncio
+async def test_affinity_skips_concurrency_held_account():
+    pool = PoolManager(PoolConfig(strategy="round_robin", conversation_affinity_seconds=600,
+                                  max_in_flight_per_account=1, concurrency_hold_seconds=30),
+                       [Account(id="a1", access_token="t1"),
+                        Account(id="a2", access_token="t2")])
+    key = affinity_key_from_payload({"session_id": "conv-held"})
+    pool._affinity.bind(key, "a1")
+    held = pool._accounts["a1"]
+    await pool.on_concurrency_refusal(held)
+
+    picked = await pool.acquire(affinity_key=key)
+    assert picked is not None and picked.id == "a2"
+    await pool.release(picked)
+
+
+@pytest.mark.asyncio
 async def test_stale_binding_falls_back_to_a_candidate():
     pool = PoolManager(PoolConfig(strategy="round_robin", conversation_affinity_seconds=600),
                        [Account(id="a1", access_token="t1")])

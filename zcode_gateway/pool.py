@@ -70,6 +70,13 @@ class Account:
     # dashboard "why did this account die" view and the health sparkline
     error_history: deque = field(default_factory=lambda: deque(maxlen=50))
 
+    # Upstream concurrency refusals (3008/3009/3010). This is not a cooldown:
+    # state stays READY and no quota/model park is applied, but pick() skips the
+    # account until the hold expires so retries stop hammering a slot upstream
+    # still counts as busy. Doubles per consecutive refusal, cleared by success.
+    concurrency_hold_until: float = 0.0
+    concurrency_strikes: int = 0
+
     # Credit exhaustion is per model-class, not per account: a paid model can 402
     # (insufficient_credits) while zcode-free/* models keep working on the same
     # account, because free models do not consume Zcode Credits.
@@ -118,6 +125,9 @@ class Account:
         now = now or time.time()
         until = self.model_caps.get(model)
         return bool(until and until > now)
+
+    def is_concurrency_held(self, now: float | None = None) -> bool:
+        return self.concurrency_hold_until > (time.time() if now is None else now)
 
     @property
     def is_free_tier(self) -> bool:
@@ -180,16 +190,22 @@ class Account:
 
     def to_public(self) -> dict:
         tok = self.access_token or ""
+        now = time.time()
         return {
             "id": self.id,
             "email": self.email,
             "state": self.state.value,
+            "death_reason": self.death_reason,
+            "cooldown_in_s": int(max(self.cooldown_until - now, 0)),
             "paid_exhausted": self.paid_exhausted,
             "expires_at": self.expires_at,
             "expires_in_s": round(self.expires_in(), 1),
             "needs_refresh": self.needs_refresh(600),
             "in_flight": self.in_flight,
             "error_count": self.error_count,
+            "concurrency_strikes": self.concurrency_strikes,
+            "concurrency_hold_until": self.concurrency_hold_until,
+            "concurrency_hold_in_s": int(max(self.concurrency_hold_until - now, 0)),
             "balance_micro": self.balance_micro,
             "balance_checked_at": self.balance_checked_at,
             "quota_check_attempted_at": self.notes.get("quota_check_attempted_at"),
@@ -320,7 +336,8 @@ class Router:
                 and not (a.state is AccountState.COOLING and now < a.cooldown_until)
                 and a.access_token]
         if self.cfg.strategy == "quota_aware" and model and pool:
-            available = [a for a in pool if a.in_flight < self.cfg.max_in_flight_per_account]
+            available = [a for a in pool if a.in_flight < self.cfg.max_in_flight_per_account
+                         and not a.is_concurrency_held(now)]
             # Keep saturated candidates only when there is no free slot, so
             # acquire() can still distinguish saturation from ineligibility.
             if available:
@@ -354,7 +371,12 @@ class Router:
         if not accounts:
             return None
         cap = self.cfg.max_in_flight_per_account
-        under_cap = [a for a in accounts if a.in_flight < cap]
+        now = time.time()
+        # Held accounts stay in candidates() so acquire() knows the pool is
+        # saturated (and waits) rather than absent — but they are not pickable
+        # until the hold expires.
+        under_cap = [a for a in accounts
+                     if a.in_flight < cap and not a.is_concurrency_held(now)]
         if not under_cap:
             # The configured cap must be a cap, not a preference: when every
             # candidate is saturated, report no candidate. The manager waits
@@ -810,8 +832,36 @@ class PoolManager:
             account.error_count = 0
             account.last_error = ""
             account.auth_strikes = 0
+            account.concurrency_strikes = 0
+            account.concurrency_hold_until = 0.0
             if account.state is AccountState.COOLING:
                 account.state = AccountState.READY
+
+    async def on_concurrency_refusal(self, account: Account, *,
+                                     expected_credentials: tuple | None = None) -> None:
+        """Bench an account briefly after upstream refuses for concurrency.
+
+        The refusal means a slot upstream still counts as busy, not that the
+        account is bad, so state stays READY and nothing is cooled or parked.
+        Holding the account out of pick() makes the retry go to another account
+        (or queue) instead of immediately hitting the same saturated slot.
+        Repeated refusals double the hold; a successful stream clears it.
+        """
+        async with self._lock:
+            if expected_credentials is not None and (self._accounts.get(account.id) is not account
+                    or account.credential_key() != expected_credentials):
+                return
+            account.concurrency_strikes += 1
+            base = self.cfg.concurrency_hold_seconds
+            if base <= 0:
+                return
+            cap = max(base, self.cfg.concurrency_hold_max_seconds)
+            exponent = min(account.concurrency_strikes - 1, 16)
+            hold = min(cap, base * (2 ** exponent))
+            account.concurrency_hold_until = max(account.concurrency_hold_until,
+                                                 time.time() + hold)
+            log.info('concurrency refusal on %s; holding %.1fs (strike %s)',
+                     account.id, hold, account.concurrency_strikes)
 
     async def restore(self, account: Account, *, plan_recovered: bool = False,
                       expected_credentials: tuple | None = None) -> bool:
@@ -1024,7 +1074,8 @@ class PoolManager:
             return None
         cap = self.cfg.max_in_flight_per_account
         for account in candidates:
-            if account.id == bound and (cap <= 0 or account.in_flight < cap):
+            if (account.id == bound and (cap <= 0 or account.in_flight < cap)
+                    and not account.is_concurrency_held()):
                 return account
         return None
 
