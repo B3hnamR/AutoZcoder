@@ -21,7 +21,7 @@ from .zcode_protocol import MessageAccumulator, OpenAITranslator, usage_openai
 from .upstream import (build_headers, build_upstream_body, iter_sse_events, sse_frame,
                        parse_upstream_error, anthropic_error, openai_error, TransportError,
                        is_block_code, is_concurrency_code, client_not_supported,
-                       CLIENT_NOT_SUPPORTED_PARK_S)
+                       is_account_suspended, CLIENT_NOT_SUPPORTED_PARK_S)
 from .registry import model_caps
 
 log = logging.getLogger('zcode_gateway.service')
@@ -213,6 +213,14 @@ class ChatService:
             # not match. Every account then fails identically, so a 900s park
             # per account only spreads a pool-wide outage over 15 minutes of
             # misleading state. Park briefly and name the real cause instead.
+            if is_account_suspended(message):
+                # The account itself is banned upstream for proxying: no model
+                # on it can serve, and retrying only produces a 405 per request.
+                # Take it out of rotation until an operator re-enables it.
+                await self.pool.kill(account, reason=str(message)[:200],
+                                     cause='suspended',
+                                     expected_credentials=expected_credentials)
+                return
             if client_not_supported(message):
                 await self.pool.cap_model(account, model,
                                           CLIENT_NOT_SUPPORTED_PARK_S,

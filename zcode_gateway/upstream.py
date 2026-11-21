@@ -169,6 +169,19 @@ def client_not_supported(message: str | None) -> bool:
     return any(marker in text for marker in CLIENT_NOT_SUPPORTED_MARKERS)
 
 
+# Account-level suspension ("Your account has been suspended for misusing the
+# Start Plan, such as proxying it to non-ZCode clients"). Unlike an "unusual
+# activity" block, this is not scoped to one model and does not lift on its
+# own: every request on the account fails until support restores it, so the
+# account must leave the pool instead of being retried.
+SUSPENSION_MARKERS = ("has been suspended", "account suspended")
+
+
+def is_account_suspended(message: str | None) -> bool:
+    text = (message or "").lower()
+    return any(marker in text for marker in SUSPENSION_MARKERS)
+
+
 def _error_code(body: str | bytes | None) -> str:
     """Best-effort extraction of error.code from a JSON error body."""
     text = body.decode("utf-8", "replace") if isinstance(body, bytes) else (body or "")

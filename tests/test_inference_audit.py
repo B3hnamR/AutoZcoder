@@ -507,3 +507,19 @@ async def test_genuine_unusual_activity_still_parks_for_the_full_window():
     await service._apply_error(account, MODEL, 405, "3012",
                                "request has been blocked due to unusual activity.")
     assert account.model_cap_info[MODEL]["code"] == "UNUSUAL_ACTIVITY"
+
+
+@pytest.mark.asyncio
+async def test_suspended_account_leaves_rotation_instead_of_parking_one_model():
+    """The suspension message is account-wide and permanent. Parking only the
+    requested model kept a banned account in rotation for the next request."""
+    service, _ = service_for([])
+    account = await service.pool.find("one")
+    await service._apply_error(
+        account, MODEL, 405, "3012",
+        "Your account has been suspended for misusing the Start Plan, "
+        "such as proxying it to non-ZCode clients.")
+    assert account.state is AccountState.DEAD
+    assert account.death_reason == "suspended"
+    assert MODEL not in account.model_caps
+    assert await service.pool.acquire() is None
