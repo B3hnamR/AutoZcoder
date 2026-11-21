@@ -144,6 +144,18 @@ def is_block_code(code: str, status: int = 0) -> bool:
     return c in BLOCKED_CODES or "3012" in c or "405" in c
 
 
+# Capacity codes, not quota codes: the request is valid and the account is
+# healthy — the upstream just refuses more parallel work right now.
+#   3008 = user-level concurrency (all models on this account share the limit)
+#   3009 = model-level concurrency
+#   3010 = concurrency family (upstream busy)
+CONCURRENCY_CODES = frozenset({"3008", "3009", "3010"})
+
+
+def is_concurrency_code(code) -> bool:
+    return str(code or "").strip() in CONCURRENCY_CODES
+
+
 # The bootstrap system text (identity line + harness body) is fingerprinted
 # byte-for-byte upstream: one wrong space answers 405/3012 "This client is not
 # supported. Please use the official ZCode client." with the SAME outcome on
@@ -195,6 +207,8 @@ def classify(status: int, body: str | bytes | None = None) -> ErrorKind:
     info = parse_upstream_error(status, body)
     if info["code"] == "11113":
         return ErrorKind.INSUFFICIENT_CREDITS
+    if is_concurrency_code(info["code"]):
+        return ErrorKind.RATE_LIMITED
     if status == 200:
         return ErrorKind.OK
     if status == 401:

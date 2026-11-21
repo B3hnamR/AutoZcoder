@@ -16,6 +16,9 @@ upstream:
   overload_max_attempts: 11
   overload_base_delay_seconds: 2
   overload_max_delay_seconds: 60
+  concurrency_max_attempts: 5
+  concurrency_base_delay_seconds: 1
+  concurrency_max_delay_seconds: 10
 pool:
   strategy: drain_first
   cooldown_seconds: 30

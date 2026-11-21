@@ -2,6 +2,7 @@ import asyncio
 import json
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -452,6 +453,13 @@ async def test_overload_waits_and_reuses_single_account_without_blocking_flash(s
 async def test_overload_rotates_accounts_after_wait_without_cooling(service, monkeypatch):
     service.cfg.pool.strategy = 'least_in_flight'
     await service.pool.upsert(Account(id='two', access_token='token-two'))
+    # least_in_flight breaks ties on last_used. Back-to-back mocked retries can
+    # land in the same Windows clock tick, which made the expected alternation
+    # a coin flip; give the pool its own strictly increasing clock.
+    ticks = iter(range(1000, 100000))
+    monkeypatch.setattr('zcode_gateway.pool.time',
+                        SimpleNamespace(time=lambda: next(ticks),
+                                        monotonic=lambda: next(ticks)))
     waits = []
     async def wait(delay, disconnected=None): waits.append(delay)
     monkeypatch.setattr('zcode_gateway.service.wait_for_retry', wait)
@@ -525,6 +533,89 @@ async def test_cancel_during_overload_backoff_releases_reservation(service, monk
     assert all(a.in_flight == 0 and a.state is AccountState.READY for a in await service.pool.all())
 
 
+def concurrency_response(code=3008, status=429):
+    return FakeResponse(json.dumps({'error':{'code':str(code),'message':'user concurrency limit exceeded'}}).encode(), status)
+
+
+def concurrency_envelope(code=3008):
+    response=FakeResponse(json.dumps({'code':str(code),'msg':'user concurrency limit exceeded'}).encode(),200)
+    response.headers['content-type']='application/json'
+    return response
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('code', [3008, 3009, 3010])
+async def test_concurrency_codes_retry_without_parking_or_cooling(service, monkeypatch, code):
+    waits=[]
+    async def wait(delay, disconnected=None):
+        waits.append(delay)
+        account=(await service.pool.all())[0]
+        assert account.in_flight==0 and service.client.responses[-1].closed
+    monkeypatch.setattr('zcode_gateway.service.wait_for_retry', wait)
+    service.client=FakeClient(responses=[concurrency_response(code),FakeResponse(sample_sse())])
+    result=await service.complete({'messages':[{'role':'user','content':'hi'}]}, model='GLM-5.3')
+    assert result.status==200 and len(service.client.calls)==2 and len(waits)==1
+    account=(await service.pool.all())[0]
+    assert account.state is AccountState.READY and account.in_flight==0
+    assert not account.model_caps and not account.error_history
+    assert all(r.closed for r in service.client.responses)
+
+
+@pytest.mark.asyncio
+async def test_http200_concurrency_envelope_retries_as_429(service, monkeypatch):
+    waits=[]
+    async def wait(delay, disconnected=None): waits.append(delay)
+    monkeypatch.setattr('zcode_gateway.service.wait_for_retry', wait)
+    service.client=FakeClient(responses=[concurrency_envelope(3008),FakeResponse(sample_sse())])
+    result=await service.complete({'messages':[{'role':'user','content':'hi'}]}, model='GLM-5.3')
+    assert result.status==200 and len(service.client.calls)==2 and len(waits)==1
+    account=(await service.pool.all())[0]
+    assert account.state is AccountState.READY and account.in_flight==0
+    assert not account.model_caps and not account.error_history
+
+
+@pytest.mark.asyncio
+async def test_persistent_concurrency_is_bounded_429_without_parking(service, monkeypatch):
+    monkeypatch.setattr(service.cfg.upstream, 'concurrency_max_attempts', 3)
+    waits=[]
+    async def wait(delay, disconnected=None): waits.append(delay)
+    monkeypatch.setattr('zcode_gateway.service.wait_for_retry', wait)
+    service.client=FakeClient(responses=[concurrency_response() for _ in range(3)])
+    with pytest.raises(UpstreamFailure) as err:
+        await service.open_stream({'messages':[{'role':'user','content':'hi'}]}, model='GLM-5.3')
+    assert err.value.status==429 and err.value.code=='3008'
+    assert len(service.client.calls)==3 and len(waits)==2
+    account=(await service.pool.all())[0]
+    assert account.state is AccountState.READY and account.in_flight==0
+    assert not account.model_caps
+    assert all(r.closed for r in service.client.responses)
+
+
+@pytest.mark.asyncio
+async def test_midstream_concurrency_error_is_429_without_cooling(service):
+    events=sample_events()
+    events.insert(1, {'type':'error','error':{'code':3008,'message':'user concurrency limit exceeded'}})
+    service.client=FakeClient(b''.join(frame(e) for e in events))
+    with pytest.raises(UpstreamFailure) as err:
+        await service.complete({'messages':[{'role':'user','content':'hi'}]}, model='GLM-5.3')
+    assert err.value.status==429 and err.value.code=='3008'
+    account=(await service.pool.all())[0]
+    assert account.state is AccountState.READY and account.in_flight==0
+    assert not account.model_caps
+
+
+@pytest.mark.asyncio
+async def test_stream_concurrency_error_does_not_park_model(service):
+    events=sample_events()
+    events.insert(1, {'type':'error','error':{'code':3009,'message':'model concurrency limit exceeded'}})
+    service.client=FakeClient(b''.join(frame(e) for e in events))
+    handle=await service.open_stream({'messages':[{'role':'user','content':'hi'}]}, model='GLM-5.3')
+    out=b''.join([part async for part in service.stream_from(handle, model='GLM-5.3')])
+    assert b'model concurrency limit exceeded' in out and len(service.client.calls)==1
+    assert handle.account.state is AccountState.READY and handle.account.in_flight==0
+    assert not handle.account.model_caps
+
+
 @pytest.mark.parametrize('path', ['/v1/chat/completions', '/v1/messages'])
 @pytest.mark.parametrize('stream', [False, True])
 def test_api_retries_busy_model_in_both_dialects(cfg, path, stream):
@@ -538,3 +629,34 @@ def test_api_retries_busy_model_in_both_dialects(cfg, path, stream):
         assert response.status_code == 200
         assert len(state.service.client.calls) == 2
         assert state.pool._accounts['one'].in_flight == 0
+
+
+@pytest.mark.parametrize('path', ['/v1/chat/completions', '/v1/messages'])
+@pytest.mark.parametrize('stream', [False, True])
+def test_api_retries_concurrency_in_both_dialects(cfg, path, stream):
+    cfg.upstream.concurrency_base_delay_seconds = 0
+    with TestClient(create_app(cfg)) as client:
+        state = client.app.state.app_state
+        state.pool._accounts['one'] = Account(id='one', access_token='fake')
+        state.service.client = FakeClient(responses=[concurrency_response(), FakeResponse(sample_sse())])
+        response = client.post(path, headers={'Authorization':'Bearer test-client'},
+            json={'model':'GLM-5.3','messages':[{'role':'user','content':'hi'}],'stream':stream})
+        assert response.status_code == 200
+        assert len(state.service.client.calls) == 2
+        account = state.pool._accounts['one']
+        assert account.in_flight == 0 and not account.model_caps
+
+
+def test_api_surfaces_concurrency_as_429(cfg):
+    cfg.upstream.concurrency_max_attempts = 2
+    cfg.upstream.concurrency_base_delay_seconds = 0
+    with TestClient(create_app(cfg)) as client:
+        state = client.app.state.app_state
+        state.pool._accounts['one'] = Account(id='one', access_token='fake')
+        state.service.client = FakeClient(responses=[concurrency_response(), concurrency_response()])
+        response = client.post('/v1/chat/completions', headers={'Authorization':'Bearer test-client'},
+            json={'model':'GLM-5.3','messages':[{'role':'user','content':'hi'}],'stream':False})
+        assert response.status_code == 429
+        assert response.json()['error']['code'] == '3008'
+        account = state.pool._accounts['one']
+        assert account.in_flight == 0 and not account.model_caps
