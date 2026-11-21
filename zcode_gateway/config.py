@@ -214,6 +214,12 @@ class UpstreamConfig(BaseModel):
     overload_max_attempts: int = Field(default=11, ge=1, le=30)
     overload_base_delay_seconds: float = Field(default=2, ge=0, le=60, allow_inf_nan=False)
     overload_max_delay_seconds: float = Field(default=60, ge=0, le=60, allow_inf_nan=False)
+    # 3008 (user concurrency) / 3009 (model concurrency) / 3010 (busy) are
+    # capacity rejections, not quota: retry briefly without parking the
+    # account or model. The wait stays short because a slot frees quickly.
+    concurrency_max_attempts: int = Field(default=5, ge=1, le=30)
+    concurrency_base_delay_seconds: float = Field(default=1, ge=0, le=60, allow_inf_nan=False)
+    concurrency_max_delay_seconds: float = Field(default=10, ge=0, le=60, allow_inf_nan=False)
     # Whether the anthropic body variant carries `cache_control`. The capture
     # always included it; flip to false to test whether it is optional.
     anthropic_cache_control: bool = True
@@ -235,11 +241,20 @@ class PoolConfig(BaseModel):
     min_balance_micro: int = 0
     refresh_lead_seconds: int = Field(default=600, ge=0)
     cooldown_seconds: int = Field(default=30, ge=0)
+    # Measured ZCode limit: one concurrent request per account for GLM-5.3
+    # (3008/3009 above it). Queueing beats over-admitting and getting 429s.
     # 0 would make every account permanently busy — all requests 503 forever
-    max_in_flight_per_account: int = Field(default=4, ge=1)
+    max_in_flight_per_account: int = Field(default=1, ge=1)
     # how long acquire() waits for an in-flight slot when every eligible
-    # account is at max_in_flight_per_account (0 = fail immediately)
-    acquire_wait_seconds: float = Field(default=5.0, ge=0)
+    # account is at max_in_flight_per_account or briefly held (0 = fail
+    # immediately). This is the request queue: wait, do not oversubscribe.
+    acquire_wait_seconds: float = Field(default=120.0, ge=0)
+    # After a 3008/3009/3010 refusal, skip this account for this long (doubling
+    # per consecutive refusal up to the max, cleared by the next success), so
+    # retries rotate to another account or wait instead of re-hitting the same
+    # saturated slot. Not a cooldown: state stays READY.
+    concurrency_hold_seconds: float = Field(default=10.0, ge=0)
+    concurrency_hold_max_seconds: float = Field(default=60.0, ge=0)
     balance_poll_seconds: int = Field(default=300, ge=10)
     # 405/code 3012 "unusual activity": park this model on the offending
     # account for this long, then rotate. Per model, so other models on the

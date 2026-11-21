@@ -16,11 +16,12 @@ from .aggregate import aggregate_openai_stream
 from .affinity import affinity_key_from_payload
 from .pool import Account
 from .breaker import EdgeBlockBreaker
-from .model_retry import is_model_overload, overload_delay, retry_after_seconds, wait_for_retry
+from .model_retry import concurrency_delay, is_model_overload, overload_delay, retry_after_seconds, wait_for_retry
 from .zcode_protocol import MessageAccumulator, OpenAITranslator, usage_openai
 from .upstream import (build_headers, build_upstream_body, iter_sse_events, sse_frame,
                        parse_upstream_error, anthropic_error, openai_error, TransportError,
-                       is_block_code, client_not_supported, CLIENT_NOT_SUPPORTED_PARK_S)
+                       is_block_code, is_concurrency_code, client_not_supported,
+                       is_account_suspended, CLIENT_NOT_SUPPORTED_PARK_S)
 from .registry import model_caps
 
 log = logging.getLogger('zcode_gateway.service')
@@ -83,6 +84,27 @@ def _split_sse_frames(pending):
 
 def _sse_event(name, data):
     return (f'event: {name}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n').encode()
+
+
+def _normalize_error_status(status, code):
+    """Concurrency business codes are 429 capacity rejections even when the
+    HTTP envelope says 200 or a 5xx."""
+    if is_concurrency_code(code):
+        return 429
+    if status == 200:
+        return 429 if code in ('11113', '1005') else 502
+    return status
+
+
+def _stream_error_status(code):
+    """Status for an error delivered inside an SSE frame."""
+    if is_model_overload(502, code):
+        return 529
+    if is_concurrency_code(code) or code in ('11113', 'rate_limit_error'):
+        return 429
+    if is_block_code(code):
+        return 405
+    return 502
 
 
 async def upstream_events(resp):
@@ -159,9 +181,16 @@ class ChatService:
     async def _apply_error(self, account, model, status, code, message, headers=None, *, expected_credentials=None):
         if expected_credentials is not None and account.credential_key() != expected_credentials:
             return
+        if is_concurrency_code(code):
+            # Upstream still counts a slot as busy for this account: bench it
+            # briefly so the retry rotates instead of immediately re-hitting
+            # the same saturated slot. No error history, no cooling/parking.
+            await self.pool.on_concurrency_refusal(
+                account, expected_credentials=expected_credentials)
+            return
         if is_model_overload(status, code):
             # A busy model is not evidence of a bad account or spent quota.
-            # Keep this account available for other models and delayed retries.
+            # Keep this account available for other models and the retry loop.
             return
         # autopsy trail: keep the last errors for the dashboard "why" view
         try:
@@ -184,6 +213,14 @@ class ChatService:
             # not match. Every account then fails identically, so a 900s park
             # per account only spreads a pool-wide outage over 15 minutes of
             # misleading state. Park briefly and name the real cause instead.
+            if is_account_suspended(message):
+                # The account itself is banned upstream for proxying: no model
+                # on it can serve, and retrying only produces a 405 per request.
+                # Take it out of rotation until an operator re-enables it.
+                await self.pool.kill(account, reason=str(message)[:200],
+                                     cause='suspended',
+                                     expected_credentials=expected_credentials)
+                return
             if client_not_supported(message):
                 await self.pool.cap_model(account, model,
                                           CLIENT_NOT_SUPPORTED_PARK_S,
@@ -376,22 +413,35 @@ class ChatService:
 
     async def _open_model_stream(self, payload, *, model, variant='anthropic', dialect='openai', client_key='anonymous', is_disconnected=None):
         # Only retry before a StreamHandle is returned. Never replay output or tools.
-        attempts = self.cfg.upstream.overload_max_attempts
-        for attempt in range(attempts):
+        overloads = concurrency = 0
+        while True:
             if is_disconnected is not None and await is_disconnected():
                 raise asyncio.CancelledError()
             try:
                 return await self._open_model_stream_once(payload, model=model, variant=variant,
                     dialect=dialect, client_key=client_key)
             except UpstreamFailure as exc:
+                if is_concurrency_code(exc.code):
+                    concurrency += 1
+                    delay = concurrency_delay(self.cfg.upstream, concurrency, exc.retry_after)
+                    if concurrency >= self.cfg.upstream.concurrency_max_attempts:
+                        exc.release_in_s = max(1, int(delay + .999))
+                        raise
+                    log.info('ZCode concurrency limit (%s) for %s; retry %s/%s in %.2fs',
+                             exc.code, model, concurrency,
+                             self.cfg.upstream.concurrency_max_attempts - 1, delay)
+                    await wait_for_retry(delay, is_disconnected)
+                    continue
                 if not is_model_overload(exc.status, exc.code):
                     raise
-                delay = overload_delay(self.cfg.upstream, attempt + 1, exc.retry_after)
-                if attempt + 1 == attempts:
+                overloads += 1
+                delay = overload_delay(self.cfg.upstream, overloads, exc.retry_after)
+                if overloads >= self.cfg.upstream.overload_max_attempts:
                     exc.release_in_s = max(1, int(delay + .999))
                     raise
                 log.info('ZCode model %s overloaded (%s); retry %s/%s in %.2fs',
-                         model, exc.code, attempt + 1, attempts - 1, delay)
+                         model, exc.code, overloads,
+                         self.cfg.upstream.overload_max_attempts - 1, delay)
                 await wait_for_retry(delay, is_disconnected)
 
     async def _open_model_stream_once(self, payload, *, model, variant='anthropic', dialect='openai', client_key='anonymous'):
@@ -462,8 +512,7 @@ class ChatService:
                     raw = await resp.aread()
                     info = parse_upstream_error(resp.status_code, raw)
                     status, code, message = resp.status_code, str(info['code']), info['message']
-                    if status == 200:
-                        status = 429 if code in ('11113', '1005') else 502
+                    status = _normalize_error_status(status, code)
                     if status == 401 and await self.tokens.refresh(
                             account, force=True, expected_credentials=credentials):
                         # Retry a newly imported token once, without a second pool reservation.
@@ -479,8 +528,7 @@ class ChatService:
                             raw = await resp.aread()
                             info = parse_upstream_error(resp.status_code, raw)
                             status, code, message = resp.status_code, str(info['code']), info['message']
-                            if status == 200:
-                                status = 429 if code in ('11113', '1005') else 502
+                            status = _normalize_error_status(status, code)
                     if status != 200:
                         # IP-wide CDN edge block (HTML body, not API JSON)?
                         # Detect BEFORE _apply_error — this is not an account
@@ -528,7 +576,7 @@ class ChatService:
                     if first.get('type') == 'error' or (first.get('type') is None and 'error' in first):
                         info = first.get('error') or first
                         code, message = str(info.get('code') or info.get('type') or 'api_error'), info.get('message', 'ZCode stream failed')
-                        status = 529 if is_model_overload(502, code) else (429 if code in ('11113', 'rate_limit_error') else (405 if is_block_code(code) else 502))
+                        status = _stream_error_status(code)
                         await self._apply_error(account, model, status, code, message,
                                                 expected_credentials=credentials)
                         last = UpstreamFailure(status, code, message)
@@ -640,7 +688,8 @@ class ChatService:
                         if kind == 'error' or (kind is None and 'error' in event):
                             info = event.get('error') or event
                             code, message = str(info.get('code') or info.get('type') or 'api_error'), info.get('message', 'ZCode stream failed')
-                            status = 529 if is_model_overload(502, code) else (429 if code in ('11113', 'rate_limit_error') else 502)
+                            status = 529 if is_model_overload(502, code) else (
+                                429 if code in ('11113', 'rate_limit_error') or is_concurrency_code(code) else 502)
                             await self._apply_error(handle.account, model, status, code, message,
                                                     expected_credentials=handle.credentials)
                             self._log_stream_failure(handle, UpstreamFailure(status, code, message),
@@ -707,7 +756,7 @@ class ChatService:
                     if event.get('type') == 'error' or (event.get('type') is None and 'error' in event):
                         info = event.get('error') or event
                         code = str(info.get('code') or info.get('type') or 'api_error')
-                        status = 529 if is_model_overload(502, code) else (429 if code in ('11113', 'rate_limit_error') else (405 if is_block_code(code) else 502))
+                        status = _stream_error_status(code)
                         message = info.get('message', 'ZCode stream failed')
                         await self._apply_error(handle.account, model, status, code, message,
                                                 expected_credentials=handle.credentials)

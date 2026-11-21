@@ -144,6 +144,18 @@ def is_block_code(code: str, status: int = 0) -> bool:
     return c in BLOCKED_CODES or "3012" in c or "405" in c
 
 
+# Capacity codes, not quota codes: the request is valid and the account is
+# healthy — the upstream just refuses more parallel work right now.
+#   3008 = user-level concurrency (all models on this account share the limit)
+#   3009 = model-level concurrency
+#   3010 = concurrency family (upstream busy)
+CONCURRENCY_CODES = frozenset({"3008", "3009", "3010"})
+
+
+def is_concurrency_code(code) -> bool:
+    return str(code or "").strip() in CONCURRENCY_CODES
+
+
 # The bootstrap system text (identity line + harness body) is fingerprinted
 # byte-for-byte upstream: one wrong space answers 405/3012 "This client is not
 # supported. Please use the official ZCode client." with the SAME outcome on
@@ -155,6 +167,19 @@ CLIENT_NOT_SUPPORTED_PARK_S = 120.0
 def client_not_supported(message: str | None) -> bool:
     text = (message or "").lower()
     return any(marker in text for marker in CLIENT_NOT_SUPPORTED_MARKERS)
+
+
+# Account-level suspension ("Your account has been suspended for misusing the
+# Start Plan, such as proxying it to non-ZCode clients"). Unlike an "unusual
+# activity" block, this is not scoped to one model and does not lift on its
+# own: every request on the account fails until support restores it, so the
+# account must leave the pool instead of being retried.
+SUSPENSION_MARKERS = ("has been suspended", "account suspended")
+
+
+def is_account_suspended(message: str | None) -> bool:
+    text = (message or "").lower()
+    return any(marker in text for marker in SUSPENSION_MARKERS)
 
 
 def _error_code(body: str | bytes | None) -> str:
@@ -195,6 +220,8 @@ def classify(status: int, body: str | bytes | None = None) -> ErrorKind:
     info = parse_upstream_error(status, body)
     if info["code"] == "11113":
         return ErrorKind.INSUFFICIENT_CREDITS
+    if is_concurrency_code(info["code"]):
+        return ErrorKind.RATE_LIMITED
     if status == 200:
         return ErrorKind.OK
     if status == 401:

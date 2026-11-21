@@ -40,6 +40,19 @@ def overload_delay(cfg, retry_number, retry_after=None):
     return delay * random.uniform(.5, 1)
 
 
+def concurrency_delay(cfg, retry_number, retry_after=None):
+    """Short exponential backoff for 3008/3009/3010 capacity rejections.
+
+    These clear as soon as an in-flight request finishes, so the wait is much
+    shorter than an overload backoff and never parks the account.
+    """
+    base = cfg.concurrency_base_delay_seconds * 2 ** (retry_number - 1)
+    if retry_after is not None:
+        return min(retry_after, cfg.concurrency_max_delay_seconds)
+    delay = min(base, cfg.concurrency_max_delay_seconds)
+    return delay * random.uniform(.5, 1)
+
+
 async def wait_for_retry(delay, is_disconnected=None):
     if is_disconnected is None:
         await asyncio.sleep(delay)
