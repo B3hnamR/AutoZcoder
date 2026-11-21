@@ -112,17 +112,155 @@ function tokenCell(a) {
   });
 }
 
+function stateCell(a) {
+  const parts = [stateBadge(a.state)];
+  const hold = Number(a.concurrency_hold_in_s) || 0;
+  const cooldown = Number(a.cooldown_in_s) || 0;
+  if (hold > 0) {
+    parts.push(el("div", {
+      class: "faint text-xs", text: "throttled " + duration(hold),
+      title: "Upstream refused a parallel request on this account (3008). "
+           + "It is benched briefly and returns automatically.",
+    }));
+  } else if (a.state === "cooling" && cooldown > 0) {
+    parts.push(el("div", {
+      class: "faint text-xs", text: "retry in " + duration(cooldown),
+      title: a.last_error || "Transient upstream error",
+    }));
+  } else if (a.last_error && (a.state === "dead" || a.state === "exhausted")) {
+    parts.push(el("div", {
+      class: "text-err text-xs", text: a.last_error, title: a.last_error,
+      style: { maxWidth: "220px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
+    }));
+  }
+  return el("div", { style: { display: "flex", flexDirection: "column", gap: "3px" } }, parts);
+}
+
+const SUSPENDED = /suspended/i;
+
+function errorLabel(e) {
+  const code = String(e.code || "");
+  if (SUSPENDED.test(e.message || "") || SUSPENDED.test(code)) return "suspended";
+  if (code === "UNUSUAL_ACTIVITY") return "unusual activity";
+  if (code === "CLIENT_NOT_SUPPORTED") return "client not supported";
+  return [e.status, code].filter((v) => v !== null && v !== undefined && v !== "").join(" · ") || "error";
+}
+
 function errorCell(a) {
   const errs = (a.error_history || []).slice(-12);
-  if (!errs.length) return el("span", { class: "faint", text: "—" });
-  const detail = errs.map((e) => (e.ago_s ?? "?") + "s ago · " + (e.status || "") + " " + (e.code || "")).join("\n");
-  return el("span", {
-    class: "mono text-xs " + (a.state === "dead" ? "text-err" : "text-warn"),
-    text: errs.length + " err",
-    title: detail,
-    style: { cursor: "help" },
+  if (!errs.length) {
+    return a.last_error
+      ? el("div", { class: "text-warn text-xs", text: a.last_error, title: a.last_error })
+      : el("span", { class: "faint", text: "—" });
+  }
+  const last = errs[errs.length - 1];
+  const detail = errs.slice().reverse().map((e) => {
+    const when = Number.isFinite(Number(e.ago_s)) ? duration(e.ago_s) + " ago" : "?";
+    const model = e.model ? " · " + String(e.model).split("/").pop() : "";
+    return when + " · " + errorLabel(e) + model
+         + (e.message ? "\n    " + e.message : "");
+  }).join("\n");
+  return el("div", { title: detail, style: { cursor: "help" } }, [
+    el("div", {
+      class: "text-xs " + (a.state === "dead" ? "text-err" : "text-warn"),
+      text: errorLabel(last),
+    }),
+    el("div", {
+      class: "faint text-xs",
+      text: (Number.isFinite(Number(last.ago_s)) ? duration(last.ago_s) + " ago" : "?")
+          + (errs.length > 1 ? " · " + errs.length + " recent" : ""),
+    }),
+  ]);
+}
+
+/** One dominant, human-readable problem per account, or null when healthy.
+    Order matters: the first match is what the operator needs to act on. */
+function accountIssue(a) {
+  const suspended = SUSPENDED.test(a.last_error || "") || a.death_reason === "suspended";
+  if (suspended) {
+    return {
+      tone: "err", label: "Suspended by upstream",
+      detail: a.last_error || "ZCode suspended this account for proxying; support must restore it.",
+      dead: a.state === "dead",
+    };
+  }
+  if (a.state === "dead") {
+    const why = a.death_reason === "plan_lost"
+      ? "The ZCode plan expired or was removed."
+      : a.death_reason === "authentication_error"
+        ? "The token was revoked; sign in again or reimport the account."
+        : "";
+    return {
+      tone: "err", label: "Out of rotation",
+      detail: why || a.last_error || a.death_reason || "Account is dead; re-enable it to retry.",
+      dead: true,
+    };
+  }
+  if (a.state === "exhausted") {
+    return {
+      tone: "err", label: "Exhausted",
+      detail: a.last_error || "Repeated quota rejections with no visible quota buckets.",
+    };
+  }
+  const hold = Number(a.concurrency_hold_in_s) || 0;
+  if (hold > 0) {
+    return {
+      tone: "warn", label: "Throttled " + duration(hold),
+      detail: "Upstream reported a concurrency limit (3008); retries resume on their own.",
+    };
+  }
+  if (a.state === "cooling") {
+    return {
+      tone: "warn", label: "Cooling " + duration(a.cooldown_in_s),
+      detail: a.last_error || "Transient upstream error; the account returns automatically.",
+    };
+  }
+  if (Number(a.expires_at) > 0 && Number(a.expires_at) <= Date.now()) {
+    return {
+      tone: "err", label: "Token expired",
+      detail: "Sign in again or reimport the account to restore service.",
+    };
+  }
+  if (a.quota_check_error) {
+    return {
+      tone: "warn", label: "Quota check failed",
+      detail: a.quota_check_error,
+    };
+  }
+  return null;
+}
+
+/** Accounts with a real blocker, kept visible above the table so a bad
+    account never hides behind a tooltip in the Errors column. */
+function attentionCard(accounts, reload) {
+  const rows = accounts
+    .map((a) => ({ account: a, issue: accountIssue(a) }))
+    .filter((r) => r.issue);
+  if (!rows.length) return null;
+  return card({
+    title: "Needs attention",
+    desc: rows.length + (rows.length === 1 ? " account is" : " accounts are")
+        + " not serving (or about to stop). Hover a reason for the full upstream message.",
+    body: el("div", { class: "stack stack--tight" }, rows.map(({ account: a, issue }) =>
+      el("div", {
+        class: "row row--tight",
+        style: { alignItems: "center", padding: "6px 0", borderBottom: "1px solid var(--border)" },
+      }, [
+        badge(issue.label, issue.tone),
+        el("div", { style: { flex: "1", minWidth: "0" } }, [
+          el("div", { text: a.email || a.id, style: { fontWeight: "500" } }),
+          el("div", {
+            class: "faint text-xs", text: issue.detail, title: issue.detail,
+            style: { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: "760px" },
+          }),
+        ]),
+        issue.dead
+          ? button({ label: "Enable", icon: "check", onClick: () => accountAction("enable", a.id, reload) })
+          : el("span", { class: "faint text-xs", text: "automatic" }),
+      ]))),
   });
 }
+
 
 /* ----------------------------------------------------------- actions ---- */
 
@@ -324,9 +462,12 @@ function render(root, accounts, pool, reload, batch, signal, campaign = {}) {
     : "Locked until the Weekend Build window opens";
 
   const counts = pool.by_state || {};
+  const issueCount = accounts.filter((a) => accountIssue(a)).length;
   const summary = el("div", { class: "grid grid--metrics" }, [
     metric({ label: "Accounts", value: num(pool.accounts ?? rows.length) }),
     metric({ label: "Ready", value: num(pool.ready ?? 0), tone: (pool.ready ?? 0) > 0 ? "ok" : "warn" }),
+    metric({ label: "Issues", value: num(issueCount), tone: issueCount ? "warn" : "ok",
+             hint: issueCount ? "See Needs attention below" : "Every account can serve" }),
     metric({ label: "Cooling", value: num(counts.cooling ?? 0), tone: counts.cooling ? "warn" : null }),
     metric({ label: "Dead", value: num(counts.dead ?? 0), tone: counts.dead ? "err" : null }),
     metric({ label: "Strategy", value: pool.strategy || "—" }),
@@ -402,7 +543,7 @@ function render(root, accounts, pool, reload, batch, signal, campaign = {}) {
         ]),
         el("div", { class: "mono faint text-xs", text: a.id }),
       ]),
-      stateBadge(a.state),
+      stateCell(a),
       planCell(a),
       tokenCell(a),
       quotaCell(a),
@@ -436,7 +577,9 @@ function render(root, accounts, pool, reload, batch, signal, campaign = {}) {
     flush: true,
   });
 
-  fill(root, el("div", { class: "stack" }, [summary, quotaTotals, bar, batch.node, tableCard]));
+  fill(root, el("div", { class: "stack" },
+    [summary, quotaTotals, attentionCard(accounts, reload), bar, batch.node, tableCard]
+      .filter(Boolean)));
   applyFilter(root);
   paintSocks();
 }
