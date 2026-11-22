@@ -1,11 +1,13 @@
 """Model-cap parks (UNUSUAL_ACTIVITY / GEO_BLOCKED) survive restarts."""
 import asyncio
+import json
 import time
 
 import pytest
 
 from zcode_gateway.config import PoolConfig
-from zcode_gateway.pool import Account, PoolManager
+from zcode_gateway.pool import Account, AccountState, PoolManager, load_from_pool_file
+from zcode_gateway.token_utils import persist_pool_states
 
 
 def _mgr(tmp_path, accounts):
@@ -85,3 +87,21 @@ async def test_removed_account_pruned(tmp_path):
     import json
     data = json.loads((tmp_path / "model-caps.json").read_text())
     assert "gone" not in data
+
+
+@pytest.mark.asyncio
+async def test_killed_account_stays_dead_in_pool_file(tmp_path):
+    pool_file = tmp_path / "pool.json"
+    pool_file.write_text(json.dumps([{"id": "acc-1", "email": "a@x.io",
+                                      "access_token": "t"}]), encoding="utf-8")
+    acc = load_from_pool_file(pool_file)[0]
+    m = _mgr(tmp_path, [acc])
+    m.set_state_saver(lambda rows: persist_pool_states(pool_file, rows))
+    await m.kill(acc, "banned for proxying", cause="suspended")
+    await _flush(m)
+
+    # a flat file keeps its shape; a restart reads the hard state back
+    assert isinstance(json.loads(pool_file.read_text(encoding="utf-8")), list)
+    reloaded = load_from_pool_file(pool_file)[0]
+    assert reloaded.state is AccountState.DEAD
+    assert reloaded.death_reason == "suspended"

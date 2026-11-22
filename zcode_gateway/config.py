@@ -255,6 +255,11 @@ class PoolConfig(BaseModel):
     # saturated slot. Not a cooldown: state stays READY.
     concurrency_hold_seconds: float = Field(default=10.0, ge=0)
     concurrency_hold_max_seconds: float = Field(default=60.0, ge=0)
+    # The upstream keeps a just-finished request in its per-user concurrency
+    # count for a few seconds, so re-admitting a released account immediately
+    # answers 3008 even though in_flight is 0. After release(), wait this long
+    # before pick() hands the account out again. 0 disables it.
+    concurrency_settle_seconds: float = Field(default=5.0, ge=0)
     balance_poll_seconds: int = Field(default=300, ge=10)
     # 405/code 3012 "unusual activity": park this model on the offending
     # account for this long, then rotate. Per model, so other models on the

@@ -71,8 +71,40 @@ def persist_pool_snapshot(cfg: Config, accounts: list[Account]) -> None:
                 "imported_jwt": bool(a.notes.get("imported_jwt") or a.source == "jwt-import"),
                 "name": a.notes.get("name", ""),
                 "device_mid": a.notes.get("device_mid", ""),
+                "timezone": a.notes.get("timezone", ""),
+                "state": a.state.value,
+                "death_reason": a.death_reason,
+                "paid_exhausted": a.paid_exhausted,
+                "cooldown_until": a.cooldown_until,
             }
             for a in accounts
         ]
     }
     _atomic_write(path, json.dumps(payload, indent=2))
+
+
+def persist_pool_states(path: str | Path, rows: list[dict]) -> None:
+    """Write hard-state fields into an existing pool file, leaving the rest.
+
+    Only the rows that actually changed are rewritten, so the debounced saver
+    does not touch every credential record on every account event.
+    """
+    p = Path(path)
+    data = json.loads(p.read_text(encoding="utf-8"))
+    items = (data.get("accounts") or []) if isinstance(data, dict) else data
+    by_id = {str(row["id"]): row for row in rows}
+    changed = False
+    for i, item in enumerate(items or []):
+        if not isinstance(item, dict):
+            continue
+        auth = item.get("auth") or {}
+        ident = str(auth.get("accountId") or item.get("id") or f"pool-{i}")
+        row = by_id.get(ident)
+        if row is None:
+            continue
+        for key in ("state", "death_reason", "paid_exhausted", "cooldown_until"):
+            if item.get(key) != row[key]:
+                item[key] = row[key]
+                changed = True
+    if changed:
+        _atomic_write(p, json.dumps(data, indent=2))

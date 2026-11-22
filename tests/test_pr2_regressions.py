@@ -417,6 +417,17 @@ def test_generator_telemetry_timezone_and_device(monkeypatch):
     assert claim._headers('token')['x-client-timezone'] == 'UTC'
 
 
+def test_generator_and_gateway_derive_the_same_device_mid(monkeypatch):
+    import base64
+    from zcode_gateway.zcode_device import account_device_mid
+    monkeypatch.syspath_prepend(str(ROOT / 'generator'))
+    pc = _load_script('plan_check')
+    claims = base64.urlsafe_b64encode(
+        json.dumps({'user_id': 'usr-123'}).encode()).decode().rstrip('=')
+    assert pc.account_device_mid('usr-123') == account_device_mid('usr-123')
+    assert pc.per_account_device_mid('header.' + claims + '.signature') == account_device_mid('usr-123')
+
+
 @pytest.mark.parametrize('script', ['export_starter', 'recheck_plans'])
 def test_generator_batch_continues_after_failure(tmp_path, monkeypatch, script):
     monkeypatch.syspath_prepend(str(ROOT / 'generator'))

@@ -116,11 +116,18 @@ function stateCell(a) {
   const parts = [stateBadge(a.state)];
   const hold = Number(a.concurrency_hold_in_s) || 0;
   const cooldown = Number(a.cooldown_in_s) || 0;
+  const settling = Number(a.settling_in_s) || 0;
   if (hold > 0) {
     parts.push(el("div", {
       class: "faint text-xs", text: "throttled " + duration(hold),
       title: "Upstream refused a parallel request on this account (3008). "
            + "It is benched briefly and returns automatically.",
+    }));
+  } else if (settling > 0 && a.in_flight === 0) {
+    parts.push(el("div", {
+      class: "faint text-xs", text: "settling " + duration(settling),
+      title: "Just served a request; briefly held out so upstream's concurrency "
+           + "count clears before the next one. Not an error.",
     }));
   } else if (a.state === "cooling" && cooldown > 0) {
     parts.push(el("div", {
@@ -207,6 +214,14 @@ function accountIssue(a) {
     return {
       tone: "warn", label: "Throttled " + duration(hold),
       detail: "Upstream reported a concurrency limit (3008); retries resume on their own.",
+    };
+  }
+  const settling = Number(a.settling_in_s) || 0;
+  if (settling > 0 && a.in_flight === 0) {
+    return {
+      tone: "info", label: "Settling " + duration(settling),
+      detail: "Just served a request; held out briefly so upstream's concurrency "
+            + "count clears before the next one. Not an error.",
     };
   }
   if (a.state === "cooling") {
@@ -462,7 +477,11 @@ function render(root, accounts, pool, reload, batch, signal, campaign = {}) {
     : "Locked until the Weekend Build window opens";
 
   const counts = pool.by_state || {};
-  const issueCount = accounts.filter((a) => accountIssue(a)).length;
+  // settling is a planned pause, not a problem: keep it out of the Issues count
+  const issueCount = accounts.filter((a) => {
+    const issue = accountIssue(a);
+    return issue && !(issue.tone === "info");
+  }).length;
   const summary = el("div", { class: "grid grid--metrics" }, [
     metric({ label: "Accounts", value: num(pool.accounts ?? rows.length) }),
     metric({ label: "Ready", value: num(pool.ready ?? 0), tone: (pool.ready ?? 0) > 0 ? "ok" : "warn" }),

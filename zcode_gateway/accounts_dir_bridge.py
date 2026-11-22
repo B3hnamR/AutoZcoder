@@ -17,6 +17,7 @@ from .accounts_dir import (
     snapshot_filename,
     write_snapshot,
 )
+from .zcode_device import account_device_mid
 
 log = logging.getLogger("zcode_gateway.accounts_dir_bridge")
 
@@ -61,6 +62,9 @@ def mint_and_register(accounts_dir: str | Path, email: str, zcode_jwt: str,
     saved: dict[str, str] = {}
 
     def write_saved(path, fields):
+        # a re-registration keeps the mid the account already had; a new
+        # account gets the derived one, never the global fingerprint
+        fields["device_mid"] = fields.get("device_mid") or account_device_mid(account_id)
         _write_snapshot(path, fields)
         saved.update(fields)
 
@@ -70,8 +74,10 @@ def mint_and_register(accounts_dir: str | Path, email: str, zcode_jwt: str,
         "account_id": account_id,
         "access_token": zcode_jwt,
         "expires_at_ms": str(expires_ms),
-        "email": email, "device_mid": device_mid, "plan": plan,
+        "email": email, "plan": plan,
     }
+    if device_mid:
+        fields["device_mid"] = device_mid
     if claims.get("exp"):
         fields["expires_at"] = str(claims["exp"])
     if receipt:

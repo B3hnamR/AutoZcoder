@@ -53,7 +53,8 @@ def test_map_expires_and_drops():
 
 @pytest.mark.asyncio
 async def test_acquire_reuses_bound_account():
-    pool = PoolManager(PoolConfig(strategy="round_robin", conversation_affinity_seconds=600),
+    pool = PoolManager(PoolConfig(strategy="round_robin", conversation_affinity_seconds=600,
+                                  concurrency_settle_seconds=0),
                        [Account(id="a1", access_token="t1"),
                         Account(id="a2", access_token="t2")])
     key = affinity_key_from_payload({"session_id": "conv-1"})
@@ -66,7 +67,8 @@ async def test_acquire_reuses_bound_account():
 
 @pytest.mark.asyncio
 async def test_acquire_binds_on_first_pick_then_sticks():
-    pool = PoolManager(PoolConfig(strategy="round_robin", conversation_affinity_seconds=600),
+    pool = PoolManager(PoolConfig(strategy="round_robin", conversation_affinity_seconds=600,
+                                  concurrency_settle_seconds=0),
                        [Account(id="a1", access_token="t1"),
                         Account(id="a2", access_token="t2")])
     key = affinity_key_from_payload({"session_id": "conv-2"})
@@ -98,8 +100,26 @@ async def test_affinity_skips_concurrency_held_account():
 
 
 @pytest.mark.asyncio
+async def test_affinity_skips_settling_account():
+    pool = PoolManager(PoolConfig(strategy="round_robin", conversation_affinity_seconds=600,
+                                  max_in_flight_per_account=1, concurrency_settle_seconds=30),
+                       [Account(id="a1", access_token="t1"),
+                        Account(id="a2", access_token="t2")])
+    key = affinity_key_from_payload({"session_id": "conv-settle"})
+    first = await pool.acquire(affinity_key=key)
+    assert first.id == "a1"
+    await pool.release(first)       # arms the settle window on a1
+    assert pool._accounts["a1"].is_settling()
+
+    picked = await pool.acquire(affinity_key=key)
+    assert picked is not None and picked.id == "a2"
+    await pool.release(picked)
+
+
+@pytest.mark.asyncio
 async def test_stale_binding_falls_back_to_a_candidate():
-    pool = PoolManager(PoolConfig(strategy="round_robin", conversation_affinity_seconds=600),
+    pool = PoolManager(PoolConfig(strategy="round_robin", conversation_affinity_seconds=600,
+                                  concurrency_settle_seconds=0),
                        [Account(id="a1", access_token="t1")])
     key = affinity_key_from_payload({"session_id": "conv-3"})
     pool._affinity.bind(key, "gone")

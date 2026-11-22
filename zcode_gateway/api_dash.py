@@ -26,6 +26,8 @@ import yaml
 
 from .deps import admin_key, get_state, internal_or_admin
 from .logbuffer import LogBuffer
+from .zcode_detect import jwt_claims
+from .zcode_device import account_device_mid
 
 log = logging.getLogger("zcode_gateway.dash")
 
@@ -1117,14 +1119,13 @@ def _generator(request: Request):
                     log.info("generator: %s has no plan after retries — leaving "
                              "it for the catch-up scan", email)
                     return
+                identity = jwt_claims(zjwt)
                 if auto:
                     from plan_check import is_start_plan
                     if not plan_info or plan_info.get("code") != 0 or not any(is_start_plan(p) for p in plans):
                         return {"qualified": False, "category": "no_plan", "error": "No active Starter/Start Plan verified"}
                     # The run must count a NEW provider identity, not a duplicate
                     # token for an account already loaded before registration.
-                    from .zcode_detect import jwt_claims
-                    identity = jwt_claims(zjwt)
                     ident = identity.get("user_id") or identity.get("sub")
                     if not ident:
                         return {"qualified": False, "category": "registration_error", "error": "Account identity missing"}
@@ -1147,7 +1148,7 @@ def _generator(request: Request):
                     receipt = {"auto_run_id": run_id, "auto_attempt_id": attempt_id, "auto_qualified": "true"}
                 account = mint_and_register(
                     state.cfg.accounts.dir, email, zjwt,
-                    state.cfg.upstream.fingerprint.device_mid,
+                    account_device_mid(identity.get("user_id") or identity.get("sub") or email),
                     plan=chosen_plan, **({"receipt": receipt} if auto else {}))
                 if account:
                     log.info("generator: %s joined the pool (plan=%s)", email, chosen_plan)

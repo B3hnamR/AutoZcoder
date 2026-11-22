@@ -28,3 +28,15 @@ def test_default_device_uses_saved_identity_or_uuid(monkeypatch):
     assert zcode_device.default_device_mid()=='saved-device'
     monkeypatch.setattr(zcode_device,'read_device_mid',lambda:None)
     assert str(uuid.UUID(zcode_device.default_device_mid()))
+
+
+def test_new_account_device_mid_is_a_distinct_uuid():
+    first, second = zcode_device.new_account_device_mid(), zcode_device.new_account_device_mid()
+    assert str(uuid.UUID(first)) == first
+    assert str(uuid.UUID(second)) == second
+    assert first != second
+
+
+def test_account_device_mid_is_stable_per_account():
+    assert zcode_device.account_device_mid('usr-one') == zcode_device.account_device_mid('usr-one')
+    assert zcode_device.account_device_mid('usr-one') != zcode_device.account_device_mid('usr-two')

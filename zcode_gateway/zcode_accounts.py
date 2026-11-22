@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .accounts_dir import parse_snapshot, save_account_snapshot, snapshot_transaction
 from .zcode_detect import jwt_claims
-from .zcode_device import read_device_mid
+from .zcode_device import account_device_mid, read_device_mid
 
 
 def decrypt_credential(value):
@@ -33,7 +33,12 @@ def decrypt_credential(value):
 
 def read_credentials(path):
     data = json.loads(Path(path).read_text(encoding='utf-8-sig'))
-    device_mid = read_device_mid(Path(path).parent / 'telemetry-state.json')
+    # The desktop install's mid belongs to the ONE account it is signed into.
+    # Stamping it on every record made the whole pool share one device; with
+    # several records there is no telling which one the desktop owns.
+    shared_mid = read_device_mid(Path(path).parent / 'telemetry-state.json')
+    record_mid = data.get('device_mid')
+    record_mid = record_mid.strip() if isinstance(record_mid, str) else ''
     token = decrypt_credential(data.get('zcodejwttoken') or data.get('zcodeJWT'))
     user = decrypt_credential(data.get('oauth:zai:user_info')) or data.get('user') or {}
     if isinstance(user, str):
@@ -58,11 +63,16 @@ def read_credentials(path):
         account_user = user if ident == current_id else {}
         fields = {'account_id': ident, 'email': account_user.get('email', ''), 'name': account_user.get('name', ''),
                   'access_token': candidate, 'expires_at_ms': str(int(claims.get('exp') or 0) * 1000),
-                  'source': str(path), 'captured_at': datetime.now(timezone.utc).isoformat()}
-        if device_mid:
-            fields['device_mid'] = device_mid
+                  'source': str(path), 'captured_at': datetime.now(timezone.utc).isoformat(),
+                  'device_mid': account_device_mid(ident)}
         if ident not in accounts or int(claims.get('iat') or 0) > int(jwt_claims(accounts[ident]['access_token']).get('iat') or 0):
             accounts[ident] = fields
+    if len(accounts) == 1:
+        # the file's own mid belongs to the ONE account it holds; with more
+        # than one there is no telling which record it came from
+        hint = record_mid or shared_mid
+        if hint:
+            next(iter(accounts.values()))['device_mid'] = hint
     return list(accounts.values())
 
 

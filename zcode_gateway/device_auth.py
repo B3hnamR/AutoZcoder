@@ -10,6 +10,7 @@ from .config import Fingerprint
 from .pool import Account
 from .upstream import build_headers
 from .zcode_detect import jwt_claims
+from .zcode_device import new_account_device_mid
 
 class DeviceLogin:
     def __init__(self, accounts_dir: Path, client=None, on_account=None, base_url='https://zcode.z.ai/api/v1', fingerprint=None):
@@ -22,6 +23,9 @@ class DeviceLogin:
         self._ready, self._cancel = asyncio.Event(), asyncio.Event()
         self._poll_token, self._flow_id = None, None
         self._expires_at, self._interval = 0, 2
+        # one stable identity for this login: OAuth init/poll and the account
+        # this login registers must present the same device
+        self._device_mid = new_account_device_mid()
 
     def status(self):
         return {'state': self.state, 'user_code': self.user_code, 'verification_url': self.verification_url,
@@ -31,7 +35,8 @@ class DeviceLogin:
 
     async def _authorize(self):
         self._poll_token = secrets.token_hex(32)
-        headers = build_headers(self._poll_token, self.fingerprint)
+        headers = build_headers(self._poll_token, self.fingerprint,
+                                device_mid=self._device_mid)
         headers.pop('x-api-key', None)
         resp = await self.client.post(self.base_url+'/oauth/cli/init', json={'provider': 'zai'},
                                       headers=headers)
@@ -60,7 +65,8 @@ class DeviceLogin:
             if self._cancel.is_set():
                 self.state = 'cancelled'
                 return None
-            headers = build_headers(self._poll_token, self.fingerprint)
+            headers = build_headers(self._poll_token, self.fingerprint,
+                                    device_mid=self._device_mid)
             headers.pop('x-api-key', None)
             resp = await self.client.get(self.base_url+'/oauth/cli/poll/'+quote(self._flow_id, safe=''), headers=headers)
             resp.raise_for_status()
@@ -86,18 +92,21 @@ class DeviceLogin:
         if not ident: raise ValueError('ZCode login returned no account identity')
         account = Account(id=ident, email=user.get('email', ''), access_token=token,
                           expires_at=int(claims.get('exp') or 0)*1000, source='device-login',
-                          notes={'name': user.get('name', ''), 'device_mid': self.fingerprint.device_mid})
+                          notes={'name': user.get('name', ''), 'device_mid': self._device_mid})
         fields = {}
 
         def write_saved(path, merged):
+            # a re-login keeps the mid its account already had
+            merged['device_mid'] = merged.get('device_mid') or self._device_mid
             write_snapshot(path, merged)
             fields.update(merged)
 
         self.snapshot_path = await asyncio.to_thread(save_account_snapshot, self.accounts_dir,
             {'account_id': ident, 'email': account.email, 'name': user.get('name', ''),
              'access_token': token, 'expires_at_ms': str(account.expires_at),
-             'device_mid': self.fingerprint.device_mid, 'source': 'ZCode CLI OAuth'},
+             'source': 'ZCode CLI OAuth'},
             writer=write_saved)
+        self._device_mid = fields.get('device_mid') or self._device_mid
         account.email = fields.get('email', account.email)
         account.refresh_token = fields.get('refresh_token', '')
         account.notes.update({key: fields.get(key, '') for key in (

@@ -49,6 +49,7 @@ class DummyClient:
 def service_for(responses, accounts=None):
     cfg = Config()
     cfg.pool.acquire_wait_seconds = 0
+    cfg.pool.concurrency_settle_seconds = 0
     cfg.upstream.max_attempts = 2
     cfg.upstream.overload_max_attempts = 2
     pool = PoolManager(cfg.pool, accounts or [Account(id='one', access_token='dummy-one')])

@@ -56,7 +56,7 @@ def merge_anthropic_beta(base: str, extra: str | None) -> str:
 
 
 def build_headers(access_token, fp, task_id=None, *, device_mid=None, include_device_mid=True,
-                  anthropic_beta: str | None = None):
+                  anthropic_beta: str | None = None, timezone: str | None = None):
     token = access_token.removeprefix("Bearer ").strip()
     h = dict(STATIC_HEADERS)
     if anthropic_beta:
@@ -64,7 +64,7 @@ def build_headers(access_token, fp, task_id=None, *, device_mid=None, include_de
             STATIC_HEADERS.get("anthropic-beta", ""), anthropic_beta)
     h.update({"authorization": "Bearer " + token, "x-api-key": token,
         "user-agent": fp.user_agent, "x-device-mid": device_mid or fp.device_mid,
-        "x-client-language": fp.language, "x-client-timezone": fp.timezone,
+        "x-client-language": fp.language, "x-client-timezone": timezone or fp.timezone,
         "x-os-category": fp.os_category, "x-os-version": fp.os_version,
         "x-platform": fp.platform, "x-release-channel": "production",
         "x-title": "Z Code@electron", "x-zcode-agent": "glm",

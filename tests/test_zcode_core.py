@@ -32,6 +32,7 @@ def cfg(tmp_path):
     config.pool.balance_poll_seconds=0
     config.pool.acquire_wait_seconds=0
     config.pool.concurrency_hold_seconds=0
+    config.pool.concurrency_settle_seconds=0
     config.server.admin_key='test-admin'
     config.server.client_keys=[ClientKey(key='test-client')]
     return config
@@ -207,6 +208,17 @@ def unusual_activity_response():
     return response
 
 
+SUSPENDED_MESSAGE=('Your account has been suspended for misusing the Start Plan, '
+                   'such as proxying it to non-ZCode clients.')
+
+
+def suspended_response():
+    body=json.dumps({'error':{'message':SUSPENDED_MESSAGE,'type':'api_error','code':'3012'}}).encode()
+    response=FakeResponse(body,405)
+    response.headers['content-type']='application/json'
+    return response
+
+
 @pytest.mark.asyncio
 async def test_unusual_activity_parks_model_and_rotates_accounts(service):
     await service.pool.upsert(Account(id='two',access_token='second-token'))
@@ -244,6 +256,60 @@ async def test_unusual_activity_drives_model_fallback(service):
     assert result.status==200
     assert service.client.calls[0][1]['model']=='GLM-5.3'
     assert service.client.calls[1][1]['model']=='GLM-5.3-Flash'
+
+
+@pytest.mark.asyncio
+async def test_suspended_account_aborts_request_without_rotation(service):
+    await service.pool.upsert(Account(id='two',access_token='second-token'))
+    service.client=FakeClient(responses=[suspended_response(),FakeResponse(sample_sse())])
+    with pytest.raises(UpstreamFailure) as err:
+        await service.complete({'model':'GLM-5.3','messages':[{'role':'user','content':'hi'}]},model='GLM-5.3')
+    assert err.value.status==405
+    assert len(service.client.calls)==1
+    killed=await service.pool.find('one')
+    spare=await service.pool.find('two')
+    assert killed.state is AccountState.DEAD and killed.death_reason=='suspended'
+    assert spare.state is AccountState.READY and spare.in_flight==0
+
+
+@pytest.mark.asyncio
+async def test_suspension_logs_upstream_text(service, caplog):
+    service.client=FakeClient(responses=[suspended_response()])
+    with caplog.at_level('WARNING', logger='zcode_gateway.service'):
+        with pytest.raises(UpstreamFailure):
+            await service.complete({'model':'GLM-5.3','messages':[{'role':'user','content':'hi'}]},model='GLM-5.3')
+    text='\n'.join(record.getMessage() for record in caplog.records)
+    assert 'SUSPENDED' in text and 'misusing the Start Plan' in text and 'one' in text
+
+
+@pytest.mark.asyncio
+async def test_accounts_without_device_mid_get_distinct_mids(service):
+    import uuid
+    await service.pool.upsert(Account(id='two',access_token='second-token'))
+    service.client=FakeClient(responses=[FakeResponse(sample_sse()),FakeResponse(sample_sse())])
+    for ident in ('one','two'):
+        result=await service.complete({'model':'GLM-5.3','messages':[{'role':'user','content':'hi'}],
+                                       'account':ident},model='GLM-5.3')
+        assert result.status==200
+    mids=[json.loads(body['metadata']['user_id'])['device_id'] for _,body in service.client.calls]
+    assert len(mids)==2 and mids[0]!=mids[1]
+    assert all(str(uuid.UUID(mid))==mid for mid in mids)
+    assert service.cfg.upstream.fingerprint.device_mid not in mids
+
+
+@pytest.mark.asyncio
+async def test_account_timezone_overrides_config_default(service):
+    account=await service.pool.find('one')
+    account.notes['timezone']='Asia/Tehran'
+    service.client=FakeClient()
+    assert (await service.complete({'model':'GLM-5.3','messages':[{'role':'user','content':'hi'}]},
+                                   model='GLM-5.3')).status==200
+    assert service.client.calls[0][0]['x-client-timezone']=='Asia/Tehran'
+    account.notes.pop('timezone')
+    service.client=FakeClient()
+    assert (await service.complete({'model':'GLM-5.3','messages':[{'role':'user','content':'hi'}]},
+                                   model='GLM-5.3')).status==200
+    assert service.client.calls[0][0]['x-client-timezone']==service.cfg.upstream.fingerprint.timezone
 
 def test_import_all_coding_plan_jwts_excludes_api_keys(tmp_path):
     import base64
@@ -596,6 +662,7 @@ async def test_persistent_concurrency_is_bounded_429_without_parking(service, mo
 @pytest.mark.asyncio
 async def test_concurrency_refusals_do_not_kill_burst_of_sessions(cfg):
     cfg.pool.concurrency_hold_seconds=30
+    cfg.pool.concurrency_settle_seconds=0
     cfg.pool.acquire_wait_seconds=2
     cfg.upstream.concurrency_base_delay_seconds=0
     cfg.upstream.max_attempts=3
@@ -664,6 +731,90 @@ async def test_midstream_concurrency_error_benches_account(service):
     assert account.state is AccountState.READY and account.in_flight==0
     assert account.concurrency_strikes==1 and account.is_concurrency_held()
     assert not account.model_caps
+
+
+@pytest.mark.asyncio
+async def test_settle_window_blocks_instant_reacquire_but_queue_serves(cfg, monkeypatch):
+    """The core regression the settle window fixes: a released account must
+    not be handed out again immediately, but a queued waiter gets it the
+    moment the settle window passes — no 3008, no failure."""
+    cfg.pool.concurrency_settle_seconds=0.2
+    cfg.pool.acquire_wait_seconds=5
+    pool=PoolManager(cfg.pool,[Account(id='one',access_token='test-token')])
+    store=Store(cfg.store.sqlite_path)
+    class FakeTokens:
+        async def refresh(self, account, force=False, *, expected_credentials=None): return False
+    svc=ChatService(cfg,pool,FakeTokens(),FakeClient(),Registry(),store,JsonlCapture(cfg.logging.capture_dir,False))
+    try:
+        # first call succeeds, releasing with the settle window armed;
+        # second call must wait out the window and still succeed
+        svc.client=FakeClient(responses=[FakeResponse(sample_sse()),FakeResponse(sample_sse())])
+        first=await svc.complete({'messages':[{'role':'user','content':'hi'}]}, model='GLM-5.3')
+        assert first.status==200
+        assert pool._accounts['one'].is_settling()
+        second=await svc.complete({'messages':[{'role':'user','content':'hi'}]}, model='GLM-5.3')
+        assert second.status==200 and len(svc.client.calls)==2
+        assert pool._accounts['one'].in_flight==0
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_settle_window_with_two_accounts_avoids_the_bench_entirely(cfg, monkeypatch):
+    """With a second account available, a just-released account is skipped in
+    favor of the idle one — the refusal-prone pattern never happens."""
+    cfg.pool.concurrency_settle_seconds=30
+    cfg.pool.strategy='least_recently_used'
+    pool=PoolManager(cfg.pool,[Account(id='one',access_token='t-one'),
+                               Account(id='two',access_token='t-two')])
+    store=Store(cfg.store.sqlite_path)
+    class FakeTokens:
+        async def refresh(self, account, force=False, *, expected_credentials=None): return False
+    svc=ChatService(cfg,pool,FakeTokens(),FakeClient(),Registry(),store,JsonlCapture(cfg.logging.capture_dir,False))
+    try:
+        svc.client=FakeClient(responses=[FakeResponse(sample_sse()),FakeResponse(sample_sse())])
+        first=await svc.complete({'messages':[{'role':'user','content':'hi'}]}, model='GLM-5.3')
+        assert first.status==200
+        # 'one' just served and is settling; the next request must go to 'two'
+        # WITHOUT any 3008 round-trip
+        second=await svc.complete({'messages':[{'role':'user','content':'hi'}]}, model='GLM-5.3')
+        assert second.status==200
+        assert [call[0]['authorization'] for call in svc.client.calls]==['Bearer t-one','Bearer t-two']
+        assert pool._accounts['one'].concurrency_strikes==0
+        assert pool._accounts['two'].concurrency_strikes==0
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_refusal_strikes_decay_so_idle_accounts_recover(cfg):
+    """End-to-end decay through the real request path: a 3008 refusal banks a
+    strike (mirrors the production hold config); the decay math itself is
+    covered pool-level in test_acquire_wait."""
+    cfg.pool.concurrency_hold_seconds=10
+    cfg.pool.concurrency_hold_max_seconds=60
+    cfg.pool.acquire_wait_seconds=0.5
+    pool=PoolManager(cfg.pool,[Account(id='one',access_token='test-token')])
+    store=Store(cfg.store.sqlite_path)
+    class FakeTokens:
+        async def refresh(self, account, force=False, *, expected_credentials=None): return False
+    svc=ChatService(cfg,pool,FakeTokens(),FakeClient(),Registry(),store,JsonlCapture(cfg.logging.capture_dir,False))
+    try:
+        svc.client=FakeClient(responses=[concurrency_response()])
+        # real request path banks the strike: the 3008 benches the account
+        # (with a single account the retry then fails fast on the hold —
+        # multi-account rotation is covered by the burst test above)
+        with pytest.raises((UpstreamFailure, NoAccountsAvailable)):
+            await svc.open_stream({'messages':[{'role':'user','content':'hi'}]}, model='GLM-5.3')
+        one=pool._accounts['one']
+        assert one.concurrency_strikes==1 and one.is_concurrency_held()
+        # quiet gap longer than the max hold decays the escalation
+        one.concurrency_hold_until=time.time()-61
+        await pool.on_concurrency_refusal(one)
+        hold=one.concurrency_hold_until-time.time()
+        assert one.concurrency_strikes==2 and hold<=20.0
+    finally:
+        store.close()
 
 
 @pytest.mark.asyncio

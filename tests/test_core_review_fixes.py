@@ -292,6 +292,9 @@ async def test_retried_http_401_uses_credentials_of_second_send():
     service, _ = service_for([])
     service.cfg.upstream.max_attempts = 1
     account = await service.pool.find('one')
+    # a bare account is assigned a mid on its first request, and the mid is
+    # part of the credential key; pin one so `before` is the key actually sent
+    account.notes['device_mid'] = 'test-device'
     calls, refresh_keys = [], []
 
     async def refresh(account, force=False, *, expected_credentials=None):
@@ -399,6 +402,9 @@ async def test_rotation_during_open_does_not_penalize_new_credentials(failure):
     account = await service.pool.find('one')
     if failure == 'expired':
         account.expires_at = 1
+    # a bare account is assigned a mid on its first request, and the mid is
+    # part of the credential key; pin one so `before` is the key actually sent
+    account.notes['device_mid'] = 'test-device'
     before = account.credential_key()
 
     def rotate():

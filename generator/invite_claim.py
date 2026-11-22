@@ -25,7 +25,13 @@ sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
 from utils import BROWSER_ARGS
-from plan_check import APP_VERSION, _request, client_timezone, direct_requests
+from plan_check import (
+    APP_VERSION,
+    _request,
+    client_timezone,
+    direct_requests,
+    per_account_device_mid,
+)
 
 # NOTE: playwright is imported lazily inside claim_invite(). The referral
 # helpers below (referral_summary / send_one_message) are imported by the
@@ -557,20 +563,11 @@ def _direct_proxy_while(fn):
     return wrapper
 
 
-def per_account_device_mid(token: str) -> str:
-    """Stable per-account device id (uuid5 of the chat token) instead of the
-    hardcoded shared one — every account reporting the SAME x-device-mid in
-    telemetry is a direct cross-account correlation signal."""
-    import uuid as _u
-    return str(_u.uuid5(_u.NAMESPACE_URL, 'zcode-device:' + (token or '')))
-
-
 APP_HEADERS = {  # exact cli/init header set captured from the desktop app
     'content-type': 'application/json',
     'http-referer': 'https://zcode.z.ai',
     'user-agent': 'ZCode/' + APP_VERSION,
     'x-client-language': 'en-US',
-    'x-device-mid': '58aca3b3-3239-4cb7-9c70-df3e5488fb99',
     'x-os-category': 'windows',
     'x-os-version': '10.0.26200',
     'x-platform': 'win32-x64',

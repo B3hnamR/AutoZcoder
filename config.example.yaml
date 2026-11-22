@@ -28,6 +28,11 @@ pool:
   acquire_wait_seconds: 120
   concurrency_hold_seconds: 10
   concurrency_hold_max_seconds: 60
+  # Upstream keeps a just-finished request in its per-user concurrency count
+  # for a few seconds, so handing a released account out again immediately
+  # answers 3008 even though the slot is free locally. Wait this long after
+  # release() before re-admitting the account.
+  concurrency_settle_seconds: 5
   balance_poll_seconds: 60
   blocked_model_cooldown_seconds: 900
 accounts:

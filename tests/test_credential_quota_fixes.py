@@ -401,6 +401,7 @@ def test_quota_aware_skips_saturated_highest_quota_before_ranking():
 async def test_quota_aware_waits_only_when_all_eligible_accounts_are_saturated():
     cfg = Config().pool
     cfg.strategy, cfg.max_in_flight_per_account = 'quota_aware', 1
+    cfg.concurrency_settle_seconds = 0
     accounts = [Account(id='best', access_token='dummy-best', in_flight=1,
                         notes={'quotas': {MODEL: {'remaining': 100}}}),
                 Account(id='next', access_token='dummy-next', in_flight=1,

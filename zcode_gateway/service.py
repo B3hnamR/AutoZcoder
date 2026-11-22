@@ -14,7 +14,7 @@ import httpx
 import anyio
 from .aggregate import aggregate_openai_stream
 from .affinity import affinity_key_from_payload
-from .pool import Account
+from .pool import Account, AccountState
 from .breaker import EdgeBlockBreaker
 from .model_retry import concurrency_delay, is_model_overload, overload_delay, retry_after_seconds, wait_for_retry
 from .zcode_protocol import MessageAccumulator, OpenAITranslator, usage_openai
@@ -23,6 +23,7 @@ from .upstream import (build_headers, build_upstream_body, iter_sse_events, sse_
                        is_block_code, is_concurrency_code, client_not_supported,
                        is_account_suspended, CLIENT_NOT_SUPPORTED_PARK_S)
 from .registry import model_caps
+from .zcode_device import new_account_device_mid
 
 log = logging.getLogger('zcode_gateway.service')
 
@@ -217,10 +218,14 @@ class ChatService:
                 # The account itself is banned upstream for proxying: no model
                 # on it can serve, and retrying only produces a 405 per request.
                 # Take it out of rotation until an operator re-enables it.
+                log.warning('ZCode account %s (%s) SUSPENDED by upstream (status=%s code=%s): %s',
+                            account.id, account.email, status, code, message)
                 await self.pool.kill(account, reason=str(message)[:200],
                                      cause='suspended',
                                      expected_credentials=expected_credentials)
                 return
+            if status == 405:
+                log.warning('ZCode 405/3012 on account %s model %s: %s', account.id, model, message)
             if client_not_supported(message):
                 await self.pool.cap_model(account, model,
                                           CLIENT_NOT_SUPPORTED_PARK_S,
@@ -480,11 +485,16 @@ class ChatService:
                     raise UpstreamFailure(reason['status'], reason['code'], reason['message'],
                                           reason.get('release_at'), reason.get('release_in_s'))
                 raise NoAccountsAvailable()
+            device_mid = account.notes.get('device_mid')
+            if not device_mid:
+                device_mid = account.notes['device_mid'] = new_account_device_mid()
+                log.warning('account %s had no device_mid; assigned a fresh one', account.id)
             credentials = account.credential_key()
+            timezone = account.notes.get('timezone') or None
             headers = build_headers(account.access_token, self.cfg.upstream.fingerprint,
-                                    device_mid=account.notes.get('device_mid'), include_device_mid=False)
+                                    device_mid=device_mid, include_device_mid=False,
+                                    timezone=timezone)
             if generated_identity:
-                device_mid = account.notes.get('device_mid') or self.cfg.upstream.fingerprint.device_mid
                 body['metadata'] = {**(original_metadata or {}),
                     'user_id': json.dumps({'device_id': device_mid,
                         'account_uuid': '', 'session_id': headers['x-session-id']}, separators=(',', ':'))}
@@ -505,8 +515,8 @@ class ChatService:
                 # credentials actually sent, not the mutable account later.
                 credentials = account.credential_key()
                 headers = build_headers(account.access_token, self.cfg.upstream.fingerprint,
-                                        task_id=headers['x-session-id'], device_mid=account.notes.get('device_mid'),
-                                        include_device_mid=False)
+                                        task_id=headers['x-session-id'], device_mid=device_mid,
+                                        include_device_mid=False, timezone=timezone)
                 resp = await self.client.send(headers, body, stream=True)
                 if resp.status_code != 200 or 'application/json' in resp.headers.get('content-type', ''):
                     raw = await resp.aread()
@@ -519,8 +529,8 @@ class ChatService:
                         await resp.aclose()
                         credentials = account.credential_key()
                         headers = build_headers(account.access_token, self.cfg.upstream.fingerprint,
-                                                task_id=headers['x-session-id'], device_mid=account.notes.get('device_mid'),
-                                                include_device_mid=False)
+                                                task_id=headers['x-session-id'], device_mid=device_mid,
+                                                include_device_mid=False, timezone=timezone)
                         resp = await self.client.send(headers, body, stream=True)
                         if resp.status_code == 200 and 'application/json' not in resp.headers.get('content-type', ''):
                             status = 200
@@ -552,6 +562,10 @@ class ChatService:
                         if (status < 500 and status not in (401, 402, 403, 405, 429, 451)
                                 and code != '11113' and not is_block_code(code, status)):
                             raise last
+                        # a killed account cannot serve this request; rotating
+                        # now only burns the next account on the same ban
+                        if account.state is AccountState.DEAD:
+                            raise last
                         tried.add(account.id)
                         continue
                 handle = StreamHandle(account, headers, body, resp, variant, time.time(),
@@ -581,6 +595,8 @@ class ChatService:
                                                 expected_credentials=credentials)
                         last = UpstreamFailure(status, code, message)
                         if is_model_overload(status, code): raise last
+                        if account.state is AccountState.DEAD:
+                            raise last
                         tried.add(account.id)
                         break
                     if first.get('type') != 'message_start':

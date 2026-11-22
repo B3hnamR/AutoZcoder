@@ -246,16 +246,22 @@ STATIC_HEADERS = {
 }
 # Stable PER-ACCOUNT device id: every account using one shared hardcoded
 # x-device-mid is a direct cross-account correlation signal for risk control.
-# uuid5 of the chat token keeps the id deterministic per account (the gateway
-# plan-checker and the message flow then report a consistent device).
 DEVICE_MID = "58aca3b3-3239-4cb7-9c70-df3e5488fb99"   # legacy fallback only
 
 
+def account_device_mid(account_id: str) -> str:
+    """Same derivation as zcode_gateway.zcode_device.account_device_mid.
+
+    The generator runs under its own interpreter, where the gateway package is
+    not importable, so the formula is duplicated; tests pin the two together.
+    """
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, 'zcode-device:' + (account_id or '')))
+
+
 def per_account_device_mid(token: str) -> str:
-    import uuid as _u
-    if not token:
-        return DEVICE_MID
-    return str(_u.uuid5(_u.NAMESPACE_URL, 'zcode-device:' + token))
+    """The device of the account a chat token or zjwt belongs to."""
+    ident = jwt_user_id(token)
+    return account_device_mid(ident) if ident else DEVICE_MID
 
 
 _TZ_CACHE = None

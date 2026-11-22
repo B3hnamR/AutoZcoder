@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
+import base64
+import json
+import time
 from pathlib import Path
+
+import pytest
 
 from zcode_gateway.accounts_dir import (
     load_from_accounts_dir,
     parse_snapshot,
+    persist_account_states,
     write_snapshot,
 )
+from zcode_gateway.pool import AccountState, PoolConfig, PoolManager
+from zcode_gateway.zcode_accounts import read_credentials
 
 SNAPSHOT = """\
 # Zcode account snapshot
@@ -134,3 +142,61 @@ def parse_snapshot_file(tmp_path) -> dict:
     f = tmp_path / "src.txt"
     f.write_text(SNAPSHOT, encoding="utf-8")
     return parse_snapshot(f)
+
+
+def test_shared_telemetry_mid_does_not_reach_two_records(tmp_path):
+    def token(ident):
+        claims = base64.urlsafe_b64encode(
+            json.dumps({"user_id": ident, "iat": 1}).encode()).decode().rstrip("=")
+        return f"header.{claims}.signature"
+
+    (tmp_path / "telemetry-state.json").write_text(
+        json.dumps({"deviceMid": "desktop-mid"}), encoding="utf-8")
+    (tmp_path / "credentials.json").write_text(json.dumps({
+        "account-provider:coding-plan:account:a:api-key": token("acct-a"),
+        "account-provider:coding-plan:account:b:api-key": token("acct-b"),
+    }), encoding="utf-8")
+    mids = {row["account_id"]: row["device_mid"]
+            for row in read_credentials(tmp_path / "credentials.json")}
+    assert len(mids) == 2
+    assert len(set(mids.values())) == 2
+    assert "desktop-mid" not in mids.values()
+    # a second import (or a providers_json restart) keeps the same identity
+    again = {row["account_id"]: row["device_mid"]
+             for row in read_credentials(tmp_path / "credentials.json")}
+    assert again == mids
+
+
+def test_state_and_death_reason_round_trip(tmp_path):
+    fields = parse_snapshot_file(tmp_path)
+    fields.update(state="dead", death_reason="suspended",
+                  paid_exhausted="true", cooldown_until="0")
+    write_snapshot(tmp_path / "src.txt", fields)
+    account = load_from_accounts_dir(tmp_path)[0]
+    assert account.state is AccountState.DEAD
+    assert account.death_reason == "suspended"
+    assert account.paid_exhausted is True
+
+
+def test_expired_cooldown_restores_ready(tmp_path):
+    fields = parse_snapshot_file(tmp_path)
+    fields.update(state="cooling", cooldown_until=str(time.time() - 5))
+    write_snapshot(tmp_path / "src.txt", fields)
+    assert load_from_accounts_dir(tmp_path)[0].state is AccountState.READY
+
+
+@pytest.mark.asyncio
+async def test_killed_account_reloads_dead_with_its_reason(tmp_path):
+    write_snapshot(tmp_path / "one.txt", {
+        "account_id": "acct-one", "email": "one@example.test",
+        "access_token": "offline", "expires_at_ms": "0", "device_mid": "device-one",
+    })
+    accounts = load_from_accounts_dir(tmp_path)
+    pool = PoolManager(PoolConfig(), accounts)
+    pool._STATE_SAVE_DEBOUNCE_S = 0.01
+    pool.set_state_saver(lambda rows: persist_account_states(tmp_path, rows))
+    await pool.kill(accounts[0], "banned for proxying", cause="suspended")
+    await pool.aclose()
+    reloaded = load_from_accounts_dir(tmp_path)[0]
+    assert reloaded.state is AccountState.DEAD
+    assert reloaded.death_reason == "suspended"

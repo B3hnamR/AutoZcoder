@@ -27,7 +27,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .pool import Account
+from .pool import Account, _restore_hard_state
 
 log = logging.getLogger("zcode_gateway.accounts_dir")
 
@@ -224,10 +224,12 @@ def _to_account(fields: dict[str, str], path: Path) -> Account | None:
         "workos_user_id": fields.get("workos_user_id", ""),
         "file": path.name,
         "device_mid": fields.get("device_mid", ""),
+        "timezone": fields.get("timezone", ""),
         "auto_run_id": fields.get("auto_run_id", ""),
         "auto_attempt_id": fields.get("auto_attempt_id", ""),
         "imported_jwt": fields.get("imported_jwt") == "true" or fields.get("source") == "Manual JWT import",
     }
+    _restore_hard_state(account, fields)
     return account
 
 
@@ -279,6 +281,7 @@ def write_snapshot(path: Path, fields: dict[str, str]) -> None:
         "issuer", "client_id",
         "", "balance_micro", "balance_usd", "plan",
         "", "access_token", "refresh_token",
+        "", "state", "death_reason", "paid_exhausted", "cooldown_until", "timezone",
     ]
     lines = ["# Zcode account snapshot"]
     for key in order:
@@ -304,3 +307,35 @@ def write_snapshot(path: Path, fields: dict[str, str]) -> None:
             os.replace(tmp, path)
         finally:
             tmp.unlink(missing_ok=True)
+
+
+def persist_account_states(directory: str | Path, rows: list[dict]) -> None:
+    """Write hard-state fields into the matching snapshots.
+
+    The LIVE source is a folder of files, not pool.json: without this a
+    restart re-reads a banned account as READY. Files whose fields already
+    match are left untouched.
+    """
+    by_id = {str(row["id"]): row for row in rows}
+    with snapshot_transaction(directory) as folder:
+        for path in sorted(folder.iterdir()):
+            if path.suffix.casefold() != ".txt" or not path.is_file() or path.is_symlink():
+                continue
+            try:
+                fields = parse_snapshot(path)
+            except Exception:
+                continue
+            ident = fields.get("account_id") or fields.get("zcode_user_id") or path.stem
+            row = by_id.get(str(ident))
+            if row is None:
+                continue
+            update = {
+                "state": str(row["state"]),
+                "death_reason": str(row["death_reason"] or ""),
+                "paid_exhausted": "true" if row["paid_exhausted"] else "false",
+                "cooldown_until": f"{float(row['cooldown_until']):.6f}",
+            }
+            if all(fields.get(key, "") == value for key, value in update.items()):
+                continue
+            fields.update(update)
+            write_snapshot(path, fields)

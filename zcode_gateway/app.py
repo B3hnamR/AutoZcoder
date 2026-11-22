@@ -83,6 +83,16 @@ async def lifespan(app: FastAPI):
         pool.load_caps()
     except Exception:
         log.warning("model-cap persistence unavailable", exc_info=True)
+    # hard state (DEAD / EXHAUSTED) must reach the live source, or a restart
+    # resurrects a banned account as READY
+    if cfg.accounts.source == "accounts_dir":
+        from .accounts_dir import persist_account_states
+        pool.set_state_saver(
+            lambda rows: persist_account_states(cfg.accounts.dir, rows))
+    elif cfg.accounts.source == "pool_file":
+        from .token_utils import persist_pool_states
+        pool.set_state_saver(
+            lambda rows: persist_pool_states(cfg.accounts.pool_file, rows))
     tokens = TokenManager(cfg, pool)
     client = UpstreamClient(cfg.upstream, relay_manager=relay_manager,
                             pacing=cfg.models.pacing)

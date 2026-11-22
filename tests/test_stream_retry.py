@@ -43,6 +43,7 @@ def cfg(tmp_path):
     config.logging.capture = False
     config.pool.balance_poll_seconds = 0
     config.pool.acquire_wait_seconds = 0
+    config.pool.concurrency_settle_seconds = 0
     config.server.admin_key = 'test-admin'
     config.server.client_keys = [ClientKey(key='test-client')]
     return config

@@ -78,6 +78,25 @@ def test_import_persists_validated_token_and_copy_fetches_current(tmp_path, monk
         assert client.get(f"/admin/accounts/{IDENT}/token").status_code in (401, 403)
 
 
+def test_import_without_export_device_mid_assigns_a_valid_one(tmp_path, monkeypatch):
+    import uuid
+    seen = []
+
+    def handler(request):
+        seen.append(request.headers.get("x-device-mid"))
+        return httpx.Response(200, json={"code": 0, "data": {"plans": [], "balances": []}})
+
+    cfg = config(tmp_path)
+    with TestClient(create_app(cfg)) as client:
+        provider(monkeypatch, handler)
+        response = client.post("/admin/accounts/import-jwt", headers=HEADERS, json={"token": jwt()})
+        assert response.status_code == 200, response.text
+        row = load_from_accounts_dir(cfg.accounts.dir)[0]
+        assert str(uuid.UUID(row.notes["device_mid"])) == row.notes["device_mid"]
+        assert row.notes["device_mid"] == seen[0]
+        assert row.notes["device_mid"] != cfg.upstream.fingerprint.device_mid
+
+
 @pytest.mark.parametrize("token", [None, "junk", jwt(exp=1), jwt(exp=True), jwt(sub="invalid"), jwt(exp="NaN")])
 def test_import_rejects_malformed_before_provider_or_persistence(tmp_path, monkeypatch, token):
     with TestClient(create_app(config(tmp_path))) as client:

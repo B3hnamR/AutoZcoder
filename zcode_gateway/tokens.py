@@ -14,6 +14,7 @@ from .token_utils import _parse_expiry, _atomic_write, persist_pool_snapshot
 from .accounts_dir import (parse_snapshot, snapshot_path, snapshot_transaction,
                            write_snapshot)
 from .upstream import build_headers
+from .zcode_device import new_account_device_mid
 
 log = logging.getLogger('zcode_gateway.tokens')
 
@@ -215,10 +216,14 @@ class TokenManager:
                 return None
             account.quota_check_generation += 1
             revision = account.quota_check_generation
+            device_mid = account.notes.get('device_mid')
+            if not device_mid:
+                device_mid = account.notes['device_mid'] = new_account_device_mid()
+                log.warning('account %s had no device_mid; assigned a fresh one', account.id)
             credentials = account.credential_key()
             account.notes['quota_check_attempted_at'] = time.time()
             headers = build_headers(account.access_token, self.cfg.upstream.fingerprint,
-                                    device_mid=account.notes.get('device_mid'))
+                                    device_mid=device_mid)
         url = self.cfg.upstream.base_url.rstrip('/') + '/zcode-plan/billing/balance'
         try:
             for attempt in range(2):

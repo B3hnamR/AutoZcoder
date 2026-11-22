@@ -74,8 +74,19 @@ class Account:
     # state stays READY and no quota/model park is applied, but pick() skips the
     # account until the hold expires so retries stop hammering a slot upstream
     # still counts as busy. Doubles per consecutive refusal, cleared by success.
+    # Strikes decay: a refusal that arrives after the previous hold has already
+    # expired counts the escalation from near the base again, so a burst of
+    # refusals spread over minutes cannot bench an account for the max hold
+    # forever (live: one account reached strike 13 / 120s holds on 3008s that
+    # each cleared seconds later).
     concurrency_hold_until: float = 0.0
     concurrency_strikes: int = 0
+    # Settle window: upstream keeps a just-finished request in its per-user
+    # concurrency count briefly after the stream ends, so a released account
+    # re-admitted at once answers 3008 with in_flight already 0 (observed live:
+    # refusals landing on idle accounts seconds after their last request).
+    # release() marks settled_until; pick() skips the account until it passes.
+    settled_until: float = 0.0
 
     # Credit exhaustion is per model-class, not per account: a paid model can 402
     # (insufficient_credits) while zcode-free/* models keep working on the same
@@ -128,6 +139,9 @@ class Account:
 
     def is_concurrency_held(self, now: float | None = None) -> bool:
         return self.concurrency_hold_until > (time.time() if now is None else now)
+
+    def is_settling(self, now: float | None = None) -> bool:
+        return self.settled_until > (time.time() if now is None else now)
 
     @property
     def is_free_tier(self) -> bool:
@@ -206,6 +220,8 @@ class Account:
             "concurrency_strikes": self.concurrency_strikes,
             "concurrency_hold_until": self.concurrency_hold_until,
             "concurrency_hold_in_s": int(max(self.concurrency_hold_until - now, 0)),
+            "settled_until": self.settled_until,
+            "settling_in_s": int(max(self.settled_until - now, 0)),
             "balance_micro": self.balance_micro,
             "balance_checked_at": self.balance_checked_at,
             "quota_check_attempted_at": self.notes.get("quota_check_attempted_at"),
@@ -244,7 +260,7 @@ class Account:
 
 def _account_from_auth(auth: dict, ident: str, source: str) -> Account:
     meta = (auth.get("metadata") or {}).get("userInfo") or {}
-    return Account(
+    account = Account(
         id=auth.get("accountId") or ident,
         email=meta.get("email", ""),
         access_token=auth.get("accessToken", ""),
@@ -252,6 +268,8 @@ def _account_from_auth(auth: dict, ident: str, source: str) -> Account:
         expires_at=_expiry_ms(auth.get("expiresAt")),
         source=source,
     )
+    _restore_hard_state(account, auth)
+    return account
 
 
 def _expiry_ms(value) -> int:
@@ -262,6 +280,40 @@ def _expiry_ms(value) -> int:
     """
     from .tokens import _parse_expiry
     return _parse_expiry(value)
+
+
+def _as_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in ("1", "true", "yes")
+
+
+def _restore_hard_state(account: Account, item: dict, now: float | None = None) -> None:
+    """Re-apply only the states a restart must not forget.
+
+    DEAD and EXHAUSTED are account-level and last until an operator acts;
+    COOLING is transient and survives only while its window is still running.
+    Anything else — including a corrupt value — falls back to READY: a bad
+    file must never strand an account in a state no request can leave.
+    """
+    now = time.time() if now is None else now
+    try:
+        state = AccountState(str(item.get("state") or "").strip().lower())
+    except ValueError:
+        state = AccountState.READY
+    if state in (AccountState.DEAD, AccountState.EXHAUSTED):
+        account.state = state
+        account.death_reason = str(item.get("death_reason") or "")[:200]
+    elif state is AccountState.COOLING:
+        try:
+            until = float(item.get("cooldown_until") or 0)
+        except (TypeError, ValueError):
+            until = 0.0
+        if until > now:
+            account.state = AccountState.COOLING
+            account.cooldown_until = until
+    if "paid_exhausted" in item:
+        account.paid_exhausted = _as_bool(item.get("paid_exhausted"))
 
 
 def load_from_providers_json(path: str) -> list[Account]:
@@ -283,10 +335,12 @@ def load_from_pool_file(path: str) -> list[Account]:
     out: list[Account] = []
     for i, item in enumerate(raw or []):
         if "auth" in item:
-            out.append(_account_from_auth(item["auth"], item.get("id", f"pool-{i}"),
-                                          "pool.json"))
+            account = _account_from_auth(item["auth"], item.get("id", f"pool-{i}"),
+                                         "pool.json")
+            _restore_hard_state(account, item)
+            out.append(account)
         else:
-            out.append(Account(
+            account = Account(
                 id=item.get("id") or f"pool-{i}",
                 email=item.get("email", ""),
                 access_token=item.get("access_token") or item.get("accessToken", ""),
@@ -294,8 +348,11 @@ def load_from_pool_file(path: str) -> list[Account]:
                 expires_at=_expiry_ms(item.get("expires_at") or item.get("expiresAt")),
                 source="pool.json",
                 notes={"imported_jwt": bool(item.get("imported_jwt") or item.get("source") == "jwt-import"),
-                       "name": item.get("name", ""), "device_mid": item.get("device_mid", "")},
-            ))
+                       "name": item.get("name", ""), "device_mid": item.get("device_mid", ""),
+                       "timezone": item.get("timezone", "")},
+            )
+            _restore_hard_state(account, item)
+            out.append(account)
     return out
 
 
@@ -374,9 +431,11 @@ class Router:
         now = time.time()
         # Held accounts stay in candidates() so acquire() knows the pool is
         # saturated (and waits) rather than absent — but they are not pickable
-        # until the hold expires.
+        # until the hold expires. Settling accounts likewise: released seconds
+        # ago, upstream still counts the finished request as busy.
         under_cap = [a for a in accounts
-                     if a.in_flight < cap and not a.is_concurrency_held(now)]
+                     if a.in_flight < cap and not a.is_concurrency_held(now)
+                     and not a.is_settling(now)]
         if not under_cap:
             # The configured cap must be a cap, not a preference: when every
             # candidate is saturated, report no candidate. The manager waits
@@ -434,6 +493,15 @@ class PoolManager:
         self._caps_io_lock = threading.Lock()
         self._caps_close_lock = asyncio.Lock()
         self._caps_closing = False
+        # debounced hard-state persistence (see _schedule_state_save): DEAD /
+        # EXHAUSTED must reach the live account source or a restart resurrects
+        # a banned account as READY
+        self._state_saver = None
+        self._state_dirty = False
+        self._state_save_task: asyncio.Task | None = None
+        self._state_write_task: asyncio.Task | None = None
+        self._state_io_lock = threading.Lock()
+        self._state_closing = False
         # notification center (attached in app setup); pool events worth a
         # human's attention go through here, safe from any thread
         self._notify = None
@@ -445,6 +513,7 @@ class PoolManager:
         """Join the actual disk writer before flushing the latest snapshot."""
         async with self._caps_close_lock:
             self._caps_closing = True
+            self._state_closing = True
             task = self._caps_save_task
             if task is not None and not task.done():
                 task.cancel()
@@ -457,6 +526,19 @@ class PoolManager:
                     self._caps_dirty = True
             while self._caps_dirty and self.caps_path:
                 if not await self._flush_caps():
+                    break
+            task = self._state_save_task
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            if self._state_write_task is not None:
+                if not await asyncio.shield(self._state_write_task):
+                    self._state_dirty = True
+            while self._state_dirty and self._state_saver:
+                if not await self._flush_state():
                     break
 
     def notify(self, category: str, message: str, level: str = "info") -> None:
@@ -596,6 +678,78 @@ class PoolManager:
             return
         out = self._caps_snapshot()
         self._write_caps_snapshot(out)
+
+    _STATE_SAVE_DEBOUNCE_S = 5.0
+
+    def set_state_saver(self, saver) -> None:
+        """Point hard-state persistence at the configured account source."""
+        self._state_saver = saver
+
+    def _schedule_state_save(self) -> None:
+        """Debounced, off-loop write of DEAD/EXHAUSTED to the live source."""
+        self._state_dirty = True
+        if self._state_closing:
+            return
+        task = self._state_save_task
+        if task is not None and not task.done():
+            return
+        self._state_save_task = asyncio.get_running_loop().create_task(
+            self._state_save_later())
+
+    async def _state_save_later(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(self._STATE_SAVE_DEBOUNCE_S)
+                if not self._state_dirty or self._state_saver is None:
+                    return
+                if not await self._flush_state():
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._state_dirty = True
+            log.debug("debounced account-state save failed", exc_info=True)
+
+    async def _flush_state(self) -> bool:
+        if self._state_write_task is not None:
+            if not await asyncio.shield(self._state_write_task):
+                self._state_dirty = True
+        async with self._lock:
+            self._state_dirty = False
+            out = self._state_snapshot()
+        self._state_write_task = asyncio.create_task(
+            asyncio.to_thread(self._write_state_snapshot, out))
+        ok = await asyncio.shield(self._state_write_task)
+        if not ok:
+            self._state_dirty = True
+        return ok
+
+    def _state_snapshot(self) -> list[dict]:
+        """Hard-state rows for every account. Caller holds the lock."""
+        now = time.time()
+        out = []
+        for acc in self._accounts.values():
+            state = acc.state.value
+            if acc.state is AccountState.COOLING and acc.cooldown_until <= now:
+                state = AccountState.READY.value
+            out.append({"id": acc.id, "state": state,
+                        "death_reason": acc.death_reason,
+                        "paid_exhausted": bool(acc.paid_exhausted),
+                        "cooldown_until": float(acc.cooldown_until)})
+        return out
+
+    def _write_state_snapshot(self, rows: list[dict]) -> bool:
+        """Returns False when the write failed so the debounced saver retries."""
+        saver = self._state_saver
+        if saver is None:
+            return True
+        try:
+            with self._state_io_lock:
+                saver(rows)
+            return True
+        except Exception:
+            log.debug("could not persist account state", exc_info=True)
+            return False
 
     # -- access ---------------------------------------------------------- #
 
@@ -820,6 +974,10 @@ class PoolManager:
     async def release(self, account: Account) -> None:
         async with self._lock:
             account.in_flight = max(0, account.in_flight - 1)
+            settle = self.cfg.concurrency_settle_seconds
+            if settle > 0:
+                account.settled_until = max(account.settled_until,
+                                            time.time() + settle)
             self._slot_gen += 1     # wake acquire() waiters
 
     # -- state transitions ----------------------------------------------- #
@@ -851,6 +1009,13 @@ class PoolManager:
             if expected_credentials is not None and (self._accounts.get(account.id) is not account
                     or account.credential_key() != expected_credentials):
                 return
+            # Strike decay: escalation only makes sense while failures chain.
+            # If the previous hold already expired (minutes of quiet, no
+            # success to clear the counter), the next refusal starts from
+            # near the base again instead of stacking on banked strikes.
+            quiet_s = time.time() - account.concurrency_hold_until
+            if account.concurrency_strikes > 1 and quiet_s > self.cfg.concurrency_hold_max_seconds:
+                account.concurrency_strikes = 1
             account.concurrency_strikes += 1
             base = self.cfg.concurrency_hold_seconds
             if base <= 0:
@@ -920,6 +1085,7 @@ class PoolManager:
                     account.state = AccountState.READY
             else:
                 account.state = AccountState.EXHAUSTED
+        self._schedule_state_save()
 
     async def kill(self, account: Account, reason: str = "", *, cause: str = "",
                    expected_credentials: tuple | None = None) -> bool:
@@ -936,6 +1102,7 @@ class PoolManager:
                 account.error_history.append(
                     {'ts': time.time(), 'status': None, 'code': cause,
                      'message': reason, 'state': 'dead'})
+        self._schedule_state_save()
         self.notify('account_dead',
                     f"account {account.id} marked DEAD — {reason}",
                     level='error')
@@ -963,7 +1130,8 @@ class PoolManager:
                 account.last_error = reason
                 return
             account.auth_strikes = n
-            if n >= strikes:
+            killed = n >= strikes
+            if killed:
                 account.state = AccountState.DEAD
                 account.death_reason = reason or 'authentication_error'
                 account.last_error = reason
@@ -981,6 +1149,8 @@ class PoolManager:
                 account.error_history.append(
                     {"ts": time.time(), "status": 401, "code": f"auth_strike_{n}",
                      "message": reason, "state": "cooling"})
+        if killed:
+            self._schedule_state_save()
 
     async def auth_failed(self, account: Account, reason: str = "", *,
                           expected_credentials: tuple | None = None) -> None:
@@ -1000,7 +1170,8 @@ class PoolManager:
             acc.last_error = ""
             acc.auth_strikes = 0
             acc.quota_strikes = 0
-            return True
+        self._schedule_state_save()
+        return True
 
     async def upsert(self, account: Account) -> None:
         """Insert or UPDATE-IN-PLACE.
@@ -1075,7 +1246,8 @@ class PoolManager:
         cap = self.cfg.max_in_flight_per_account
         for account in candidates:
             if (account.id == bound and (cap <= 0 or account.in_flight < cap)
-                    and not account.is_concurrency_held()):
+                    and not account.is_concurrency_held()
+                    and not account.is_settling()):
                 return account
         return None
 

@@ -6,6 +6,7 @@ import asyncio
 import logging
 import json
 import math
+import re
 import time
 import uuid
 
@@ -19,6 +20,7 @@ from fastapi.responses import JSONResponse
 from .deps import admin_key, get_state
 from .pool import Account, load_accounts
 from .tokens import _parse_expiry, persist_pool_snapshot
+from .zcode_device import new_account_device_mid
 
 log = logging.getLogger("zcode_gateway.admin")
 
@@ -197,9 +199,14 @@ async def import_jwt_account(request: Request, body: dict[str, Any] = Body(...),
         raise HTTPException(400, "Invalid email label")
     name = bundle.get("name", "") if bundle else ""
     device = bundle.get("device_mid", "") if bundle else ""
+    timezone = bundle.get("timezone", "") if bundle else ""
     if any(not isinstance(v, str) or len(v) > 254 or any(ord(c) < 32 or ord(c) == 127 for c in v)
-           for v in (name, device)):
+           for v in (name, device, timezone)):
         raise HTTPException(400, "Invalid account export metadata")
+    if timezone and not re.fullmatch(r"[\w/+_-]{1,64}", timezone):
+        raise HTTPException(400, "Invalid account export metadata")
+    bundle_device = device
+    device = device or new_account_device_mid()
     if state.cfg.accounts.source not in ("accounts_dir", "pool_file"):
         raise HTTPException(409, "Account import requires Accounts source: Accounts folder or Pool file")
     # Decoding a JWT is not signature validation. Require the configured Zcode
@@ -211,7 +218,7 @@ async def import_jwt_account(request: Request, body: dict[str, Any] = Body(...),
             response = await client.get(
                 state.cfg.upstream.base_url.rstrip("/") + "/zcode-plan/billing/balance",
                 params={"app_version": state.cfg.upstream.fingerprint.client_version},
-                headers=build_headers(token, state.cfg.upstream.fingerprint, device_mid=device or None))
+                headers=build_headers(token, state.cfg.upstream.fingerprint, device_mid=device))
         if response.status_code in (401, 403):
             raise HTTPException(400, "Zcode rejected this token")
         response.raise_for_status()
@@ -231,12 +238,17 @@ async def import_jwt_account(request: Request, body: dict[str, Any] = Body(...),
     async with state.account_persist_lock, state.tokens._lock_for(ident):
         existing = await state.pool.find(ident)
         email = email or (existing.email if existing else "")
+        if not bundle_device and existing is not None:
+            device = existing.notes.get("device_mid") or device
+        if not timezone and existing is not None:
+            timezone = existing.notes.get("timezone", "")
         account = Account(id=ident, email=email, access_token=token,
                           refresh_token=existing.refresh_token if existing else "", expires_at=int(expiry * 1000),
                           source="jwt-import", notes={"name": name or (existing.notes.get("name", "") if existing else ""),
                                                        "imported_jwt": True})
-        if device:
-            account.notes["device_mid"] = device
+        account.notes["device_mid"] = device
+        if timezone:
+            account.notes["timezone"] = timezone
         account.notes.update(plans=plans, quotas=quotas, quota_check_attempted_at=time.time())
         account.balance_checked_at = time.time()
         account.plan_checked_at = account.balance_checked_at
@@ -246,9 +258,10 @@ async def import_jwt_account(request: Request, body: dict[str, Any] = Body(...),
                 folder = Path(state.cfg.accounts.dir)
                 fields = dict(account_id=ident, email=email, name=account.notes["name"],
                                 access_token=token, expires_at_ms=str(account.expires_at),
-                                source="Manual JWT import", imported_jwt="true")
-                if device:
-                    fields["device_mid"] = device
+                                source="Manual JWT import", imported_jwt="true",
+                                device_mid=device)
+                if timezone:
+                    fields["timezone"] = timezone
                 path = await asyncio.to_thread(save_account_snapshot, folder, fields)
                 account.notes["file"] = path.name
             else:
@@ -295,6 +308,8 @@ async def export_account(request: Request, account_id: str,
                   "name": account.notes.get("name", ""),
                   "device_mid": account.notes.get("device_mid", ""),
                   "access_token": account.access_token, "expires_at_ms": account.expires_at}
+        if account.notes.get("timezone"):
+            bundle["timezone"] = account.notes["timezone"]
         return JSONResponse(bundle, headers={"Cache-Control": "no-store, private", "Pragma": "no-cache"})
 
 
