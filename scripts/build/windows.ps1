@@ -163,6 +163,8 @@ $buildArgs = @(
     # so PyInstaller cannot see them
     "--hidden-import", "zcode_gateway.generator",
     "--hidden-import", "zcode_gateway.accounts_dir_bridge",
+    # the desktop shell imports the notification-area module inside main()
+    "--hidden-import", "zcode_gateway.tray",
     # ship the example config, the app icon assets, the dashboard page, the
     # Cloudflare mail-worker template, and the bundled generator scripts
     "--add-data", "$(Join-Path $Here 'config.example.yaml');.",

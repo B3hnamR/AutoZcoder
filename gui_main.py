@@ -3,6 +3,9 @@
 Replaces the Tkinter GUI. The gateway runs on a background thread; the window
 is the served dashboard (/dash) in a native WebView2 shell via pywebview.
 A single-instance mutex prevents a second exe from fighting over the port.
+
+A notification-area icon keeps the gateway reachable with the window closed:
+closing hides the window, the tray menu reopens it or quits for real.
 """
 
 from __future__ import annotations
@@ -22,6 +25,17 @@ from pathlib import Path
 # exclusive (they share the port). Session-local: no Local\ prefix needed.
 MUTEX_NAME = "ZcodeGatewayByB3hnamR-SingleInstance"
 DASH_PATH = "/dash"
+
+CMD_OPEN, CMD_COPY, CMD_LOG, CMD_FOLDER, CMD_QUIT = 1, 2, 3, 4, 9
+TRAY_MENU = (
+    (CMD_OPEN, "Open dashboard"),
+    (CMD_COPY, "Copy address"),
+    (None, ""),
+    (CMD_LOG, "Open log"),
+    (CMD_FOLDER, "Open data folder"),
+    (None, ""),
+    (CMD_QUIT, "Quit"),
+)
 
 _mutex_handle = None
 
@@ -244,6 +258,86 @@ def _offer_webview2_or_browser(url: str) -> bool:
     return True
 
 
+def _log_file() -> Path:
+    return Path(os.environ.get("LOCALAPPDATA", ".")) / "ZcodeGateway" / "zcode-gateway.log"
+
+
+def _open_path(path: Path) -> None:
+    try:
+        os.startfile(str(path))
+    except OSError:
+        pass
+
+
+def _quit_from_tray(window_ref: list, quitting: threading.Event) -> None:
+    """Destroy the window from the tray thread; main() finishes the shutdown."""
+    quitting.set()
+
+    def finish() -> None:
+        window = window_ref[0]
+        try:
+            if window is not None:
+                window.destroy()
+        except Exception:
+            pass
+        # main() runs the normal shutdown once webview.start() returns. If the
+        # UI thread is wedged, quit anyway rather than leave a dead tray icon.
+        time.sleep(8)
+        _shutdown_generator()
+        os._exit(0)
+
+    threading.Thread(target=finish, daemon=True, name="tray-quit").start()
+
+
+def _start_tray(url: str, quitting: threading.Event, window_ref: list):
+    """Notification-area icon, or None when the shell will not give us one."""
+    from zcode_gateway import tray as tray_icon
+
+    def open_dashboard() -> None:
+        window = window_ref[0]
+        if window is None:
+            return
+        try:
+            window.show()
+            window.restore()
+        except Exception:
+            pass
+
+    def run_command(command: int) -> None:
+        if command == CMD_OPEN:
+            open_dashboard()
+        elif command == CMD_COPY:
+            tray_icon.copy_text(url)
+        elif command == CMD_LOG:
+            _open_path(_log_file())
+        elif command == CMD_FOLDER:
+            _open_path(_exe_dir())
+        elif command == CMD_QUIT:
+            _quit_from_tray(window_ref, quitting)
+
+    icon = tray_icon.TrayIcon(
+        tooltip=f"Zcode Gateway - {url}",
+        menu=TRAY_MENU,
+        on_activate=open_dashboard,
+        on_command=run_command,
+        icon_path=tray_icon.asset_path("assets", "zcode.ico"))
+    if not icon.start():
+        print("[tray] notification-area icon unavailable", file=sys.stderr, flush=True)
+        return None
+    return icon
+
+
+def _watch_gateway(icon, quitting: threading.Event) -> None:
+    """Turn the icon into an alarm when the gateway thread dies."""
+    _server_failed.wait()
+    if quitting.is_set() or not icon.alive:
+        return
+    icon.set_tooltip("Zcode Gateway - gateway stopped")
+    icon.notify("Gateway stopped",
+                "The gateway exited. Open the log, then restart Zcode Gateway.",
+                warning=True)
+
+
 def main() -> None:
     global _server, _server_error
     _server = None
@@ -253,6 +347,10 @@ def main() -> None:
     import argparse
     parser = argparse.ArgumentParser(description='Zcode Gateway desktop or headless server')
     parser.add_argument('--headless', action='store_true')
+    parser.add_argument('--tray', action='store_true',
+                        help='start hidden in the notification area')
+    parser.add_argument('--no-tray', action='store_true',
+                        help='no notification-area icon; closing the window quits')
     parser.add_argument('--config')
     args = parser.parse_args()
     if args.config:
@@ -315,10 +413,36 @@ def main() -> None:
         raise SystemExit(1) from _server_error
 
     import webview
-    webview.create_window(
+    quitting = threading.Event()
+    window_ref: list = [None]
+    tray_icon = None if args.no_tray else _start_tray(url, quitting, window_ref)
+    window = webview.create_window(
         "Zcode Gateway", url,
         width=1280, height=800, min_size=(980, 620),
-        background_color="#0f1115", text_select=True)
+        background_color="#0f1115", text_select=True,
+        hidden=bool(args.tray and tray_icon is not None))
+    window_ref[0] = window
+
+    if tray_icon is not None:
+        def on_closing():
+            # if the tray thread died there is no icon to restore from, so
+            # hiding here would strand an invisible, unclosable app
+            if quitting.is_set() or not tray_icon.alive:
+                return True
+            window.hide()
+            tray_icon.notify(
+                "Zcode Gateway is still running",
+                "The dashboard is in the notification area. Right-click the "
+                "icon to reopen it or quit.")
+            return False
+
+        window.events.closing += on_closing
+        threading.Thread(target=_watch_gateway, args=(tray_icon, quitting),
+                         name="tray-watchdog", daemon=True).start()
+        if args.tray:
+            tray_icon.notify("Zcode Gateway is running",
+                             f"The dashboard is in the notification area ({url}).")
+
     webview.start(gui="edgechromium")
 
     # The window closed. edgechromium/pythonnet leave non-daemon threads that
@@ -328,6 +452,8 @@ def main() -> None:
     # Before the hard exit, stop the generator's workers — os._exit skips
     # atexit and the FastAPI lifespan, and spawned Chromium children would
     # otherwise be orphaned on the machine.
+    if tray_icon is not None:
+        tray_icon.stop()
     _shutdown_generator()
     os._exit(0)
 
