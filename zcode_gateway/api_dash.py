@@ -1541,6 +1541,16 @@ async def generator_status(request: Request, key: str = Depends(admin_key)) -> d
 @router.post("/admin/dash/generator/options")
 async def generator_options(request: Request, body: dict = Body(...),
                             key: str = Depends(admin_key)) -> dict:
+    # "After signup" is the dashboard's single claim switch. An explicit OFF
+    # must also stop the legacy pipelines: a persisted claim=true otherwise
+    # kept running the 100M invite pass (and opening its browser) even though
+    # the switch read Off.
+    if "claim_start" in body:
+        value = body["claim_start"]
+        if not (value if isinstance(value, bool)
+                else str(value).strip().lower() in ("true", "1", "yes", "on")):
+            body["claim"] = False
+            body["claim500"] = False
     _generator(request).set_options(**body)
     return {"ok": True}
 

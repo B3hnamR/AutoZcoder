@@ -204,7 +204,9 @@ export async function mount({ root, signal }) {
       class: "select", on: { change: () => { syncVisibility(); saveOptions(); } },
     }, opts.map(([v, label]) => el("option", { value: v, text: label, selected: String(value) === String(v) })));
 
-    claimStartOn = o.claim_start !== false;
+    // The switch reflects any active claim pipeline: a seeded or persisted
+    // legacy claim would otherwise read "Off" while still claiming.
+    claimStartOn = o.claim_start !== false || o.claim === true || o.claim500 === true;
     const claimToggle = el("input", {
       class: "switch__input", type: "checkbox", checked: claimStartOn,
     });

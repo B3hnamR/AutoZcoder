@@ -136,6 +136,32 @@ def test_saved_route_survives_actual_api_manager_creation(tmp_path, monkeypatch)
         assert not manager.claim_start
 
 
+def test_disabling_after_signup_stops_the_legacy_invite_claim(tmp_path, monkeypatch):
+    from zcode_gateway import generator
+    gen = tmp_path / "generator"
+    gen.mkdir()
+    (gen / "main.py").touch()
+    (gen / "config.py").touch()
+    monkeypatch.setattr(generator, "resolve_python", lambda explicit="": "/usr/bin/python3")
+    seed = generator.GeneratorManager(gen, data_dir=gen / "output")
+    # A saved choice from the legacy UI (or a claim:true config seed): the
+    # 100M invite pass stays armed while the new switch only writes claim_start.
+    seed.set_options(claim=True, claim500=False, claim_start=False)
+    seed.shutdown()
+    app = _app(tmp_path)
+    app.state.cfg.generator.zcodeauto_dir = str(gen)
+    with TestClient(app) as client:
+        headers = {"Authorization": "Bearer audit-admin-credential"}
+        assert client.get("/admin/dash/generator/status", headers=headers).status_code == 200
+        manager = app.state.app_state.generator
+        assert manager.claim and not manager.claim_start
+        assert manager._worker_env("pre")["ZAI_INVITE_CODE"] == "MT9GNDQ8"
+        assert client.post("/admin/dash/generator/options", headers=headers,
+                           json={"claim_start": False}).status_code == 200
+        assert not manager.claim and not manager.claim500
+        assert manager._worker_env("post")["ZAI_INVITE_CODE"] == ""
+
+
 def test_setup_created_before_manager_publishes_interpreter(tmp_path):
     from zcode_gateway.api_dash import _env_setup_shared
     app = _app(tmp_path)
