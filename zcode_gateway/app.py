@@ -164,6 +164,9 @@ async def lifespan(app: FastAPI):
              __version__, len(accounts), cfg.pool.strategy)
 
     try:
+        if cfg.claims.daily_enabled:
+            from .api_dash import _start_daily_scheduler
+            _start_daily_scheduler(app.state.app_state)
         yield
     finally:
         scheduler = getattr(app.state.app_state, "claim_scheduler", None)

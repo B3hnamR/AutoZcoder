@@ -125,3 +125,32 @@ def test_status_shape():
     assert status["daily_time"] == "08:25"
     assert status["utc_offset_hours"] == 3.5
     assert status["enabled"] is False
+
+
+def test_enabled_scheduler_starts_at_boot_without_admin_request(tmp_path, monkeypatch):
+    from threading import Event
+
+    from fastapi.testclient import TestClient
+
+    from zcode_gateway.app import create_app
+    from zcode_gateway.config import Config
+    from zcode_gateway.generator import GeneratorManager
+
+    ran = Event()
+    monkeypatch.setattr(GeneratorManager, "start_claim_all", lambda self, mode: ran.set())
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    (scripts / "main.py").touch()
+    (scripts / "config.py").touch()
+    cfg = Config(
+        generator={"zcodeauto_dir": str(scripts)},
+        claims={"daily_enabled": True, "daily_time": "00:00"},
+        accounts={"dir": str(tmp_path / "accounts")},
+        logging={"capture_dir": str(tmp_path / "logs")},
+        store={"sqlite_path": str(tmp_path / "gateway.db")},
+    )
+    app = create_app(cfg)
+    with TestClient(app):
+        assert ran.wait(2)
+        scheduler = app.state.app_state.claim_scheduler
+    assert not scheduler._thread.is_alive()

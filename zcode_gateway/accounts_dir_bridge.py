@@ -41,7 +41,7 @@ def _write_snapshot(path: Path, fields: dict) -> None:
 
 
 def mint_and_register(accounts_dir: str | Path, email: str, zcode_jwt: str,
-                      device_mid: str = "", plan: str = "", *, receipt: dict | None = None):
+                      device_mid: str = "", plan: str = ""):
     """Write the snapshot and return the pool Account for upsert.
 
     Imports Account lazily so this module stays import-safe outside the gateway.
@@ -74,8 +74,6 @@ def mint_and_register(accounts_dir: str | Path, email: str, zcode_jwt: str,
     }
     if claims.get("exp"):
         fields["expires_at"] = str(claims["exp"])
-    if receipt:
-        fields.update({key: str(receipt[key]) for key in ("auto_run_id", "auto_attempt_id", "auto_qualified") if key in receipt})
     path = save_account_snapshot(accounts_dir, fields, writer=write_saved)
     name, fields = path.name, saved
 

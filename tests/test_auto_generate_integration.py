@@ -187,8 +187,10 @@ def test_auto_admin_api_save_does_not_start_and_caps_concurrency(tmp_path,monkey
         assert client.post('/admin/dash/generator/auto/resume',headers=headers).status_code==409
 
 
-@pytest.mark.parametrize('active,quota,expected', [(True,10,True),(False,10,False),(True,0,False)])
-def test_auto_registration_requires_verified_start_plan_and_usable_quota(tmp_path,monkeypatch,active,quota,expected):
+@pytest.mark.parametrize('active,quota,interrupted,expected', [
+    (True,10,False,True), (False,10,False,False), (True,0,False,False), (True,10,True,False),
+])
+def test_auto_registration_requires_verified_start_plan_and_usable_quota(tmp_path,monkeypatch,active,quota,interrupted,expected):
     import base64,time,contextlib,sys
     from zcode_gateway import api_dash
     gen=tmp_path/'scripts';gen.mkdir();(gen/'main.py').write_text('')
@@ -213,10 +215,18 @@ def test_auto_registration_requires_verified_start_plan_and_usable_quota(tmp_pat
         mgr=client.app.state.app_state.generator
         mgr.auto_generate._run_id = 'fixture-run'
         mgr.auto_generate._counts['attempts'] = 1
+        if interrupted:
+            from unittest.mock import AsyncMock
+            monkeypatch.setattr(client.app.state.app_state.pool, 'upsert',
+                                AsyncMock(side_effect=RuntimeError('pool insertion interrupted')))
         result=mgr.on_account({'email':'new@example.test','chat_token':'eyJ.fixture.sig','auto_generate':True,
                                'route_policy':'direct','registration_proxy':'',
                                'auto_run_id':'fixture-run','auto_attempt_id':'fixture-run-1'})
         assert result['qualified'] is expected
+        if interrupted:
+            from zcode_gateway.accounts_dir import parse_snapshot
+            persisted = parse_snapshot(next(Path(cfg.accounts.dir).glob('*.txt')))
+            assert 'auto_qualified' not in persisted
         if expected:
             assert result['account_id']==ident
             from zcode_gateway.accounts_dir import parse_snapshot
