@@ -147,7 +147,7 @@ async def delete_account(request: Request, account_id: str,
 async def import_jwt_account(request: Request, body: dict[str, Any] = Body(...),
                              key: str = Depends(admin_key)) -> JSONResponse:
     """Validate an account transfer or CLI JWT before persisting it."""
-    from .accounts_dir import save_account_snapshot
+    from .accounts_dir import StaleAccountCredentials, save_account_snapshot, token_is_older
     from .upstream import build_headers
     from .zcode_detect import jwt_claims
 
@@ -247,6 +247,8 @@ async def import_jwt_account(request: Request, body: dict[str, Any] = Body(...),
         account.plan_checked_at = account.balance_checked_at
         account.has_plan = account.plan_active()
         try:
+            if existing and token_is_older(token, account.expires_at, existing.access_token, existing.expires_at):
+                raise StaleAccountCredentials
             if state.cfg.accounts.source == "accounts_dir":
                 folder = Path(state.cfg.accounts.dir)
                 fields = dict(account_id=ident, email=email, name=account.notes["name"],
@@ -254,11 +256,13 @@ async def import_jwt_account(request: Request, body: dict[str, Any] = Body(...),
                                 source="Manual JWT import", imported_jwt="true")
                 if device:
                     fields["device_mid"] = device
-                path = await asyncio.to_thread(save_account_snapshot, folder, fields)
+                path = await asyncio.to_thread(save_account_snapshot, folder, fields, reject_stale=True)
                 account.notes["file"] = path.name
             else:
                 accounts = [a for a in await state.pool.all() if a.id != ident] + [account]
                 await asyncio.to_thread(persist_pool_snapshot, state.cfg, accounts)
+        except StaleAccountCredentials:
+            raise HTTPException(409, "A newer credential is already saved for this account") from None
         except (OSError, ValueError):
             raise HTTPException(500, "Could not save account snapshot; nothing added to pool") from None
         await state.pool.upsert(account)
@@ -270,6 +274,28 @@ async def import_jwt_account(request: Request, body: dict[str, Any] = Body(...),
         current.notes.pop("quota_check_error", None)
         state.tokens._scan_at = 0
     return JSONResponse({"account": current.to_public(), "updated": existing is not None},
+                        headers={"Cache-Control": "no-store"})
+
+
+@router.post("/accounts/import-accounts")
+async def import_accounts(request: Request, bundle: dict = Body(...),
+                          key: str = Depends(admin_key)) -> JSONResponse:
+    entries = bundle.get("accounts")
+    if (bundle.get("format") != "autozcoder-accounts" or type(bundle.get("version")) is not int
+            or bundle["version"] != 1 or not isinstance(entries, list) or not entries
+            or any(not isinstance(entry, dict) for entry in entries)):
+        raise HTTPException(400, "Invalid AutoZCoder account bundle")
+    imported = updated = 0
+    failures = []
+    for index, entry in enumerate(entries, start=1):
+        try:
+            result = await import_jwt_account(request, {"token": json.dumps(entry)}, key)
+        except HTTPException as exc:
+            failures.append({"entry": index, "status": exc.status_code})
+        else:
+            imported += 1
+            updated += int(json.loads(result.body)["updated"])
+    return JSONResponse({"imported": imported, "updated": updated, "failures": failures},
                         headers={"Cache-Control": "no-store"})
 
 
@@ -286,6 +312,31 @@ async def current_account_token(request: Request, account_id: str,
                             headers={"Cache-Control": "no-store, private", "Pragma": "no-cache"})
 
 
+_EXPORT_HEADERS = {"Cache-Control": "no-store, private", "Pragma": "no-cache"}
+
+
+def _account_export(account: Account) -> dict:
+    return {"format": "autozcoder-account", "version": 1,
+            "account_id": account.id, "email": account.email,
+            "name": account.notes.get("name", ""),
+            "device_mid": account.notes.get("device_mid", ""),
+            "access_token": account.access_token, "expires_at_ms": account.expires_at}
+
+
+@router.get("/accounts/export")
+async def export_working_accounts(request: Request, key: str = Depends(admin_key)) -> JSONResponse:
+    state = get_state(request)
+    accounts = []
+    for candidate in await state.pool.all():
+        async with state.tokens._lock_for(candidate.id):
+            account = await state.pool.find(candidate.id)
+            now = time.time()
+            if account is not None and account.is_ready(now) and account.expires_in(now) > 0:
+                accounts.append(_account_export(account))
+    return JSONResponse({"format": "autozcoder-accounts", "version": 1, "accounts": accounts},
+                        headers=_EXPORT_HEADERS)
+
+
 @router.get("/accounts/{account_id}/export")
 async def export_account(request: Request, account_id: str,
                          key: str = Depends(admin_key)) -> JSONResponse:
@@ -295,12 +346,7 @@ async def export_account(request: Request, account_id: str,
     if account is None:
         raise HTTPException(404, "account not found")
     async with state.tokens._lock_for(account_id):
-        bundle = {"format": "autozcoder-account", "version": 1,
-                  "account_id": account.id, "email": account.email,
-                  "name": account.notes.get("name", ""),
-                  "device_mid": account.notes.get("device_mid", ""),
-                  "access_token": account.access_token, "expires_at_ms": account.expires_at}
-        return JSONResponse(bundle, headers={"Cache-Control": "no-store, private", "Pragma": "no-cache"})
+        return JSONResponse(_account_export(account), headers=_EXPORT_HEADERS)
 
 
 @router.post("/accounts/purge_drained")

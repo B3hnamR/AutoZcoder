@@ -136,6 +136,21 @@ def test_failed_snapshot_write_preserves_existing_token(tmp_path, monkeypatch):
         assert client.get(f"/admin/accounts/{IDENT}/token", headers=HEADERS).json()["access_token"] == first
 
 
+def test_import_rejects_token_older_than_snapshot_even_if_not_loaded(tmp_path, monkeypatch):
+    from zcode_gateway.accounts_dir import write_snapshot
+
+    cfg = config(tmp_path)
+    with TestClient(create_app(cfg)) as client:
+        provider(monkeypatch, lambda _: httpx.Response(200, json={"code": 0, "data": {"plans": [], "balances": []}}))
+        snapshot = Path(cfg.accounts.dir) / "current.txt"
+        current = jwt(iat=200)
+        write_snapshot(snapshot, {"account_id": IDENT, "access_token": current})
+        response = client.post("/admin/accounts/import-jwt", headers=HEADERS, json={"token": jwt(iat=100)})
+        assert response.status_code == 409
+        assert parse_snapshot(snapshot)["access_token"] == current
+        assert client.get(f"/admin/accounts/{IDENT}/token", headers=HEADERS).status_code == 404
+
+
 def test_import_rejects_conflicting_claims_and_bad_labels(tmp_path, monkeypatch):
     with TestClient(create_app(config(tmp_path))) as client:
         provider(monkeypatch, lambda _: pytest.fail("invalid import reached provider"))
@@ -214,6 +229,54 @@ def test_account_export_import_roundtrip_between_installations(tmp_path, monkeyp
         assert loaded.notes["name"] == "Owner Label"
         assert loaded.notes["imported_jwt"]
         assert loaded.access_token == jwt()
+
+
+def test_bulk_copy_exports_only_working_accounts_and_roundtrips(tmp_path, monkeypatch):
+    import time
+
+    from zcode_gateway.pool import Account, AccountState
+
+    now = time.time()
+    working = [IDENT, "bbb44433-1234-433c-874f-616aa15d6e02"]
+    source = config(tmp_path / "source")
+    with TestClient(create_app(source)) as client:
+        pool = client.app.state.app_state.pool
+        for account_id in working:
+            client.portal.call(pool.upsert, Account(account_id, access_token=jwt(sub=account_id),
+                                                    refresh_token="never-for-export"))
+        for state in (AccountState.DEAD, AccountState.EXHAUSTED, AccountState.COOLING):
+            client.portal.call(pool.upsert, Account(state.value, access_token="not-working",
+                                                    state=state, cooldown_until=now + 3600))
+        client.portal.call(pool.upsert, Account("expired", access_token="expired-token", expires_at=1))
+        client.portal.call(pool.upsert, Account("missing"))
+        assert client.get("/admin/accounts/export").status_code == 403
+        response = client.get("/admin/accounts/export", headers=HEADERS)
+        assert response.status_code == 200
+        assert "no-store" in response.headers["cache-control"]
+        assert "never-for-export" not in response.text
+        bundle = response.json()
+        assert [entry["account_id"] for entry in bundle["accounts"]] == working
+
+    destination = config(tmp_path / "destination")
+    with TestClient(create_app(destination)) as client:
+        provider(monkeypatch, lambda _: httpx.Response(200, json={"code": 0, "data": {"plans": [], "balances": []}}))
+        assert client.post("/admin/accounts/import-accounts", json=bundle).status_code == 403
+        bundle["accounts"].insert(1, {**bundle["accounts"][0], "access_token": "malformed"})
+        response = client.post("/admin/accounts/import-accounts", headers=HEADERS, json=bundle)
+        assert response.status_code == 200
+        assert response.json() == {"imported": 2, "updated": 0, "failures": [{"entry": 2, "status": 400}]}
+        assert "no-store" in response.headers["cache-control"]
+        assert {account.id for account in load_from_accounts_dir(destination.accounts.dir)} == set(working)
+
+
+def test_bulk_copy_empty_pool_does_not_export_credentials(tmp_path):
+    with TestClient(create_app(config(tmp_path))) as client:
+        assert client.get("/admin/accounts/export", headers=HEADERS).json() == {
+            "format": "autozcoder-accounts", "version": 1, "accounts": [],
+        }
+        invalid = {"format": "autozcoder-accounts", "version": True, "accounts": [{}]}
+        response = client.post("/admin/accounts/import-accounts", headers=HEADERS, json=invalid)
+        assert response.status_code == 400
 
 
 @pytest.mark.parametrize("changes", [

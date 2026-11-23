@@ -160,7 +160,12 @@ def _snapshot_freshness(fields: dict[str, str], path: Path) -> tuple:
     return observed, issued, modified, expiry, path.name.casefold(), path.name
 
 
-def save_account_snapshot(directory: str | Path, fields: dict[str, str], *, writer=None) -> Path:
+class StaleAccountCredentials(ValueError):
+    """A newer credential is already stored for this account."""
+
+
+def save_account_snapshot(directory: str | Path, fields: dict[str, str], *,
+                          writer=None, reject_stale: bool = False) -> Path:
     """Save one verified owner atomically, retaining metadata and its filename."""
     ident = snapshot_account_id(fields)
     for key, value in fields.items():
@@ -192,6 +197,8 @@ def save_account_snapshot(directory: str | Path, fields: dict[str, str], *, writ
 
             if token_is_older(new_token, _parse_expiry(fields.get("expires_at_ms")),
                               previous["access_token"], _parse_expiry(previous.get("expires_at_ms"))):
+                if reject_stale:
+                    raise StaleAccountCredentials
                 return path
         merged = dict(previous)
         if previous.get("source") == "Manual JWT import":
