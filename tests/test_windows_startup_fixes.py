@@ -123,6 +123,21 @@ def test_headless_startup_exception_is_nonzero(monkeypatch, tmp_path):
     assert exited.value.code == 1
 
 
+@pytest.mark.parametrize("cli", [False, True])
+def test_launcher_uses_env_config_before_bootstrap(monkeypatch, tmp_path, cli):
+    import os
+
+    env_path = tmp_path / "env.yaml"
+    cli_path = tmp_path / "cli.yaml"
+    monkeypatch.setenv("ZCODE_GATEWAY_CONFIG", str(env_path))
+    monkeypatch.setattr(sys, "argv", ["gateway", "--headless", *(["--config", str(cli_path)] if cli else [])])
+    monkeypatch.setattr(gui, "_fix_streams", lambda: None)
+    monkeypatch.setattr(gui, "_bootstrap_config", Mock(side_effect=AssertionError("unexpected bootstrap")))
+    monkeypatch.setattr(gui, "_run_server", lambda: None)
+    gui.main()
+    assert os.environ["ZCODE_GATEWAY_CONFIG"] == str(cli_path if cli else env_path)
+
+
 def test_startup_probe_manifest_has_no_config_secrets(monkeypatch):
     from zcode_gateway import config
 

@@ -265,8 +265,9 @@ def main() -> None:
     parser.add_argument('--headless', action='store_true')
     parser.add_argument('--config')
     args = parser.parse_args()
-    if args.config:
-        cfg_path = Path(args.config).resolve()
+    configured = args.config or os.environ.get('ZCODE_GATEWAY_CONFIG')
+    if configured:
+        cfg_path = Path(configured).resolve()
         os.environ['ZCODE_GATEWAY_CONFIG'] = str(cfg_path)
     else:
         cfg_path = _bootstrap_config()
