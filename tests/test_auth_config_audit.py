@@ -14,7 +14,7 @@ from starlette.requests import Request
 from zcode_gateway.api_dash import _atomic_write_yaml
 from zcode_gateway.app import create_app
 from zcode_gateway.config import Config, ServerConfig
-from zcode_gateway.deps import admin_key
+from zcode_gateway.deps import admin_key, client_key
 
 
 def _app(tmp_path, **server):
@@ -57,6 +57,22 @@ def test_public_static_internal_token_no_longer_authenticates():
                        "client": ("127.0.0.1", 1234), "app": app})
     with pytest.raises(HTTPException):
         asyncio.run(admin_key(request))
+
+
+def test_disabling_client_keys_only_applies_to_local_peers():
+    cfg = Config(server={"require_client_key": False, "client_keys": [{"key": "dummy-client"}]})
+    state = SimpleNamespace(cfg=cfg, internal_token="")
+    app = SimpleNamespace(state=SimpleNamespace(app_state=state))
+
+    def request(peer, headers=()):
+        return Request({"type": "http", "headers": headers, "client": (peer, 1234), "app": app})
+
+    assert asyncio.run(client_key(request("127.0.0.1"))) == "anonymous"
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(client_key(request("203.0.113.5")))
+    assert exc.value.status_code == 401
+    headers = [(b"authorization", b"Bearer dummy-client")]
+    assert asyncio.run(client_key(request("203.0.113.5", headers))) == "client"
 
 
 def test_explicit_trusted_host_preserves_remote_dashboard(tmp_path):

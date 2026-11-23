@@ -51,7 +51,7 @@ async def client_key(request: Request) -> str:
     if getattr(state, "update_phase", "idle") == "applying":
         raise HTTPException(status_code=503, detail="Gateway is preparing an update; retry after restart", headers={"Retry-After": "15"})
     cfg = state.cfg.server
-    if not cfg.require_client_key:
+    if not cfg.require_client_key and peer_is_local(request):
         return "anonymous"
 
     supplied = _bearer(request)
