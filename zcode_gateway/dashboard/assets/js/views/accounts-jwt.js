@@ -20,12 +20,29 @@ export async function copyAccountForSharing(accountId) {
   } catch (e) { toast("Could not export account: " + e.message, "err"); }
 }
 
+export async function copyAllAccountsForSharing() {
+  const approved = await confirmDialog({
+    title: "Copy all working accounts?",
+    body: "The clipboard export grants access to every working account in the pool, regardless of the table filter. Share it only with someone you trust. Both installations share the same quotas and limits.",
+    okLabel: "Copy all accounts", danger: true,
+  });
+  if (!approved) return;
+  try {
+    const bundle = await api.get("/admin/accounts/export");
+    const count = bundle.accounts.length;
+    if (!count) { toast("No working accounts to copy.", "warn"); return; }
+    const ok = await copyText(JSON.stringify(bundle));
+    toast(ok ? `${count} ${count === 1 ? "account" : "accounts"} copied. Paste the bundle into Import account.`
+      : "Clipboard unavailable; copy was not completed.", ok ? "ok" : "err");
+  } catch (e) { toast("Could not export accounts: " + e.message, "err"); }
+}
+
 export function importJwt(onImported) {
   const previousFocus = document.activeElement;
   const token = el("textarea", {
     class: "textarea input--mono", rows: 5, id: "jwt-import-token", required: true,
     autocomplete: "off", spellcheck: false, autocapitalize: "none",
-    placeholder: "Paste the copied AutoZCoder account export", style: { overflowWrap: "anywhere", WebkitTextSecurity: "disc" },
+     placeholder: "Paste an account export, account bundle, or CLI JWT", style: { overflowWrap: "anywhere", WebkitTextSecurity: "disc" },
   });
   const email = el("input", {
     class: "input", type: "email", id: "jwt-import-email", autocomplete: "off",
@@ -48,9 +65,23 @@ export function importJwt(onImported) {
       submit.querySelector("span").textContent = "Validating with Zcode...";
       error.hidden = true;
       try {
-        const result = await api.post("/admin/accounts/import-account", {
-          token: token.value.trim(), email: email.value.trim(),
-        });
+        const value = token.value.trim();
+        let bundle;
+        if (value.startsWith("{")) {
+          try { bundle = JSON.parse(value); } catch (_) { /* The API reports invalid JSON. */ }
+        }
+        if (bundle?.format === "autozcoder-accounts") {
+          if (email.value.trim()) throw new Error("Clear the email label when importing multiple accounts.");
+          const result = await api.post("/admin/accounts/import-accounts", bundle);
+          const failed = result.failures.length;
+          if (!result.imported) throw new Error(`No accounts imported. ${failed} failed validation or could not be saved.`);
+          busy = false;
+          close();
+          toast(`${result.imported} imported${failed ? `; ${failed} could not be imported` : ""}.`, failed ? "warn" : "ok");
+          await onImported?.();
+          return;
+        }
+        const result = await api.post("/admin/accounts/import-account", { token: value, email: email.value.trim() });
         busy = false;
         close();
         toast(result.updated ? "Account token updated and saved" : "Account validated and saved", "ok");
@@ -68,8 +99,8 @@ export function importJwt(onImported) {
   }, [
     el("div", { class: "modal__head" }, el("h2", { id: "jwt-import-title", text: "Import account" })),
     el("div", { class: "modal__body stack" }, [
-      el("p", { text: "Paste an account copied from another AutoZCoder. Its current token is validated with Zcode and saved locally. The same account ID updates an existing entry. A raw CLI JWT is also accepted." }),
-      el("div", { class: "field" }, [el("label", { class: "field__label", for: token.id, text: "Account export or JWT" }), token]),
+      el("p", { text: "Paste one or more accounts copied from AutoZCoder, or a raw CLI JWT. Each token is validated with Zcode before saving. An existing account with the same ID is updated." }),
+      el("div", { class: "field" }, [el("label", { class: "field__label", for: token.id, text: "Account export, bundle, or JWT" }), token]),
       el("div", { class: "field" }, [el("label", { class: "field__label", for: email.id, text: "Email label (optional)" }), email,
         el("p", { class: "field__help", text: "Normally included in an account export. Optional override for a raw JWT; this label is not a verified identity." })]),
       el("p", { class: "field__help", text: "You share the original account's quota and limits. Credentials are saved on this gateway, never in browser storage. Imported tokens can be revoked and do not gain automatic renewal." }),

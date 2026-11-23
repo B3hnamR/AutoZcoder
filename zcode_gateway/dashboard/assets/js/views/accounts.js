@@ -6,7 +6,7 @@ import { toast, confirmDialog } from "../core/toast.js";
 import { card, table, toolbar, searchBox, button, stateBadge, badge, metric } from "../core/ui.js";
 import { num, duration, dateTime, relative, parseTime } from "../core/format.js";
 import { can, gate } from "../core/caps.js";
-import { importJwt, copyAccountForSharing } from "./accounts-jwt.js";
+import { importJwt, copyAccountForSharing, copyAllAccountsForSharing } from "./accounts-jwt.js";
 import { createClaimBatch } from "./claim-batch.js";
 import { aggregateModelQuotas } from "./model-quota.js";
 
@@ -346,6 +346,7 @@ function render(root, accounts, pool, reload, batch, signal, campaign = {}, mode
   const bar = toolbar([
     button({ label: "Login with Zcode", icon: "key", variant: "primary", onClick: () => loginWithZcode(reload, signal) }),
     button({ label: "Import account", icon: "key", onClick: () => importJwt(reload) }),
+    button({ label: "Copy all accounts", icon: "copy", onClick: copyAllAccountsForSharing }),
     // No desktop Zcode app on a server: the import would always 404.
     gate(button({ label: "Import from app", icon: "copy", onClick: () => importFromApp(reload) }), "import_from_app"),
     button({ label: "Reload pool", icon: "refresh", onClick: () => reloadPool(reload) }),
@@ -463,4 +464,3 @@ export async function mount({ root, signal }) {
   await load();
   return { refresh: load };
 }
-
