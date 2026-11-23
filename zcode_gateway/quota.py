@@ -1,5 +1,50 @@
 """Normalize coding-plan quota buckets; keep resets and plan ends independent."""
-from .registry import Registry
+import re
+
+from .registry import Registry, is_retired_model
+
+# ZCode can omit display names. Prefer the model capability and use
+# the legacy entitlement token only when neither model field identifies it.
+_CAPABILITY_PREFIX = 'model:'
+_ENTITLEMENT_ID_MODELS = {
+    'glm_5p4f': 'GLM-5.4-Flash',
+    'glm_5p3f': 'GLM-5.3-Flash',
+    'glm_5p4': 'GLM-5.4',
+}
+_LEGACY_MODEL_TOKEN = re.compile(
+    r'(?<![a-z0-9])(' + '|'.join(_ENTITLEMENT_ID_MODELS) + r')(?![a-z0-9])'
+)
+
+
+def _known(registry: Registry, name: str | None) -> str | None:
+    # Registry.resolve('') falls back to the default model, which would make
+    # every unlabelled bucket look like Flash; an empty label must stay unknown.
+    if not isinstance(name, str) or not name.strip():
+        return None
+    model = registry.resolve(name.strip())
+    return model if registry.knows(model) else None
+
+
+def bucket_model(record: dict, registry: Registry | None = None) -> str | None:
+    """Resolve a balance bucket or entitlement to a known model."""
+    registry = registry or Registry()
+    for capability in record.get('capabilities') or []:
+        if isinstance(capability, str) and capability.startswith(_CAPABILITY_PREFIX):
+            name = capability[len(_CAPABILITY_PREFIX):]
+            if is_retired_model(name):
+                return None
+            model = _known(registry, name)
+            if model:
+                return model
+    label = record.get('show_name')
+    if isinstance(label, str) and is_retired_model(label):
+        return None
+    model = _known(registry, label)
+    if model:
+        return model
+    ident = str(record.get('entitlement_id') or '').lower()
+    match = _LEGACY_MODEL_TOKEN.search(ident)
+    return _known(registry, _ENTITLEMENT_ID_MODELS[match.group(1)]) if match else None
 
 
 def parse_balance(data: dict, now: float):
@@ -33,8 +78,8 @@ def parse_balance(data: dict, now: float):
         expires = bucket.get('expires_at') or 0
         if (expires and expires <= now) or (bucket.get('period_end') and bucket['period_end'] <= now):
             continue
-        model = registry.resolve(bucket.get('show_name') or '')
-        if not registry.knows(model):
+        model = bucket_model(bucket, registry)
+        if not model:
             continue
         add(model, max(0, bucket.get('available_units', bucket.get('remaining_units', 0))),
             bucket.get('total_units', 0), bucket.get('used_units', 0),
@@ -56,8 +101,8 @@ def parse_balance(data: dict, now: float):
             grant = ent.get('grant_units') or 0
             if grant <= 0:
                 continue
-            model = registry.resolve(ent.get('show_name') or '')
-            if not registry.knows(model):
+            model = bucket_model(ent, registry)
+            if not model:
                 continue
             add(model, grant, grant, 0, ent.get('effective_at') or 0)
     for q in quotas.values():

@@ -78,7 +78,7 @@ _TOOL = {"type": "function", "function": {"name": "f", "parameters": {"type": "o
 
 def test_tool_choice_none_drops_tools_for_a_fresh_conversation():
     from zcode_gateway.zcode_protocol import build_body
-    body = build_body({"model": "GLM-5.3", "tool_choice": "none", "tools": [_TOOL],
+    body = build_body({"model": "GLM-5.4", "tool_choice": "none", "tools": [_TOOL],
                        "messages": [{"role": "user", "content": "hi"}]})
     assert "tools" not in body and "tool_choice" not in body
 
@@ -86,7 +86,7 @@ def test_tool_choice_none_drops_tools_for_a_fresh_conversation():
 def test_tool_choice_none_rejects_unsupported_history_combination():
     from zcode_gateway.zcode_protocol import build_body
     with pytest.raises(ValueError, match="tool_choice"):
-        build_body({"model": "GLM-5.3", "tool_choice": "none", "tools": [_TOOL],
+        build_body({"model": "GLM-5.4", "tool_choice": "none", "tools": [_TOOL],
                        "messages": [
                            {"role": "user", "content": "hi"},
                            {"role": "assistant", "content": None, "tool_calls": [

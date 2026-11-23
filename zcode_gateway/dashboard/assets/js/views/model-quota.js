@@ -1,5 +1,5 @@
 // Pure public-account quota aggregation, shared by Models and Accounts.
-const CONFIG_MODELS = ["GLM-5.3", "GLM-5.3-Flash"];
+const CONFIG_MODELS = ["GLM-5.4", "GLM-5.3-Flash"];
 const key = (name) => String(name).trim().toLowerCase();
 const finite = (value) => value !== null && value !== undefined && value !== ""
   && typeof value !== "boolean" && Number.isFinite(Number(value));
@@ -21,10 +21,10 @@ const seconds = (value) => {
  * is no arbitrary age TTL. errors counts failed latest checks, not last_error.
  * Model keys are case-insensitive only; aliases/namespaces are not conflated.
  */
-export function aggregateModelQuotas(accounts, nowSeconds) {
+export function aggregateModelQuotas(accounts, nowSeconds, configuredModels = CONFIG_MODELS) {
   if (!Number.isFinite(nowSeconds)) throw new TypeError("nowSeconds must be finite epoch seconds");
   const rows = Array.isArray(accounts) ? accounts : [];
-  const names = new Map(CONFIG_MODELS.map((name) => [key(name), name]));
+  const names = new Map(configuredModels.map((name) => [key(name), name]));
   for (const account of rows) {
     for (const name of [...Object.keys(account.quotas || {}),
       ...Object.keys(account.model_caps || {}), ...(account.capped_models || [])]) {

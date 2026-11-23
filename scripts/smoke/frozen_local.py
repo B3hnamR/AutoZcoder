@@ -60,10 +60,10 @@ def main():
                 assert auto.status_code == 200 and auto.json()["status"]["state"] == "idle"
                 caps = client.get("/admin/dash/capabilities", headers=headers).json()
                 assert caps["frozen"] is True
-                if os.name == "nt":
-                    assert client.post("/admin/dash/shutdown", headers=headers).status_code == 200
                 assert client.get("/dash", headers={"Host": "rebound.invalid"}).status_code == 400
-            print("PASS: frozen binary startup, bundled modular UI, generator sources, Host/auth")
+                assert client.post("/admin/dash/shutdown", headers=headers).status_code == 200
+            assert child.wait(timeout=15) == 0, "frozen binary did not shut down cleanly"
+            print("PASS: frozen startup, bundled UI, generator, Host/auth, and graceful shutdown")
         except Exception:
             log.flush()
             log.seek(0)

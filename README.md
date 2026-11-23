@@ -4,7 +4,7 @@
 
 # AutoZCoder
 
-A self-hosted gateway for the **ZCode coding-plan API** (GLM-5.3 / GLM-5.3-Flash),
+A self-hosted gateway for the **ZCode coding-plan API** (GLM-5.4 / GLM-5.3-Flash),
 bundled with an **account generator** and a **Cloudflare mail worker**.
 
 It exposes OpenAI- and Anthropic-compatible endpoints locally, pools multiple
@@ -152,7 +152,7 @@ First [add an account](#adding-accounts). Copy a **client key** from the
 | API base URL | `http://127.0.0.1:8788/v1` |
 | OpenAI endpoints | `/v1/chat/completions`, `/v1/completions`, `/v1/models` |
 | Anthropic endpoint | `/v1/messages` |
-| Models | `GLM-5.3`, `GLM-5.3-Flash` |
+| Models | `GLM-5.4`, `GLM-5.3-Flash` |
 
 For a VPS, use your HTTPS server address instead of loopback. Clients differ
 in whether they append `/v1`; configure the base URL so the final request uses

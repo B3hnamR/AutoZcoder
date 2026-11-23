@@ -21,7 +21,7 @@ from zcode_gateway.upstream import RelayTransportError, UpstreamClient
 from zcode_gateway.zcode_protocol import build_body
 
 
-MODEL = 'GLM-5.3'
+MODEL = 'GLM-5.4'
 TOOL = {'type': 'function', 'function': {'name': 'f', 'parameters': {'type': 'object'}}}
 START = {'type': 'message_start', 'message': {
     'id': 'msg_dummy', 'type': 'message', 'role': 'assistant', 'content': [],

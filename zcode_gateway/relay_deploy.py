@@ -14,6 +14,7 @@ import json
 import time
 import zipfile
 from typing import Any
+from urllib.parse import urlsplit
 
 import urllib3
 
@@ -693,8 +694,14 @@ def deploy_netlify(netlify_token: str, site_name: str = "", secret: str = "") ->
 
 def ping_relay(relay_url: str, timeout: float = 12.0, secret: str = "") -> dict[str, Any]:
     relay_url = (relay_url or "").strip()
-    if not relay_url or not relay_url.startswith("http"):
-        return {"ok": False, "status": 400, "error": "Invalid relay URL"}
+    try:
+        parsed = urlsplit(relay_url)
+        if (parsed.scheme != "https" or not parsed.hostname
+                or parsed.username is not None or parsed.password is not None):
+            raise ValueError("invalid HTTPS relay URL")
+        parsed.port  # validate the port before sending credentials
+    except ValueError:
+        return {"ok": False, "status": 400, "error": "Relay URL must be HTTPS"}
 
     headers = {
         "x-relay-target": "https://httpbin.org",
@@ -707,7 +714,7 @@ def ping_relay(relay_url: str, timeout: float = 12.0, secret: str = "") -> dict[
     try:
         # TLS stays verified (truststore/certifi are wired on the session
         # above); verify=False here would let a MITM fake a healthy relay
-        r = requests.get(relay_url, headers=headers, timeout=timeout, verify=True)
+        r = requests.get(relay_url, headers=headers, timeout=timeout, verify=True, allow_redirects=False)
         elapsed_ms = int((time.time() - t0) * 1000)
         if r.status_code == 200:
             return {"ok": True, "status": 200, "elapsed_ms": elapsed_ms}

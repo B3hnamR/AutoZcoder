@@ -1,17 +1,25 @@
-"""Coding-plan models observed in the ZCode 3.14.4 captures."""
-CAPTURED_MODEL_VARIANTS = {'GLM-5.3': 'anthropic', 'GLM-5.3-Flash': 'anthropic'}
+"""Coding-plan models observed in the ZCode captures."""
+CAPTURED_MODEL_VARIANTS = {
+    'GLM-5.3-Flash': 'anthropic',
+    'GLM-5.4': 'anthropic',
+}
+UPSTREAM_MODEL_IDS = {'GLM-5.4': 'glm-5.4'}
 CATALOG_FREE_MODELS = frozenset(CAPTURED_MODEL_VARIANTS)
+DEFAULT_OPENAI_MODEL = 'GLM-5.3-Flash'
+DEFAULT_ANTHROPIC_MODEL = 'GLM-5.4'
 
-# Per-model capabilities. Vision is confirmed for BOTH plan models (live-
-# measured 2026-10-21 by the owner: Flash reads images natively; GLM-5.3
-# also accepts image blocks — forwarding is ON by default per owner
-# decision). If the upstream ever starts rejecting images on one of them,
-# flip that entry to False to restore server-side stripping.
+
+def is_retired_model(model: str) -> bool:
+    # Recognize only the retired ID when upgrading existing user state.
+    return model.strip().casefold() == 'glm-5.3'
+
+# Captured 2026-11-23: GLM-5.4 accepted a PNG, a 131072 ceiling, and a
+# 1048576 context window on the coding-plan endpoint.
 MODEL_CAPS = {
-    'GLM-5.3':       {'vision': True,  'max_output_tokens': 128000,
-                      'context_window': 1000000},
+    'GLM-5.4': {'vision': True, 'max_output_tokens': 131072,
+                      'context_window': 1048576},
     'GLM-5.3-Flash': {'vision': True,  'max_output_tokens': 128000,
-                      'context_window': 1000000},
+                      'context_window': 1048576},
 }
 
 
@@ -20,13 +28,22 @@ def model_caps(model: str) -> dict:
     if caps:
         return caps
     # unknown ids (aliases of the future): safe permissive defaults
-    return {'vision': True, 'max_output_tokens': 128000, 'context_window': 1000000}
+    return {'vision': True, 'max_output_tokens': 131072, 'context_window': 1048576}
 
 
 class Registry:
-    def __init__(self, aliases=None, default='GLM-5.3-Flash', default_anthropic='GLM-5.3', probe_unknown=False):
-        self.aliases = dict(aliases or {})
-        self.default, self.default_anthropic = default, default_anthropic
+    def __init__(self, aliases=None, default=DEFAULT_OPENAI_MODEL,
+                 default_anthropic=DEFAULT_ANTHROPIC_MODEL, probe_unknown=False):
+        allowed_aliases = {
+            alias: target for alias, target in (aliases or {}).items()
+            if not is_retired_model(alias) and not is_retired_model(target)
+        }
+        dropped_aliases = (aliases or {}).keys() - allowed_aliases.keys()
+        self.aliases = allowed_aliases
+        self.default = (DEFAULT_ANTHROPIC_MODEL if is_retired_model(default)
+                        or default in dropped_aliases else default)
+        self.default_anthropic = (DEFAULT_ANTHROPIC_MODEL if is_retired_model(default_anthropic)
+                                  or default_anthropic in dropped_aliases else default_anthropic)
         self.free_models = CATALOG_FREE_MODELS
     def resolve(self, requested, dialect='openai'):
         model = requested or (self.default_anthropic if dialect == 'anthropic' else self.default)

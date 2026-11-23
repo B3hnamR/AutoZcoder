@@ -24,14 +24,14 @@ def config_path(tmp_path, monkeypatch):
 def test_collection_environment_overrides_are_typed(config_path, monkeypatch):
     monkeypatch.setenv("ZCODE_GATEWAY_SERVER__ALLOWED_HOSTS", '["gw.example.test", "::1"]')
     monkeypatch.setenv("ZCODE_GATEWAY_SERVER__CLIENT_KEYS", '[{"key":"dummy-client","rpm":7}]')
-    monkeypatch.setenv("ZCODE_GATEWAY_MODELS__ALIASES", '{"short":"GLM-5.3"}')
+    monkeypatch.setenv("ZCODE_GATEWAY_MODELS__ALIASES", '{"short":"GLM-5.4"}')
     monkeypatch.setenv("ZCODE_GATEWAY_UPDATE__LEGACY_REPOS", '["example/old"]')
     cfg = load_config(config_path)
     assert cfg.server.allowed_hosts == ["gw.example.test", "::1"]
     assert "gw.example.test" in cfg.server.trusted_hosts()
     assert cfg.server.client_keys[0].key == "dummy-client"
     assert cfg.server.client_keys[0].rpm == 7
-    assert cfg.models.aliases == {"short": "GLM-5.3"}
+    assert cfg.models.aliases == {"short": "GLM-5.4"}
     assert cfg.update.legacy_repos == ("example/old",)
 
 

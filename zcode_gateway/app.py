@@ -34,6 +34,27 @@ from .upstream import UpstreamClient, anthropic_error, openai_error
 log = logging.getLogger("zcode_gateway")
 
 
+class InferenceRequests:
+    """Count requests through the last response frame and stream cleanup."""
+
+    paths = {"/v1/chat/completions", "/v1/completions", "/v1/messages"}
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if (scope["type"] != "http" or scope["method"] != "POST"
+                or scope["path"] not in self.paths):
+            await self.app(scope, receive, send)
+            return
+        state = scope["app"].state.app_state
+        state.active_inference += 1
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            state.active_inference -= 1
+
+
 def setup_logging(level: str = "INFO") -> None:
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
@@ -58,8 +79,10 @@ async def lifespan(app: FastAPI):
     )
     catalog = ModelCatalog(cfg.upstream.base_url, registry)
 
+    inventory_loaded = False
     try:
         accounts = load_accounts(cfg.accounts)
+        inventory_loaded = cfg.accounts.source != "accounts_dir" or Path(cfg.accounts.dir).is_dir()
     except Exception as exc:
         log.warning("could not load accounts from %s: %s", cfg.accounts.source, exc)
         accounts = []
@@ -79,8 +102,9 @@ async def lifespan(app: FastAPI):
     # the sqlite store so a restart doesn't forget and re-burn every account
     try:
         caps_file = Path(cfg.store.sqlite_path).resolve().parent / "model-caps.json"
-        pool.set_caps_path(caps_file)
-        pool.load_caps()
+        if inventory_loaded:
+            pool.set_caps_path(caps_file)
+            pool.load_caps()
     except Exception:
         log.warning("model-cap persistence unavailable", exc_info=True)
     tokens = TokenManager(cfg, pool)
@@ -142,6 +166,9 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        scheduler = getattr(app.state.app_state, "claim_scheduler", None)
+        if scheduler is not None:
+            await asyncio.to_thread(scheduler.stop)
         generator = getattr(app.state.app_state, "generator", None)
         if generator is not None:
             try:
@@ -185,31 +212,8 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     cfg = cfg or load_config()
     setup_logging(cfg.logging.level)
 
-    # --- bind security (VPS / remote deployments) --------------------------
-    # The admin key is local root-equivalent: it can point the generator at
-    # arbitrary code, swap the binary, and rewrite config. A non-loopback
-    # bind is only allowed with real credentials in place.
+    cfg.server.validate_bind_policy()
     if not cfg.server.is_loopback_bind():
-        if not cfg.server.require_client_key:
-            raise RuntimeError(
-                f"server.host={cfg.server.host} is a public bind but "
-                "server.require_client_key is false — an unauthenticated "
-                "proxy on a public interface is an open relay. Set "
-                "require_client_key: true (and configure client_keys).")
-        if not cfg.server.client_keys:
-            raise RuntimeError(
-                "server.host is a public bind but no client_keys are "
-                "configured — nothing would authenticate. Configure "
-                "client_keys.")
-        if cfg.server.has_placeholder_client_key():
-            raise RuntimeError(
-                "server.host is a public bind but a client key is still the "
-                "example placeholder from config.example.yaml — set real "
-                "long random keys (see docs/guides/VPS-DEPLOY.md).")
-        if cfg.server.admin_key_is_placeholder():
-            raise RuntimeError(
-                "server.host is a public bind but server.admin_key is still "
-                "a template placeholder — set a long random admin key first.")
         if not cfg.server.tls_cert:
             log.warning("serving PLAIN HTTP on a public bind: set server.tls_cert / "
                         "tls_key (built-in HTTPS) or put a TLS proxy in front")
@@ -222,6 +226,7 @@ def create_app(cfg: Config | None = None) -> FastAPI:
 
     app = FastAPI(title="Zcode Gateway", version=__version__, lifespan=lifespan)
     app.state.cfg = cfg
+    app.add_middleware(InferenceRequests)
 
     # No CORS middleware on purpose: the dashboard is served same-origin and
     # every API client is a non-browser tool. `allow_origins=["*"]` let any

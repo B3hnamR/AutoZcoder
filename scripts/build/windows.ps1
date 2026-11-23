@@ -49,10 +49,12 @@ if (($needInstaller -or $needRuntime) -and -not $usingVenv) {
 if ($needInstaller) {
     Write-Host "  installing pyinstaller (venv)..." -ForegroundColor Yellow
     & $py -m pip install --upgrade pyinstaller
+    if ($LASTEXITCODE -ne 0) { throw "PyInstaller installation failed" }
 }
 if ($needRuntime) {
     Write-Host "  installing runtime deps (venv)..." -ForegroundColor Yellow
     & $py -m pip install -r (Join-Path $Here "requirements\windows.txt")
+    if ($LASTEXITCODE -ne 0) { throw "Runtime dependency installation failed" }
 }
 
 $mode = if ($Console) { "--console" } else { "--windowed" }
@@ -109,7 +111,7 @@ if (Test-Path $mintExe) {
     $mintData = @("--add-data", "$mintExe;captcha-mint")
     Write-Host ("  captcha-mint: {0:N1} MB (bundled)" -f ((Get-Item $mintExe).Length / 1MB))
 } else {
-    Write-Host "  WARN: captcha-mint.exe missing - headless Start Plan claims will answer 3007" -ForegroundColor Yellow
+    throw "Required native helper is missing. Install Bun to build it."
 }
 
 # icon: official Zcode logo, extracted to assets/ by tools/make_icon.py

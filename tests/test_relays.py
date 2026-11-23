@@ -22,8 +22,8 @@ def test_relay_manager_defaults(tmp_path: Path):
     mgr = RelayManager(data_dir=tmp_path)
     st = mgr.get_settings()
     assert st["enabled"] is False
-    # By default, only GLM-5.3 routes through relay!
-    assert st["models"] == ["GLM-5.3"]
+    # By default, only GLM-5.4 routes through relay!
+    assert st["models"] == ["GLM-5.4"]
     assert st["active_url"] == ""
     assert st["relays"] == []
 
@@ -38,7 +38,7 @@ def test_adding_relay_does_not_enable_routing(tmp_path: Path):
     mgr = RelayManager(data_dir=tmp_path)
     mgr.add_relay("cf", "https://relay.workers.dev", "cloudflare")
     assert mgr.get_settings()["enabled"] is False
-    assert mgr.get_relay_for_model("GLM-5.3") is None
+    assert mgr.get_relay_for_model("GLM-5.4") is None
 
 
 def test_relay_manager_add_and_select(tmp_path: Path):
@@ -55,8 +55,8 @@ def test_relay_manager_add_and_select(tmp_path: Path):
 
     # Model routing check
     mgr.update_options(enabled=True)
-    assert mgr.get_relay_for_model("GLM-5.3") == "https://relay.workers.dev"
-    assert mgr.get_relay_for_model("glm-5.3") == "https://relay.workers.dev"
+    assert mgr.get_relay_for_model("GLM-5.4") == "https://relay.workers.dev"
+    assert mgr.get_relay_for_model("glm-5.4") == "https://relay.workers.dev"
     # GLM-5.3-Flash is NOT routed by default
     assert mgr.get_relay_for_model("GLM-5.3-Flash") is None
 
@@ -66,13 +66,13 @@ def test_relay_manager_model_toggle(tmp_path: Path):
     mgr.add_relay("cf", "https://relay.workers.dev", "cloudflare")
 
     # Add GLM-5.3-Flash to enabled models
-    mgr.update_options(enabled=True, models=["GLM-5.3", "GLM-5.3-Flash"])
-    assert mgr.get_relay_for_model("GLM-5.3") == "https://relay.workers.dev"
+    mgr.update_options(enabled=True, models=["GLM-5.4", "GLM-5.3-Flash"])
+    assert mgr.get_relay_for_model("GLM-5.4") == "https://relay.workers.dev"
     assert mgr.get_relay_for_model("GLM-5.3-Flash") == "https://relay.workers.dev"
 
     # Disable relay master switch
     mgr.update_options(enabled=False)
-    assert mgr.get_relay_for_model("GLM-5.3") is None
+    assert mgr.get_relay_for_model("GLM-5.4") is None
     assert mgr.get_relay_for_model("GLM-5.3-Flash") is None
 
 
@@ -97,7 +97,8 @@ def test_test_relay_success(monkeypatch):
     mock_resp.text = "ok"
 
     captured_req = {}
-    def mock_get(url, headers=None, timeout=None, verify=None):
+    def mock_get(url, headers=None, timeout=None, verify=None, allow_redirects=True):
+        assert allow_redirects is False
         captured_req["url"] = url
         captured_req["headers"] = headers
         return mock_resp
@@ -171,8 +172,8 @@ async def test_upstream_client_routes_through_relay(tmp_path: Path):
     cfg = UpstreamConfig(base_url="https://zcode.z.ai/api/v1", chat_path="/zcode-plan/anthropic/v1/messages")
     client = UpstreamClient(cfg, relay_manager=mgr)
 
-    # 1. For GLM-5.3, build_request targets relay_url with x-relay-target and x-relay-path
-    req_model = "GLM-5.3"
+    # 1. For GLM-5.4, build_request targets relay_url with x-relay-target and x-relay-path
+    req_model = "GLM-5.4"
     relay_url = client.relay_manager.get_relay_for_model(req_model)
     assert relay_url == "https://cf-relay.workers.dev"
 
@@ -199,7 +200,7 @@ def test_strategy_single_uses_active(tmp_path: Path):
     mgr.add_relay("cf2", "https://cf2.workers.dev", "cloudflare")
     mgr.update_options(enabled=True, strategy="single", active_id=r1["id"])
     for _ in range(5):
-        assert mgr.get_relay_for_model("GLM-5.3") == "https://cf1.workers.dev"
+        assert mgr.get_relay_for_model("GLM-5.4") == "https://cf1.workers.dev"
 
 
 def test_strategy_round_robin_cycles(tmp_path: Path):
@@ -207,7 +208,7 @@ def test_strategy_round_robin_cycles(tmp_path: Path):
     mgr.add_relay("cf1", "https://cf1.workers.dev", "cloudflare")
     mgr.add_relay("cf2", "https://cf2.workers.dev", "cloudflare")
     mgr.update_options(enabled=True, strategy="round_robin")
-    picks = [mgr.get_relay_for_model("GLM-5.3") for _ in range(4)]
+    picks = [mgr.get_relay_for_model("GLM-5.4") for _ in range(4)]
     assert picks == ["https://cf1.workers.dev", "https://cf2.workers.dev",
                      "https://cf1.workers.dev", "https://cf2.workers.dev"]
 
@@ -218,7 +219,7 @@ def test_strategy_random_picks_from_pool(tmp_path: Path):
     mgr.add_relay("cf2", "https://cf2.workers.dev", "cloudflare")
     mgr.update_options(enabled=True, strategy="random")
     allowed = {"https://cf1.workers.dev", "https://cf2.workers.dev"}
-    picks = {mgr.get_relay_for_model("GLM-5.3") for _ in range(30)}
+    picks = {mgr.get_relay_for_model("GLM-5.4") for _ in range(30)}
     assert picks.issubset(allowed) and len(picks) >= 1
 
 
@@ -231,11 +232,11 @@ def test_failed_relay_is_skipped_and_recovers(tmp_path: Path):
     # cool down cf1: rotation must fall to cf2 only
     mgr.mark_relay_failed("https://cf1.workers.dev")
     for _ in range(4):
-        assert mgr.get_relay_for_model("GLM-5.3") == "https://cf2.workers.dev"
+        assert mgr.get_relay_for_model("GLM-5.4") == "https://cf2.workers.dev"
 
     # success on cf1 clears the failure: full rotation resumes
     mgr.mark_relay_ok("https://cf1.workers.dev")
-    picks = {mgr.get_relay_for_model("GLM-5.3") for _ in range(10)}
+    picks = {mgr.get_relay_for_model("GLM-5.4") for _ in range(10)}
     assert picks == {"https://cf1.workers.dev", "https://cf2.workers.dev"}
 
 
@@ -247,5 +248,5 @@ def test_all_relays_failed_still_routes(tmp_path: Path):
     mgr.update_options(enabled=True)
     mgr.mark_relay_failed("https://cf1.workers.dev")
     mgr.mark_relay_failed("https://cf2.workers.dev")
-    assert mgr.get_relay_for_model("GLM-5.3") in {
+    assert mgr.get_relay_for_model("GLM-5.4") in {
         "https://cf1.workers.dev", "https://cf2.workers.dev"}

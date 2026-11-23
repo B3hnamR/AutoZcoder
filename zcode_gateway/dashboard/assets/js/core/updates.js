@@ -102,8 +102,14 @@ async function apply() {
     await api.post("/admin/dash/update/apply");
     message = "Restarting to apply the update. The app will relaunch.";
   } catch (e) {
-    phase = "ready";
-    message = "Restart not started: " + e.message + ". The download is ready; retry when your work has finished.";
+    try {
+      const current = await api.get("/admin/dash/update/status");
+      receive(current);
+    } catch (_) {
+      phase = "ready";
+    }
+    message = "Restart not started: " + e.message
+      + (phase === "ready" ? ". The download is ready. You can retry Apply." : "");
   } finally {
     operation = null;
     paint();

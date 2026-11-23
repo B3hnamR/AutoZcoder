@@ -521,7 +521,10 @@ def apply_update(new_exe: Path, *, config_path: str | Path | None = None) -> Non
     if not expected_path.is_file():
         raise RuntimeError("no recorded checksum for the downloaded update; "
                            "download again before applying")
-    expected_hash = expected_path.read_text(encoding="ascii").strip()
+    try:
+        expected_hash = expected_path.read_text(encoding="ascii").strip()
+    except UnicodeError as exc:
+        raise RuntimeError("invalid recorded checksum; download again before applying") from exc
     if not _HASH_RE.fullmatch(expected_hash):
         raise RuntimeError("invalid recorded checksum; download again before applying")
     own_hash = _sha256_file(current)

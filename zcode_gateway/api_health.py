@@ -56,6 +56,12 @@ async def ready(request: Request):
         return JSONResponse(status_code=404, content={"detail": "Not Found"})
     state = request.app.state.app_state
     ready_count = await state.pool.ready_count()
+    breaker = getattr(getattr(state, "service", None), "breaker", None)
+    if breaker is not None and breaker.check() is not None:
+        return JSONResponse(
+            status_code=503,
+            content={"ready": False, "accounts_ready": ready_count, "reason": "upstream_edge_block"},
+        )
     if ready_count == 0:
         # orchestrators decide readiness from the status code; a 200 with
         # ready=false kept them routing to a dead gateway

@@ -27,6 +27,8 @@ from collections import deque
 from pathlib import Path
 from .captcha_tickets import CaptchaTicketPool
 
+from .process_env import external_process_env
+
 
 def _gen_dir_under(path: Path) -> Path | None:
     """If `path` is (or contains) a generator folder with main.py, return it.
@@ -215,7 +217,7 @@ def _python_has_pip(py: str) -> bool:
     try:
         return subprocess.run(
             [py, "-c", "import pip, sys; sys.exit(0 if sys.prefix != sys.base_prefix else 1)"],
-            capture_output=True, timeout=20, **_child_kwargs()).returncode == 0
+            capture_output=True, timeout=20, env=external_process_env(), **_child_kwargs()).returncode == 0
     except (OSError, subprocess.SubprocessError):
         return False
 
@@ -294,7 +296,7 @@ def _run_installer(argv: list[str], emit, timeout: float = 1200, cwd=None) -> bo
     try:
         proc = subprocess.Popen(
             argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, encoding="utf-8", errors="replace", cwd=cwd,
+            text=True, encoding="utf-8", errors="replace", cwd=cwd, env=external_process_env(),
             **_child_kwargs())
     except Exception as exc:
         emit(f"  failed to start: {type(exc).__name__}: {exc}")
@@ -386,7 +388,7 @@ class EnvSetup:
             r = subprocess.run(
                 [str(p), "-c",
                  "import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)"],
-                capture_output=True, timeout=20, **_child_kwargs())
+                capture_output=True, timeout=20, env=external_process_env(), **_child_kwargs())
             return r.returncode == 0
         except Exception:
             return False
@@ -527,7 +529,7 @@ class EnvSetup:
                   "print(1 if os.path.exists(marker) and sys.prefix == sys.base_prefix else 0)")
         try:
             r = subprocess.run([py, "-c", script], capture_output=True, text=True,
-                               timeout=30, **_child_kwargs())
+                               timeout=30, env=external_process_env(), **_child_kwargs())
             return (r.stdout or "").strip().endswith("1")
         except Exception:
             return False
@@ -556,7 +558,7 @@ class EnvSetup:
             "    except Exception:\n        bad.append(m)\nprint(','.join(bad))"
         try:
             r = subprocess.run([py, "-c", script], capture_output=True,
-                               text=True, timeout=120, **_child_kwargs())
+                               text=True, timeout=120, env=external_process_env(), **_child_kwargs())
             if r.returncode != 0:
                 return list(GEN_DEPS)      # can't even run: install everything
             return [m for m in (r.stdout or "").strip().split(",") if m]
@@ -574,7 +576,7 @@ class EnvSetup:
                       "    exe = p.chromium.executable_path\n"
                       "    print('1' if exe and os.path.exists(exe) else '0')")
             r = subprocess.run([py, "-c", script], capture_output=True,
-                               text=True, timeout=60, **_child_kwargs())
+                               text=True, timeout=60, env=external_process_env(), **_child_kwargs())
             return (r.stdout or "").strip().endswith("1")
         except Exception:
             return False
@@ -784,7 +786,7 @@ class PlaywrightSetup:
         # -B keeps even Python's import cache read-only. Both subprocess paths
         # inherit PLAYWRIGHT_BROWSERS_PATH and the rest of the service environment.
         result = subprocess.run([py, "-B", "-c", script], capture_output=True,
-                                text=True, timeout=60, **_child_kwargs())
+                                text=True, timeout=60, env=external_process_env(), **_child_kwargs())
         state = (result.stdout or "").strip()
         if result.returncode != 0 or state not in {"ready", "package-missing", "chromium-missing"}:
             detail = _tail(result.stderr or result.stdout or "no readiness result", limit=400)
@@ -919,6 +921,7 @@ class GenWorker:
         env = os.environ.copy()
         env.update(self.env)
         env["PYTHONUNBUFFERED"] = "1"
+        env = external_process_env(env)
         try:
             self.proc = subprocess.Popen(
                 self.argv, cwd=str(self.gen_dir), env=env,
@@ -1184,7 +1187,7 @@ class ProxyChecker:
                 env["PROXY_DEAD_HOURS"] = str(dead_cache_hours)
             self.proc = subprocess.Popen(
                 [self.python_exe, "-u", "proxy_pool.py", action],
-                cwd=str(self.gen_dir), env=env,
+                cwd=str(self.gen_dir), env=external_process_env(env),
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding="utf-8", errors="replace", bufsize=1,
                 **_child_kwargs())
@@ -1539,7 +1542,7 @@ def _run_capture(args, cwd, timeout, env=None) -> subprocess.CompletedProcess:
     extra = {"start_new_session": True} if os.name != "nt" else {}
     proc = subprocess.Popen(
         args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, encoding="utf-8", errors="replace", shell=False, env=env,
+        text=True, encoding="utf-8", errors="replace", shell=False, env=external_process_env(env),
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), **extra)
     try:
         out, err = proc.communicate(timeout=timeout)
@@ -1688,6 +1691,7 @@ class ClaimJob:
         env = os.environ.copy()
         env.update(self.child_env)
         env.update(_bundled_captcha_env())
+        env = external_process_env(env)
         env.update({"PYTHONUNBUFFERED": "1",
                     "ZAI_OUTPUT_DIR": str(self.data_dir),
                     "ZAI_INVITE_CODE": self.invite_code or ""})
@@ -2399,9 +2403,23 @@ class GeneratorManager:
             return {"ok": False, "error": "worker source not found in this build"}
         out = Path(dest) if dest else self.data_dir.parent / "mail-worker"
         try:
-            if out.exists():
-                _sh.rmtree(out, ignore_errors=True)
-            _sh.copytree(src, out)
+            source = src.resolve()
+            target = out.resolve()
+            if target == source or source in target.parents or target in source.parents:
+                if dest:
+                    return {"ok": False, "error": "worker export overlaps its source"}
+                out = out.with_name("mail-worker-export")
+            out.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix=".worker-export-", dir=out.parent) as staging:
+                staged = Path(staging) / "worker"
+                _sh.copytree(source, staged)
+                if not (staged / "package.json").is_file() or not (staged / "src").is_dir():
+                    return {"ok": False, "error": "worker source is incomplete"}
+                if out.exists() or out.is_symlink():
+                    if dest:
+                        return {"ok": False, "error": "worker export destination already exists"}
+                    out = out.with_name(f"mail-worker-{Path(staging).name.removeprefix('.worker-export-')}")
+                staged.rename(out)
         except OSError as e:
             return {"ok": False, "error": str(e)}
         files = sorted(p.name for p in out.rglob('*') if p.is_file())
@@ -2410,7 +2428,13 @@ class GeneratorManager:
     # ---- one-click worker deploy -------------------------------------------- #
 
     def _worker_dir(self) -> Path:
-        return self.data_dir.parent / "mail-worker"
+        parent = self.data_dir.parent
+        previous = self.mail_cfg.get("deployed_worker_dir", "")
+        if isinstance(previous, str) and Path(previous).name == previous and previous.startswith("mail-worker"):
+            current = parent / previous
+            if current.is_dir() and not current.is_symlink():
+                return current
+        return parent / "mail-worker"
 
     # ---- node.js tooling ----------------------------------------------------- #
 
@@ -2462,8 +2486,9 @@ class GeneratorManager:
         with a cryptic npx error instead of triggering our auto-install."""
         try:
             r = subprocess.run(["node", "--version"], capture_output=True, text=True,
-                               timeout=15, shell=False, encoding="utf-8", errors="replace",
-                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                                timeout=15, shell=False, encoding="utf-8", errors="replace",
+                                env=external_process_env(),
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             m = re.match(r"v(\d+)", (r.stdout or "").strip())
             return bool(m and int(m.group(1)) >= self._NODE_MIN_MAJOR)
         except (OSError, subprocess.SubprocessError):
@@ -3187,7 +3212,7 @@ class GeneratorManager:
                 [npx, "wrangler", "secret", "put", "INBOX_SECRET"],
                 cwd=str(wdir), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT, text=True, encoding="utf-8",
-                errors="replace", shell=False, env=_secret_env,
+                errors="replace", shell=False, env=external_process_env(_secret_env),
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 **({"start_new_session": True} if os.name != "nt" else {}))
             # EOF terminates piped input; do not alter the configured value.
@@ -3208,6 +3233,7 @@ class GeneratorManager:
 
         # 5) persist the URL and smoke-test
         self.mail_cfg["inbox_url"] = base_url + "/inbox"
+        self.mail_cfg["deployed_worker_dir"] = wdir.name
         self._save_mail_config()
         say("testing inbox…")
         test = self._verify_inbox(base_url + "/inbox", secret)
@@ -3634,7 +3660,7 @@ class GeneratorManager:
                     proc = subprocess.Popen(
                         [xvfb, *display_args, "-displayfd", str(ready.fileno()), "-screen", "0", "1280x720x24",
                          "-nolisten", "tcp"], pass_fds=(ready.fileno(),),
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **_child_kwargs())
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=external_process_env(), **_child_kwargs())
                 except OSError as exc:
                     return f"Xvfb could not start ({exc}); configure a working DISPLAY before retrying"
                 self._display_proc = proc
@@ -3859,76 +3885,12 @@ class GeneratorManager:
             return {"total": 0, "active": 0, "ready": False}
 
     def _cleanup_layout(self) -> None:
-        """One-time tidy of a legacy-flat generator-data folder into the
-        sorted v1.0.5 layout (best effort, never raises):
-
-            accounts/  results/ (accounts*/plans*/starter*)   [flat files]
-            logs/workers/      worker solve logs              [new location]
-            profiles/          .pw-profile-* leftovers        [orphaned]
-            screenshots/       *.png debug images             [flat files]
-
-        Old builds wrote everything flat next to pool.json; 74 orphan chromium
-        profiles and 900MB accumulated that way. Live files (pool.json,
-        proxies*, mail_config.json, generator_options.json, relays.json,
-        registered.json, pending_referral.json) stay where they are — the
-        gateway reads them from the data dir root.
-        """
+        """Create output folders; legacy paths remain readable by their consumers."""
         try:
-            import shutil as _sh
-            moves = {
-                "results": ("accounts*.txt", "plans*.jsonl", "starter*.txt"),
-                "screenshots": ("*.png",),
-                "profiles": tuple(),
-            }
-            for sub, pats in moves.items():
-                d = self.data_dir / sub
-                d.mkdir(parents=True, exist_ok=True)
-                if not pats:
-                    # orphaned profiles from crashed runs
-                    for p in self.data_dir.glob(".pw-profile-*"):
-                        if p.is_dir():
-                            _sh.rmtree(p, ignore_errors=True)
-                    continue
-                for pat in pats:
-                    for p in self.data_dir.glob(pat):
-                        if p.is_file():
-                            try:
-                                _sh.move(str(p), str(d / p.name))
-                            except OSError:
-                                pass
-            # legacy single mega-log: archive under logs/
-            old_log = self.data_dir / "output.txt"
-            if old_log.exists():
-                lg = self.data_dir / "logs"
-                lg.mkdir(parents=True, exist_ok=True)
-                stamp = time.strftime("%Y%m%d_%H%M%S")
-                try:
-                    _sh.move(str(old_log), str(lg / f"legacy_output_{stamp}.txt"))
-                except OSError:
-                    pass
-            # debug PNGs (ai_bg_* / ai_piece_* / captcha_failed / error) grow
-            # unbounded at 3+ per AI attempt (~40-60 MB per 8-worker batch).
-            # Keep the newest 40; the rest were write-before-request debug
-            # copies with no diagnostic value once the batch is over.
-            try:
-                shots = sorted(self.data_dir.glob("screenshots/*.png"),
-                               key=lambda p: p.stat().st_mtime, reverse=True)
-                for p in shots[40:]:
-                    try:
-                        p.unlink()
-                    except OSError:
-                        pass
-                wlogs = sorted(self.data_dir.glob("logs/workers/*.log"),
-                               key=lambda p: p.stat().st_mtime, reverse=True)
-                for p in wlogs[60:]:
-                    try:
-                        p.unlink()
-                    except OSError:
-                        pass
-            except OSError:
-                pass
-        except Exception:
-            log.debug("generator-data layout cleanup skipped", exc_info=True)
+            for relative in ("results", "screenshots", "profiles", "logs/workers"):
+                (self.data_dir / relative).mkdir(parents=True, exist_ok=True)
+        except OSError:
+            log.debug("could not create generator output folders", exc_info=True)
 
     def start_workers_checked(self, count: int = 1, emit=print) -> dict:
         """start_workers, but with a guaranteed Playwright setup first

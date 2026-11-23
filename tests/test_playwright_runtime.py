@@ -39,7 +39,7 @@ def test_ready_root_skips_all_installers_and_inherits_browser_path(monkeypatch):
     assert "p.chromium.executable_path" in argv[3]
     assert "os.path.isfile(exe)" in argv[3]
     assert "install" not in argv[3]
-    assert "env" not in kwargs
+    assert kwargs["env"]["PLAYWRIGHT_BROWSERS_PATH"] == "/opt/app/browsers"
     assert kwargs["capture_output"] and kwargs["timeout"] == 60
     assert setup.status() == {"installing": False, "ready": True}
 

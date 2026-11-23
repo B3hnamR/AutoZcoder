@@ -166,7 +166,9 @@ def test_no_systemd_install_completes_without_live_health_checks(tmp_path, exist
 ZGW_INSTALL_DIR="$PWD"; CERT_DIR="$PWD/certs"; LOG_FILE="$PWD/install.log"
 ZGW_SKIP_SYSTEMD=1; ZGW_SKIP_GENERATOR=1; ZGW_PORT=8443
 ZGW_SSL_MODE=self; ZGW_SERVER_IP=192.0.2.1; ZGW_DOMAIN=""
+if [[ -f config.yaml ]]; then SAVED_INSTALL_DIR="$PWD"; fi
 need_root() { :; }
+acquire_mutation_lock() { :; }
 uname() { echo x86_64; }
 openssl() { echo fixture-random-key; }
 socat() { :; }
@@ -202,6 +204,87 @@ cmd_install
     for marker in ("manager-written", "state-written", "report-written"):
         assert (tmp_path / marker).is_file()
     assert stat.S_IMODE((tmp_path / "config.yaml").stat().st_mode) == 0o600
+    ownership = tmp_path / ".autozcoder-install"
+    assert ownership.read_text().strip() == str(tmp_path)
+    assert stat.S_IMODE(ownership.stat().st_mode) == 0o600
+
+
+def test_install_rejects_nonempty_unowned_directory_before_mutating(tmp_path):
+    sentinel = tmp_path / "unrelated.txt"
+    sentinel.write_text("keep me")
+    result = _shell(tmp_path, """
+need_root() { :; }
+acquire_mutation_lock() { :; }
+cmd_install
+""")
+    assert result.returncode != 0
+    assert "an unowned install directory must be empty" in result.stderr
+    assert sentinel.read_text() == "keep me"
+
+
+def test_uninstall_rejects_directory_override_before_removing_files(tmp_path):
+    sentinel = tmp_path / "unrelated.txt"
+    sentinel.write_text("keep me")
+    (tmp_path / "recorded").mkdir()
+    result = _shell(tmp_path, """
+need_root() { :; }
+acquire_mutation_lock() { :; }
+SAVED_INSTALL_DIR="$PWD/recorded"
+cmd_uninstall --yes
+""")
+    assert result.returncode != 0
+    assert "install directory differs from the recorded installation" in result.stderr
+    assert sentinel.read_text() == "keep me"
+
+
+def test_uninstall_backup_preserves_custom_paths_and_committed_wal_rows(tmp_path):
+    import sqlite3
+    import tarfile
+    from contextlib import closing
+
+    install = tmp_path / "install"
+    data = install / "custom"
+    data.mkdir(parents=True)
+    _config(install, """accounts:
+  dir: custom
+  pool_file: custom/pool-set.json
+store:
+  sqlite_path: custom/ledger.db
+""")
+    (data / "account.txt").write_text("fixture snapshot")
+    (data / "pool-set.json").write_text('{"accounts":[]}')
+    (data / "model-caps.json").write_text("{}")
+    db = data / "ledger.db"
+    with closing(sqlite3.connect(db)) as live:
+        live.execute("PRAGMA journal_mode=WAL")
+        live.execute("CREATE TABLE usage (tokens INTEGER)")
+        live.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        live.execute("INSERT INTO usage VALUES (42)")
+        live.commit()
+        assert (data / "ledger.db-wal").stat().st_size > 0
+        result = _shell(tmp_path, r"""
+mktemp() {
+    case "$*" in
+        *'/root/.autozcoder-backup.'*) command mktemp -d "$PWD/.autozcoder-backup.XXXXXXXX";;
+        /root/autozcoder-backup-*) command mktemp "$PWD/autozcoder-backup-XXXXXXXX.tar.gz";;
+        *) return 1;;
+    esac
+}
+system_python() { python "$@"; }
+uninstall_backup "$PWD/install"
+""")
+        assert result.returncode == 0, result.stderr
+        [archive] = tmp_path.glob("autozcoder-backup-*.tar.gz")
+        assert stat.S_IMODE(archive.stat().st_mode) == 0o600
+        with tarfile.open(archive) as backup:
+            assert set(backup.getnames()) == {
+                "config.yaml", "custom", "custom/account.txt", "custom/ledger.db",
+                "custom/model-caps.json", "custom/pool-set.json",
+            }
+            restored = tmp_path / "restored.db"
+            restored.write_bytes(backup.extractfile("custom/ledger.db").read())
+        with closing(sqlite3.connect(restored)) as connection:
+            assert connection.execute("SELECT tokens FROM usage").fetchall() == [(42,)]
 
 
 @pytest.mark.parametrize("kind,success", [

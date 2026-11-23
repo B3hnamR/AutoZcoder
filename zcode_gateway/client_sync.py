@@ -31,6 +31,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .registry import is_retired_model
+
 log = logging.getLogger("zcode_gateway.client_sync")
 
 # Local endpoints that mean "this provider is our gateway"
@@ -39,7 +41,10 @@ GATEWAY_HOST_MARKERS = ("127.0.0.1", "localhost", "0.0.0.0")
 # Model families whose thinking ladder we know, and what to offer for them.
 # Everything else gets `reasoning: true` only, letting the client generate its
 # own ladder (our gateway normalises the effort values it sends).
-KNOWN_LADDERS = {"glm-5.3": {
+KNOWN_LADDERS = {"glm-5.4": {
+    "low": {"reasoning_effort": "low"},
+    "high": {"reasoning_effort": "high"}, "max": {"reasoning_effort": "max"}},
+    "glm-5.3-flash": {
     "low": {"reasoning_effort": "low"},
     "high": {"reasoning_effort": "high"}, "max": {"reasoning_effort": "max"}}}
 NON_REASONING_MARKERS = ()
@@ -80,7 +85,7 @@ def _ladder_for(model_id: str) -> dict | None:
 
 def _should_flag(model_id: str) -> bool:
     low = model_id.lower()
-    if any(marker in low for marker in NON_REASONING_MARKERS):
+    if is_retired_model(low) or any(marker in low for marker in NON_REASONING_MARKERS):
         return False
     return True
 

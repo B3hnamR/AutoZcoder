@@ -80,8 +80,8 @@ def test_load_config_upgrades_a_shipped_stale_fingerprint(
 
     fingerprint = load_config(conf).upstream.fingerprint
 
-    assert fingerprint.client_version == "3.18.2"
-    assert fingerprint.user_agent.startswith("ZCode/3.18.2 ")
+    assert fingerprint.client_version == "4.0.0"
+    assert fingerprint.user_agent.startswith("ZCode/4.0.0 ")
 
 
 def test_load_config_preserves_custom_fingerprint(tmp_path, monkeypatch):

@@ -127,10 +127,8 @@ function modelCard(model, quotas, index) {
 }
 
 function render(root, data, accounts, reload, actions, actionStatus) {
-  // Null placeholders let the helper describe unchecked catalogue models too.
-  const catalogueQuotas = Object.fromEntries((data.models || []).map((model) => [model.model, null]));
-  const totals = aggregateModelQuotas(accounts.map((account) => ({ ...account,
-    quotas: { ...catalogueQuotas, ...account.quotas } })), Date.now() / 1000);
+  const catalogModels = (data.models || []).map((model) => model.model);
+  const totals = aggregateModelQuotas(accounts, Date.now() / 1000, catalogModels);
   const byModel = new Map(totals.models.map((model) => [model.model.toLowerCase(), model]));
   const catalog = data.catalog || {};
   const models = [...(data.models || [])].sort((a, b) => a.model.localeCompare(b.model));

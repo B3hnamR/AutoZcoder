@@ -28,6 +28,7 @@ class AppState:
     capture: JsonlCapture
     service: ChatService
     limiter: RateLimiter
+    active_inference: int = 0
     updater: Any = None          # updater.UpdateChecker, wired in lifespan
     catalog: Any = None          # model_catalog.ModelCatalog, wired in lifespan
     generator: Any = None        # generator.GeneratorManager, lazily created

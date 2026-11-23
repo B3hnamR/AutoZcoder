@@ -33,7 +33,7 @@ def test_settings_endpoint_ships_the_dropdown_choices(tmp_path, monkeypatch):
         for o in opts:
             assert o["label"] and o["desc"], (path, o)         # every option is explained
     assert {"accounts.source", "logging.level", "models.default_effort", "server.host"} <= set(choices)
-    assert "GLM-5.3" in s["models"] and "GLM-5.3-Flash" in s["models"]
+    assert "GLM-5.4" in s["models"] and "GLM-5.3-Flash" in s["models"]
     assert "enabled" in s["effective"]["update"]                 # update.* shows its real value
 
 
@@ -50,8 +50,12 @@ def test_enum_settings_reject_values_that_would_break_the_next_boot(tmp_path, mo
 
         assert put({"pool.strategy": "round_robin"}).status_code == 200
         assert put({"logging.level": "debug"}).status_code == 200      # normalised
+        assert put({"server.host": "0.0.0.0"}).status_code == 400
+        assert "host" not in yaml.safe_load(conf.read_text(encoding="utf-8"))["server"]
+        monkeypatch.setenv("ZCODE_GATEWAY_SERVER__ADMIN_KEY", "fixture-public-admin")
+        monkeypatch.setenv("ZCODE_GATEWAY_SERVER__CLIENT_KEYS", '[{"key":"fixture-public-client"}]')
         assert put({"server.host": "0.0.0.0"}).status_code == 200
-        assert put({"server.host": "my-pc.lan"}).status_code == 200    # any host name is allowed
+        assert put({"server.host": "my-pc.lan"}).status_code == 200
     written = yaml.safe_load(conf.read_text(encoding="utf-8"))
     assert written["pool"]["strategy"] == "round_robin"
     assert written["logging"]["level"] == "DEBUG"

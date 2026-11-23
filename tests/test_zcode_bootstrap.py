@@ -15,11 +15,13 @@ def test_openai_bootstrap_keeps_caller_instruction_and_tools():
         'tools':[{'type':'function','function':{'name':'weather','parameters':{'type':'object'}}}]}
     original=copy.deepcopy(payload)
     body=build_body(payload)
-    assert [b['text'] for b in body['system']]==[
-        ZCODE_IDENTITY,ZCODE_HARNESS,ZCODE_OUTPUT_STYLE+'\n\nAnswer in Persian.']
+    assert [b['text'] for b in body['system']]==[ZCODE_IDENTITY,ZCODE_HARNESS,ZCODE_OUTPUT_STYLE]
     assert len(body['system'])==3
     assert body['system'][1]['cache_control']=={'type':'ephemeral'}
-    assert body['messages']==[{'role':'user','content':[{'type':'text','text':'hi'}]}]
+    # 4.0.0 keeps system turns mid-conversation instead of merging them into
+    # the style block.
+    assert body['messages'][0]=={'role':'system','content':[{'type':'text','text':'Answer in Persian.'}]}
+    assert body['messages'][1]['content'][0]['text']=='hi'
     assert [t['name'] for t in body['tools']]==['weather']
     assert payload==original
 
@@ -41,7 +43,7 @@ def test_existing_native_bootstrap_and_cache_markers_preserved():
 
 
 def test_plain_native_system_kept_after_bootstrap():
-    body=build_body({'model':'GLM-5.3','_anthropic':{'system':'Caller context','messages':[{'role':'user','content':'hi'}]}})
+    body=build_body({'model':'GLM-5.4','_anthropic':{'system':'Caller context','messages':[{'role':'user','content':'hi'}]}})
     assert body['system'][-1]=={'type':'text','text':ZCODE_OUTPUT_STYLE+'\n\nCaller context',
                                'cache_control':{'type':'ephemeral'}}
     assert 'cache_control' not in body['system'][0]

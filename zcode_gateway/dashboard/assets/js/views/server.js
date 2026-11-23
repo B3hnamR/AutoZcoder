@@ -138,19 +138,30 @@ function render(root, s) {
       ...kvRow("Working directory", copyable(s.cwd || "—")),
     ]));
 
-  const snippet = "base_url: " + base + "/v1\napi_key:  " + maskSecret(s.admin_key || "", 4) + "   # admin key, or any client key";
+  const keyPicker = clientKeys.length > 1 ? el("select", {
+    class: "select", "aria-label": "Client key for example",
+  }, clientKeys.map((key, i) => el("option", { value: String(i), text: key.name || "Client " + (i + 1) }))) : null;
+  const clientKey = () => clientKeys[Number(keyPicker?.value || 0)]?.key || "";
+  const snippet = el("div", { class: "code" });
+  const paintSnippet = () => {
+    snippet.textContent = "base_url: " + base + "/v1\napi_key:  "
+      + (clientKey() ? maskSecret(clientKey(), 4) : "<client key>");
+  };
+  keyPicker?.addEventListener("change", paintSnippet);
+  paintSnippet();
   const snippetBody = el("div", { class: "stack stack--tight" }, [
-    el("div", { class: "code", text: snippet }),
+    snippet,
+    ...(keyPicker ? [keyPicker] : []),
     el("div", { class: "row" }, [
       el("button", {
         class: "btn btn--sm btn--ghost",
         type: "button",
         on: { click: async () => {
-          const real = "base_url: " + base + "/v1\napi_key: " + (s.admin_key || "");
-          toast(await copyText(real) ? "Config copied (with the real key)" : "Could not copy",
+          const real = "base_url: " + base + "/v1\napi_key: " + (clientKey() || "<client key>");
+          toast(await copyText(real) ? "Client config copied" : "Could not copy",
                 "ok", 2200);
         } },
-      }, [icon(ICONS.copy, 14), el("span", { text: "Copy with real key" })]),
+      }, [icon(ICONS.copy, 14), el("span", { text: "Copy client config" })]),
       el("span", { class: "field__help", text: "Works with the OpenAI SDK, Anthropic SDK, Kilo, or plain curl." }),
     ]),
   ]);

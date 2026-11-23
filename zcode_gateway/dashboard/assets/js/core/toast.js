@@ -32,9 +32,7 @@ export function toast(message, kind = "", ms = 4200) {
 }
 
 /**
- * Replacement for window.confirm. Focus-trapped, Escape cancels, and Enter
- * only confirms while focus is inside the dialog so a stray keypress can never
- * trigger a destructive action.
+ * Replacement for window.confirm with a focus trap and Escape to cancel.
  */
 export function confirmDialog({ title, body, okLabel = "OK", cancelLabel = "Cancel", danger = false }) {
   return new Promise((resolve) => {
@@ -68,7 +66,6 @@ export function confirmDialog({ title, body, okLabel = "OK", cancelLabel = "Canc
 
     function onKey(e) {
       if (e.key === "Escape") { e.preventDefault(); done(false); return; }
-      if (e.key === "Enter" && modal.contains(document.activeElement)) { e.preventDefault(); done(true); return; }
       if (e.key === "Tab") {
         const focusables = [cancelBtn, okBtn];
         const i = focusables.indexOf(document.activeElement);
@@ -83,7 +80,7 @@ export function confirmDialog({ title, body, okLabel = "OK", cancelLabel = "Canc
     document.addEventListener("keydown", onKey, true);
 
     document.body.append(overlay);
-    okBtn.focus();
+    (danger ? cancelBtn : okBtn).focus();
   });
 }
 

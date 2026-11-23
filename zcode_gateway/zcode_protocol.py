@@ -78,8 +78,45 @@ def _strip_image_blocks_system(system) -> None:
     pass  # system is always text-only; images there already 400 in content_blocks
 
 
+def _image_marker(block: dict) -> str:
+    source = block.get('source') or {}
+    if source.get('type') == 'url' and source.get('url'):
+        return f"[Image: source: {source['url']}]"
+    media = str(source.get('media_type') or 'image/png')
+    return f"[Image: source: image.{media.rsplit('/', 1)[-1]}]"
+
+
+def _annotate_messages(messages, cache_control: bool) -> None:
+    """Follow images with source labels and optionally add a user cache marker."""
+    last_user = None
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        if message.get('role') == 'user':
+            last_user = message
+        content = message.get('content')
+        if not isinstance(content, list):
+            continue
+        blocks = []
+        for index, block in enumerate(content):
+            blocks.append(block)
+            if isinstance(block, dict) and block.get('type') == 'image':
+                nxt = content[index + 1] if index + 1 < len(content) else None
+                if not (isinstance(nxt, dict) and nxt.get('type') == 'text'
+                        and str(nxt.get('text') or '').startswith('[Image: source:')):
+                    blocks.append({'type': 'text', 'text': _image_marker(block)})
+        message['content'] = blocks
+    if not cache_control or last_user is None:
+        return
+    content = last_user.get('content')
+    if isinstance(content, str) and content:
+        content = last_user['content'] = [{'type': 'text', 'text': content}]
+    if isinstance(content, list) and content and isinstance(content[-1], dict):
+        content[-1].setdefault('cache_control', {'type': 'ephemeral'})
+
+
 def build_body(payload: dict, default_max_tokens=128000, model_caps=None,
-               default_effort='high', harness=True) -> dict:
+               default_effort='high', harness=True, cache_control=True) -> dict:
     """Build the current ZCode wire body from native or OpenAI requests.
 
     `model_caps` (optional): the registry's per-model capability dict — when
@@ -88,8 +125,8 @@ def build_body(payload: dict, default_max_tokens=128000, model_caps=None,
     clamped to the model's real output cap.
     `harness` (default True): inject the full captured ZCode harness block;
     False injects the identity line only (upstream.bootstrap_harness: false).
-    With the harness enabled, caller system text is folded into the official
-    third system block because an extra block triggers upstream code 3012."""
+    A native caller's top-level system text is folded into the bootstrap
+    envelope. System messages stay in the message list."""
     vision = None
     if isinstance(model_caps, dict):
         vision = bool(model_caps.get('vision'))
@@ -105,14 +142,17 @@ def build_body(payload: dict, default_max_tokens=128000, model_caps=None,
             _strip_image_blocks_system(body.get('system'))
     else:
         body = {'model': payload['model'], 'messages': []}
-        system = []
         for message in payload.get('messages', []):
             role = message.get('role')
             blocks = content_blocks(message.get('content'))
             if role in ('system', 'developer'):
                 if any(block.get('type') != 'text' for block in blocks):
                     raise ValueError('system messages must contain text')
-                system.extend(blocks)
+                # 4.0.0 keeps mid-conversation system turns inside `messages`
+                # (the anthropic-beta header covers them). A leading system
+                # turn still becomes a message: the three-block envelope is
+                # always top-level, so nothing is hoisted or merged here.
+                body['messages'].append({'role': 'system', 'content': blocks})
                 continue
             if role == 'tool':
                 blocks = [{'type': 'tool_result', 'tool_use_id': message.get('tool_call_id'),
@@ -137,8 +177,6 @@ def build_body(payload: dict, default_max_tokens=128000, model_caps=None,
                 body['messages'][-1]['content'].extend(blocks)
             else:
                 body['messages'].append({'role': role, 'content': blocks})
-        if system:
-            body['system'] = system
         if payload.get('tools'):
             body['tools'] = []
             for tool in payload['tools']:
@@ -204,6 +242,7 @@ def build_body(payload: dict, default_max_tokens=128000, model_caps=None,
     if (body.get('thinking') or {}).get('type') == 'disabled':
         raise ValueError('ZCode GLM models always use reasoning. Use reasoning_effort low, high, or max; disabling reasoning is not supported.')
     body['system'] = bootstrap_system(body.get('system'), harness=harness)
+    _annotate_messages(body.get('messages') or [], cache_control)
     return body
 
 
@@ -248,7 +287,14 @@ class MessageAccumulator:
 
     def finish(self):
         for index, partial in self.partial_json.items():
-            self.blocks[index]['input'] = json.loads(partial or '{}')
+            try:
+                self.blocks[index]['input'] = json.loads(partial or '{}')
+            except json.JSONDecodeError:
+                if self.message.get('stop_reason') != 'max_tokens':
+                    raise
+                # OpenAI keeps the raw argument deltas. A native message
+                # requires a JSON input object, so omit an unfinished call.
+                del self.blocks[index]
         self.message['content'] = [self.blocks[index] for index in sorted(self.blocks)]
         return self.message
 

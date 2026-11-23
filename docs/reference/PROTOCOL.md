@@ -1,4 +1,4 @@
-# ZCode protocol notes (3.16.x captures, 3.18.0 client default)
+# ZCode protocol notes (4.0.0 capture 2026-11-23; 3.16.x history retained)
 
 Evidence: six retained model captures and OAuth/billing flows, plus the installed
 ZCode client's `resources/glm/zcode.cjs` bundle and `resources/app.asar` archive.
@@ -13,14 +13,19 @@ Anthropic version is `2023-06-01`; beta is
 `mid-conversation-system-2026-04-07`. Fingerprinting matches the captured
 ZCode UA, version, platform, agent and session headers. Native Anthropic blocks
 are kept intact. OpenAI requests are converted at the transport boundary.
-Both routes include ZCode's default identity and harness system blocks. Existing
-native bootstrap blocks are preserved without duplication; caller instructions
-follow the defaults. No captured workspace context or extra tools are injected.
-Model requests include HTTP-Referer and carry the saved ZCode device identity
-in metadata; billing/OAuth requests also include X-Device-Mid. See
+Both routes carry ZCode's default three-block system envelope (identity,
+harness, output style). Existing native bootstrap blocks are preserved without
+duplication. 4.0.0 keeps `role: system` turns inside `messages` (after the user
+turn) instead of merging them into the style block, and every image block is
+followed by an `[Image: source: ...]` marker text block. The newest user turn's
+last block is marked `cache_control: ephemeral`. Model requests include
+HTTP-Referer and put the device id in `metadata.user_id`
+(`{"device_id","account_uuid","session_id"}`); no `X-Device-Mid` header is sent
+on messages. Billing/OAuth requests still use `X-Device-Mid`. See
 [the 3012 investigation](../troubleshooting/DIAGNOSIS-3012.md) for the resolved initialization issue.
 The coding-plan catalog is separate from `chat.z.ai/api/models` and the API-key
-providers. Only GLM-5.3 and GLM-5.3-Flash were validated in the supplied captures.
+providers. GLM-5.4 and GLM-5.3-Flash are supported; GLM-5.4 is the only
+model that needs a bare wire id (`glm-5.4`).
 
 ## OAuth: correction to the audit prose
 

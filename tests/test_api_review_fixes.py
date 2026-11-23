@@ -44,7 +44,7 @@ def test_tls_paths_are_relative_to_config_directory(tmp_path):
 def test_start_qualification_only_uses_own_current_balance():
     now=time.time()
     def plan(owner,name):return {'user_plan_id':owner,'plan_id':name,'status':'active','starts_at':now-1,'ends_at':now+60}
-    def bucket(owner,remaining):return {'user_plan_id':owner,'show_name':'GLM-5.3','remaining_units':remaining,'total_units':100,'period_end':now+60}
+    def bucket(owner,remaining):return {'user_plan_id':owner,'show_name':'GLM-5.4','remaining_units':remaining,'total_units':100,'period_end':now+60}
     raw={'plans':[plan('start','zcode-v3-start-plan-fixture'),plan('paid','paid-fixture')],
          'balances':[bucket('start',0),bucket('paid',100)]}
     assert not api_dash._qualifying_start_balance(raw,now)
@@ -101,9 +101,9 @@ def test_expired_bucket_cannot_be_restored_from_entitlement_for_goal():
     now=time.time()
     raw={'plans':[{'user_plan_id':'s','plan_id':'zcode-v3-start-plan-test','status':'active',
                    'starts_at':now-100,'ends_at':now+100,
-                   'entitlements':[{'entitlement_id':'e','show_name':'GLM-5.3',
+                   'entitlements':[{'entitlement_id':'e','show_name':'GLM-5.4',
                                     'grant_units':100,'effective_at':now-50}]}],
-         'balances':[{'user_plan_id':'s','entitlement_id':'e','show_name':'GLM-5.3',
+         'balances':[{'user_plan_id':'s','entitlement_id':'e','show_name':'GLM-5.4',
                       'remaining_units':100,'total_units':100,'expires_at':now-1,'period_end':now-1}]}
     assert not api_dash._qualifying_start_balance(raw,now)
     _,quotas=parse_balance(raw,now)

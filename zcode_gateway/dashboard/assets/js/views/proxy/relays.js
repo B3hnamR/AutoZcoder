@@ -24,15 +24,9 @@ export function createRelaysCard() {
 
   const node = card({
     title: "Edge relays",
-    desc: "Cloudflare, Vercel, Deno or Netlify. Required for GLM-5.3 from most IPs.",
+    desc: "Route selected models through a configured relay.",
     actions: statusNote,
     body: el("div", { class: "stack" }, [
-      el("div", { class: "notice notice--warn" }, [
-        el("b", { text: "Why this exists: " }),
-        el("span", { text:
-          "ZCode blocks GLM-5.3 from ordinary residential and datacenter IPs with HTTP 405 "
-          + "(“unusual activity”). Routing through an edge relay avoids that." }),
-      ]),
       controlsBox,
       el("div", { class: "row" }, [
         ...PROVIDERS.map((p) => button({
@@ -53,7 +47,7 @@ export function createRelaysCard() {
       enabled: controls.enabled.checked,
       strategy: controls.strategy.value,
       models: [
-        controls.glm53.checked ? "glm-5.3" : null,
+        controls.glm54.checked ? "glm-5.4" : null,
         controls.flash.checked ? "glm-5.3-flash" : null,
       ].filter(Boolean),
     };
@@ -66,7 +60,7 @@ export function createRelaysCard() {
 
   const controls = {
     enabled: el("input", { class: "switch__input", type: "checkbox", on: { change: saveSettings } }),
-    glm53: el("input", { type: "checkbox", on: { change: saveSettings } }),
+    glm54: el("input", { type: "checkbox", on: { change: saveSettings } }),
     flash: el("input", { type: "checkbox", on: { change: saveSettings } }),
     strategy: el("select", { class: "select", style: { maxWidth: "190px" }, on: { change: saveSettings } }, [
       el("option", { value: "single", text: "Single (active relay only)" }),
@@ -83,7 +77,7 @@ export function createRelaysCard() {
     ]),
     el("div", { class: "relay-controls__sep" }),
     el("span", { class: "text-sm muted", text: "Route models:" }),
-    el("label", { class: "checkline" }, [controls.glm53, el("span", { text: "GLM-5.3" }), badge("recommended", "ok")]),
+    el("label", { class: "checkline" }, [controls.glm54, el("span", { text: "GLM-5.4" }), badge("recommended", "ok")]),
     el("label", { class: "checkline" }, [controls.flash, el("span", { text: "GLM-5.3-Flash" })]),
     el("div", { class: "relay-controls__sep" }),
     el("span", { class: "text-sm muted", text: "Rotation:" }),
@@ -217,7 +211,7 @@ export function createRelaysCard() {
     controls.enabled.checked = !!s.enabled;
     controls.strategy.value = s.strategy || "single";
     const models = s.models || [];
-    controls.glm53.checked = models.some((m) => /5\.3$/i.test(m));
+    controls.glm54.checked = models.some((m) => /5\.4$/i.test(m));
     controls.flash.checked = models.some((m) => /flash/i.test(m));
 
     fill(listBox, table({
@@ -228,7 +222,7 @@ export function createRelaysCard() {
       rows: relays,
       empty: {
         title: "No relays yet",
-        text: "Deploy one above. GLM-5.3 needs a relay on most connections.",
+        text: "Deploy a relay or add an existing URL above.",
       },
       render: (r) => {
         const isActive = s.active_id === r.id;

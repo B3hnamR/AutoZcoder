@@ -20,10 +20,27 @@ from .model_retry import is_model_overload, overload_delay, retry_after_seconds,
 from .zcode_protocol import MessageAccumulator, OpenAITranslator, usage_openai
 from .upstream import (build_headers, build_upstream_body, iter_sse_events, sse_frame,
                        parse_upstream_error, anthropic_error, openai_error, TransportError,
-                       is_block_code, client_not_supported, CLIENT_NOT_SUPPORTED_PARK_S)
+                       is_block_code, is_entitlement_code, client_not_supported, CLIENT_NOT_SUPPORTED_PARK_S,
+                       REQUIRE_INCREMENTAL, StreamingRelayUnsupported)
 from .registry import model_caps
 
 log = logging.getLogger('zcode_gateway.service')
+
+def _sse_error_status(code):
+    if is_model_overload(502, code):
+        return 529
+    if code in ('invalid_request_error', 'validation_error'):
+        return 400
+    if code in ('11113', 'rate_limit_error'):
+        return 429
+    if is_block_code(code):
+        return 405
+    if code == 'authentication_error':
+        return 401
+    if code == 'permission_error' or is_entitlement_code(code):
+        return 403
+    return 502
+
 
 class NoAccountsAvailable(Exception): pass
 
@@ -128,6 +145,7 @@ class ChatService:
         caps = model_caps(self.registry.resolve(model or payload.get('model') or '')) \
             if hasattr(self, 'registry') and self.registry is not None else None
         return build_upstream_body(payload, variant, self.cfg.models.default_max_tokens,
+                                   anthropic_cache_control=self.cfg.upstream.anthropic_cache_control,
                                    model_caps=caps,
                                    default_effort=getattr(self.cfg.models, 'default_effort', 'high'),
                                    harness=getattr(self.cfg.upstream, 'bootstrap_harness', True))
@@ -365,10 +383,12 @@ class ChatService:
                 # upstream's real rate-limit code — `rate_limit_error` was
                 # missing from this list, so a 429 on the paid model never
                 # fell back to the free one (measured: 0 retries on 429).
-                if exc.code not in ('11113', '1005', 'rate_limit_error', 'RATE_LIMITED', 'MODEL_CAPPED', 'MODEL_PARKED',
+                fallback_status = exc.status in (402, 403, 429)
+                if not (fallback_status or is_entitlement_code(exc.code) or exc.code in (
+                        '11113', '1005', 'rate_limit_error', 'RATE_LIMITED', 'MODEL_CAPPED', 'MODEL_PARKED',
                                     'INFERENCE_CAP_ERROR', 'ENTITLEMENT_ERROR',
                                     'UNUSUAL_ACTIVITY', '3012', '405', 'HTTP_405',
-                                    'GEO_BLOCKED', 'HTTP_451', 'http_451'):
+                                    'GEO_BLOCKED', 'HTTP_451', 'http_451')):
                     raise
                 if candidate == candidates[-1]:
                     exc.details['attempted_models'] = attempted
@@ -409,6 +429,7 @@ class ChatService:
             raise UpstreamFailure(400, 'invalid_request_error', str(exc)) from exc
         if not body.get('messages'):
             raise UpstreamFailure(400, 'invalid_request_error', 'at least one user or assistant message is required')
+        require_incremental = bool((payload.get('_anthropic') or payload).get('stream'))
         original_metadata = body.get('metadata')
         generated_identity = original_metadata is None or (
             isinstance(original_metadata, dict) and 'user_id' not in original_metadata)
@@ -457,7 +478,8 @@ class ChatService:
                 headers = build_headers(account.access_token, self.cfg.upstream.fingerprint,
                                         task_id=headers['x-session-id'], device_mid=account.notes.get('device_mid'),
                                         include_device_mid=False)
-                resp = await self.client.send(headers, body, stream=True)
+                upstream_headers = {**headers, REQUIRE_INCREMENTAL: '1'} if require_incremental else headers
+                resp = await self.client.send(upstream_headers, body, stream=True)
                 if resp.status_code != 200 or 'application/json' in resp.headers.get('content-type', ''):
                     raw = await resp.aread()
                     info = parse_upstream_error(resp.status_code, raw)
@@ -472,7 +494,8 @@ class ChatService:
                         headers = build_headers(account.access_token, self.cfg.upstream.fingerprint,
                                                 task_id=headers['x-session-id'], device_mid=account.notes.get('device_mid'),
                                                 include_device_mid=False)
-                        resp = await self.client.send(headers, body, stream=True)
+                        upstream_headers = {**headers, REQUIRE_INCREMENTAL: '1'} if require_incremental else headers
+                        resp = await self.client.send(upstream_headers, body, stream=True)
                         if resp.status_code == 200 and 'application/json' not in resp.headers.get('content-type', ''):
                             status = 200
                         else:
@@ -528,11 +551,11 @@ class ChatService:
                     if first.get('type') == 'error' or (first.get('type') is None and 'error' in first):
                         info = first.get('error') or first
                         code, message = str(info.get('code') or info.get('type') or 'api_error'), info.get('message', 'ZCode stream failed')
-                        status = 529 if is_model_overload(502, code) else (429 if code in ('11113', 'rate_limit_error') else (405 if is_block_code(code) else 502))
+                        status = _sse_error_status(code)
                         await self._apply_error(account, model, status, code, message,
                                                 expected_credentials=credentials)
                         last = UpstreamFailure(status, code, message)
-                        if is_model_overload(status, code): raise last
+                        if status == 400 or is_model_overload(status, code): raise last
                         tried.add(account.id)
                         break
                     if first.get('type') != 'message_start':
@@ -542,6 +565,8 @@ class ChatService:
                     transferred = True
                     handle, resp = None, None
                     return result
+            except StreamingRelayUnsupported as exc:
+                raise UpstreamFailure(501, 'streaming_relay_unsupported', str(exc)) from exc
             except (TransportError, httpx.HTTPError) as exc:
                 # A block that arrived THROUGH a relay is the relay's exit-IP
                 # problem: UpstreamClient already rotated+cooled every relay
@@ -640,7 +665,7 @@ class ChatService:
                         if kind == 'error' or (kind is None and 'error' in event):
                             info = event.get('error') or event
                             code, message = str(info.get('code') or info.get('type') or 'api_error'), info.get('message', 'ZCode stream failed')
-                            status = 529 if is_model_overload(502, code) else (429 if code in ('11113', 'rate_limit_error') else 502)
+                            status = _sse_error_status(code)
                             await self._apply_error(handle.account, model, status, code, message,
                                                     expected_credentials=handle.credentials)
                             self._log_stream_failure(handle, UpstreamFailure(status, code, message),
@@ -707,7 +732,7 @@ class ChatService:
                     if event.get('type') == 'error' or (event.get('type') is None and 'error' in event):
                         info = event.get('error') or event
                         code = str(info.get('code') or info.get('type') or 'api_error')
-                        status = 529 if is_model_overload(502, code) else (429 if code in ('11113', 'rate_limit_error') else (405 if is_block_code(code) else 502))
+                        status = _sse_error_status(code)
                         message = info.get('message', 'ZCode stream failed')
                         await self._apply_error(handle.account, model, status, code, message,
                                                 expected_credentials=handle.credentials)

@@ -55,11 +55,11 @@ def test_sse_unicode_payload(sep, ending):
 async def test_upsert_preserves_state_and_resets_strikes(state):
     account = Account(id='a', access_token='old', state=state, auth_strikes=3, quota_strikes=3)
     account.cooldown_until = 12345678900
-    account.model_caps['GLM-5.3'] = 12345678900
+    account.model_caps['GLM-5.4'] = 12345678900
     pool = PoolManager(Config().pool, [account])
     await pool.upsert(Account(id='a', access_token='new'))
     assert account.state is state and account.cooldown_until == 12345678900
-    assert account.model_caps['GLM-5.3'] == 12345678900
+    assert account.model_caps['GLM-5.4'] == 12345678900
     assert account.access_token == 'new'
     assert account.auth_strikes == account.quota_strikes == 0
     account.auth_strikes = account.quota_strikes = 3
@@ -236,7 +236,7 @@ def test_disabled_capture_skips_deepcopy(tmp_path):
                           SimpleNamespace(record=lambda **rec: records.append(rec)),
                           JsonlCapture(str(tmp_path), enabled=False))
     service._record(Account(id='a'), {}, Body(stream=True), 200, {}, 'response', 1,
-                    'key', 'openai', 'GLM-5.3', {'input_tokens': 2, 'output_tokens': 3})
+                    'key', 'openai', 'GLM-5.4', {'input_tokens': 2, 'output_tokens': 3})
     assert records[0]['total_tokens'] == 5
 
 
@@ -259,7 +259,7 @@ async def test_relay_retry_does_not_repeat(tmp_path, strategy, expected):
     client._client = SimpleNamespace(build_request=lambda method, url, **kw: calls.append(url),
                                      send=refuse)
     with pytest.raises(RelayTransportError):
-        await client.send({}, {'model': 'GLM-5.3'}, True)
+        await client.send({}, {'model': 'GLM-5.4'}, True)
     assert len(calls) == len(set(calls)) == expected
 
 
@@ -276,9 +276,9 @@ def test_relay_reload_and_single_model(tmp_path, monkeypatch):
         return real_read(path, *args, **kwargs)
     monkeypatch.setattr(Path, 'read_text', flaky)
     assert fresh.get_settings()['relays'] == []
-    fresh.update_options(enabled=True, models='GLM-5.3')
+    fresh.update_options(enabled=True, models='GLM-5.4')
     assert fresh.get_settings()['relays'][0]['id'] == entry['id']
-    assert fresh.get_settings()['models'] == ['GLM-5.3']
+    assert fresh.get_settings()['models'] == ['GLM-5.4']
     (tmp_path / 'relays.json').write_text('{ truncated')
     repaired = RelayManager(data_dir=tmp_path)
     assert repaired.get_settings()['relays'] == []

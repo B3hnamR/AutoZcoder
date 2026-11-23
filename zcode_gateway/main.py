@@ -43,7 +43,7 @@ def main(argv: list[str] | None = None) -> int:
         # an import string, not an already-constructed app object; the config
         # path travels via the environment
         if args.config:
-            os.environ.setdefault("ZCODE_GATEWAY_CONFIG", str(args.config))
+            os.environ["ZCODE_GATEWAY_CONFIG"] = str(cfg._config_file)
         if args.port:
             os.environ["ZCODE_GATEWAY_SERVER__PORT"] = str(port)
         uvicorn.run("zcode_gateway.app:create_app", factory=True, host=host,
@@ -52,9 +52,13 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     app = create_app(cfg)
-    uvicorn.run(app, host=host, port=port, log_level="info",
-                **({"timeout_graceful_shutdown": 10} if sys.platform.startswith("linux") else {}),
-                **cfg.server.ssl_kwargs())
+    server = uvicorn.Server(uvicorn.Config(
+        app, host=host, port=port, log_level="info",
+        **({"timeout_graceful_shutdown": 10} if sys.platform.startswith("linux") else {}),
+        **cfg.server.ssl_kwargs(),
+    ))
+    app.state.request_shutdown = lambda: setattr(server, "should_exit", True)
+    server.run()
     return 0
 
 

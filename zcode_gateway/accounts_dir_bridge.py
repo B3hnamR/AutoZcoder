@@ -9,7 +9,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .accounts_dir import (
@@ -65,7 +65,7 @@ def mint_and_register(accounts_dir: str | Path, email: str, zcode_jwt: str,
         saved.update(fields)
 
     fields = {
-        "captured_at": datetime.now(UTC).isoformat(),
+        "captured_at": datetime.now(timezone.utc).isoformat(),
         "source": "ZCODEAUTO generator (device flow)",
         "account_id": account_id,
         "access_token": zcode_jwt,

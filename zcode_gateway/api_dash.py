@@ -21,9 +21,11 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
+from starlette.background import BackgroundTask
 import yaml
 
+from .config import Config, apply_config_env
 from .deps import admin_key, get_state, internal_or_admin
 from .logbuffer import LogBuffer
 
@@ -413,12 +415,17 @@ async def dash_settings_put(request: Request, body: dict = Body(...),
     # Use the same full schema as startup before committing any changed file.
     # Report field names/reasons only: ValidationError strings can echo secrets.
     try:
-        type(state.cfg).model_validate(raw)
+        Config.model_validate(raw)
+        validated = Config.model_validate(apply_config_env(raw))
     except ValueError as exc:
         errors = exc.errors(include_input=False) if hasattr(exc, "errors") else []
         detail = "; ".join(".".join(map(str, error["loc"])) + ": " + error["msg"] for error in errors)
         raise HTTPException(400, "Configuration validation failed: " + (detail or "invalid setting")) from None
     if changed:
+        try:
+            validated.server.validate_bind_policy()
+        except RuntimeError as exc:
+            raise HTTPException(400, str(exc)) from exc
         await asyncio.to_thread(_atomic_write_yaml, cfg_path, raw)
     return {"changed": changed, "restart_required": bool(changed)}
 
@@ -551,28 +558,30 @@ async def dash_zcode_status(request: Request, key: str = Depends(admin_key)) -> 
     }
 
 
-@router.post("/admin/dash/shutdown")
-async def dash_shutdown(request: Request, key: str = Depends(admin_key)) -> dict:
-    """Stop the tool: answer, then exit the process a moment later.
+def _shutdown_callback(request: Request):
+    callback = getattr(getattr(getattr(request, "app", None), "state", None), "request_shutdown", None)
+    if callback is None:
+        raise HTTPException(409, "Stop the gateway using its process manager")
+    return callback
 
-    There is no other way to stop the exe build (no tray, no stop path, and
-    closing the WebView2 window leaves the process — and its port and
-    single-instance mutex — alive on non-daemon WebView2 threads). A hard
-    exit is deliberate: uvicorn's should_exit would free the port but leave
-    the windowless process running, which is exactly the bug this fixes.
-    """
-    state = get_state(request)
-    def finish():
-        manager = getattr(state, "generator", None)
-        if manager is not None:
-            _scheduler = getattr(state, "claim_scheduler", None)
-            if _scheduler is not None:
-                _scheduler.stop()
-            manager.shutdown()
-        os._exit(0)
-    threading.Timer(1.0, finish).start()
-    return {"stopping": True,
-            "note": "the gateway process is exiting; you can close this window"}
+
+@router.post("/admin/dash/shutdown")
+async def dash_shutdown(request: Request, key: str = Depends(admin_key)):
+    """Send the response before asking the server to shut down."""
+    callback = _shutdown_callback(request)
+    return JSONResponse({"stopping": True, "note": "the gateway is shutting down"},
+                        background=BackgroundTask(callback))
+
+
+def _update_identity(status):
+    return status.get("latest"), status.get("download_url"), status.get("checksum_url")
+
+
+def _update_phase(state, status):
+    phase = getattr(state, "update_phase", "idle")
+    if phase == "ready" and getattr(state, "staged_update", None) != _update_identity(status):
+        return "idle"
+    return phase
 
 
 @router.get("/admin/dash/update/status")
@@ -582,8 +591,9 @@ async def update_status(request: Request, key: str = Depends(admin_key)) -> dict
     updater = getattr(state, "updater", None)
     if updater is None:
         return {"update_available": False, "checked_at": None}
-    return {**updater.status, "updater_phase": getattr(state, "update_phase", "idle"),
-            "downloaded": getattr(state, "update_phase", "idle") == "ready"}
+    status = updater.status
+    phase = _update_phase(state, status)
+    return {**status, "updater_phase": phase, "downloaded": phase == "ready"}
 
 
 @router.post("/admin/dash/update/check")
@@ -593,7 +603,9 @@ async def update_check(request: Request, key: str = Depends(admin_key)) -> dict:
     updater = getattr(state, "updater", None)
     if updater is None:
         raise HTTPException(status_code=503, detail="updater not running")
-    return await updater.check(force=True)
+    status = await updater.check(force=True)
+    phase = _update_phase(state, updater.status)
+    return {**status, "updater_phase": phase, "downloaded": phase == "ready"}
 
 
 @router.post("/admin/dash/update/download")
@@ -602,7 +614,9 @@ async def update_download(request: Request, key: str = Depends(admin_key)) -> di
     state = get_state(request)
     _windows_update_only()
     _require_newer_update(state)
-    phase = getattr(state, "update_phase", "idle")
+    updater = getattr(state, "updater", None)
+    status = updater.status if updater else {}
+    phase = _update_phase(state, status)
     if phase in ("downloading", "applying"):
         raise HTTPException(409, "An update operation is already in progress")
     if phase == "ready":
@@ -610,15 +624,18 @@ async def update_download(request: Request, key: str = Depends(admin_key)) -> di
         staged = updater_mod.exe_dir() / updater_mod.NEW_EXE_NAME
         if staged.is_file():
             return {"downloaded": str(staged), "size": staged.stat().st_size}
-    updater = getattr(state, "updater", None)
-    status = updater.status if updater else {}
+    identity = _update_identity(status)
     url = status.get("download_url")
     if not (status.get("update_available") and url):
         raise HTTPException(status_code=400, detail="no update available")
     from . import updater as updater_mod
+    state.staged_update = None
     state.update_phase = "downloading"
     try:
         path = await updater_mod.download_update(url, status.get("checksum_url"))
+    except asyncio.CancelledError:
+        state.update_phase = "idle"
+        raise
     except RuntimeError as exc:
         state.update_phase = "idle"
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -627,6 +644,10 @@ async def update_download(request: Request, key: str = Depends(admin_key)) -> di
         raise HTTPException(status_code=502,
                             detail=f"download failed ({exc.__class__.__name__})") \
             from exc
+    if identity != _update_identity(updater.status):
+        state.update_phase = "idle"
+        raise HTTPException(409, "A different release is available; download it before applying")
+    state.staged_update = identity
     state.update_phase = "ready"
     return {"downloaded": str(path), "size": path.stat().st_size}
 
@@ -649,32 +670,27 @@ async def update_apply(request: Request, key: str = Depends(admin_key)) -> dict:
         state.update_phase = phase
         raise
     from . import updater as updater_mod
-    if getattr(state, "update_applying", False):
-        raise HTTPException(409, "An update is already being applied")
-    state.update_applying = True
+    status = state.updater.status
+    if phase != "ready" or getattr(state, "staged_update", None) != _update_identity(status):
+        state.update_phase = "idle"
+        raise HTTPException(409, "Download the current release before applying")
+    try:
+        callback = _shutdown_callback(request)
+    except HTTPException:
+        state.update_phase = phase
+        raise
     try:
         await asyncio.to_thread(updater_mod.apply_update, updater_mod.exe_dir() / updater_mod.NEW_EXE_NAME,
                                 config_path=getattr(state.cfg, "_config_file", None))
     except RuntimeError as exc:
-        state.update_applying = False
-        state.update_phase = "ready"
+        state.staged_update = None
+        state.update_phase = "idle"
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception:
-        state.update_applying = False
         state.update_phase = "ready"
         raise HTTPException(500, "Could not prepare the updater; application was not stopped") from None
-    # the swapper waits for this process to die; answer first, then exit
-    def finish():
-        manager = getattr(state, "generator", None)
-        if manager is not None:
-            _scheduler = getattr(state, "claim_scheduler", None)
-            if _scheduler is not None:
-                _scheduler.stop()
-            manager.shutdown()
-        os._exit(0)
-    threading.Timer(1.0, finish).start()
-    return {"applying": True, "note": "the gateway exits, swaps the exe, and "
-                                      "relaunches itself"}
+    return JSONResponse({"applying": True, "note": "the gateway will drain and restart"},
+                        background=BackgroundTask(callback))
 
 
 def _windows_update_only() -> None:
@@ -693,6 +709,8 @@ def _require_newer_update(state) -> None:
 
 async def _check_update_idle(state) -> None:
     """Never silently discard generation or streaming work for an update."""
+    if getattr(state, "active_inference", 0):
+        raise HTTPException(409, "Requests are active; wait before applying an update")
     pool = await state.pool.snapshot()
     if any(account.get("in_flight", 0) for account in pool.get("detail", [])):
         raise HTTPException(409, "Requests are active; wait before applying an update")

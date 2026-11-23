@@ -8,7 +8,7 @@ def frame(event):
 
 def sample_events(tools=False):
     events = [
-        {'type':'message_start','message':{'id':'msg_test','type':'message','role':'assistant','model':'glm-5.3','content':[], 'usage':{'input_tokens':3,'output_tokens':0},'stop_reason':None,'stop_sequence':None}},
+        {'type':'message_start','message':{'id':'msg_test','type':'message','role':'assistant','model':'glm-5.4','content':[], 'usage':{'input_tokens':3,'output_tokens':0},'stop_reason':None,'stop_sequence':None}},
         {'type':'content_block_start','index':0,'content_block':{'type':'thinking','thinking':'','signature':''}},
         {'type':'content_block_delta','index':0,'delta':{'type':'thinking_delta','thinking':'think 😀'}},
         {'type':'content_block_delta','index':0,'delta':{'type':'signature_delta','signature':'opaque_signature'}},

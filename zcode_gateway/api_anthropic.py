@@ -102,8 +102,10 @@ async def count_tokens(
             and all(isinstance(message, dict) for message in messages)):
         return _error(400, "'messages' must be a non-empty list of message objects")
     try:
-        payload = request_to_openai(body, state.registry.resolve(body.get("model"),
-                                                                 "anthropic"))
+        model = state.registry.resolve(body.get("model"), "anthropic")
+        if not state.registry.knows(model):
+            return _error(400, f"unknown ZCode model: {model}", "unknown_model")
+        payload = request_to_openai(body, model)
     except (TypeError, ValueError, AttributeError) as exc:
         return _error(400, str(exc))
     chars = 0

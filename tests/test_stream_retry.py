@@ -13,7 +13,7 @@ from zcode_gateway.service import ChatService, UpstreamFailure
 from zcode_gateway.store import JsonlCapture, Store
 from tests_fixtures import FakeClient, FakeResponse, frame, sample_events, sample_sse
 
-REQ = {'model': 'GLM-5.3', 'messages': [{'role': 'user', 'content': 'hi'}]}
+REQ = {'model': 'GLM-5.4', 'messages': [{'role': 'user', 'content': 'hi'}]}
 LOGGER = 'zcode_gateway.service'
 
 
@@ -68,9 +68,9 @@ WITH_CONTENT = b''.join(frame(e) for e in sample_events()[:3])  # + thinking blo
 
 
 async def run_stream(service, anthropic=False):
-    h = await service.open_stream(dict(REQ), model='GLM-5.3')
+    h = await service.open_stream(dict(REQ), model='GLM-5.4')
     out = b''.join([x async for x in service.stream_from(
-        h, model='GLM-5.3', dialect='anthropic' if anthropic else 'openai', anthropic=anthropic)])
+        h, model='GLM-5.4', dialect='anthropic' if anthropic else 'openai', anthropic=anthropic)])
     return h, out
 
 
@@ -173,7 +173,7 @@ async def test_failure_log_names_the_relay(service, caplog):
 async def test_nonstream_truncation_is_retried(service, caplog):
     service.client = FakeClient(responses=[FakeResponse(WITH_CONTENT), FakeResponse(sample_sse())])
     with caplog.at_level(logging.WARNING, logger=LOGGER):
-        result = await service.complete(dict(REQ), model='GLM-5.3', dialect='anthropic')
+        result = await service.complete(dict(REQ), model='GLM-5.4', dialect='anthropic')
     assert len(service.client.calls) == 2 and b'hello' in result.raw
     assert 'retrying transparently' in caplog.text
     assert all(r.closed for r in service.client.responses) and await idle(service)
@@ -182,7 +182,7 @@ async def test_nonstream_truncation_is_retried(service, caplog):
 @pytest.mark.asyncio
 async def test_nonstream_cut_connection_is_retried(service):
     service.client = FakeClient(responses=[CutResponse(WITH_CONTENT), FakeResponse(sample_sse())])
-    result = await service.complete(dict(REQ), model='GLM-5.3', dialect='anthropic')
+    result = await service.complete(dict(REQ), model='GLM-5.4', dialect='anthropic')
     assert len(service.client.calls) == 2 and b'hello' in result.raw
     assert await idle(service)
 
@@ -191,7 +191,7 @@ async def test_nonstream_cut_connection_is_retried(service):
 async def test_nonstream_gives_up_with_the_original_error(service):
     service.client = FakeClient(responses=[FakeResponse(WITH_CONTENT) for _ in range(5)])
     with pytest.raises(UpstreamFailure) as err:
-        await service.complete(dict(REQ), model='GLM-5.3', dialect='anthropic')
+        await service.complete(dict(REQ), model='GLM-5.4', dialect='anthropic')
     assert err.value.code == 'truncated_stream'
     assert len(service.client.calls) == 1 + service.STREAM_RETRIES
     assert await idle(service)
@@ -201,10 +201,10 @@ async def test_nonstream_gives_up_with_the_original_error(service):
 async def test_retry_keeps_the_anthropic_account_pin(cfg, service):
     """open_stream pops the account pin from the payload; the retry must still
     honour it (it is re-opened from a snapshot, not from the mutated payload)."""
-    payload = {'model': 'GLM-5.3', '_anthropic': {**REQ, 'account': 'one'}}
+    payload = {'model': 'GLM-5.4', '_anthropic': {**REQ, 'account': 'one'}}
     service.client = FakeClient(responses=[FakeResponse(PRELUDE_ONLY), FakeResponse(sample_sse())])
-    h = await service.open_stream(payload, model='GLM-5.3', dialect='anthropic', variant='anthropic')
-    out = b''.join([x async for x in service.stream_from(h, model='GLM-5.3', dialect='anthropic', anthropic=True)])
+    h = await service.open_stream(payload, model='GLM-5.4', dialect='anthropic', variant='anthropic')
+    out = b''.join([x async for x in service.stream_from(h, model='GLM-5.4', dialect='anthropic', anthropic=True)])
     assert len(service.client.calls) == 2 and b'hello' in out
 
 
@@ -226,7 +226,7 @@ class _BlockedRelayClient:
 async def test_flagged_relay_ip_is_a_clean_405_not_an_unhandled_crash(service):
     service.client = _BlockedRelayClient()
     with pytest.raises(UpstreamFailure) as err:
-        await service.open_stream(dict(REQ), model='GLM-5.3')
+        await service.open_stream(dict(REQ), model='GLM-5.4')
     assert err.value.status == 405 and err.value.code == '3012'
     assert 'relay exit IP' in err.value.message and 'retry shortly' in err.value.message
     assert await idle(service)                       # the account slot was released
@@ -254,6 +254,6 @@ def test_flagged_relay_ip_reaches_api_clients_as_405_json(tmp_path):
         state.service.client = _BlockedRelayClient()
         for stream in (False, True):
             r = c.post("/v1/chat/completions", headers={"Authorization": "Bearer cli-test"},
-                       json={"model": "GLM-5.3", "stream": stream, "messages": [{"role": "user", "content": "hi"}]})
+                       json={"model": "GLM-5.4", "stream": stream, "messages": [{"role": "user", "content": "hi"}]})
             assert r.status_code == 405, (stream, r.status_code, r.text)
             assert "internal error" not in r.text and "3012" in r.text

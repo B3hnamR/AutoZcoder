@@ -157,7 +157,7 @@ def test_reimport_reuses_pooled_account_preserving_caps_and_inflight(tmp_path, m
         cfg = config(tmp_path)
         existing = Account(id=IDENT, email="old@example.test", access_token="old")
         existing.in_flight = 2
-        existing.model_caps["GLM-5.3"] = 9999999999
+        existing.model_caps["GLM-5.4"] = 9999999999
         pool = PoolManager(cfg.pool, [existing])
         tokens = SimpleNamespace(_lock_for=lambda _: lock, _scan_at=123)
         lock = asyncio.Lock()
@@ -167,7 +167,7 @@ def test_reimport_reuses_pooled_account_preserving_caps_and_inflight(tmp_path, m
         provider(monkeypatch, lambda _: httpx.Response(200, json={"code": 0, "data": {"plans": [], "balances": []}}))
         await import_jwt_account(request, {"token": jwt()}, "test-admin")
         assert await pool.find(IDENT) is existing
-        assert existing.in_flight == 2 and "GLM-5.3" in existing.model_caps
+        assert existing.in_flight == 2 and "GLM-5.4" in existing.model_caps
         assert existing.to_public()["imported_jwt"] is True
         assert tokens._scan_at == 0
         await pool.aclose()

@@ -76,7 +76,7 @@ def test_hourly_series_and_percentiles(store):
     # boundary can split them, so assert on the SUM (robust near XX:00)
     for i in range(10):
         store.record(ts=now - i * 60, account_id="a1", client_key="k1",
-                     dialect="openai", model="GLM-5.3", variant="anthropic",
+                     dialect="openai", model="GLM-5.4", variant="anthropic",
                      stream=1, status=200, duration_ms=100.0 + i * 50,
                      prompt_tokens=10, completion_tokens=5, total_tokens=15,
                      error_code="")
@@ -90,11 +90,11 @@ def test_hourly_series_and_percentiles(store):
 def test_error_breakdown_and_by_key(store):
     now = time.time()
     store.record(ts=now, status=200, duration_ms=10, client_key="k1",
-                 total_tokens=5, model="GLM-5.3", dialect="openai")
+                 total_tokens=5, model="GLM-5.4", dialect="openai")
     store.record(ts=now, status=429, duration_ms=0, client_key="k1",
-                 error_code="rate_limit_error", model="GLM-5.3", dialect="openai")
+                 error_code="rate_limit_error", model="GLM-5.4", dialect="openai")
     store.record(ts=now, status=429, duration_ms=0, client_key="k2",
-                 error_code="rate_limit_error", model="GLM-5.3", dialect="openai")
+                 error_code="rate_limit_error", model="GLM-5.4", dialect="openai")
     errs = store.error_breakdown(3600)
     assert errs and errs[0]["status"] == 429 and errs[0]["count"] == 2
     keys = store.by_client_key(3600)

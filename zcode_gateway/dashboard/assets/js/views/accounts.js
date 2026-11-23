@@ -305,7 +305,7 @@ function applyFilter(root) {
   if (none) none.hidden = !(total > 0 && shown === 0);
 }
 
-function render(root, accounts, pool, reload, batch, signal, campaign = {}) {
+function render(root, accounts, pool, reload, batch, signal, campaign = {}, models) {
   const rows = accounts.map((a) => Object.assign(a, {
     __searchText: [a.email, a.id, a.state, a.source, ...(a.capped_models || [])]
       .filter(Boolean).join(" ").toLowerCase(),
@@ -331,9 +331,9 @@ function render(root, accounts, pool, reload, batch, signal, campaign = {}) {
     metric({ label: "Dead", value: num(counts.dead ?? 0), tone: counts.dead ? "err" : null }),
     metric({ label: "Strategy", value: pool.strategy || "—" }),
   ]);
-  const quotaSummary = aggregateModelQuotas(accounts, Date.now() / 1000);
+  const quotaSummary = aggregateModelQuotas(accounts, Date.now() / 1000, models);
   const quotaTotals = el("div", { class: "grid grid--metrics" }, quotaSummary.models
-    .filter(model => ["GLM-5.3", "GLM-5.3-Flash"].includes(model.model)).map(model => {
+    .map(model => {
     const node = metric({ label: model.model + " tokens remaining",
       value: model.known ? num(model.remaining) : "Unknown",
       hint: model.known + "/" + accounts.length + " accounts with known quota | "
@@ -456,7 +456,7 @@ export async function mount({ root, signal }) {
     if (active && active.type === "search" && root.contains(active)) {
       return;
     }
-    render(root, accs.accounts || [], pool || {}, load, batch, signal, campaign || {});
+    render(root, accs.accounts || [], pool || {}, load, batch, signal, campaign || {}, accs.models);
     batch.refresh();
   };
 

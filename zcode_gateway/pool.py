@@ -167,7 +167,12 @@ class Account:
         # starts_at 1-2s in the future is "open now", and parking for it
         # flashed quota errors at clients for 1-2s until the cap expired.
         if quota.get("starts_at", 0) > now + WINDOW_GRACE_S: return False
-        return quota.get("remaining", 0) > 0 or (quota.get("resets_at", 0) > 0 and quota["resets_at"] < now)
+        pending_start = quota.get("pending_starts_at") or 0
+        return (
+            quota.get("remaining", 0) > 0
+            or 0 < (quota.get("resets_at") or 0) <= now
+            or (0 < pending_start <= now and (quota.get("pending_remaining") or 0) > 0)
+        )
 
     def expires_in(self, now: float | None = None) -> float:
         now = now or time.time()
@@ -451,6 +456,7 @@ class PoolManager:
 
     def load_caps(self) -> None:
         """Re-apply unexpired saved parks onto loaded accounts."""
+        from .registry import is_retired_model
         if not self.caps_path or not self.caps_path.is_file():
             return
         try:
@@ -465,6 +471,9 @@ class PoolManager:
                 changed = True          # account gone: prune next save
                 continue
             for model, cap in (models or {}).items():
+                if is_retired_model(model):
+                    changed = True
+                    continue
                 release_at = float(cap.get("release_at_epoch", 0))
                 if release_at > now:
                     acc.model_caps[model] = release_at

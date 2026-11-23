@@ -81,26 +81,24 @@ async def test_breaker_prober_resumes_on_non_edge_answer():
 # --------------------------------------------------------------------------- #
 
 def test_model_caps_table():
-    assert MODEL_CAPS["GLM-5.3"]["vision"] is True
+    assert MODEL_CAPS["GLM-5.4"]["vision"] is True
     assert MODEL_CAPS["GLM-5.3-Flash"]["vision"] is True
     assert model_caps("unknown-future-model")["vision"] is True   # permissive default
 
 
-def test_build_body_forwards_images_to_53_by_owner_decision():
-    """2026-10-21 owner live-test: GLM-5.3 DOES read images — vision ON for
-    both plan models; nothing is stripped any more."""
-    payload = {"model": "GLM-5.3", "max_tokens": 100, "messages": [
+def test_build_body_forwards_images_to_glm54():
+    payload = {"model": "GLM-5.4", "max_tokens": 100, "messages": [
         {"role": "user", "content": [
             {"type": "text", "text": "hello"},
             {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}},
         ]}]}
-    body = build_body(payload, model_caps=model_caps("GLM-5.3"))
+    body = build_body(payload, model_caps=model_caps("GLM-5.4"))
     kinds = [b["type"] for b in body["messages"][0]["content"]]
-    assert kinds == ["text", "image"]
+    assert kinds == ["text", "image", "text"]
 
 
 def test_model_caps_all_vision_on():
-    assert MODEL_CAPS["GLM-5.3"]["vision"] is True
+    assert MODEL_CAPS["GLM-5.4"]["vision"] is True
     assert MODEL_CAPS["GLM-5.3-Flash"]["vision"] is True
 
 
@@ -112,18 +110,18 @@ def test_build_body_keeps_images_for_vision():
         ]}]}
     body = build_body(payload, model_caps=model_caps("GLM-5.3-Flash"))
     kinds = [b["type"] for b in body["messages"][0]["content"]]
-    assert kinds == ["text", "image"]
+    assert kinds == ["text", "image", "text"]
 
 
 def test_build_body_clamps_max_tokens():
-    payload = {"model": "GLM-5.3", "max_tokens": 999_999_999,
+    payload = {"model": "GLM-5.4", "max_tokens": 999_999_999,
                "messages": [{"role": "user", "content": "hi"}]}
-    body = build_body(payload, model_caps=model_caps("GLM-5.3"))
-    assert body["max_tokens"] == MODEL_CAPS["GLM-5.3"]["max_output_tokens"]
+    body = build_body(payload, model_caps=model_caps("GLM-5.4"))
+    assert body["max_tokens"] == MODEL_CAPS["GLM-5.4"]["max_output_tokens"]
 
 
 def test_build_body_no_caps_is_uncapped_forwards():
-    payload = {"model": "GLM-5.3", "max_tokens": 999_999_999,
+    payload = {"model": "GLM-5.4", "max_tokens": 999_999_999,
                "messages": [{"role": "user", "content": "hi"}]}
     body = build_body(payload)      # no model_caps: legacy behaviour
     assert body["max_tokens"] == 999_999_999
@@ -132,8 +130,8 @@ def test_build_body_no_caps_is_uncapped_forwards():
 def test_registry_vision_helpers():
     r = Registry()
     assert r.supports_vision("GLM-5.3-Flash") is True
-    assert r.supports_vision("GLM-5.3") is True       # owner live-test 2026-10-21
-    assert r.max_output("GLM-5.3") == 128000
+    assert r.supports_vision("GLM-5.4") is True
+    assert r.max_output("GLM-5.4") == 131072
 
 
 # --------------------------------------------------------------------------- #
@@ -141,13 +139,13 @@ def test_registry_vision_helpers():
 # --------------------------------------------------------------------------- #
 
 def test_default_effort_high_when_unspecified():
-    body = build_body({"model": "GLM-5.3", "max_tokens": 10,
+    body = build_body({"model": "GLM-5.4", "max_tokens": 10,
                        "messages": [{"role": "user", "content": "hi"}]})
     assert body["output_config"]["effort"] == "high"
 
 
 def test_explicit_effort_wins():
-    body = build_body({"model": "GLM-5.3", "max_tokens": 10, "reasoning_effort": "max",
+    body = build_body({"model": "GLM-5.4", "max_tokens": 10, "reasoning_effort": "max",
                        "messages": [{"role": "user", "content": "hi"}]})
     assert body["output_config"]["effort"] == "max"
 
@@ -209,7 +207,7 @@ def test_aggregate_emits_both_reasoning_keys():
     text = (_sse('{"id":"1","choices":[{"delta":{"reasoning":"think"}}]}')
             + _sse('{"id":"1","choices":[{"delta":{"content":"answer"}}]}')
             + _sse('{"id":"1","choices":[{"delta":{},"finish_reason":"stop"}]}'))
-    msg = aggregate_openai_stream(text, "GLM-5.3", "x")["choices"][0]["message"]
+    msg = aggregate_openai_stream(text, "GLM-5.4", "x")["choices"][0]["message"]
     assert msg["reasoning"] == "think"
     assert msg["reasoning_content"] == "think"
     assert msg["content"] == "answer"
@@ -217,13 +215,13 @@ def test_aggregate_emits_both_reasoning_keys():
 
 def test_aggregate_reads_reasoning_content_delta():
     text = _sse('{"id":"1","choices":[{"delta":{"reasoning_content":"alt"}}]}')
-    msg = aggregate_openai_stream(text, "GLM-5.3", "x")["choices"][0]["message"]
+    msg = aggregate_openai_stream(text, "GLM-5.4", "x")["choices"][0]["message"]
     assert msg["reasoning"] == "alt"
 
 
 def test_aggregate_only_reasoning_content_not_none():
     text = _sse('{"id":"1","choices":[{"delta":{"reasoning":"only thinking"}}]}')
-    msg = aggregate_openai_stream(text, "GLM-5.3", "x")["choices"][0]["message"]
+    msg = aggregate_openai_stream(text, "GLM-5.4", "x")["choices"][0]["message"]
     assert msg["content"] == ""          # '' not None (clients .strip() it)
 
 
@@ -238,13 +236,13 @@ def test_model_eligible_ignores_tiny_start_skew():
     a = Account(id="a", email="a@x", access_token="t", expires_at=0)
     a.state = AccountState.READY
     now = time.time()
-    a.notes["quotas"] = {"GLM-5.3": {"remaining": 5_000_000,
+    a.notes["quotas"] = {"GLM-5.4": {"remaining": 5_000_000,
                                      "starts_at": now + 2,
                                      "resets_at": now + 3600}}
-    assert a.model_eligible("GLM-5.3", now=now) is True
+    assert a.model_eligible("GLM-5.4", now=now) is True
     # a REAL future window (night grant) still parks
-    a.notes["quotas"]["GLM-5.3"]["starts_at"] = now + WINDOW_GRACE_S + 600
-    assert a.model_eligible("GLM-5.3", now=now) is False
+    a.notes["quotas"]["GLM-5.4"]["starts_at"] = now + WINDOW_GRACE_S + 600
+    assert a.model_eligible("GLM-5.4", now=now) is False
 
 
 def test_cap_model_skips_duplicate_writes():
@@ -268,7 +266,7 @@ def test_cap_model_skips_duplicate_writes():
         asyncio.run(pm.upsert(a))
 
         async def park_and_flush():
-            await pm.cap_model(a, "GLM-5.3", 900, reason="MODEL_CAPPED",
+            await pm.cap_model(a, "GLM-5.4", 900, reason="MODEL_CAPPED",
                                message="x")
             await pm.aclose()
 
@@ -279,7 +277,7 @@ def test_cap_model_skips_duplicate_writes():
         _t.sleep(0.02)
 
         async def park_again_assert_clean():
-            await pm.cap_model(a, "GLM-5.3", 900, reason="MODEL_CAPPED",
+            await pm.cap_model(a, "GLM-5.4", 900, reason="MODEL_CAPPED",
                                message="x")
             assert pm._caps_dirty is False, \
                 "duplicate park marked the debounced writer dirty"
@@ -311,7 +309,7 @@ def test_caps_flush_rearms_when_marked_dirty_during_write():
         async def scenario():
             await pm.upsert(a)
             await pm.upsert(b)
-            await pm.cap_model(a, "GLM-5.3", 900, reason="MODEL_CAPPED")
+            await pm.cap_model(a, "GLM-5.4", 900, reason="MODEL_CAPPED")
             task = pm._caps_save_task
             assert task is not None
             # hook the snapshot: while the writer holds the flushed snapshot
@@ -321,7 +319,7 @@ def test_caps_flush_rearms_when_marked_dirty_during_write():
                 out = orig()
                 if not pm._caps_dirty:   # only on the first flush
                     asyncio.get_running_loop().create_task(
-                        pm.cap_model(b, "GLM-5.3", 900, reason="MODEL_CAPPED"))
+                        pm.cap_model(b, "GLM-5.4", 900, reason="MODEL_CAPPED"))
                 return out
             pm._caps_snapshot = snapshot_and_park
             # wait long enough for: first flush + park-during-write + the
@@ -356,7 +354,7 @@ def test_aclose_flushes_a_park_marked_after_the_timer_fired():
         async def scenario():
             await pm.upsert(a)
             # park, let the debounce fire and the task finish clean
-            await pm.cap_model(a, "GLM-5.3", 900, reason="MODEL_CAPPED")
+            await pm.cap_model(a, "GLM-5.4", 900, reason="MODEL_CAPPED")
             await asyncio.sleep(0.1)
             task = pm._caps_save_task
             assert task is not None and task.done()
@@ -402,7 +400,7 @@ def test_apply_error_1005_escalates_to_exhausted():
     svc.pool = pm
 
     for i in range(3):
-        asyncio.run(svc._apply_error(a, "GLM-5.3", 502, "1005",
+        asyncio.run(svc._apply_error(a, "GLM-5.4", 502, "1005",
                                      "exceed quota limit"))
     assert a.state is AccountState.EXHAUSTED
     assert a.quota_strikes == 3
@@ -419,7 +417,7 @@ def test_apply_error_1005_with_resets_at_parks_model():
     pm = PoolManager(PoolConfig(), accounts=[])
     a = Account(id="ok", email="o@x", access_token="t", expires_at=0)
     a.state = AccountState.READY
-    a.notes["quotas"] = {"GLM-5.3": {"remaining": 0, "total": 100,
+    a.notes["quotas"] = {"GLM-5.4": {"remaining": 0, "total": 100,
                                      "resets_at": time.time() + 7200}}
     asyncio.run(pm.upsert(a))
 
@@ -429,7 +427,7 @@ def test_apply_error_1005_with_resets_at_parks_model():
     svc.cfg.pool.blocked_model_cooldown_seconds = 900
     svc.pool = pm
 
-    asyncio.run(svc._apply_error(a, "GLM-5.3", 502, "1005",
+    asyncio.run(svc._apply_error(a, "GLM-5.4", 502, "1005",
                                  "exceed quota limit"))
     assert a.state is AccountState.READY          # not exhausted
-    assert "GLM-5.3" in a.model_caps              # parked with a release time
+    assert "GLM-5.4" in a.model_caps              # parked with a release time

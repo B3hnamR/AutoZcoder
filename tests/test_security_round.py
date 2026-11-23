@@ -64,8 +64,8 @@ def test_add_relay_generates_secret_and_pick_returns_it(tmp_path):
     mgr = RelayManager(tmp_path / "relays.json")
     entry = mgr.add_relay("cf", "https://relay.workers.dev", "cloudflare")
     assert entry["secret"].startswith("zr_")
-    mgr.update_options(enabled=True, models=["GLM-5.3"], active_id=entry["id"])
-    picked = mgr.pick_relay_for_model("GLM-5.3")
+    mgr.update_options(enabled=True, models=["GLM-5.4"], active_id=entry["id"])
+    picked = mgr.pick_relay_for_model("GLM-5.4")
     assert picked["url"] == "https://relay.workers.dev"
     assert picked["secret"] == entry["secret"]
 
@@ -305,7 +305,7 @@ def test_config_example_placeholders_are_all_rejected():
 def test_tool_choice_none_omits_tools():
     from zcode_gateway.zcode_protocol import build_body
     body = build_body({
-        "model": "GLM-5.3", "max_tokens": 16,
+        "model": "GLM-5.4", "max_tokens": 16,
         "messages": [{"role": "user", "content": "hi"}],
         "tools": [{"type": "function",
                    "function": {"name": "f", "parameters": {"type": "object"}}}],
@@ -318,7 +318,7 @@ def test_tool_choice_none_omits_tools():
 def test_tool_choice_required_maps_to_any():
     from zcode_gateway.zcode_protocol import build_body
     body = build_body({
-        "model": "GLM-5.3", "max_tokens": 16,
+        "model": "GLM-5.4", "max_tokens": 16,
         "messages": [{"role": "user", "content": "hi"}],
         "tools": [{"type": "function",
                    "function": {"name": "f", "parameters": {"type": "object"}}}],
@@ -335,11 +335,11 @@ def test_tool_choice_required_maps_to_any():
 def test_bootstrap_harness_flag():
     from zcode_gateway.zcode_protocol import build_body
     from zcode_gateway.zcode_bootstrap import ZCODE_IDENTITY, ZCODE_HARNESS
-    full = build_body({"model": "GLM-5.3", "max_tokens": 16,
+    full = build_body({"model": "GLM-5.4", "max_tokens": 16,
                        "messages": [{"role": "user", "content": "hi"}]},
                       harness=True)
     assert any(b.get("text") == ZCODE_HARNESS for b in full["system"])
-    ident = build_body({"model": "GLM-5.3", "max_tokens": 16,
+    ident = build_body({"model": "GLM-5.4", "max_tokens": 16,
                         "messages": [{"role": "user", "content": "hi"}]},
                        harness=False)
     assert ident["system"][0]["text"] == ZCODE_IDENTITY

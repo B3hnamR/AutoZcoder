@@ -409,8 +409,8 @@ def _normalize_config(cfg_path: Path | None) -> None:
 
 
 DEFAULT_FREE_FALLBACK_CHAIN = [
-    "GLM-5.3",
     "GLM-5.3-Flash",
+    "GLM-5.4",
 ]
 
 
@@ -439,6 +439,8 @@ class ServerController:
         self._stop_requested = threading.Event()
         self.host = "127.0.0.1"
         self.port = 8788
+        self.origin = "http://127.0.0.1:8788"
+        self.tls_context = None
         self.error: str | None = None
         self.accounts_loaded = 0
         self.effective_accounts_dir: str | None = None
@@ -449,7 +451,7 @@ class ServerController:
 
     @property
     def base_url(self) -> str:
-        return f"http://{self.host}:{self.port}"
+        return self.origin
 
     def start(self, cfg_path: Path | None) -> None:
         if self.running:
@@ -468,6 +470,12 @@ class ServerController:
                     return
                 cfg = load_config(str(cfg_path) if cfg_path else None)
                 self.host, self.port = cfg.server.host, cfg.server.port
+                self.origin, ca_file = cfg.server.child_connection()
+                if ca_file:
+                    from gui_main import _gateway_context
+                    self.tls_context = _gateway_context(ca_file)
+                else:
+                    self.tls_context = None
                 self._config_ready.set()
 
                 # If the configured accounts folder is not there (e.g. a default
@@ -497,7 +505,7 @@ class ServerController:
                 # background thread - the window opens but nothing ever binds.
                 config = uvicorn.Config(app, host=self.host, port=self.port,
                                         log_level="info", access_log=False,
-                                        log_config=None)
+                                        log_config=None, **cfg.server.ssl_kwargs())
                 self._server = uvicorn.Server(config)
                 self._server.install_signal_handlers = lambda: None
                 self._server.run()
@@ -541,7 +549,7 @@ class ServerController:
                 time.sleep(0.05)
                 continue
             try:
-                with urllib.request.urlopen(self.base_url + "/health", timeout=1):
+                with urllib.request.urlopen(self.base_url + "/health", timeout=1, context=self.tls_context):
                     return True
             except Exception:
                 time.sleep(0.3)
@@ -566,7 +574,7 @@ class Api:
         req.add_header("Authorization", f"Bearer {self.key}")
         req.add_header("Content-Type", "application/json")
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
+            with urllib.request.urlopen(req, timeout=timeout, context=self.c.tls_context) as r:
                 return r.status, json.loads(r.read().decode("utf-8") or "{}")
         except urllib.error.HTTPError as e:
             try:

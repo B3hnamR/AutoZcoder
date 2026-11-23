@@ -48,8 +48,13 @@ async def pool_state(request: Request, key: str = Depends(admin_key)) -> dict:
 
 @router.get("/accounts")
 async def list_accounts(request: Request, key: str = Depends(admin_key)) -> dict:
-    accounts = await get_state(request).pool.all()
-    return {"accounts": [a.to_public() for a in accounts]}
+    state = get_state(request)
+    accounts = await state.pool.all()
+    result = {"accounts": [a.to_public() for a in accounts]}
+    registry = getattr(state, "registry", None)
+    if registry is not None:
+        result["models"] = [entry["id"] for entry in registry.catalogue() if "alias_of" not in entry]
+    return result
 
 
 @router.get("/accounts/campaign_window")
@@ -314,16 +319,22 @@ async def purge_drained_accounts(request: Request,
     from .pool import AccountState
     import time as _time
     purged, kept_unknown = [], 0
+    now = _time.time()
     for account in list(state.pool._accounts.values()):
         quotas = (account.notes or {}).get("quotas") or {}
         is_dead = account.state is AccountState.DEAD
         # proven-drained: quota data exists AND every bucket is empty
         drained = bool(quotas) and all(
             (q.get("remaining", 0) or 0) <= 0 for q in quotas.values())
-        # any model still capped-with-reset means tokens come back later
         recovers = any(
-            (q.get("resets_at", 0) or 0) > _time.time()
-            for q in quotas.values())
+            (q.get(field) or 0) > now
+            for q in quotas.values()
+            for field in ("resets_at", "starts_at", "pending_starts_at")
+        ) or any(until > now for until in account.model_caps.values())
+        # An opened grant can remain pending in the last billing snapshot.
+        recovers = recovers or any(
+            (q.get("pending_remaining") or 0) > 0 for q in quotas.values()
+        )
         if not is_dead and not drained:
             if not quotas:
                 kept_unknown += 1
@@ -374,11 +385,10 @@ async def refresh_account(request: Request, account_id: str,
             match = next((f for f in fresh if f.id == account_id), None)
             if match and match.access_token and \
                     match.access_token != account.access_token:
-                await state.tokens.apply_credentials(
+                adopted = await state.tokens.apply_credentials(
                     account, access_token=match.access_token,
                     refresh_token=match.refresh_token,
                     expires_at=match.expires_at)
-                adopted = True
     except Exception:
         log.warning("snapshot re-read failed for %s", account_id, exc_info=True)
 
@@ -466,13 +476,15 @@ async def reload_pool(request: Request, key: str = Depends(admin_key)) -> dict:
             # mutate under the account's refresh lock: writing the fields
             # directly raced concurrent requests building headers and any
             # in-flight token refresh
-            await state.tokens.apply_credentials(
+            adopted = await state.tokens.apply_credentials(
                 existing,
                 access_token=account.access_token,
                 refresh_token=account.refresh_token,
                 expires_at=account.expires_at, email=account.email,
                 name=account.notes.get("name"), device_mid=account.notes.get("device_mid"),
                 notes=account.notes)
+            if not adopted:
+                continue
             updated += 1
             # re-settle plan/balance too — a re-exported snapshot after a plan
             # change (e.g. Global Build issued) must surface here, otherwise the

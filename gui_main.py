@@ -131,13 +131,23 @@ def _run_server() -> None:
             cfg = load_config(os.environ.get("ZCODE_GATEWAY_CONFIG") or None)
             global _shutdown_admin_key
             _shutdown_admin_key = cfg.server.admin_key
+            app = create_app(cfg)
             config = uvicorn.Config(
-                create_app(cfg), host=cfg.server.host, port=cfg.server.port,
+                app, host=cfg.server.host, port=cfg.server.port,
                 log_level="info", access_log=False, log_config=None,
-                **cfg.server.ssl_kwargs())
+                timeout_graceful_shutdown=30, **cfg.server.ssl_kwargs())
             server = uvicorn.Server(config)
+            exit_requested = threading.Event()
+
+            def request_shutdown():
+                exit_requested.set()
+                server.should_exit = True
+
+            app.state.request_shutdown = request_shutdown
             _server = server
             server.run()
+            if exit_requested.is_set():
+                os._exit(0)
             if not server.started:
                 raise RuntimeError("Gateway exited before opening its listener")
             return  # clean shutdown
@@ -325,10 +335,12 @@ def main() -> None:
     # keep the interpreter — and with it the port and the single-instance
     # mutex — alive forever, so the next launch hits the "already running"
     # alert. Hard-exit: window close must mean the tool actually quit.
-    # Before the hard exit, stop the generator's workers — os._exit skips
-    # atexit and the FastAPI lifespan, and spawned Chromium children would
-    # otherwise be orphaned on the machine.
-    _shutdown_generator()
+    # Let the server finish the application lifespan before exiting.
+    if _server is not None:
+        _server.should_exit = True
+        _server_failed.wait()
+    else:
+        _shutdown_generator()
     os._exit(0)
 
 

@@ -1,8 +1,6 @@
 """ZCode long-lived JWTs: reload credentials on rejection; poll model quotas."""
 from __future__ import annotations
 import asyncio
-import base64
-import json
 import logging
 import time
 
@@ -12,7 +10,7 @@ from .pool import Account, AccountState, PoolManager, load_accounts
 from .quota import parse_balance
 from .token_utils import _parse_expiry, _atomic_write, persist_pool_snapshot
 from .accounts_dir import (parse_snapshot, snapshot_path, snapshot_transaction,
-                           write_snapshot)
+                           token_is_older, write_snapshot)
 from .upstream import build_headers
 
 log = logging.getLogger('zcode_gateway.tokens')
@@ -70,14 +68,6 @@ class TokenManager:
             return await self._refresh_locked(account, force)
 
     @staticmethod
-    def _issued_at(token):
-        try:
-            payload = token.removeprefix('workos:').split('.')[1]
-            return float(json.loads(base64.urlsafe_b64decode(payload + '=' * (-len(payload) % 4))).get('iat', 0))
-        except (ValueError, TypeError, IndexError, AttributeError):
-            return 0
-
-    @staticmethod
     def _persist_refreshed(path, fields, previous_token):
         with snapshot_transaction(path.parent):
             current = parse_snapshot(path)
@@ -101,13 +91,8 @@ class TokenManager:
             if fresh.id != account.id or not fresh.access_token:
                 continue
             if fresh.access_token != account.access_token:
-                old_iat, new_iat = self._issued_at(account.access_token), self._issued_at(fresh.access_token)
-                if old_iat and new_iat and new_iat < old_iat:
-                    continue
-                # Unknown expiry is not an expiry of zero: a captured no-exp
-                # token is authoritative unless its issuance proves it older.
-                if not (old_iat and new_iat) and fresh.expires_at and account.expires_at \
-                        and fresh.expires_at < account.expires_at and account.expires_in() > 0:
+                if token_is_older(fresh.access_token, fresh.expires_at,
+                                  account.access_token, account.expires_at):
                     continue
             else:
                 # A fresh scan may carry new device/identity metadata even when
@@ -167,9 +152,13 @@ class TokenManager:
             account.quota_strikes = 0
             account.notes.pop('quota_check_error', None)
 
-    async def apply_credentials(self, account, **credentials):
+    async def apply_credentials(self, account, **credentials) -> bool:
         async with self._lock_for(account.id):
+            if token_is_older(credentials["access_token"], credentials.get("expires_at", 0),
+                              account.access_token, account.expires_at):
+                return False
             self._apply_credentials_locked(account, **credentials)
+            return True
 
     async def refresh_loop(self):
         while not self._stop.is_set():

@@ -1,7 +1,7 @@
 """Relay manager for edge proxies (Cloudflare, Vercel, Deno, Netlify).
 
 Manages deployed relays, testing, active relay selection, model-level
-relay routing (defaulting to GLM-5.3), and rotation strategies:
+relay routing (defaulting to GLM-5.4), and rotation strategies:
 
     single    — always the active relay (legacy behavior)
     round_robin — cycle through all relays in order, one request at a time
@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import json
 import copy
+
+from .registry import DEFAULT_ANTHROPIC_MODEL, is_retired_model
 import logging
 import os
 import random
@@ -122,7 +124,7 @@ class RelayManager:
             "enabled": False,
             "active_url": "",
             "active_id": "",
-            "models": ["GLM-5.3"],  # Default to GLM-5.3 only as required
+            "models": [DEFAULT_ANTHROPIC_MODEL],
             "strategy": "single",   # single | round_robin | random
             "relays": [],
         }
@@ -137,6 +139,7 @@ class RelayManager:
                     if isinstance(data, dict):
                         settings = self._default_settings()
                         settings.update(data)
+                        settings["models"] = self._supported_models(settings.get("models"))
                         self._cache = settings
                         return copy.deepcopy(settings)
                 except Exception:
@@ -156,17 +159,17 @@ class RelayManager:
             tmp.write_text(json.dumps(settings, indent=2, ensure_ascii=False), encoding="utf-8")
             tmp.replace(self.path)
 
+    @staticmethod
+    def _supported_models(models) -> list[str]:
+        if isinstance(models, str):
+            models = [models]
+        return list(dict.fromkeys(
+            model for model in (models or [])
+            if isinstance(model, str) and model.strip() and not is_retired_model(model)
+        ))
+
     def _model_matches(self, model: str, models: list[str]) -> bool:
-        norm = model.lower().strip()
-        lowered = [m.lower() for m in models]
-        if norm in lowered or model in models:
-            return True
-        # Also check alias normalization like glm-5.3 vs GLM-5.3
-        if "glm-5.3" in norm and "flash" not in norm and "glm-5.3" in lowered:
-            return True
-        if "flash" in norm and "glm-5.3-flash" in lowered:
-            return True
-        return False
+        return model.strip().casefold() in {name.strip().casefold() for name in models}
 
     def _failed_keys(self) -> set[str]:
         """Identifiers of relays in failure cool-down (ids AND urls — callers
@@ -384,9 +387,7 @@ class RelayManager:
         with self._lock:
             st = self.get_settings()
             if models is not None:
-                if isinstance(models, str):
-                    models = [models]
-                st["models"] = list(dict.fromkeys(models))
+                st["models"] = self._supported_models(models)
             if enabled is not None:
                 st["enabled"] = bool(enabled)
             if strategy is not None:

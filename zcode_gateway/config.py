@@ -13,6 +13,7 @@ from typing import Any, ClassVar, get_origin
 
 import yaml
 from pydantic import BaseModel, Field, ValidationError, model_validator
+from .registry import DEFAULT_ANTHROPIC_MODEL, DEFAULT_OPENAI_MODEL, Registry, is_retired_model
 from .zcode_device import default_device_mid
 
 
@@ -151,6 +152,30 @@ class ServerConfig(BaseModel):
         authority = f"[{host}]" if ":" in host else host
         return f"{'https' if tls else 'http'}://{authority}:{self.port}", self.tls_cert if tls else ""
 
+    def validate_bind_policy(self) -> None:
+        """Require production credentials on public listeners."""
+        if not self.is_loopback_bind():
+            if not self.require_client_key:
+                raise RuntimeError(
+                    f"server.host={self.host} is a public bind but "
+                    "server.require_client_key is false — an unauthenticated "
+                    "proxy on a public interface is an open relay. Set "
+                    "require_client_key: true (and configure client_keys).")
+            if not self.client_keys:
+                raise RuntimeError(
+                    "server.host is a public bind but no client_keys are "
+                    "configured — nothing would authenticate. Configure "
+                    "client_keys.")
+            if self.has_placeholder_client_key():
+                raise RuntimeError(
+                    "server.host is a public bind but a client key is still the "
+                    "example placeholder from config.example.yaml — set real "
+                    "long random keys (see docs/guides/VPS-DEPLOY.md).")
+            if self.admin_key_is_placeholder():
+                raise RuntimeError(
+                    "server.host is a public bind but server.admin_key is still "
+                    "a template placeholder — set a long random admin key first.")
+
     def ssl_kwargs(self) -> dict:
         """uvicorn TLS arguments; empty when TLS is not configured."""
         cert, key = (self.tls_cert or "").strip(), (self.tls_key or "").strip()
@@ -174,7 +199,7 @@ class ServerConfig(BaseModel):
                    for k in self.client_keys)
 
 
-CURRENT_ZCODE_CLIENT_VERSION = "3.18.2"
+CURRENT_ZCODE_CLIENT_VERSION = "4.0.0"
 CURRENT_ZCODE_USER_AGENT = (
     f"ZCode/{CURRENT_ZCODE_CLIENT_VERSION} "
     "ai-sdk/provider-utils/4.0.27 runtime/node.js/24"
@@ -188,7 +213,8 @@ class Fingerprint(BaseModel):
     # The billing preview gift list (and the plan shown on /billing/balance)
     # is version-gated: 3.14.3..3.16.0 answer [], 3.16.1+ name the plan. A
     # 3.14.x fingerprint therefore reads as "this account has no plan" even
-    # when the Start Plan is active. 3.18.2 is the build this repo tracks.
+    # when the Start Plan is active. 4.0.0 is the build this repo tracks
+    # (captured 2026-11-23: Electron 44.7.0 / Chrome 152).
     client_version: str = CURRENT_ZCODE_CLIENT_VERSION
     core_version: str = "0.0.83"
     platform: str = "win32-x64"
@@ -214,8 +240,7 @@ class UpstreamConfig(BaseModel):
     overload_max_attempts: int = Field(default=11, ge=1, le=30)
     overload_base_delay_seconds: float = Field(default=2, ge=0, le=60, allow_inf_nan=False)
     overload_max_delay_seconds: float = Field(default=60, ge=0, le=60, allow_inf_nan=False)
-    # Whether the anthropic body variant carries `cache_control`. The capture
-    # always included it; flip to false to test whether it is optional.
+    # Add an ephemeral cache marker to the newest user message when absent.
     anthropic_cache_control: bool = True
     # Inject the full captured ZCode harness (policy + tooling paragraphs)
     # into every request's system block. True = fingerprint-faithful (this is
@@ -260,7 +285,7 @@ class AccountsConfig(BaseModel):
 
 class AutoFreeFallbackConfig(BaseModel):
     enabled: bool = False
-    chain: list[str] = Field(default_factory=lambda: ["GLM-5.3", "GLM-5.3-Flash"])
+    chain: list[str] = Field(default_factory=lambda: [DEFAULT_ANTHROPIC_MODEL, DEFAULT_OPENAI_MODEL])
 
 
 class PacingConfig(BaseModel):
@@ -278,8 +303,8 @@ class PacingConfig(BaseModel):
 
 class ModelsConfig(BaseModel):
     aliases: dict[str, str] = Field(default_factory=dict)
-    default: str = "GLM-5.3-Flash"
-    default_anthropic: str = "GLM-5.3"
+    default: str = DEFAULT_OPENAI_MODEL
+    default_anthropic: str = DEFAULT_ANTHROPIC_MODEL
     default_max_tokens: int = 128000
     probe_unknown: bool = False
     # Reasoning effort used when the client doesn't specify one. 'max' made
@@ -289,6 +314,21 @@ class ModelsConfig(BaseModel):
     auto_free_fallback: AutoFreeFallbackConfig = Field(
         default_factory=AutoFreeFallbackConfig)
     pacing: PacingConfig = Field(default_factory=PacingConfig)
+
+    @model_validator(mode="after")
+    def migrate_retired_models(self):
+        registry = Registry(self.aliases, self.default, self.default_anthropic)
+        removed_aliases = self.aliases.keys() - registry.aliases.keys()
+        self.aliases = registry.aliases
+        self.default = registry.default
+        self.default_anthropic = registry.default_anthropic
+        chain = self.auto_free_fallback.chain
+        migrated_chain = (
+            DEFAULT_ANTHROPIC_MODEL if is_retired_model(model) or model in removed_aliases else model
+            for model in chain
+        )
+        self.auto_free_fallback.chain = list(dict.fromkeys(migrated_chain))
+        return self
 
 
 class LoggingConfig(BaseModel):
@@ -484,31 +524,8 @@ def _upgrade_shipped_fingerprint(data: dict[str, Any]) -> None:
     fingerprint["user_agent"] = CURRENT_ZCODE_USER_AGENT
 
 
-def load_config(path: str | os.PathLike | None = None) -> Config:
-    """Load config.yaml (if present) merged over defaults, then env overrides."""
-    data: dict[str, Any] = {}
-
-    candidates = []
-    if path:
-        candidates.append(Path(path))
-    env_path = os.environ.get("ZCODE_GATEWAY_CONFIG")
-    if env_path:
-        candidates.append(Path(env_path))
-    candidates.append(Path.cwd() / "config.yaml")
-    candidates.append(Path(__file__).resolve().parent.parent / "config.yaml")
-
-    base: Path | None = None
-    config_file: Path | None = None
-    for c in candidates:
-        if c and c.is_file():
-            with open(c, encoding="utf-8") as fh:
-                loaded = yaml.safe_load(fh) or {}
-            data = _deep_merge(data, loaded)
-            _upgrade_shipped_fingerprint(data)
-            config_file = Path(c).resolve()
-            base = config_file.parent
-            break
-
+def apply_config_env(data: dict[str, Any]) -> dict[str, Any]:
+    data = dict(data)
     # Decode collections explicitly; all overrides then pass through the same
     # schema validation as YAML rather than unchecked setattr assignments.
     for key, val in os.environ.items():
@@ -534,6 +551,39 @@ def load_config(path: str | os.PathLike | None = None) -> Config:
                     f"config error: {key} ({section}.{field}) must contain valid JSON") from None
         section_data = data.get(section, {})
         data[section] = {**(section_data if isinstance(section_data, dict) else {}), field: value}
+
+    return data
+
+
+def load_config(path: str | os.PathLike | None = None) -> Config:
+    """Load config.yaml (if present) merged over defaults, then env overrides."""
+    data: dict[str, Any] = {}
+
+    candidates = []
+    if path is not None:
+        explicit_path = Path(path)
+        if not explicit_path.is_file():
+            raise FileNotFoundError(f"config file not found: {explicit_path}")
+        candidates.append(explicit_path)
+    env_path = os.environ.get("ZCODE_GATEWAY_CONFIG")
+    if env_path:
+        candidates.append(Path(env_path))
+    candidates.append(Path.cwd() / "config.yaml")
+    candidates.append(Path(__file__).resolve().parent.parent / "config.yaml")
+
+    base: Path | None = None
+    config_file: Path | None = None
+    for c in candidates:
+        if c and c.is_file():
+            with open(c, encoding="utf-8") as fh:
+                loaded = yaml.safe_load(fh) or {}
+            data = _deep_merge(data, loaded)
+            _upgrade_shipped_fingerprint(data)
+            config_file = Path(c).resolve()
+            base = config_file.parent
+            break
+
+    data = apply_config_env(data)
 
     try:
         cfg = Config(**data)

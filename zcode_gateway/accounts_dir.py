@@ -121,6 +121,26 @@ def parse_snapshot(path: Path) -> dict[str, str]:
     return fields
 
 
+def token_issued_at(token: str) -> float:
+    try:
+        payload = token.split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        return float(claims.get("iat") or 0)
+    except (ValueError, TypeError, IndexError, AttributeError):
+        return 0
+
+
+def token_is_older(token: str, expiry: int, previous: str, previous_expiry: int) -> bool:
+    """Prefer explicitly comparable JWT issuance, then known, live expiry."""
+    if not previous or token == previous:
+        return False
+    old_iat, new_iat = token_issued_at(previous), token_issued_at(token)
+    if old_iat and new_iat:
+        return new_iat < old_iat
+    return bool(expiry and previous_expiry and expiry < previous_expiry
+                and previous_expiry > datetime.now(timezone.utc).timestamp() * 1000)
+
+
 def _snapshot_freshness(fields: dict[str, str], path: Path) -> tuple:
     """Capture time (or file time), then JWT issuance, never token expiry."""
     try:
@@ -132,12 +152,7 @@ def _snapshot_freshness(fields: dict[str, str], path: Path) -> tuple:
         observed = captured.replace(tzinfo=captured.tzinfo or timezone.utc).timestamp()
     except (ValueError, OverflowError, OSError):
         observed = modified
-    try:
-        payload = fields.get("access_token", "").split(".")[1]
-        claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
-        issued = float(claims.get("iat") or 0)
-    except (ValueError, TypeError, IndexError, AttributeError):
-        issued = 0.0
+    issued = token_issued_at(fields.get("access_token", ""))
     try:
         expiry = int(fields.get("expires_at_ms") or 0)
     except (ValueError, TypeError):
@@ -171,6 +186,13 @@ def save_account_snapshot(directory: str | Path, fields: dict[str, str], *, writ
         else:
             path = snapshot_path(folder, snapshot_filename(fields.get("email", ""), ident, used))
             previous = {}
+        new_token = fields.get("access_token")
+        if new_token and previous.get("access_token"):
+            from .token_utils import _parse_expiry
+
+            if token_is_older(new_token, _parse_expiry(fields.get("expires_at_ms")),
+                              previous["access_token"], _parse_expiry(previous.get("expires_at_ms"))):
+                return path
         merged = dict(previous)
         if previous.get("source") == "Manual JWT import":
             merged["imported_jwt"] = "true"

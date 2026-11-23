@@ -229,7 +229,9 @@ def test_legacy_rejects_unsupported_semantics(options):
 
 
 def test_token_estimate_counts_assistant_tool_names_and_arguments(monkeypatch):
-    state = SimpleNamespace(registry=SimpleNamespace(resolve=lambda *args: "fixture"))
+    from zcode_gateway.registry import Registry
+
+    state = SimpleNamespace(registry=Registry())
     monkeypatch.setattr(api_anthropic, "get_state", lambda request: state)
 
     def estimate(size):

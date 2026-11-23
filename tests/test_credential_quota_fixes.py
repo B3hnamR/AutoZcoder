@@ -16,7 +16,7 @@ from zcode_gateway.quota import parse_balance
 from zcode_gateway.tokens import TokenManager
 
 
-MODEL = 'GLM-5.3'
+MODEL = 'GLM-5.4'
 
 
 def balance(remaining=10):

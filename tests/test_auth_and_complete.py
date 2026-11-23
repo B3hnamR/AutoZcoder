@@ -123,8 +123,8 @@ async def test_complete_aggregates_stream_and_releases(tmp_path):
     from tests_fixtures import sample_sse, FakeClient
     resp_client = FakeClient(sample_sse())
     svc.client = resp_client
-    result = await svc.complete({"model": "GLM-5.3", "messages": [{"role":"user","content":"hi"}]},
-                                model="GLM-5.3", variant="anthropic",
+    result = await svc.complete({"model": "GLM-5.4", "messages": [{"role":"user","content":"hi"}]},
+                                model="GLM-5.4", variant="anthropic",
                                 dialect="openai", client_key="k")
     resp = resp_client.responses[0]
 

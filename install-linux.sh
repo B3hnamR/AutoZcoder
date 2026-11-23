@@ -73,6 +73,7 @@ ZGW_REPO="B3hnamR/AutoZcoder"
 ACME_VERSION="3.1.6"
 ACME_SHA256="0d3f9000ac44a6331314742a88c475f79134e24fc991997883652adc59efc486"
 SVC_USER="autozcoder"
+INSTALL_MARKER=".autozcoder-install"
 ENV_FILE="/etc/autozcoder.env"
 MANAGER_BIN="/usr/local/bin/autozcoder"
 SERVICE="zcodegateway"
@@ -127,7 +128,7 @@ run_quiet() { # run_quiet "what we are doing" cmd args...
 # ------------------------------------------------------------ state / config
 # precedence: environment override > saved state (/etc/autozcoder.env) > default
 resolve_config() {
-    SAVED_INSTALL_DIR=""; SAVED_PORT=""; SAVED_DOMAIN=""; SAVED_SERVER_IP=""
+    SAVED_INSTALL_DIR=""; SAVED_SERVICE_UID=""; SAVED_PORT=""; SAVED_DOMAIN=""; SAVED_SERVER_IP=""
     SAVED_SCHEME=""; SAVED_SSL_MODE=""; SAVED_ACME_HOST="__legacy__"; SAVED_PAUSE_UNITS=""; SAVED_FROM_SOURCE=""; SAVED_RUN_AS_ROOT=""; SAVED_SKIP_SYSTEMD=""
     # shellcheck disable=SC1090
     [[ -f "$ENV_FILE" ]] && . "$ENV_FILE"
@@ -163,6 +164,7 @@ save_state() {
     tmp="$(mktemp "${ENV_FILE}.XXXXXXXX")" || return 1
     {
         printf 'SAVED_INSTALL_DIR=%q\n' "$ZGW_INSTALL_DIR"
+        printf 'SAVED_SERVICE_UID=%q\n' "${SAVED_SERVICE_UID:-}"
         printf 'SAVED_PORT=%q\n' "$ZGW_PORT"
         printf 'SAVED_DOMAIN=%q\n' "$ZGW_DOMAIN"
         printf 'SAVED_SERVER_IP=%q\n' "${SERVER_IP:-${ZGW_SERVER_IP}}"
@@ -230,6 +232,7 @@ ensure_service_user() {
     useradd --system --no-create-home --home-dir "${ZGW_INSTALL_DIR}/home" \
             --shell "$shell" "$u" >>"$LOG_FILE" 2>&1 \
         || fail "could not create the '${u}' service user (no useradd?) — rerun with ZGW_RUN_AS_ROOT=1 to run as root"
+    [[ "$u" != "$SVC_USER" ]] || SAVED_SERVICE_UID="$(id -u "$u")"
 }
 fix_ownership() {
     local u; u="$(service_user)"
@@ -239,7 +242,7 @@ fix_ownership() {
     # directory permits those without letting the service replace root binaries.
     ensure_service_user "$SVC_USER" || return 1
     chown "root:${SVC_USER}" "$ZGW_INSTALL_DIR" && chmod 1770 "$ZGW_INSTALL_DIR" || return 1
-    find "$ZGW_INSTALL_DIR" -mindepth 1 -maxdepth 1 ! -name ZcodeGateway ! -name certs ! -name node ! -name '.tls.*' \
+    find "$ZGW_INSTALL_DIR" -mindepth 1 -maxdepth 1 ! -name ZcodeGateway ! -name certs ! -name node ! -name "$INSTALL_MARKER" ! -name '.tls.*' \
         -exec chown -hR "${u}:${u}" -- {} + || return 1
     # Private Node is installer-owned executable tooling, not runtime data.
     if [[ -e "$ZGW_INSTALL_DIR/node" || -L "$ZGW_INSTALL_DIR/node" ]]; then
@@ -1254,6 +1257,19 @@ setup_generator_env() {
 cmd_install() (
     need_root
     acquire_mutation_lock
+    local target recorded="" contents
+    [[ "$ZGW_INSTALL_DIR" == /* && ! -L "$ZGW_INSTALL_DIR" ]] \
+        || fail "install directory must be an absolute, non-symlink path"
+    target="$(realpath -m -- "$ZGW_INSTALL_DIR")" || fail "could not resolve install directory"
+    if [[ -n "${SAVED_INSTALL_DIR:-}" ]]; then
+        recorded="$(realpath -m -- "$SAVED_INSTALL_DIR")" || fail "could not resolve saved installation"
+        [[ "$target" == "$recorded" ]] || fail "install directory differs from the recorded installation"
+    elif [[ -e "$target" ]]; then
+        [[ -d "$target" ]] || fail "install path is not a directory"
+        contents="$(find "$target" -mindepth 1 -maxdepth 1 -print -quit)" \
+            || fail "could not inspect the install directory"
+        [[ -z "$contents" ]] || fail "an unowned install directory must be empty"
+    fi
     local TLS_NOTE="" TLS_TRUSTED=0 SSL_SCHEME="https" SERVER_IP="" CURRENT_ACME_HOST=""
     ( umask 077; : > "$LOG_FILE" )
     trap 'bad "Install failed at step ${STEP:-?} (line ${LINENO}). Details: ${LOG_FILE}"' ERR
@@ -1314,9 +1330,6 @@ cmd_install() (
         cfg_yaml validate || fail "existing config.yaml is invalid; left unchanged (no keys regenerated)"
         ok "config.yaml already exists — keeping it (keys unchanged)"
         admin_key="$(cfg_admin_key)"; client_key="$(cfg_client_key)"
-        # behind a TLS front or direct, every visitor is "remote": the dashboard
-        # admin must be allowed off-box
-        cfg_set_server allow_remote_admin true
     else
         admin_key="$(openssl rand -hex 16)"; client_key="$(openssl rand -hex 16)"
         # noclobber prevents an install racing another first-run config writer.
@@ -1348,7 +1361,7 @@ accounts:
   pool_file: ./pool.json
 models:
   default: GLM-5.3-Flash
-  default_anthropic: GLM-5.3
+  default_anthropic: GLM-5.4
   default_max_tokens: 128000
   default_effort: high
 logging:
@@ -1481,7 +1494,8 @@ EOF
         done
         [[ "$activated_health" == 1 ]] || fail "ACME activation health check failed"
     fi
-    save_state
+    write_install_marker || fail "could not record installation ownership"
+    save_state || fail "could not save installation state"
     retire_acme_registration
     trap - ERR
     final_report "$admin_key" "$client_key" "$TLS_NOTE"
@@ -1809,33 +1823,148 @@ cmd_cert() (
     ok "TLS updated: ${TLS_NOTE}"
 )
 
+write_install_marker() {
+    local absolute tmp
+    absolute="$(realpath -e -- "$ZGW_INSTALL_DIR")" || return 1
+    tmp="$(mktemp "$absolute/.install-marker.XXXXXXXX")" || return 1
+    printf '%s\n' "$absolute" > "$tmp" && mv -fT -- "$tmp" "$absolute/$INSTALL_MARKER" \
+        || { rm -f -- "$tmp"; return 1; }
+}
+
+uninstall_backup() (
+    local directory="$1" work archive service_home
+    service_home="$directory/home"
+    [[ "${ZGW_SKIP_SYSTEMD:-0}" != 1 ]] || service_home=/root
+    work="$(mktemp -d /root/.autozcoder-backup.XXXXXXXX)" || return 1
+    trap 'rm -rf -- "$work"' EXIT
+    archive="$(mktemp /root/autozcoder-backup-XXXXXXXX.tar.gz)" || return 1
+
+    if system_python - "$directory" "$work" "$archive" "$service_home" <<'PYBACKUP'
+import sqlite3
+import sys
+import tarfile
+from contextlib import closing
+from pathlib import Path
+
+import yaml
+
+base, work, archive, service_home = map(Path, sys.argv[1:])
+config = base / "config.yaml"
+data = (yaml.safe_load(config.read_text(encoding="utf-8")) or {}) if config.is_file() else {}
+accounts = data.get("accounts") or {}
+store = data.get("store") or {}
+
+
+def inside_install(value):
+    # The installed service sets HOME to its private home directory.
+    # Paths outside the install are left in place by uninstall.
+    path = (service_home / value[2:]) if value.startswith("~/") else Path(value)
+    resolved = (base / path).resolve()
+    return resolved if resolved.is_relative_to(base) else None
+
+
+database = inside_install(store.get("sqlite_path") or "gateway.db")
+entries = {config, base / "accounts", base / "pool.json", base / "model-caps.json"}
+entries.update(inside_install(accounts.get(key) or default) for key, default in (
+    ("dir", "accounts"), ("pool_file", "pool.json"), ("providers_json", "~/.zcode/v2/credentials.json")
+))
+if database is not None:
+    entries.add(database.parent / "model-caps.json")
+
+excluded = set()
+snapshot = None
+if database is not None and database.exists():
+    relative = database.relative_to(base)
+    excluded = {str(relative), str(relative) + "-wal", str(relative) + "-shm"}
+    # Take a standalone SQLite snapshot that includes committed WAL rows.
+    snapshot = work / "sqlite-backup"
+    with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=10)) as reader:
+        with closing(sqlite3.connect(snapshot)) as writer:
+            reader.backup(writer)
+            if writer.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
+                raise RuntimeError("SQLite backup failed its integrity check")
+
+
+def exclude_live_sqlite(member):
+    return None if str(Path(member.name)) in excluded else member
+
+
+with tarfile.open(archive, "w:gz") as output:
+    included_dirs = []
+    for entry in sorted(e for e in entries if e is not None and (e.exists() or e.is_symlink())):
+        if any(parent in entry.parents for parent in included_dirs):
+            continue
+        output.add(entry, arcname=str(entry.relative_to(base)), filter=exclude_live_sqlite)
+        if entry.is_dir() and not entry.is_symlink():
+            included_dirs.append(entry)
+    if snapshot is not None:
+        output.add(snapshot, arcname=str(database.relative_to(base)))
+PYBACKUP
+    then
+        if tar -tzf "$archive" >/dev/null; then
+            ok "backup written: $archive"
+            return 0
+        fi
+    fi
+    rm -f -- "$archive"
+    return 1
+)
+
 cmd_uninstall() (
     need_root
     acquire_mutation_lock
-    local yes=0; [[ "${1:-}" == "--yes" || "${1:-}" == "-y" ]] && yes=1
-    # refuse a path that could wipe something important
-    case "${ZGW_INSTALL_DIR}" in
-        ""|"/"|"/usr"|"/etc"|"/var"|"/home"|"/root"|"/opt"|"/bin"|"/lib") fail "refusing to delete '${ZGW_INSTALL_DIR}'" ;;
+    local yes=0 backup=0 target recorded marker
+    [[ "${1:-}" == "--yes" || "${1:-}" == "-y" ]] && yes=1
+    [[ -n "${SAVED_INSTALL_DIR:-}" && "$ZGW_INSTALL_DIR" == /* && ! -L "$ZGW_INSTALL_DIR" ]] \
+        || fail "no matching installation state"
+    target="$(realpath -e -- "$ZGW_INSTALL_DIR")" || fail "installation directory does not exist"
+    recorded="$(realpath -e -- "$SAVED_INSTALL_DIR")" || fail "saved installation directory does not exist"
+    case "$target" in
+        ""|"/"|"/usr"|"/etc"|"/var"|"/home"|"/root"|"/opt"|"/bin"|"/lib") fail "refusing to delete '$target'" ;;
     esac
-    [[ "${ZGW_INSTALL_DIR}" == /* ]] || fail "install dir must be absolute: ${ZGW_INSTALL_DIR}"
+    [[ "$target" == "$recorded" ]] || fail "install directory differs from the recorded installation"
+    marker="$target/$INSTALL_MARKER"
+    [[ -f "$marker" && ! -L "$marker" && "$(stat -c '%u:%a' -- "$marker")" == "0:600" \
+        && "$(<"$marker")" == "$target" ]] \
+        || fail "installation ownership marker missing or invalid; reinstall to record it before uninstalling"
+    ZGW_INSTALL_DIR="$target"
 
     banner "Uninstall the Zcode Gateway"
-    echo -e "  This ${red}${bold}permanently deletes${plain}:"
-    echo -e "    • the ${SERVICE} service and the certificate-renewal timer"
-    echo -e "    • ${ZGW_INSTALL_DIR}  (binary, config.yaml, certificates, accounts/, generator venv + Chromium, gateway.db, logs)"
-    echo -e "    • the 'autozcoder' command and ${ENV_FILE}"
-    echo -e "  ${dim}System packages (curl, openssl, socat, python3-venv, Chromium's libraries) are left in place.${plain}"
-    echo
+    echo -e "  This ${red}${bold}permanently deletes${plain} $target and the gateway's service and manager."
     if [[ "$yes" != "1" ]]; then
         [[ "$TTY_OK" == "1" ]] || fail "no terminal to confirm on — re-run with: autozcoder uninstall --yes"
-        if confirm "Save a backup of config + accounts to /root first?" n; then
-            local bk; bk="/root/autozcoder-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
-            tar -czf "$bk" -C "${ZGW_INSTALL_DIR}" config.yaml accounts gateway.db pool.json 2>/dev/null || true
-            chmod 600 "$bk" 2>/dev/null || true
-            ok "backup written: $bk"
-        fi
+        if confirm "Save a backup of config, accounts, and SQLite to /root first?" n; then backup=1; fi
         local typed; typed="$(ask "Type DELETE to confirm: " "")"
         [[ "$typed" == "DELETE" ]] || { warn "cancelled — nothing was removed"; return 0; }
+    fi
+
+    local was_active=0
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$SERVICE"; then
+        was_active=1
+        systemctl stop "$SERVICE" || fail "could not stop the gateway service"
+    fi
+    local proc pid attempt
+    local -a manual_pids=()
+    for proc in /proc/[0-9]*/exe; do
+        if [[ "$(readlink -- "$proc" 2>/dev/null || true)" == "$target/ZcodeGateway" ]]; then
+            pid="${proc#/proc/}"; pid="${pid%/exe}"
+            kill -TERM "$pid" 2>/dev/null || true
+            manual_pids+=("$pid")
+        fi
+    done
+    for pid in "${manual_pids[@]}"; do
+        for attempt in {1..30}; do
+            [[ "$(readlink -- "/proc/$pid/exe" 2>/dev/null || true)" == "$target/ZcodeGateway" ]] || break
+            sleep 1
+        done
+        if [[ "$(readlink -- "/proc/$pid/exe" 2>/dev/null || true)" == "$target/ZcodeGateway" ]]; then
+            if [[ "$was_active" == 1 ]]; then systemctl start "$SERVICE" || warn "could not restart the gateway"; fi
+            fail "a manually started gateway is still running; installation was retained"
+        fi
+    done
+    if [[ "$backup" == 1 ]] && ! uninstall_backup "$target"; then
+        if [[ "$was_active" == 1 ]]; then systemctl start "$SERVICE" || warn "could not restart the gateway"; fi
+        fail "backup failed; installation was retained"
     fi
 
     local removed=()
@@ -1847,9 +1976,6 @@ cmd_uninstall() (
         systemctl daemon-reload >/dev/null 2>&1 || true
         removed+=("systemd service + renewal timer")
     fi
-    # kill a manually started instance as well
-    pkill -f "${ZGW_INSTALL_DIR}/ZcodeGateway" >/dev/null 2>&1 || true
-
     local host; host="${SAVED_ACME_HOST:-}"
     if [[ -x "${ACME_HOME}/acme.sh" && -n "$host" ]]; then
         acme --remove -d "$host" >/dev/null 2>&1 || true
@@ -1863,9 +1989,11 @@ cmd_uninstall() (
         systemctl reload nginx >/dev/null 2>&1 || true
         removed+=("old nginx site")
     fi
-    rm -rf "${ZGW_INSTALL_DIR}" && removed+=("${ZGW_INSTALL_DIR}")
+    rm -rf --one-file-system -- "$target" || fail "could not remove the installation directory"
+    removed+=("$target")
     rm -f "$ENV_FILE" && removed+=("${ENV_FILE}")
-    if id -u "$SVC_USER" >/dev/null 2>&1 && userdel "$SVC_USER" >/dev/null 2>&1; then
+    if [[ -n "${SAVED_SERVICE_UID:-}" && "$(id -u "$SVC_USER" 2>/dev/null || true)" == "$SAVED_SERVICE_UID" ]] \
+            && userdel "$SVC_USER" >/dev/null 2>&1; then
         removed+=("service user ${SVC_USER}")
     fi
 

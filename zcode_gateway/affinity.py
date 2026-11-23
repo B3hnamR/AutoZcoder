@@ -28,6 +28,9 @@ def affinity_key_from_payload(payload: dict) -> str:
     """
     if not isinstance(payload, dict):
         return ""
+    native = payload.get("_anthropic")
+    if isinstance(native, dict):
+        payload = native
     ident = ""
     meta = payload.get("metadata")
     if isinstance(meta, dict):

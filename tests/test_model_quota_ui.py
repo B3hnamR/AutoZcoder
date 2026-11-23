@@ -37,18 +37,18 @@ console.log(JSON.stringify(result));
 def account(remaining=100, **fields):
     return {"id": "account", "state": "ready", "has_plan": True,
             "balance_checked_at": 900,
-            "quotas": {"GLM-5.3": {"remaining": remaining, "starts_at": 800,
+            "quotas": {"GLM-5.4": {"remaining": remaining, "starts_at": 800,
                                     "resets_at": 2000}}, **fields}
 
 
-def model(result, name="GLM-5.3"):
+def model(result, name="GLM-5.4"):
     return next(item for item in result["models"] if item["model"] == name)
 
 
 def test_total_keeps_positive_capped_dead_cooling_and_no_plan_quotas():
     result = aggregate([
         account(100), account(200, state="dead"), account(300, state="cooling"),
-        account(400, has_plan=False), account(500, model_caps={"glm-5.3": {"release_in_s": 20}}),
+        account(400, has_plan=False), account(500, model_caps={"glm-5.4": {"release_in_s": 20}}),
         account(600, state="exhausted"),
         account(700, plans=[{"status": "active", "ends_at": 999}]),
     ])
@@ -70,7 +70,7 @@ def test_total_keeps_positive_capped_dead_cooling_and_no_plan_quotas():
     ({"remaining": 50, "resets_at": "invalid"}, 0, 0, 0),
 ])
 def test_active_window_boundaries(bucket, known, pending, expired):
-    quota = model(aggregate([account(quotas={"GLM-5.3": bucket})]))
+    quota = model(aggregate([account(quotas={"GLM-5.4": bucket})]))
     assert quota["known"] == known
     assert quota["remaining"] == (50 if known else 0)
     assert quota["pending"] == pending
@@ -104,22 +104,22 @@ def test_checked_empty_unchecked_and_failed_checks_are_distinct():
 
 def test_canonical_case_names_and_namespaces_do_not_alias():
     result = aggregate([account(quotas={
-        "GLM-5.3": None, "glm-5.3": {"remaining": 10},
+        "GLM-5.4": None, "glm-5.4": {"remaining": 10},
         "gLm-5.3-fLaSh": {"remaining": 20},
-        "zai/glm-5.3": {"remaining": 30},
+        "zai/glm-5.4": {"remaining": 30},
     })])
     assert len(result["models"]) == 3
     assert model(result)["remaining"] == 10
     assert model(result, "GLM-5.3-Flash")["remaining"] == 20
-    assert model(result, "zai/glm-5.3")["remaining"] == 30
+    assert model(result, "zai/glm-5.4")["remaining"] == 30
 
 
 def test_caps_normalize_case_and_expired_caps_do_not_block():
     result = aggregate([
-        account(10, model_caps={"glm-5.3": {"release_at": 999}}, capped_models=["GLM-5.3"]),
-        account(20, model_caps={"GLM-5.3": 1001}),
-        account(30, capped_models=["gLm-5.3"]),
-        account(40, model_caps={"GLM-5.3": {"release_in_s": 0}}),
+        account(10, model_caps={"glm-5.4": {"release_at": 999}}, capped_models=["GLM-5.4"]),
+        account(20, model_caps={"GLM-5.4": 1001}),
+        account(30, capped_models=["gLm-5.4"]),
+        account(40, model_caps={"GLM-5.4": {"release_in_s": 0}}),
     ])
     quota = model(result)
     assert quota["remaining"] == 100
@@ -130,7 +130,7 @@ def test_caps_normalize_case_and_expired_caps_do_not_block():
 def test_empty_pool_has_named_unknown_models_not_fake_eligibility():
     result = aggregate([])
     assert result["total_accounts"] == 0
-    assert [item["model"] for item in result["models"]] == ["GLM-5.3", "GLM-5.3-Flash"]
+    assert [item["model"] for item in result["models"]] == ["GLM-5.4", "GLM-5.3-Flash"]
     assert all(item["known"] == item["eligible"] == 0 for item in result["models"])
 
 
@@ -151,14 +151,14 @@ def test_models_browser_mocked_api_desktop_mobile_and_actions(tmp_path):
     accounts = [account(1000 + index, id="fixture-" + str(index),
                         email="fixture-" + str(index) + "@example.invalid") for index in range(52)]
     for item in accounts:
-        item["quotas"]["GLM-5.3"].update(starts_at=now - 100, resets_at=now + 3600)
+        item["quotas"]["GLM-5.4"].update(starts_at=now - 100, resets_at=now + 3600)
         item["balance_checked_at"] = now - 60
     accounts[-1].update(state="dead", quota_check_error="Fixture timeout")
     models = [{"model": name, "available_on": 51, "total_accounts": 52, "overall": "partial",
                "accounts": [{"account_id": item["id"], "status": "available" if index < 51 else "unavailable",
                              "reason": "Fixture eligible" if index < 51 else "Fixture dead"}
                             for index, item in enumerate(accounts)]}
-              for name in ("GLM-5.3", "GLM-5.3-Flash")]
+              for name in ("GLM-5.4", "GLM-5.3-Flash")]
     posts = []
     unexpected = []
     errors = []
@@ -201,10 +201,12 @@ window.view = await mount({root:document.querySelector('#root'),signal:new Abort
         page.goto("http://models.test/")
         page.wait_for_function("window.view !== undefined")
         assert page.locator(".model-entry").count() == 2
-        assert page.locator(".model-entry").first.inner_text().find("51 / 52") >= 0
-        assert "Unknown" in page.locator(".model-entry").nth(1).inner_text()
-        assert "53,326" in page.locator(".model-entry").first.inner_text()
-        assert "52,275" in page.locator(".model-entry").first.inner_text()
+        glm54 = page.locator(".model-entry").filter(has_text="GLM-5.4")
+        flash = page.locator(".model-entry").filter(has_text="GLM-5.3-Flash")
+        assert "51 / 52" in glm54.inner_text()
+        assert "Unknown" in flash.inner_text()
+        assert "53,326" in glm54.inner_text()
+        assert "52,275" in glm54.inner_text()
         page.screenshot(path=str(tmp_path / "models-desktop.png"), full_page=True)
         search = page.get_by_role("searchbox")
         search.fill("flash")
@@ -214,14 +216,14 @@ window.view = await mount({root:document.querySelector('#root'),signal:new Abort
         search.fill("does-not-match")
         assert page.locator("[data-nomatch]").is_visible()
         search.fill("")
-        page.locator("summary").first.focus()
+        glm54.locator("summary").focus()
         page.keyboard.press("Enter")
-        assert page.locator("details").first.get_attribute("open") is not None
-        assert page.get_by_text("Fixture timeout", exact=True).first.is_visible()
+        assert glm54.locator("details").get_attribute("open") is not None
+        assert glm54.get_by_text("Fixture timeout", exact=True).is_visible()
         page.set_viewport_size({"width": 390, "height": 844})
         assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
-        assert page.locator(".model-account-grid").first.evaluate("node => node.getBoundingClientRect().width >= 760")
-        assert page.locator(".model-account-table").first.evaluate("node => node.getBoundingClientRect().height <= 480")
+        assert glm54.locator(".model-account-grid").evaluate("node => node.getBoundingClientRect().width >= 760")
+        assert glm54.locator(".model-account-table").evaluate("node => node.getBoundingClientRect().height <= 480")
         page.screenshot(path=str(tmp_path / "models-mobile.png"), full_page=True)
         page.get_by_role("button", name="Sync models", exact=True).click()
         page.wait_for_function("document.querySelector('.model-action-status').textContent === 'Model catalogue synced.'")

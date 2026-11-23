@@ -295,6 +295,7 @@ def test_installer_arm_source_gate_before_packages(tmp_path, arch, source, accep
     result = _shell(tmp_path, f'''
 LOG_FILE="$PWD/log"; ZGW_FROM_SOURCE={"/explicit/source" if source else ""}
 need_root() {{ :; }}; uname() {{ echo {arch}; }}
+acquire_mutation_lock() {{ :; }}
 check_first_install_resources() {{ echo ARCH_ACCEPTED; exit 0; }}
 install_pkgs() {{ echo UNEXPECTED_PACKAGES; return 99; }}
 cmd_install

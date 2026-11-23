@@ -28,12 +28,16 @@ log = logging.getLogger("zcode_gateway.upstream")
 
 # Static headers emitted by the current official client's undici transport.
 # `authorization`, request IDs, `host`, and `content-length` are filled later.
+# The mid-conversation beta is sent on every turn by ZCode 4.0.0, not only on
+# model-gated requests; the body keeps `role: system` inside `messages`.
 STATIC_HEADERS = {"accept": "*/*", "accept-language": "*",
                   "content-type": "application/json",
                   "http-referer": "https://zcode.z.ai",
                   "sec-fetch-mode": "cors",
-                  "anthropic-version": "2023-06-01"}
-REQUIRED_HEADER_NAMES = set(STATIC_HEADERS) | {"authorization", "x-api-key", "x-device-mid",
+                  "anthropic-version": "2023-06-01",
+                  "anthropic-beta": "mid-conversation-system-2026-04-07"}
+REQUIRE_INCREMENTAL = "x-gateway-internal-incremental"
+REQUIRED_HEADER_NAMES = set(STATIC_HEADERS) | {"authorization", "x-api-key",
     "user-agent", "x-zcode-app-version", "x-zcode-agent", "x-zcode-query-source"}
 VARIANTS = ("anthropic",)
 
@@ -83,7 +87,8 @@ def build_upstream_body(payload, variant="anthropic", default_max_tokens=128000,
                         default_effort='high', harness=True):
     from .zcode_protocol import build_body
     return build_body(payload, default_max_tokens, model_caps=model_caps,
-                      default_effort=default_effort, harness=harness)
+                      default_effort=default_effort, harness=harness,
+                      cache_control=anthropic_cache_control)
 
 
 # --------------------------------------------------------------------------- #
@@ -131,8 +136,7 @@ def is_entitlement_code(code: str) -> bool:
 # Abuse-heuristic rejection: HTTP 405 + code 3012, message
 # "request has been blocked due to unusual activity." It is neither a quota nor
 # an account defect, and it is scoped to one account AND one model at a time —
-# the same account keeps serving other models (captured: GLM-5.3 blocked while
-# GLM-5.3-Flash still returns 200). Treated like a per-model park: the account
+# The same account can continue serving other models.
 # is skipped for that model and the request rotates to the next account.
 BLOCKED_CODES = frozenset({"3012", "405", "HTTP_405"})
 
@@ -372,6 +376,15 @@ class UpstreamClient:
                    stream: bool) -> UpstreamResponse:
         # Rotation: get_relay_for_model applies the strategy (single /
         # round_robin / random) and skips cooled-down relays.
+        from .registry import UPSTREAM_MODEL_IDS
+
+        headers = dict(headers)
+        # build_headers already carries this; a bare caller (tests, internal
+        # replays) still gets the 4.0.0 beta rather than a 5.3-shaped request.
+        headers.setdefault("anthropic-beta", STATIC_HEADERS["anthropic-beta"])
+        require_incremental = headers.pop(REQUIRE_INCREMENTAL, None)
+        wire_model = UPSTREAM_MODEL_IDS.get(body.get("model"))
+        wire_body = {**body, "model": wire_model} if wire_model else body
         tried_relay_urls: list[str] = []
         max_relay_tries = 1
         if self.relay_manager and self.relay_manager.get_relay_count() > 1:
@@ -387,6 +400,13 @@ class UpstreamClient:
                 relay_entry = self.relay_manager.pick_relay_for_model(req_model)
                 relay_url = ((relay_entry or {}).get("url") or "").strip() or None
                 relay_secret = (relay_entry or {}).get("secret") or ""
+                if relay_url and require_incremental:
+                    from urllib.parse import urlsplit
+
+                    relay_path = urlsplit(relay_url).path
+                    if relay_entry.get("type") == "netlify" or relay_path.startswith("/.netlify/functions/"):
+                        raise StreamingRelayUnsupported(
+                            "The configured Netlify relay buffers responses. Use stream=false for this relay.")
                 if relay_url and relay_url in tried_relay_urls:
                     # Never retry a relay that already failed this call.
                     break
@@ -405,13 +425,13 @@ class UpstreamClient:
                         # hardened relays require this; legacy relays ignore it
                         fwd_headers["x-relay-secret"] = relay_secret
                     req = self._client.build_request(
-                        "POST", relay_url, headers=fwd_headers, json=body,
+                        "POST", relay_url, headers=fwd_headers, json=wire_body,
                     )
                 else:
                     if attempt > 0:
                         break  # no relay path left — re-raise the last error
                     req = self._client.build_request(
-                        "POST", self.cfg.chat_url, headers=headers, json=body,
+                        "POST", self.cfg.chat_url, headers=headers, json=wire_body,
                     )
                 resp = await self._client.send(req, stream=stream)
             except httpx.HTTPError as exc:
@@ -492,6 +512,10 @@ class UpstreamClient:
 
 class TransportError(Exception):
     """Network-level failure — safe to retry on another account."""
+
+
+class StreamingRelayUnsupported(TransportError):
+    """The selected relay cannot deliver incremental output."""
 
 
 class RelayTransportError(TransportError):

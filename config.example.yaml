@@ -30,10 +30,10 @@ accounts:
   pool_file: ./pool.json
 models:
   aliases:
-    glm-5.3: GLM-5.3
+    glm-5.4: GLM-5.4
     glm-5.3-flash: GLM-5.3-Flash
   default: GLM-5.3-Flash
-  default_anthropic: GLM-5.3
+  default_anthropic: GLM-5.4
   default_max_tokens: 128000
   default_effort: high          # reasoning effort when the client doesn't say: low | high | max
   pacing:
@@ -42,7 +42,7 @@ models:
     max_gap_ms: 400
   auto_free_fallback:
     enabled: false
-    chain: [GLM-5.3, GLM-5.3-Flash]
+    chain: [GLM-5.4, GLM-5.3-Flash]
 logging:
   level: INFO
   capture: false

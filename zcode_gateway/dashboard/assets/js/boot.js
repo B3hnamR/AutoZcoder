@@ -180,8 +180,17 @@ function wireChrome() {
   });
 }
 
+let appStarted = false;
+
 async function startApp() {
   paintStatus(true);
+  if (appStarted) {
+    paintChips();
+    notifications.poll();
+    router.refresh();
+    return;
+  }
+  appStarted = true;
   // Capabilities first: views ask what this host can do while they build.
   await caps.load();
   paintVersion();

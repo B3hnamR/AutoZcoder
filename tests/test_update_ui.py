@@ -43,8 +43,11 @@ def updater_page():
                 route.fulfill(status=409, json={"detail": state["fail"][action]})
             elif action in ("status", "check"):
                 route.fulfill(json=state["status"])
+            elif action == "download":
+                state["status"].update(updater_phase="ready", downloaded=True)
+                route.fulfill(json={"downloaded": True})
             else:
-                route.fulfill(json={"downloaded": True} if action == "download" else {"applying": True})
+                route.fulfill(json={"applying": True})
         elif path.startswith("/assets/"):
             target = ASSETS / path.removeprefix("/assets/")
             route.fulfill(body=target.read_text(encoding="utf-8"),
