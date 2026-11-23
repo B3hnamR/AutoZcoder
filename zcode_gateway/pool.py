@@ -17,6 +17,7 @@ from typing import Iterable
 
 from .affinity import AffinityMap
 from .config import AccountsConfig, PoolConfig
+from .upstream import sanitize_cap_message
 
 # grant-window clock-skew grace: a starts_at less than this far in the future
 # counts as "open now" both for routing and for WINDOW_CLOSED parking
@@ -923,10 +924,13 @@ class PoolManager:
                 info = account.model_cap_info.get(model, {})
                 code = info.get("code", "MODEL_PARKED")
                 until = account.model_caps.get(model, 0.0)
+                status = 403 if _is_ent(code) else 429
                 return {
-                    "status": 403 if _is_ent(code) else 429,
+                    "status": status,
                     "code": code,
-                    "message": info.get("message", ""),
+                    # caps persisted before HTML was sanitized at write time must
+                    # not replay a raw CDN page to the client after a restart
+                    "message": sanitize_cap_message(info.get("message", "")),
                     "release_at": info.get("release_at"),
                     "release_in_s": int(max(until - time.time(), 0)),
                 }

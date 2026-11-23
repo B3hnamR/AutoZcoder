@@ -14,7 +14,7 @@ from starlette.background import BackgroundTask
 from .deps import client_key, get_state
 from .service import NoAccountsAvailable, UpstreamFailure, aggregate_openai_stream
 from .translate_anthropic import extract_stream_error, stream_had_content
-from .upstream import openai_error
+from .upstream import openai_error, retry_after_header
 
 router = APIRouter(tags=["openai"])
 
@@ -26,9 +26,12 @@ SSE_HEADERS = {
 
 
 def _error_response(status: int, code: str, message: str,
-                    extra: dict | None = None) -> JSONResponse:
+                    extra: dict | None = None,
+                    retry_after: float | None = None) -> JSONResponse:
+    headers = ({'Retry-After': retry_after_header(retry_after)} if retry_after is not None else None)
     return JSONResponse(status_code=status,
-                        content=openai_error(status, code, message, extra))
+                        content=openai_error(status, code, message, extra),
+                        headers=headers)
 
 
 def _valid_messages(messages: Any) -> bool:
@@ -121,7 +124,8 @@ async def chat_completions(
         return _error_response(503, "no_accounts_available",
                                "no usable Zcode account in the pool")
     except UpstreamFailure as exc:
-        return _error_response(exc.status, exc.code, exc.message, exc.extra())
+        return _error_response(exc.status, exc.code, exc.message, exc.extra(),
+                               retry_after=exc.retry_after)
 
 
 @router.post("/v1/completions")

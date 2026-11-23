@@ -19,7 +19,7 @@ from .deps import client_key, get_state
 from .service import NoAccountsAvailable, UpstreamFailure, aggregate_openai_stream
 from .translate_anthropic import (extract_stream_error, request_to_openai,
                                  response_to_anthropic, stream_had_content)
-from .upstream import anthropic_error
+from .upstream import anthropic_error, retry_after_header
 
 router = APIRouter(tags=["anthropic"])
 
@@ -31,9 +31,12 @@ SSE_HEADERS = {
 
 
 def _error(status: int, message: str, code: str = "",
-           extra: dict | None = None) -> JSONResponse:
+           extra: dict | None = None,
+           retry_after: float | None = None) -> JSONResponse:
+    headers = ({'Retry-After': retry_after_header(retry_after)} if retry_after is not None else None)
     return JSONResponse(status_code=status,
-                        content=anthropic_error(status, code, message, extra))
+                        content=anthropic_error(status, code, message, extra),
+                        headers=headers)
 
 
 @router.post("/v1/messages")
@@ -86,7 +89,8 @@ async def messages(
         return _error(503, "no usable Zcode account in the pool",
                       "NO_USABLE_ACCOUNTS")
     except UpstreamFailure as exc:
-        return _error(exc.status, exc.message, exc.code, exc.extra())
+        return _error(exc.status, exc.message, exc.code, exc.extra(),
+                      retry_after=exc.retry_after)
 
 
 @router.post("/v1/messages/count_tokens")

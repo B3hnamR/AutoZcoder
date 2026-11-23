@@ -259,13 +259,12 @@ async def test_unusual_activity_drives_model_fallback(service):
 
 
 @pytest.mark.asyncio
-async def test_suspended_account_aborts_request_without_rotation(service):
+async def test_suspended_account_rotates_to_healthy_account(service):
     await service.pool.upsert(Account(id='two',access_token='second-token'))
     service.client=FakeClient(responses=[suspended_response(),FakeResponse(sample_sse())])
-    with pytest.raises(UpstreamFailure) as err:
-        await service.complete({'model':'GLM-5.3','messages':[{'role':'user','content':'hi'}]},model='GLM-5.3')
-    assert err.value.status==405
-    assert len(service.client.calls)==1
+    result=await service.complete({'model':'GLM-5.3','messages':[{'role':'user','content':'hi'}]},model='GLM-5.3')
+    assert result.account.id=='two'
+    assert len(service.client.calls)==2
     killed=await service.pool.find('one')
     spare=await service.pool.find('two')
     assert killed.state is AccountState.DEAD and killed.death_reason=='suspended'
@@ -280,6 +279,137 @@ async def test_suspension_logs_upstream_text(service, caplog):
             await service.complete({'model':'GLM-5.3','messages':[{'role':'user','content':'hi'}]},model='GLM-5.3')
     text='\n'.join(record.getMessage() for record in caplog.records)
     assert 'SUSPENDED' in text and 'misusing the Start Plan' in text and 'one' in text
+
+
+@pytest.mark.asyncio
+async def test_all_accounts_suspended_returns_soft_retryable_503(service, caplog):
+    await service.pool.upsert(Account(id='two',access_token='second-token'))
+    service.client=FakeClient(responses=[suspended_response(),suspended_response()])
+    with caplog.at_level('WARNING', logger='zcode_gateway.service'):
+        with pytest.raises(UpstreamFailure) as err:
+            await service.complete({'model':'GLM-5.3','messages':[{'role':'user','content':'hi'}]},model='GLM-5.3')
+    failure=err.value
+    assert failure.status==503 and failure.code=='server_error'
+    assert failure.soft is True and failure.retry_after==30
+    assert 'unavailable' in failure.message and 'try again later' in failure.message
+    assert failure.details.get('reason')=='account_suspended'
+    assert 'misusing the Start Plan' not in failure.message
+    accounts=await service.pool.all()
+    assert all(a.state is AccountState.DEAD for a in accounts)
+    assert all(a.in_flight==0 for a in accounts)
+    text='\n'.join(record.getMessage() for record in caplog.records)
+    assert 'SUSPENDED' in text and 'misusing the Start Plan' in text
+
+
+def suspended_stream_body(*prefix):
+    events=list(prefix)+[{'type':'error','error':{'code':3012,'message':SUSPENDED_MESSAGE}}]
+    return b''.join(frame(e) for e in events)
+
+
+MESSAGE_START={'type':'message_start','message':{'id':'msg_test','type':'message','role':'assistant',
+    'model':'glm-5.3','content':[],'usage':{'input_tokens':3,'output_tokens':0},
+    'stop_reason':None,'stop_sequence':None}}
+
+
+@pytest.mark.asyncio
+async def test_midstream_suspension_rotates_to_healthy_account(service):
+    await service.pool.upsert(Account(id='two',access_token='second-token'))
+    service.client=FakeClient(responses=[FakeResponse(suspended_stream_body(MESSAGE_START)),FakeResponse(sample_sse())])
+    result=await service.complete({'model':'GLM-5.3','messages':[{'role':'user','content':'hi'}]},model='GLM-5.3')
+    assert result.account.id=='two'
+    assert len(service.client.calls)==2
+    assert (await service.pool.find('one')).state is AccountState.DEAD
+
+
+@pytest.mark.asyncio
+async def test_midstream_suspension_after_content_emits_soft_error_frame(service):
+    service.client=FakeClient(responses=[FakeResponse(suspended_stream_body(*sample_events()[:2]))])
+    handle=await service.open_stream({'model':'GLM-5.3','messages':[{'role':'user','content':'hi'}]},model='GLM-5.3')
+    out=b''.join([part async for part in service.stream_from(handle,model='GLM-5.3')])
+    assert len(service.client.calls)==1
+    text=out.decode()
+    assert 'ZCode accounts temporarily unavailable; try again later' in text
+    assert 'misusing the Start Plan' not in text
+    payloads=[json.loads(line[6:]) for line in text.splitlines()
+              if line.startswith('data: ') and line!='data: [DONE]']
+    soft=[p for p in payloads if 'error' in p][-1]['error']
+    assert soft.get('isRetryable') is True and soft.get('status')==503
+    assert (await service.pool.find('one')).state is AccountState.DEAD
+    assert handle.closed and handle.account.in_flight==0
+
+
+@pytest.mark.asyncio
+async def test_midstream_suspension_before_content_rotates_in_stream(service):
+    await service.pool.upsert(Account(id='two',access_token='second-token'))
+    service.client=FakeClient(responses=[FakeResponse(suspended_stream_body(MESSAGE_START)),FakeResponse(sample_sse())])
+    handle=await service.open_stream({'model':'GLM-5.3','messages':[{'role':'user','content':'hi'}]},model='GLM-5.3')
+    out=b''.join([part async for part in service.stream_from(handle,model='GLM-5.3')])
+    text=out.decode()
+    assert len(service.client.calls)==2
+    assert 'hello' in text
+    assert text.count('"role":"assistant"')==1
+    assert 'misusing the Start Plan' not in text
+    assert (await service.pool.find('one')).state is AccountState.DEAD
+
+
+@pytest.mark.asyncio
+async def test_suspension_without_code_rotates_in_stream(service):
+    await service.pool.upsert(Account(id='two',access_token='second-token'))
+    events=[MESSAGE_START,{'type':'error','error':{'message':SUSPENDED_MESSAGE}}]
+    service.client=FakeClient(responses=[FakeResponse(b''.join(frame(e) for e in events)),FakeResponse(sample_sse())])
+    handle=await service.open_stream({'model':'GLM-5.3','messages':[{'role':'user','content':'hi'}]},model='GLM-5.3')
+    out=b''.join([part async for part in service.stream_from(handle,model='GLM-5.3')])
+    text=out.decode()
+    assert len(service.client.calls)==2
+    assert 'hello' in text
+    assert 'misusing the Start Plan' not in text
+    assert (await service.pool.find('one')).state is AccountState.DEAD
+    assert (await service.pool.find('two')).state is AccountState.READY
+
+
+@pytest.mark.asyncio
+async def test_single_suspended_account_never_leaks_upstream_text(service):
+    service.client=FakeClient(responses=[FakeResponse(suspended_stream_body(MESSAGE_START))])
+    with pytest.raises(UpstreamFailure) as err:
+        await service.complete({'model':'GLM-5.3','messages':[{'role':'user','content':'hi'}]},model='GLM-5.3')
+    assert err.value.status==503 and err.value.code=='server_error'
+    assert 'misusing the Start Plan' not in err.value.message
+
+
+@pytest.mark.asyncio
+async def test_single_suspended_account_stream_never_leaks_upstream_text(service):
+    service.client=FakeClient(responses=[FakeResponse(suspended_stream_body(MESSAGE_START))])
+    handle=await service.open_stream({'model':'GLM-5.3','messages':[{'role':'user','content':'hi'}]},model='GLM-5.3')
+    out=b''.join([part async for part in service.stream_from(handle,model='GLM-5.3')])
+    text=out.decode()
+    assert 'ZCode accounts temporarily unavailable; try again later' in text
+    assert 'misusing the Start Plan' not in text
+    payloads=[json.loads(line[6:]) for line in text.splitlines()
+              if line.startswith('data: ') and line!='data: [DONE]']
+    soft=[p for p in payloads if 'error' in p][-1]['error']
+    assert soft.get('isRetryable') is True and soft.get('status')==503
+
+
+@pytest.mark.asyncio
+async def test_cap_message_is_bounded_while_history_keeps_upstream_text(service):
+    account=await service.pool.find('one')
+    raw='upstream rejected the request: '+'detail '*100
+    await service._apply_error(account,'GLM-5.3',405,'3012',raw)
+    cap=account.model_cap_info['GLM-5.3']['message']
+    assert len(cap)<=300
+    assert cap.startswith('upstream rejected the request')
+    assert account.error_history[-1]['message'].startswith('upstream rejected the request')
+
+
+@pytest.mark.asyncio
+async def test_unavailable_model_carries_release_retry_after(service):
+    account=await service.pool.find('one')
+    await service.pool.cap_model(account,'GLM-5.3',45,reason='UNUSUAL_ACTIVITY',message='busy')
+    with pytest.raises(UpstreamFailure) as err:
+        await service.complete({'model':'GLM-5.3','messages':[{'role':'user','content':'hi'}]},model='GLM-5.3')
+    assert err.value.code=='UNUSUAL_ACTIVITY'
+    assert err.value.release_in_s is not None
+    assert err.value.retry_after==err.value.release_in_s
 
 
 @pytest.mark.asyncio
@@ -886,3 +1016,49 @@ def test_api_surfaces_concurrency_as_429(cfg):
         assert response.json()['error']['code'] == '3008'
         account = state.pool._accounts['one']
         assert account.in_flight == 0 and not account.model_caps
+
+
+@pytest.mark.parametrize('path', ['/v1/chat/completions', '/v1/messages'])
+def test_api_suspended_accounts_return_retry_after_header(cfg, path):
+    with TestClient(create_app(cfg)) as client:
+        state = client.app.state.app_state
+        state.pool._accounts['one'] = Account(id='one', access_token='fake')
+        state.pool._accounts['two'] = Account(id='two', access_token='fake')
+        state.service.client = FakeClient(responses=[suspended_response(), suspended_response()])
+        response = client.post(path, headers={'Authorization': 'Bearer test-client'},
+            json={'model': 'GLM-5.3', 'messages': [{'role': 'user', 'content': 'hi'}]})
+        assert response.status_code == 503
+        assert response.headers['retry-after'] == '30'
+        assert 'misusing the Start Plan' not in response.text
+        assert state.pool._accounts['one'].state is AccountState.DEAD
+        assert state.pool._accounts['two'].state is AccountState.DEAD
+
+
+def test_api_stream_suspension_returns_soft_retryable_503(cfg):
+    with TestClient(create_app(cfg)) as client:
+        state = client.app.state.app_state
+        state.pool._accounts['one'] = Account(id='one', access_token='fake')
+        state.service.client = FakeClient(responses=[suspended_response()])
+        response = client.post('/v1/chat/completions',
+            headers={'Authorization': 'Bearer test-client'},
+            json={'model': 'GLM-5.3', 'messages': [{'role': 'user', 'content': 'hi'}],
+                  'stream': True})
+        assert response.status_code == 503
+        assert response.headers['retry-after'] == '30'
+        assert 'unavailable' in response.text and 'try again later' in response.text
+        assert 'misusing the Start Plan' not in response.text
+        assert state.pool._accounts['one'].state is AccountState.DEAD
+
+
+@pytest.mark.parametrize('path', ['/v1/chat/completions', '/v1/messages'])
+def test_api_clamps_long_retry_after(cfg, path, monkeypatch):
+    with TestClient(create_app(cfg)) as client:
+        state = client.app.state.app_state
+        async def fail(*args, **kwargs):
+            raise UpstreamFailure(429, 'rate_limit_error', 'upstream rate limit',
+                                  retry_after=3600)
+        monkeypatch.setattr(state.service, 'complete', fail)
+        response = client.post(path, headers={'Authorization': 'Bearer test-client'},
+            json={'model': 'GLM-5.3', 'messages': [{'role': 'user', 'content': 'hi'}]})
+        assert response.status_code == 429
+        assert response.headers['retry-after'] == '120'

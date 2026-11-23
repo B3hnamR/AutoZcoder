@@ -213,7 +213,47 @@ def _looks_like_edge_block(body: str | bytes | None) -> bool:
             else (body or "")).lower()
     if "<html" not in text:
         return False
-    return any(marker in text for marker in EDGE_BLOCK_MARKERS)
+    if any(marker in text for marker in EDGE_BLOCK_MARKERS):
+        return True
+    # Generic CDN error page (captured 2026-11: <title>405</title> with
+    # data-spm markers): same IP-wide edge response, not an account or model
+    # problem. Only HTML bodies qualify.
+    return re.search(r"<title>\s*[1-5]\d\d\b", text) is not None
+
+
+def _html_edge_message(status: int) -> str:
+    return f"upstream edge error (HTTP {status}): CDN returned an HTML error page"
+
+
+def sanitize_error_message(status: int, message: str | None) -> str:
+    """Never let a raw CDN HTML page become a client-visible error message or
+    a stored account/model cap reason."""
+    text = str(message or "")
+    lowered = text.lower()
+    if "<html" in lowered or "<!doctype" in lowered:
+        return _html_edge_message(status)
+    return text
+
+
+def sanitize_cap_message(message: str | None, limit: int = 300) -> str:
+    """A model-cap reason is replayed to clients when the pool is exhausted:
+    keep it short and single-line, never raw HTML."""
+    text = str(message or "")
+    lowered = text.lower()
+    if "<html" in lowered or "<!doctype" in lowered:
+        return "upstream error; the provider returned an HTML page (see gateway logs)"
+    return " ".join(text.split())[:limit]
+
+
+RETRY_AFTER_MAX_S = 120
+
+
+def retry_after_header(value: float | None) -> str | None:
+    """Client-facing Retry-After, clamped: upstream hints can run for hours and
+    clients honour an explicit header exactly."""
+    if value is None:
+        return None
+    return str(min(RETRY_AFTER_MAX_S, max(1, int(value))))
 
 
 def classify(status: int, body: str | bytes | None = None) -> ErrorKind:
@@ -255,18 +295,21 @@ def edge_block_message(body: str | bytes | None) -> str:
 def parse_upstream_error(status: int, body: str | bytes | None) -> dict[str, Any]:
     """Normalise an upstream error body (captured shape) into a dict."""
     text = body.decode("utf-8", "replace") if isinstance(body, bytes) else (body or "")
+    # Never replay the first 400 characters of a CDN HTML page as the error
+    # message: that raw page used to reach clients and account model caps.
+    fallback = sanitize_error_message(status, text[:400])
     try:
         parsed = json.loads(text)
         err = parsed.get("error", parsed)
         if isinstance(err, dict):
             return {
                 "code": str(err.get("code") or err.get("statusCode") or err.get("type") or f"http_{status}"),
-                "message": err.get("message") or err.get("msg") or text[:400],
+                "message": err.get("message") or err.get("msg") or fallback,
                 "raw": parsed,
             }
     except Exception:
         pass
-    return {"code": f"http_{status}", "message": text[:400], "raw": None}
+    return {"code": f"http_{status}", "message": fallback, "raw": None}
 
 
 # Mapping for the OpenAI-compatible error envelope.

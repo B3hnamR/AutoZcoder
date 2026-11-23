@@ -17,7 +17,7 @@ from zcode_gateway.relay_manager import RelayManager
 from zcode_gateway.service import ChatService, UpstreamFailure
 from zcode_gateway.store import JsonlCapture
 from zcode_gateway.tokens import TokenManager
-from zcode_gateway.upstream import RelayTransportError, UpstreamClient
+from zcode_gateway.upstream import RelayTransportError, UpstreamClient, parse_upstream_error
 from zcode_gateway.zcode_protocol import build_body
 
 
@@ -524,3 +524,62 @@ async def test_suspended_account_leaves_rotation_instead_of_parking_one_model():
     assert account.death_reason == "suspended"
     assert MODEL not in account.model_caps
     assert await service.pool.acquire() is None
+
+
+EDGE_405_HTML = (
+    '<!doctypehtml><html lang="zh-cn"><head><meta charset="utf-8">'
+    '<title>405</title></head><body>'
+    '<div data-spm="a3c0e">the request was blocked by the edge</div>'
+    '</body></html>')
+
+
+def test_parse_upstream_error_sanitizes_html_edge_page():
+    info = parse_upstream_error(405, EDGE_405_HTML)
+    assert info['code'] == 'http_405'
+    assert '<!doctype' not in info['message'].lower()
+    assert '<html' not in info['message'].lower()
+    assert '405' in info['message']
+
+
+@pytest.mark.asyncio
+async def test_html_405_is_an_edge_block_not_a_model_park():
+    account = Account(id='one', access_token='dummy')
+    page = httpx.Response(405, content=EDGE_405_HTML.encode(),
+                          headers={'content-type': 'text/html'})
+    service, _ = service_for([page], accounts=[account])
+    try:
+        with pytest.raises(UpstreamFailure) as failure:
+            await service.open_stream(
+                {'model': MODEL, 'messages': [{'role': 'user', 'content': 'hi'}]},
+                model=MODEL)
+    finally:
+        await service.breaker.aclose()
+    assert failure.value.status == 503
+    assert failure.value.code == 'waf_block'
+    assert failure.value.retry_after == 35
+    assert account.state is AccountState.READY
+    assert not account.model_caps
+    assert account.in_flight == 0
+    assert all('<html' not in str(entry.get('message', '')).lower()
+               for entry in account.error_history)
+
+
+@pytest.mark.asyncio
+async def test_apply_error_never_stores_raw_html():
+    service, _ = service_for([])
+    account = await service.pool.find('one')
+    await service._apply_error(account, MODEL, 405, 'http_405', EDGE_405_HTML)
+    assert '<html' not in account.error_history[-1]['message'].lower()
+    assert '<html' not in account.model_cap_info[MODEL]['message'].lower()
+
+
+@pytest.mark.asyncio
+async def test_unavailable_reason_never_replays_stored_html():
+    service, _ = service_for([])
+    account = await service.pool.find('one')
+    account.model_caps[MODEL] = time.time() + 60
+    account.model_cap_info[MODEL] = {'code': 'UNUSUAL_ACTIVITY',
+                                     'message': EDGE_405_HTML}
+    reason = await service.pool.unavailable_reason(MODEL)
+    assert '<html' not in reason['message'].lower()
+    assert 'html page' in reason['message'].lower()

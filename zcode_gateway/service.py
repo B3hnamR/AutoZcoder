@@ -21,25 +21,49 @@ from .zcode_protocol import MessageAccumulator, OpenAITranslator, usage_openai
 from .upstream import (build_headers, build_upstream_body, iter_sse_events, sse_frame,
                        parse_upstream_error, anthropic_error, openai_error, TransportError,
                        is_block_code, is_concurrency_code, client_not_supported,
-                       is_account_suspended, CLIENT_NOT_SUPPORTED_PARK_S)
+                       is_account_suspended, CLIENT_NOT_SUPPORTED_PARK_S,
+                       sanitize_error_message, sanitize_cap_message)
 from .registry import model_caps
 from .zcode_device import new_account_device_mid
 
 log = logging.getLogger('zcode_gateway.service')
 
+# A suspended account is dead upstream, but the pool may still have healthy
+# accounts: the request rotates instead of failing. Only a pool that cannot
+# serve at all gets this retryable soft error.
+SUSPENSION_RETRY_AFTER_S = 30
+
 class NoAccountsAvailable(Exception): pass
 
 class UpstreamFailure(Exception):
-    def __init__(self, status, code, message, release_at=None, release_in_s=None, details=None, retry_after=None):
+    def __init__(self, status, code, message, release_at=None, release_in_s=None, details=None, retry_after=None, soft=False):
         super().__init__(message)
         self.status, self.code, self.message = status, str(code), message
         self.release_at, self.release_in_s, self.details = release_at, release_in_s, details or {}
         self.retry_after = retry_after
+        self.soft = soft
     def extra(self):
         out = dict(self.details)
         if self.release_at: out['release_at'] = self.release_at
         if self.release_in_s is not None: out['release_in_s'] = self.release_in_s
         return out
+
+
+def _is_suspension_failure(exc) -> bool:
+    return isinstance(exc, UpstreamFailure) and is_account_suspended(exc.message)
+
+
+def _soft_suspension_failure() -> UpstreamFailure:
+    return UpstreamFailure(503, 'server_error',
+                           'ZCode accounts temporarily unavailable; try again later',
+                           retry_after=SUSPENSION_RETRY_AFTER_S,
+                           details={'reason': 'account_suspended'}, soft=True)
+
+
+def _soft_sse_extra(soft: UpstreamFailure) -> dict:
+    # vercel/ai marks a stream error retryable from these fields, not the HTTP
+    # status of the frame; the message alone only matches the plain-text branch.
+    return {'status': soft.status, 'isRetryable': True}
 
 @dataclass
 class StreamHandle:
@@ -182,6 +206,13 @@ class ChatService:
     async def _apply_error(self, account, model, status, code, message, headers=None, *, expected_credentials=None):
         if expected_credentials is not None and account.credential_key() != expected_credentials:
             return
+        # Defence in depth: an HTML CDN page that slipped past the breaker must
+        # not become an account/model cap reason or a dashboard error entry.
+        raw_message = message
+        message = sanitize_error_message(status, message)
+        # Cap reasons are replayed to clients when the pool is exhausted; keep
+        # them short and single-line, while the full text stays in the log.
+        cap_message = sanitize_cap_message(message)
         if is_concurrency_code(code):
             # Upstream still counts a slot as busy for this account: bench it
             # briefly so the retry rotates instead of immediately re-hitting
@@ -197,9 +228,20 @@ class ChatService:
         try:
             account.error_history.append(
                 {"ts": time.time(), "status": status, "code": str(code),
-                 "message": str(message)[:200], "model": model})
+                 "message": str(message), "model": model})
         except Exception:
             pass
+        if is_account_suspended(message):
+            # The account itself is banned upstream for proxying: no model on
+            # it can serve, and retrying only produces another refusal. This
+            # holds for every envelope (405 JSON, no-code SSE frame, 5xx), so
+            # key on the message, not the status/code shape.
+            log.warning('ZCode account %s (%s) SUSPENDED by upstream (status=%s code=%s): %s',
+                        account.id, account.email, status, code, raw_message)
+            await self.pool.kill(account, reason=str(message)[:200],
+                                 cause='suspended',
+                                 expected_credentials=expected_credentials)
+            return
         if status == 401 or code == 'authentication_error':
             await self.pool.kill_after_strikes(account, 'ZCode token revoked; sign in again',
                                                expected_credentials=expected_credentials)
@@ -214,28 +256,18 @@ class ChatService:
             # not match. Every account then fails identically, so a 900s park
             # per account only spreads a pool-wide outage over 15 minutes of
             # misleading state. Park briefly and name the real cause instead.
-            if is_account_suspended(message):
-                # The account itself is banned upstream for proxying: no model
-                # on it can serve, and retrying only produces a 405 per request.
-                # Take it out of rotation until an operator re-enables it.
-                log.warning('ZCode account %s (%s) SUSPENDED by upstream (status=%s code=%s): %s',
-                            account.id, account.email, status, code, message)
-                await self.pool.kill(account, reason=str(message)[:200],
-                                     cause='suspended',
-                                     expected_credentials=expected_credentials)
-                return
             if status == 405:
-                log.warning('ZCode 405/3012 on account %s model %s: %s', account.id, model, message)
+                log.warning('ZCode 405/3012 on account %s model %s: %s', account.id, model, raw_message)
             if client_not_supported(message):
                 await self.pool.cap_model(account, model,
                                           CLIENT_NOT_SUPPORTED_PARK_S,
                                           reason='CLIENT_NOT_SUPPORTED',
-                                          message=message,
+                                          message=cap_message,
                                           expected_credentials=expected_credentials)
             else:
                 await self.pool.cap_model(account, model,
                                           self.cfg.pool.blocked_model_cooldown_seconds,
-                                          reason='UNUSUAL_ACTIVITY', message=message,
+                                          reason='UNUSUAL_ACTIVITY', message=cap_message,
                                           expected_credentials=expected_credentials)
         elif code in ('11113', '1005') or status == 402:
             # 1005 is the SAME "exceed quota limit" rejection under an HTTP
@@ -258,7 +290,7 @@ class ChatService:
             if remaining > 0:
                 await self.pool.cap_model(account, model, 600,
                                           reason='11113' if code == '11113' else '1005',
-                                          message=message, expected_credentials=expected_credentials)
+                                          message=cap_message, expected_credentials=expected_credentials)
                 return
             seconds = max(1, quota.get('resets_at', 0) - time.time()) if quota else 0
             if seconds <= 1:
@@ -282,7 +314,7 @@ class ChatService:
                 seconds = 900      # park the model past the churn window
             await self.pool.cap_model(account, model, seconds,
                                       reason='11113' if code == '11113' else '1005',
-                                      message=message, expected_credentials=expected_credentials)
+                                      message=cap_message, expected_credentials=expected_credentials)
         elif status == 429 or code == 'rate_limit_error':
             # reuse the shared parser: handles retry-after-ms, seconds and
             # HTTP-dates (a millisecond hint used to fall through to the
@@ -291,17 +323,17 @@ class ChatService:
             hinted = retry_after_seconds(headers or {})
             seconds = min(3600, max(1, hinted if hinted is not None
                                     else self.cfg.pool.cooldown_seconds))
-            await self.pool.cap_model(account, model, seconds, reason='RATE_LIMITED', message=message,
+            await self.pool.cap_model(account, model, seconds, reason='RATE_LIMITED', message=cap_message,
                                       expected_credentials=expected_credentials)
         elif status == 403:
-            await self.pool.cap_model(account, model, 300, reason='ENTITLEMENT_ERROR', message=message,
+            await self.pool.cap_model(account, model, 300, reason='ENTITLEMENT_ERROR', message=cap_message,
                                       expected_credentials=expected_credentials)
         elif status == 451:
             # Geo/legal block tied to this account's egress context: park the
             # model on THIS account only and let the caller rotate to another
             # account (different IP) — the account itself stays healthy.
             await self.pool.cap_model(account, model, 600,
-                                      reason='GEO_BLOCKED', message=message or 'HTTP 451',
+                                      reason='GEO_BLOCKED', message=cap_message or 'HTTP 451',
                                       expected_credentials=expected_credentials)
         elif status >= 500:
             await self.pool.cool(account, reason='upstream_error', expected_credentials=expected_credentials)
@@ -343,9 +375,12 @@ class ChatService:
     @staticmethod
     def _retryable(exc) -> bool:
         # transport-level only: a dead/cut connection, or a clean EOF with no
-        # message_stop. Upstream error events and parse errors are not retried.
+        # message_stop. Upstream error events and parse errors are not retried,
+        # except a suspension: its account is dead, so a fresh account is the
+        # only way the request can still succeed.
         return isinstance(exc, httpx.HTTPError) or (
-            isinstance(exc, UpstreamFailure) and exc.code == 'truncated_stream')
+            isinstance(exc, UpstreamFailure) and (
+                exc.code == 'truncated_stream' or _is_suspension_failure(exc)))
 
     def _log_stream_failure(self, handle, exc, *, committed, events, retry):
         acct = handle.account
@@ -363,6 +398,8 @@ class ChatService:
         will_retry = (not committed) and retries_left > 0 and self._retryable(exc)
         self._log_stream_failure(handle, exc, committed=committed, events=events, retry=will_retry)
         if not will_retry:
+            if _is_suspension_failure(exc):
+                raise _soft_suspension_failure()
             return None
         reopen = getattr(handle, 'reopen', None)
         if reopen is None:
@@ -375,10 +412,19 @@ class ChatService:
             return await reopen()
         except asyncio.CancelledError:
             raise
+        except UpstreamFailure as exc2:
+            if exc2.soft:
+                raise
+            log.warning('ZCode stream retry could not open a new upstream stream (%s) - '
+                        'reporting the original failure', self._describe_failure(exc2))
         except Exception as exc2:
             log.warning('ZCode stream retry could not open a new upstream stream (%s) - '
                         'reporting the original failure', self._describe_failure(exc2))
-            return None
+        if _is_suspension_failure(exc):
+            # the suspended account is dead and no replacement could be opened:
+            # the client gets the neutral retryable error, never the raw ban text
+            raise _soft_suspension_failure()
+        return None
 
     async def open_stream(self, payload, *, model, variant='anthropic', dialect='openai', client_key='anonymous', is_disconnected=None):
         snapshot = _snapshot_payload(payload)
@@ -479,11 +525,15 @@ class ChatService:
             account = await self.pool.acquire(tried, model=model, only_id=target_account,
                                               affinity_key=affinity_key)
             if account is None:
-                if last: raise last
+                if last:
+                    if _is_suspension_failure(last):
+                        raise _soft_suspension_failure()
+                    raise last
                 reason = await self.pool.unavailable_reason(model)
                 if reason:
                     raise UpstreamFailure(reason['status'], reason['code'], reason['message'],
-                                          reason.get('release_at'), reason.get('release_in_s'))
+                                          reason.get('release_at'), reason.get('release_in_s'),
+                                          retry_after=reason.get('release_in_s'))
                 raise NoAccountsAvailable()
             device_mid = account.notes.get('device_mid')
             if not device_mid:
@@ -563,8 +613,10 @@ class ChatService:
                                 and code != '11113' and not is_block_code(code, status)):
                             raise last
                         # a killed account cannot serve this request; rotating
-                        # now only burns the next account on the same ban
-                        if account.state is AccountState.DEAD:
+                        # now only burns the next account on the same ban. A
+                        # suspension is the exception: the ban is account-wide,
+                        # so the next account may well be healthy.
+                        if account.state is AccountState.DEAD and not _is_suspension_failure(last):
                             raise last
                         tried.add(account.id)
                         continue
@@ -595,7 +647,7 @@ class ChatService:
                                                 expected_credentials=credentials)
                         last = UpstreamFailure(status, code, message)
                         if is_model_overload(status, code): raise last
-                        if account.state is AccountState.DEAD:
+                        if account.state is AccountState.DEAD and not _is_suspension_failure(last):
                             raise last
                         tried.add(account.id)
                         break
@@ -648,6 +700,8 @@ class ChatService:
                         await self.pool.release(account)
             if attempt + 1 < self.cfg.upstream.max_attempts:
                 await asyncio.sleep(0.1 * (attempt + 1))
+        if last is not None and _is_suspension_failure(last):
+            raise _soft_suspension_failure()
         raise last or NoAccountsAvailable()
 
     async def stream(self, payload, *, model, variant='anthropic', dialect='openai', client_key='anonymous', anthropic=False):
@@ -688,14 +742,6 @@ class ChatService:
                             text = json.dumps(event, ensure_ascii=False)
                             captured.append(text)
                             capture_size += len(text)
-                        if not committed:
-                            if kind in ('message_start', 'ping'):
-                                prelude.append(event)
-                                continue
-                            committed = True
-                            for held in prelude:
-                                for out in emit(held): yield out
-                            prelude.clear()
                         # OpenAI-shaped mid-stream error frame: {"error":{...}} with
                         # no "type" key (captured 2026-09-16). Without this branch it
                         # fell through to the Anthropic passthrough as `event: None`
@@ -708,11 +754,36 @@ class ChatService:
                                 429 if code in ('11113', 'rate_limit_error') or is_concurrency_code(code) else 502)
                             await self._apply_error(handle.account, model, status, code, message,
                                                     expected_credentials=handle.credentials)
+                            suspension = is_account_suspended(message)
+                            # nothing but the buffered prelude has reached the client yet:
+                            # let the outer retry loop re-open on another account
+                            if suspension and not committed:
+                                raise UpstreamFailure(status, code, message)
+                            if not committed:
+                                committed = True
+                                for held in prelude:
+                                    for out in emit(held): yield out
+                                prelude.clear()
                             self._log_stream_failure(handle, UpstreamFailure(status, code, message),
                                                      committed=committed, events=seen, retry=False)
-                            yield _sse_event('error', event) if anthropic else sse_frame(openai_error(status, code, message))
+                            if suspension:
+                                soft = _soft_suspension_failure()
+                                extra = _soft_sse_extra(soft)
+                                error = anthropic_error(soft.status, soft.code, soft.message, extra) \
+                                    if anthropic else openai_error(soft.status, soft.code, soft.message, extra)
+                                yield _sse_event('error', error) if anthropic else sse_frame(error)
+                            else:
+                                yield _sse_event('error', event) if anthropic else sse_frame(openai_error(status, code, message))
                             if not anthropic: yield b'data: [DONE]\n\n'
                             return
+                        if not committed:
+                            if kind in ('message_start', 'ping'):
+                                prelude.append(event)
+                                continue
+                            committed = True
+                            for held in prelude:
+                                for out in emit(held): yield out
+                            prelude.clear()
                         for out in emit(event): yield out
                         if kind == 'message_stop':
                             stopped = True
@@ -741,10 +812,11 @@ class ChatService:
             status = 499
             raise
         except (httpx.HTTPError, ValueError, KeyError, UpstreamFailure) as exc:
-            status = 502
+            status = exc.status if isinstance(exc, UpstreamFailure) else 502
             code = getattr(exc, 'code', 'stream_error')
             message = getattr(exc, 'message', 'ZCode stream interrupted')
-            error = anthropic_error(status, code, message) if anthropic else openai_error(status, code, message)
+            extra = _soft_sse_extra(exc) if getattr(exc, 'soft', False) else None
+            error = anthropic_error(status, code, message, extra) if anthropic else openai_error(status, code, message, extra)
             yield _sse_event('error', error) if anthropic else sse_frame(error)
             if not anthropic: yield b'data: [DONE]\n\n'
         finally:
