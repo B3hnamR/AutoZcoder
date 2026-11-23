@@ -24,7 +24,7 @@ const SECTIONS = [
     ["accounts.pool_file", "text", "Pool file", "Only used when the source is “Pool file”.", { adv: true }],
   ]},
   { id: "pool", title: "Account rotation", desc: "How requests spread across accounts, and how failures are handled.", rows: [
-    ["pool.strategy", "enum", "How to pick an account", "Decides which account serves the next request."],
+    ["pool.strategy", "enum", "How to pick an account", "Decides which account serves the next request. Applies immediately."],
     ["pool.max_in_flight_per_account", "int", "Simultaneous requests per account",
      "How many requests one account may run at once. Higher is faster but looks busier to the provider.", { min: 1 }],
     ["pool.acquire_wait_seconds", "float", "Wait for a free account",
@@ -226,7 +226,7 @@ export async function mount({ root, signal }) {
     try {
       const r = await api.put("/admin/dash/settings", { values });
       toast(r.changed.length
-        ? "Saved " + r.changed.length + " setting(s) — restart to apply"
+        ? "Saved " + r.changed.length + " setting(s)" + (r.restart_required ? ". Restart to apply remaining changes." : ". Applied immediately.")
         : "No changes", "ok");
       await load();
     } catch (e) { toast("save: " + e.message, "err"); }
@@ -305,7 +305,7 @@ export async function mount({ root, signal }) {
           finally { control.disabled = false; }
         } }),
         el("span", { class: "field__help", text:
-          "Saved to " + (data.config_path || "config.yaml") + ". Changes apply after the gateway restarts." }),
+          "Saved to " + (data.config_path || "config.yaml") + ". Most changes require a restart." }),
       ]),
       el("div", { class: "set-wrap" }, [
         toc,

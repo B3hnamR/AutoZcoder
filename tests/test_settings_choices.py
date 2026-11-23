@@ -37,6 +37,17 @@ def test_settings_endpoint_ships_the_dropdown_choices(tmp_path, monkeypatch):
     assert "enabled" in s["effective"]["update"]                 # update.* shows its real value
 
 
+def test_saving_strategy_updates_live_accounts_pool_without_restart(tmp_path, monkeypatch):
+    cfg, conf, app = _client(tmp_path, monkeypatch)
+    h = {"Authorization": f"Bearer {cfg.server.admin_key}"}
+    with TestClient(app) as c:
+        assert c.get("/admin/pool/state", headers=h).json()["strategy"] == "drain_first"
+        result = c.put("/admin/dash/settings", headers=h, json={"values": {"pool.strategy": "round_robin"}})
+        assert result.json() == {"changed": ["pool.strategy"], "restart_required": False}
+        assert c.get("/admin/pool/state", headers=h).json()["strategy"] == "round_robin"
+    assert yaml.safe_load(conf.read_text(encoding="utf-8"))["pool"]["strategy"] == "round_robin"
+
+
 def test_enum_settings_reject_values_that_would_break_the_next_boot(tmp_path, monkeypatch):
     cfg, conf, app = _client(tmp_path, monkeypatch)
     h = {"Authorization": f"Bearer {cfg.server.admin_key}"}

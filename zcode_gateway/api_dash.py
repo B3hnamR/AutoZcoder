@@ -325,8 +325,7 @@ async def dash_settings(request: Request, key: str = Depends(admin_key)) -> dict
 @_config_transaction
 async def dash_settings_put(request: Request, body: dict = Body(...),
                             key: str = Depends(admin_key)) -> dict:
-    """Write whitelisted settings keys back to config.yaml. A restart is
-    required for most of them to take effect (pool/tokens are in memory)."""
+    """Persist settings and apply the account selection strategy live."""
     state = get_state(request)
     cfg_path = _config_path(state)
     if cfg_path is None:
@@ -427,7 +426,9 @@ async def dash_settings_put(request: Request, body: dict = Body(...),
         except RuntimeError as exc:
             raise HTTPException(400, str(exc)) from exc
         await asyncio.to_thread(_atomic_write_yaml, cfg_path, raw)
-    return {"changed": changed, "restart_required": bool(changed)}
+    if "pool.strategy" in values:
+        state.cfg.pool.strategy = validated.pool.strategy
+    return {"changed": changed, "restart_required": any(k != "pool.strategy" for k in changed)}
 
 
 @router.post("/admin/dash/import")
@@ -1001,6 +1002,8 @@ async def generator_locate_set(request: Request, body: dict = Body(default={}),
                         exc_info=True)
         state.claim_scheduler = None
     state.generator = None
+    if state.cfg.claims.daily_enabled:
+        _start_daily_scheduler(state)
     return {"ok": True, "path": str(root), "found": True, "applied": "live"}
 
 
@@ -1032,8 +1035,20 @@ def _qualifying_start_balance(raw: dict, now: float) -> bool:
 
 
 def _generator(request: Request):
-    """The GeneratorManager for this app state, created lazily."""
-    state = get_state(request)
+    return _generator_for_state(get_state(request))
+
+
+def _start_daily_scheduler(state) -> None:
+    try:
+        _generator_for_state(state)
+    except HTTPException as exc:
+        log.warning("daily scheduler unavailable: %s", exc.detail)
+    except Exception:
+        log.exception("daily scheduler could not start")
+
+
+def _generator_for_state(state):
+    """Initialize the manager on first use or at boot for a daily schedule."""
     if getattr(state, "update_phase", "idle") == "applying":
         raise HTTPException(409, "Gateway is preparing an update; no new generator work can start")
     mgr = getattr(state, "generator", None)
@@ -1155,18 +1170,16 @@ def _generator(request: Request):
                                    plans[0] if plans else "")
                 if auto and cancelled():
                     return cancelled_result()
-                receipt = {}
                 if auto:
                     if not _qualifying_start_balance(plan_info.get("raw") or {}, time.time()):
                         return {"qualified": False, "category": "no_plan", "error": "No currently spendable Start Plan balance"}
                     run_id, attempt_id = info.get("auto_run_id"), info.get("auto_attempt_id")
                     if not run_id or not attempt_id:
                         return {"qualified": False, "category": "registration_error", "error": "Registration receipt identity missing"}
-                    receipt = {"auto_run_id": run_id, "auto_attempt_id": attempt_id, "auto_qualified": "true"}
                 account = mint_and_register(
                     state.cfg.accounts.dir, email, zjwt,
                     state.cfg.upstream.fingerprint.device_mid,
-                    plan=chosen_plan, **({"receipt": receipt} if auto else {}))
+                    plan=chosen_plan)
                 if account:
                     log.info("generator: %s joined the pool (plan=%s)", email, chosen_plan)
                     fut = asyncio.run_coroutine_threadsafe(
@@ -1179,9 +1192,7 @@ def _generator(request: Request):
                                     "error": "Saved account needs a fresh successful plan/quota check"}
                         if cancelled():
                             return {"qualified": False, "category": "stopped", "error": "Account saved during stop; excluded from run goal"}
-                        run_id, attempt_id = info.get("auto_run_id"), info.get("auto_attempt_id")
-                        if not run_id or not attempt_id:
-                            return {"qualified": False, "category": "registration_error", "error": "Registration receipt identity missing"}
+                        mgr.mark_registered(email)
                         from .accounts_dir import save_account_snapshot
                         # Publish the qualification receipt only after a valid
                         # Start-plan-owned balance and canonical pool insertion.
@@ -1195,11 +1206,10 @@ def _generator(request: Request):
                     if not auto:
                         asyncio.run_coroutine_threadsafe(
                             _settle_new_account(account.id), main_loop)
-                    try:
-                        mgr.mark_registered(email)   # done → never re-register
-                    except Exception:
-                        if auto:
-                            return {"qualified": False, "category": "registration_error", "error": "Registration ledger could not be saved"}
+                        try:
+                            mgr.mark_registered(email)
+                        except Exception:
+                            log.warning("could not save registration ledger", exc_info=True)
                     # 2/3 referral (bind ok, message blocked by risk control):
                     # remember it so the background finisher can complete it
                     if not auto and chosen_plan != "zcode-v3-start-plan-referral":
@@ -1240,11 +1250,11 @@ def _generator(request: Request):
 
         from .generator import GeneratorManager, claim_result_landed
         gc = state.cfg.generator
-        # Portable install: worker output (accounts/plans/proxies) lives beside
-        # the exe in ./generator-data; this source checkout keeps it in .local.
+        # Portable Windows installs share the bootstrap's writable data root.
+        # Linux installs keep worker data in the installer-managed directory.
         from .paths import app_dir, base_dir
         checkout = app_dir()
-        data_dir = (Path(sys.executable).resolve().parent / "generator-data"
+        data_dir = ((base_dir() if sys.platform == "win32" else checkout) / "generator-data"
                     if getattr(sys, "frozen", False)
                     else base_dir() / "generator-data" if (checkout / ".git").is_dir() and gen_dir.resolve() == (checkout / "generator").resolve()
                     else gen_dir / "output")
@@ -1264,9 +1274,7 @@ def _generator(request: Request):
             daily_time=getattr(cc, "daily_time", "19:02"),
             utc_offset_hours=float(getattr(cc, "daily_utc_offset_hours", 8.0)),
             state_path=data_dir / "claim_schedule.json")
-        scheduler.start()
         mgr.claim_scheduler = scheduler
-        state.claim_scheduler = scheduler
         existing_setup = getattr(state, "_env_setup", None)
         if existing_setup is not None:
             mgr.env_setup = existing_setup
@@ -1387,6 +1395,8 @@ def _generator(request: Request):
             log.exception("generator: catch-up scan failed")
 
         _start_referral_finisher(mgr)
+        state.claim_scheduler = scheduler
+        scheduler.start()
     return mgr
 
 
@@ -1912,5 +1922,3 @@ async def delete_relay_endpoint(request: Request, relay_id: str,
     if not ok:
         raise HTTPException(status_code=404, detail="Relay not found")
     return {"ok": True, "deleted": relay_id}
-
-
