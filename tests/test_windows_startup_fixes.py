@@ -34,7 +34,7 @@ def test_worker_publishes_terminal_failure(monkeypatch, error):
     assert gui._server_failed.is_set()
     assert gui._server_error is error
     network = Mock(side_effect=AssertionError("must not probe a failed server"))
-    monkeypatch.setattr(gui.urllib.request, "urlopen", network)
+    monkeypatch.setattr(gui, "_gateway_urlopen", network)
     assert not gui._wait_for("http://127.0.0.1/dash")
     network.assert_not_called()
 
@@ -73,7 +73,7 @@ def test_actual_server_startup_failure_is_terminal_without_retries(monkeypatch, 
 def test_readiness_never_accepts_unowned_listener(monkeypatch):
     monkeypatch.setattr(gui, "_server", SimpleNamespace(started=False))
     network = Mock(side_effect=AssertionError("must wait for own bound listener"))
-    monkeypatch.setattr(gui.urllib.request, "urlopen", network)
+    monkeypatch.setattr(gui, "_gateway_urlopen", network)
     assert not gui._wait_for("http://127.0.0.1/dash", timeout=0.001)
     network.assert_not_called()
 
@@ -86,7 +86,7 @@ def test_update_readiness_requires_exact_nonce(monkeypatch, received, ready):
     response.__enter__ = Mock(return_value=response)
     response.__exit__ = Mock(return_value=False)
     network = Mock(return_value=response)
-    monkeypatch.setattr(gui.urllib.request, "urlopen", network)
+    monkeypatch.setattr(gui, "_gateway_urlopen", network)
     assert gui._wait_for("http://127.0.0.1:9876/dash", timeout=0.001) is ready
     request = network.call_args.args[0]
     assert request.full_url == "http://127.0.0.1:9876/health"
@@ -216,3 +216,58 @@ def test_real_powershell_health_matches_only_replacement_nonce(tmp_path, header,
         server.shutdown()
         server.server_close()
         worker.join(2)
+
+
+
+def test_gateway_urlopen_bypasses_system_proxy(monkeypatch):
+    response = Mock()
+    opener = Mock()
+    opener.open.return_value = response
+    captured = {}
+
+    def build_opener(*handlers):
+        captured["handlers"] = handlers
+        return opener
+
+    monkeypatch.setattr(gui.urllib.request, "build_opener", build_opener)
+    result = gui._gateway_urlopen("http://127.0.0.1:9876/dash", timeout=2)
+
+    assert result is response
+    proxy_handlers = [h for h in captured["handlers"]
+                      if isinstance(h, gui.urllib.request.ProxyHandler)]
+    assert len(proxy_handlers) == 1
+    assert proxy_handlers[0].proxies == {}
+    opener.open.assert_called_once_with("http://127.0.0.1:9876/dash", timeout=2)
+
+
+def test_gateway_urlopen_uses_supplied_tls_context(monkeypatch):
+    context = ssl.create_default_context()
+    opener = Mock()
+    monkeypatch.setattr(gui.urllib.request, "build_opener", Mock(return_value=opener))
+
+    gui._gateway_urlopen("https://localhost:9876/dash", timeout=2, context=context)
+
+    handlers = gui.urllib.request.build_opener.call_args.args
+    https_handlers = [h for h in handlers
+                      if isinstance(h, gui.urllib.request.HTTPSHandler)]
+    assert len(https_handlers) == 1
+    assert https_handlers[0]._context is context
+
+
+def test_readiness_timeout_records_last_connection_error(monkeypatch, caplog):
+    monkeypatch.setattr(gui, "_server", SimpleNamespace(started=True))
+    monkeypatch.setattr(gui, "_gateway_urlopen",
+                        Mock(side_effect=OSError("proxy refused local connection")))
+    assert not gui._wait_for("http://127.0.0.1:9876/dash", timeout=0.01)
+    assert "proxy refused local connection" in caplog.text
+    assert "readiness timed out" in caplog.text.lower()
+
+
+def test_worker_logs_full_exception(monkeypatch, caplog):
+    def fail():
+        raise ValueError("diagnostic sentinel")
+
+    monkeypatch.setattr(gui, "_run_server", fail)
+    gui._server_worker()
+    assert "diagnostic sentinel" in caplog.text
+    assert "Gateway server worker crashed" in caplog.text

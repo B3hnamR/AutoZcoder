@@ -8,6 +8,7 @@ A single-instance mutex prevents a second exe from fighting over the port.
 from __future__ import annotations
 
 import ctypes
+import logging
 import os
 import secrets
 import ssl
@@ -66,20 +67,33 @@ _last_gateway_context: ssl.SSLContext | None = None
 _server = None
 _server_failed = threading.Event()
 _server_error: BaseException | None = None
+_desktop_log = logging.getLogger("zcode_gateway.desktop")
 
 
 def _fix_streams() -> None:
-    """A --windowed frozen exe has no console; sys.stdout/err may be None.
-    pywebview and the app log through these — give them a real file."""
+    """Give frozen/windowed builds durable stdout/stderr before any startup work."""
     log_dir = os.path.join(os.environ.get("LOCALAPPDATA", "."), "ZcodeGateway")
-    os.makedirs(log_dir, exist_ok=True)
-    path = os.path.join(log_dir, "zcode-gateway.log")
-    for name in ("stdout", "stderr"):
-        try:
-            f = open(path, "a", encoding="utf-8", buffering=1)
-            setattr(sys, name, f)
-        except OSError:
-            pass
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        path = os.path.join(log_dir, "zcode-gateway.log")
+        for name in ("stdout", "stderr"):
+            try:
+                setattr(sys, name, open(path, "a", encoding="utf-8", buffering=1))
+            except OSError:
+                pass
+        _desktop_log.info("Desktop launcher starting; diagnostic log: %s", path)
+    except Exception:
+        # Logging must never prevent the gateway itself from starting.
+        pass
+
+
+def _gateway_urlopen(request, *, timeout: float, context: ssl.SSLContext | None = None):
+    """Open our own listener directly; system HTTP proxies must not intercept loopback probes."""
+    handlers = [urllib.request.ProxyHandler({})]
+    if context is not None:
+        handlers.append(urllib.request.HTTPSHandler(context=context))
+    opener = urllib.request.build_opener(*handlers)
+    return opener.open(request, timeout=timeout)
 
 
 def _gateway_context(ca_file: str) -> ssl.SSLContext:
@@ -97,20 +111,40 @@ def _wait_for(url: str, timeout: float = 30.0, *,
     nonce = os.environ.get("ZCODE_GATEWAY_UPDATE_NONCE", "")
     if nonce:
         url = url.rsplit("/", 1)[0] + "/health"
+    attempts = 0
+    last_error: BaseException | None = None
+    _desktop_log.info("Waiting for gateway readiness: url=%s timeout=%.1fs nonce_check=%s",
+                      url, timeout, bool(nonce))
     while time.monotonic() < deadline:
         if _server_failed.is_set():
+            _desktop_log.error("Gateway worker terminated before readiness; error=%r", _server_error)
             return False
         try:
             # A different listener on the configured port is not our server.
             if _server is not None and _server.started:
+                attempts += 1
                 probe = urllib.request.Request(url, headers={"X-AutoZCoder-Update": nonce}) if nonce else url
-                with urllib.request.urlopen(probe, timeout=2, context=context) as r:
+                with _gateway_urlopen(probe, timeout=2, context=context) as r:
                     if (r.status == 200 and not _server_failed.is_set()
                             and (not nonce or r.headers.get("X-AutoZCoder-Update") == nonce)):
+                        _desktop_log.info("Gateway readiness confirmed after %d probe(s): HTTP %s",
+                                          attempts, r.status)
                         return True
-        except Exception:
-            pass
+                    last_error = RuntimeError(
+                        f"unexpected readiness response: HTTP {r.status}, "
+                        f"nonce_match={not nonce or r.headers.get('X-AutoZCoder-Update') == nonce}")
+        except Exception as exc:
+            last_error = exc
+            if attempts == 1 or attempts % 10 == 0:
+                _desktop_log.warning("Readiness probe %d failed for %s: %s: %s",
+                                     attempts, url, type(exc).__name__, exc)
         _server_failed.wait(0.4)
+    _desktop_log.error(
+        "Gateway readiness timed out after %.1fs (%d probe(s)); url=%s; "
+        "server_started=%s; worker_failed=%s; last_error=%s: %s",
+        timeout, attempts, url, bool(_server is not None and _server.started),
+        _server_failed.is_set(), type(last_error).__name__ if last_error else "none",
+        last_error or "no HTTP response received")
     return False
 
 
@@ -179,7 +213,13 @@ def _server_worker() -> None:
         _server_error = RuntimeError("Gateway stopped")
     except BaseException as exc:
         _server_error = exc
+        _desktop_log.error("Gateway server worker crashed: %s: %s",
+                           type(exc).__name__, exc,
+                           exc_info=(type(exc), exc, exc.__traceback__))
     finally:
+        if _server_error is None:
+            _server_error = RuntimeError("Gateway worker exited unexpectedly")
+            _desktop_log.error("Gateway server worker exited without an exception")
         _server_failed.set()
 
 
@@ -292,7 +332,7 @@ def main() -> None:
         # already live — open it in the browser. If it's the old Tkinter build
         # (no /dash route) that returns 404, so surface a clear message instead.
         try:
-            with urllib.request.urlopen(url, timeout=3, context=context) as r:
+            with _gateway_urlopen(url, timeout=3, context=context) as r:
                 if r.status == 200:
                     webbrowser.open(url)
                     return
@@ -305,10 +345,13 @@ def main() -> None:
 
     threading.Thread(target=_server_worker, daemon=True, name="gateway").start()
     browser_fallback = False
+    _desktop_log.info("Gateway process launched; expected dashboard origin=%s", origin)
     if not _wait_for(url, context=context):
         if _server is not None:
             _server.should_exit = True
-        _notify("Zcode Gateway could not start. Check the gateway log for details.")
+        _desktop_log.error("Gateway startup aborted because dashboard readiness was not confirmed; "
+                           "worker_error=%r", _server_error)
+        _notify("Zcode Gateway could not start. Check the diagnostic log for details.")
         raise SystemExit(1) from _server_error
     elif not _webview2_available():
         # native window impossible on this machine: install prompt + browser
@@ -361,7 +404,7 @@ def _shutdown_generator() -> None:
                           data=b"{}", method="POST",
                           headers={"Authorization": "Bearer " + key,
                                    "Content-Type": "application/json"})
-        with _ur.urlopen(req, timeout=90, context=_last_gateway_context) as _:
+        with _gateway_urlopen(req, timeout=90, context=_last_gateway_context) as _:
             pass
     except Exception:
         pass
@@ -370,7 +413,13 @@ def _shutdown_generator() -> None:
 if __name__ == "__main__":
     try:
         main()
-    except Exception:
+    except BaseException as exc:
         import traceback
-        sys.stderr.write(traceback.format_exc()[-1200:] + "\n")
-        raise SystemExit(1)
+        try:
+            sys.stderr.write("\n[FATAL] Desktop launcher terminated: "
+                             f"{type(exc).__name__}: {exc}\n")
+            traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)
+            sys.stderr.flush()
+        except Exception:
+            pass
+        raise SystemExit(1) from exc
