@@ -21,3 +21,8 @@
 *.png  binary
 
 *.sh   text eol=lf
+
+# bundled exit-network clients and their server list are binaries
+vendor/psiphon/psiphon-tunnel-core-* binary
+vendor/psiphon/server-list.dat binary
+vendor/surfshark/wireproxy-* binary

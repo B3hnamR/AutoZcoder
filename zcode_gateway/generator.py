@@ -28,6 +28,8 @@ from pathlib import Path
 from .captcha_tickets import CaptchaTicketPool
 
 from .process_env import external_process_env
+from .psiphon import PsiphonPool
+from .surfshark import SurfsharkPool
 
 
 def _gen_dir_under(path: Path) -> Path | None:
@@ -1893,6 +1895,10 @@ class GeneratorManager:
         self.load_options()
         # tidy a legacy-flat data dir into the sorted layout (once, best-effort)
         self._cleanup_layout()
+        # bundled exit networks used as an IP source (see zcode_gateway/vpn.py)
+        self.psiphon = PsiphonPool(self.data_dir)
+        self.surfshark = SurfsharkPool(self.data_dir)
+        self._vpn_autostarted = False
         from .auto_generate import AutoGenerateController
         self.auto_generate = AutoGenerateController(self.data_dir, launch=self._auto_launch,
                                                     preflight=self._auto_preflight)
@@ -3394,7 +3400,8 @@ class GeneratorManager:
             self.custom_ai_key = str(kw["custom_ai_key"] or "").strip()
         if "custom_ai_model" in kw:
             self.custom_ai_model = str(kw["custom_ai_model"] or "").strip()
-        if "ip_source" in kw and kw["ip_source"] in ("socks", "pool", "direct", "pin"):
+        if "ip_source" in kw and kw["ip_source"] in ("socks", "pool", "direct", "pin",
+                                                     "psiphon", "surfshark"):
             # 'socks' was the old socks-only pool entry — now the pool with the
             # proxy_types filter applied; normalize so the UI shows one option
             self.ip_source = "pool" if kw["ip_source"] == "socks" else kw["ip_source"]
@@ -3737,6 +3744,9 @@ class GeneratorManager:
                             f"to AI. Or configure a custom AI endpoint below."
                         )
                     }
+            exit_pool = self.exit_pool()
+            if exit_pool is not None and not exit_pool.ready():
+                return {"error": exit_pool.unavailable()}
             started = []
             for _ in range(max(1, min(count, 8))):
                 self._seq += 1
@@ -3954,11 +3964,43 @@ class GeneratorManager:
             schemes = self._proxy_type_schemes()
             if schemes:
                 env["ZAI_PROXY_TYPES"] = ",".join(schemes)
+        elif self.ip_source in ("psiphon", "surfshark"):
+            # Each signup gets the next ready region, so accounts do not share
+            # one exit address. No ready region: the worker is refused earlier.
+            exit_pool = self.exit_pool()
+            picked = exit_pool.pick() if exit_pool else None
+            if picked is not None:
+                env["ZAI_PROXY"] = f"socks5://127.0.0.1:{picked.port}"
         elif self.ip_source == "pin" and self.pin_proxy:
             env["ZAI_PROXY"] = self.pin_proxy
         elif self.ip_source == "direct":
             env["ZAI_PROXY"] = "0"
         return env
+
+    def exit_pool(self):
+        """The bundled exit network backing the current IP source, if any."""
+        if self.ip_source == "psiphon":
+            return getattr(self, "psiphon", None)
+        if self.ip_source == "surfshark":
+            return getattr(self, "surfshark", None)
+        return None
+
+    def vpn_status(self) -> dict:
+        state = {}
+        for kind in ("psiphon", "surfshark"):
+            pool = getattr(self, kind, None)
+            state[kind] = pool.status() if pool is not None else {}
+        return state
+
+    def autostart_vpns(self) -> None:
+        """Bring up the exit networks the user asked to start with the gateway."""
+        if getattr(self, "_vpn_autostarted", True):
+            return
+        self._vpn_autostarted = True
+        for kind in ("psiphon", "surfshark"):
+            pool = getattr(self, kind, None)
+            if pool is not None:
+                pool.autostart()
 
     def _worker_done(self, w: GenWorker):
         if w.stopped or self._closed.is_set():
@@ -4053,6 +4095,13 @@ class GeneratorManager:
             job.stop()
         for worker in workers:
             worker.stop()
+        # The bundled exit networks outlive single workers: stop them with the
+        # generator so no client process is left behind.
+        try:
+            self.psiphon.shutdown()
+            self.surfshark.shutdown()
+        except Exception:
+            pass
         try:
             self.checker.shutdown()
             for job in jobs + workers:
@@ -4429,4 +4478,5 @@ class GeneratorManager:
             "claims": [j.to_public() for j in claims],
             "alive": sum(1 for w in workers if w.alive()),
             "auto_generate": self.auto_generate.status(),
+            "vpn": self.vpn_status(),
         }

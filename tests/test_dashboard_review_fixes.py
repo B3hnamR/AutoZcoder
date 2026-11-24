@@ -363,3 +363,43 @@ def test_logs_clear_watermark_survives_polls_filters_and_duplicate_text(dashboar
     page.evaluate("view.refresh()")
     assert page.locator(".logpane__line").count() == 1
     assert "latest record" in page.locator(".logpane").inner_text()
+
+def test_generator_ip_source_card_lists_bundled_exits(dashboard):
+    """The IP source card renders Psiphon regions and the Surfshark key form."""
+    page, overrides, defaults, calls = dashboard
+    vpn = {
+        "psiphon": {
+            "installed": True, "problem": "", "busy": "", "lastError": "",
+            "running": True, "live": 1,
+            "config": {"enabled": True, "autoStart": False, "regions": ["NL"],
+                       "mode": "spread", "pinned": ""},
+            "available": ["DE", "NL"],
+            "regionNames": {"DE": "Germany", "NL": "Netherlands"},
+            "regions": [{"region": "NL", "state": "ready", "port": 47100,
+                         "exitIp": "203.0.113.7", "location": "NL", "since": 0, "error": ""}],
+        },
+        "surfshark": {
+            "installed": True, "problem": "", "busy": "", "lastError": "",
+            "running": False, "live": 0,
+            "config": {"enabled": True, "autoStart": False, "regions": [],
+                       "mode": "spread", "pinned": ""},
+            "servers": [], "keys": {"saved": False, "publicKey": ""},
+            "updatedAt": 0, "regions": [],
+        },
+    }
+    defaults["/admin/dash/generator/status"] = {
+        "options": {}, "workers": [], "claims": [], "vpn": vpn,
+    }
+    defaults["/admin/dash/generator/vpn/status"] = vpn
+    overrides["/admin/dash/generator/vpn/psiphon/renew"] = lambda route: route.fulfill(json=vpn)
+    mount(page, "generator")
+    page.get_by_text("IP source: Psiphon & Surfshark").wait_for()
+    assert page.get_by_text("1 of 1 connected").is_visible()
+    assert page.get_by_text("203.0.113.7").is_visible()
+    assert page.get_by_text("Netherlands").is_visible()
+    page.get_by_text("Surfshark key pair").wait_for()
+    assert page.get_by_text("Private key", exact=True).is_visible()
+    page.get_by_role("button", name="New address").first.click()
+    page.wait_for_timeout(200)
+    renew = [c for c in calls if c[1] == "/admin/dash/generator/vpn/psiphon/renew"]
+    assert renew and renew[-1][2] == {"region": "NL"}

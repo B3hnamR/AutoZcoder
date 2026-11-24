@@ -88,6 +88,29 @@ done
 # Whitelist worker sources and generate config without reading local secrets.
 "$PY" scripts/packaging/stage_mail_worker.py mail-worker "$MAIL_STAGE"
 
+# 3b. bundled exit networks for Generator -> IP source. Psiphon publishes a
+# Linux x86-64 client only; Surfshark's wireproxy also has arm64.
+VPN_ARGS=()
+case "$(uname -m)" in
+    x86_64|amd64)
+        VPN_ARGS+=(
+            --add-binary "$ROOT/vendor/psiphon/psiphon-tunnel-core-linux-amd64:psiphon"
+            --add-data "$ROOT/vendor/psiphon/psiphon.json:psiphon"
+            --add-data "$ROOT/vendor/psiphon/server-list.dat:psiphon"
+            --add-data "$ROOT/vendor/psiphon/LICENSE:psiphon"
+        )
+        WIREPROXY="wireproxy-linux-amd64" ;;
+    aarch64|arm64)
+        WIREPROXY="wireproxy-linux-arm64" ;;
+    *)
+        echo "Unsupported architecture for the bundled exit networks: $(uname -m)" >&2
+        exit 1 ;;
+esac
+VPN_ARGS+=(
+    --add-binary "$ROOT/vendor/surfshark/$WIREPROXY:surfshark"
+    --add-data "$ROOT/vendor/surfshark/LICENSE:surfshark"
+)
+
 # 4. pyinstaller onefile (headless entry: zcode_gateway/main.py)
 "$PY" -m PyInstaller \
     --noconfirm --clean --onefile \
@@ -118,6 +141,7 @@ done
     --add-data "$MAIL_STAGE:mail-worker" \
     --add-data "$GEN_STAGE:generator" \
     --add-binary "$ROOT/$MINT_BIN:captcha-mint" \
+    "${VPN_ARGS[@]}" \
     --paths "$ROOT" \
     --workpath .local/build --distpath .local/dist --specpath .local/build/specs \
     "$ROOT/zcode_gateway/main.py"

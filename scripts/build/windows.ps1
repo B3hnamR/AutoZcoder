@@ -171,7 +171,15 @@ $buildArgs = @(
     "--add-data", "$(Join-Path $Here 'assets');assets",
     "--add-data", "$(Join-Path $Here 'zcode_gateway/dashboard');zcode_gateway/dashboard",
     "--add-data", "$mailStage;mail-worker",
-    "--add-data", "$genStage;generator"
+    "--add-data", "$genStage;generator",
+    # bundled exit networks for Generator -> IP source (Psiphon + Surfshark's
+    # WireGuard client); zcode_gateway/vpn.py looks in <_MEIPASS>/<kind>
+    "--add-binary", "$(Join-Path $Here 'vendor/psiphon/psiphon-tunnel-core-windows-i686.exe');psiphon",
+    "--add-data", "$(Join-Path $Here 'vendor/psiphon/psiphon.json');psiphon",
+    "--add-data", "$(Join-Path $Here 'vendor/psiphon/server-list.dat');psiphon",
+    "--add-data", "$(Join-Path $Here 'vendor/psiphon/LICENSE');psiphon",
+    "--add-binary", "$(Join-Path $Here 'vendor/surfshark/wireproxy-windows-amd64.exe');surfshark",
+    "--add-data", "$(Join-Path $Here 'vendor/surfshark/LICENSE');surfshark"
 ) + $mintData + @(
     "--paths", $Here,
     "--workpath", (Join-Path $Here ".local\build"),

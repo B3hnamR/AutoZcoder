@@ -303,6 +303,16 @@ beside its script.
 - Authenticated client/admin routes, per-install keys, redacted captures (off by default).
 - One-click Cloudflare worker deploy with automatic Node.js install.
 
+### Bundled IP sources (generator)
+
+Besides the proxy pool, pinned proxy and direct connection, the generator can
+sign up through **Psiphon** (bundled client, regions of your choice) or your own
+**Surfshark** subscription (WireGuard manual setup, bundled wireproxy). Each
+signup takes the next connected region or location, and **New address**
+reconnects one of them for a different exit. Only the gateway's requests use a
+tunnel: no adapter, route or DNS change on the machine. See
+[`docs/releases/2.2.0.md`](docs/releases/2.2.0.md).
+
 ### Proxy pool (generator)
 
 <details>

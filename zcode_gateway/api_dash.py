@@ -1397,6 +1397,12 @@ def _generator_for_state(state):
         _start_referral_finisher(mgr)
         state.claim_scheduler = scheduler
         scheduler.start()
+        # Connect the bundled exit networks the user asked to start with the
+        # gateway. It runs once per manager, and never blocks this call.
+        try:
+            mgr.autostart_vpns()
+        except Exception:
+            log.exception("generator: exit networks could not start")
     return mgr
 
 
@@ -1553,6 +1559,81 @@ async def generator_options(request: Request, body: dict = Body(...),
             body["claim500"] = False
     _generator(request).set_options(**body)
     return {"ok": True}
+
+
+# ---- bundled exit networks (IP source: Psiphon / Surfshark) ---------------- #
+
+# Each region is a local SOCKS port the generator sends signups through. The
+# dashboard uses these to choose regions, connect, see the exit address, and
+# get a new address. Both clients are bundled, so a running session may drive
+# them; the admin key still gates every call.
+
+def _vpn_pool(request: Request, kind: str):
+    mgr = _generator(request)
+    if kind == "psiphon":
+        return mgr.psiphon
+    if kind == "surfshark":
+        return mgr.surfshark
+    raise HTTPException(404, "unknown exit network")
+
+
+async def _vpn_action(fn, *args) -> dict:
+    try:
+        return await asyncio.to_thread(fn, *args)
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from None
+
+
+@router.get("/admin/dash/generator/vpn/status")
+async def generator_vpn_status(request: Request, key: str = Depends(admin_key)) -> dict:
+    return _generator(request).vpn_status()
+
+
+@router.post("/admin/dash/generator/vpn/surfshark/keys")
+async def generator_surfshark_keys(request: Request, body: dict = Body(...),
+                                   key: str = Depends(admin_key)) -> dict:
+    pool = _vpn_pool(request, "surfshark")
+    return await _vpn_action(pool.set_keys, str(body.get("privateKey") or ""),
+                             str(body.get("publicKey") or ""))
+
+
+@router.post("/admin/dash/generator/vpn/surfshark/keys/remove")
+async def generator_surfshark_keys_remove(request: Request,
+                                          key: str = Depends(admin_key)) -> dict:
+    return await _vpn_action(_vpn_pool(request, "surfshark").clear_keys)
+
+
+@router.post("/admin/dash/generator/vpn/{kind}/connect")
+async def generator_vpn_connect(request: Request, kind: str,
+                                key: str = Depends(admin_key)) -> dict:
+    return await _vpn_action(_vpn_pool(request, kind).connect)
+
+
+@router.post("/admin/dash/generator/vpn/{kind}/disconnect")
+async def generator_vpn_disconnect(request: Request, kind: str,
+                                   key: str = Depends(admin_key)) -> dict:
+    return await _vpn_action(_vpn_pool(request, kind).disconnect)
+
+
+@router.post("/admin/dash/generator/vpn/{kind}/update")
+async def generator_vpn_update(request: Request, kind: str,
+                               key: str = Depends(admin_key)) -> dict:
+    return await _vpn_action(_vpn_pool(request, kind).update)
+
+
+@router.post("/admin/dash/generator/vpn/{kind}/renew")
+async def generator_vpn_renew(request: Request, kind: str, body: dict = Body(...),
+                              key: str = Depends(admin_key)) -> dict:
+    region = str(body.get("region") or "").strip()
+    if not region:
+        raise HTTPException(400, "region is required")
+    return await _vpn_action(_vpn_pool(request, kind).renew, region)
+
+
+@router.post("/admin/dash/generator/vpn/{kind}/settings")
+async def generator_vpn_settings(request: Request, kind: str, body: dict = Body(...),
+                                 key: str = Depends(admin_key)) -> dict:
+    return await _vpn_action(_vpn_pool(request, kind).set_settings, body)
 
 
 @router.post("/admin/dash/generator/start")

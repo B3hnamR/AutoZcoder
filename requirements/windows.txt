@@ -12,6 +12,10 @@ PySocks>=1.7.1,<2.0
 # bundle; AV/proxy TLS interception broke api.netlify.com etc.)
 truststore>=0.9
 certifi
+# Surfshark's WireGuard public key is derived from the private key
+# (zcode_gateway/surfshark.py); Windows CNG covers the ZCode credential
+# decrypt path only, so this is the portable implementation
+cryptography>=42
 
 # desktop shell (WebView2 window for the dashboard) — omit for headless servers
 pywebview>=6.0,<7.0

@@ -6,6 +6,7 @@ import { toast, confirmDialog } from "../core/toast.js";
 import { card, button, badge, metric } from "../core/ui.js";
 import { locateCard, openEnvSetup, ensureEnvironment } from "./generator/setup.js";
 import { createMailCard } from "./generator/mail.js";
+import { createVpnCard } from "./generator/vpn.js";
 import { can, isHeadless, platform } from "../core/caps.js";
 import { createClaimBatch } from "./claim-batch.js";
 import { createAutoGenerate } from "./auto-generate.js";
@@ -96,6 +97,7 @@ export async function mount({ root, signal }) {
   let status = null;
   const claimStates = new Map();
   const mail = createMailCard();
+  const vpn = createVpnCard();
   const batch = createClaimBatch({ signal });
   const auto = createAutoGenerate({ signal });
 
@@ -237,6 +239,8 @@ export async function mount({ root, signal }) {
         ["pool", "Proxy pool (" + (o.pool_available || 0) + ")"],
         ["direct", "My network (no proxy)"],
         ["pin", "Pinned proxy"],
+        ["psiphon", "Psiphon (bundled regions)"],
+        ["surfshark", "Surfshark (my account)"],
       ], ["pool", "socks"].includes(o.ip_source) ? "pool" : o.ip_source)),
       field("ptypes", "Proxy types", select([
         ["all", "All types (" + ((o.types_counts || {}).all || 0) + ")"],
@@ -456,6 +460,7 @@ export async function mount({ root, signal }) {
         actions: el("span", {}, [savedNote, saveFeedback]),
         body: optionsBox,
       }),
+      vpn.node,
       el("div", { class: "cols" }, [aiCard, mail.node]),
       card({ title: "Workers", body: boardBox, flush: true }),
       card({
@@ -497,6 +502,7 @@ export async function mount({ root, signal }) {
       mail.refresh();
     }
     paintBoard(st);
+    vpn.refresh(st.vpn);
     batch.refresh();
     auto.refresh();
   };
