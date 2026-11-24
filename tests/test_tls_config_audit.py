@@ -102,7 +102,7 @@ def test_gui_readiness_uses_full_tls_origin_and_scoped_context(monkeypatch):
         calls.append((url, kwargs))
         return nullcontext(SimpleNamespace(status=200))
 
-    monkeypatch.setattr(gui_main.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(gui_main, "_gateway_urlopen", urlopen)
     assert gui_main._wait_for("https://gw.example.test:9443/dash", context=context)
     assert calls == [("https://gw.example.test:9443/dash", {"timeout": 2, "context": context})]
 
@@ -121,7 +121,7 @@ def test_gui_readiness_does_not_retry_without_tls_verification(monkeypatch):
         calls.append(kwargs)
         raise ssl.SSLCertVerificationError("dummy hostname mismatch")
 
-    monkeypatch.setattr(gui_main.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(gui_main, "_gateway_urlopen", urlopen)
     assert not gui_main._wait_for("https://gw.example.test:9443/dash", timeout=1, context=context)
     assert calls == [{"timeout": 2, "context": context}]
 
@@ -137,7 +137,7 @@ def test_gui_shutdown_preserves_admin_key_and_scoped_tls(monkeypatch):
         calls.append((request, kwargs))
         return nullcontext(SimpleNamespace(status=200))
 
-    monkeypatch.setattr(gui_main.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(gui_main, "_gateway_urlopen", urlopen)
     gui_main._shutdown_generator()
     request, kwargs = calls[0]
     assert request.full_url == "https://gw.example.test:9443/admin/dash/generator/shutdown"
@@ -173,7 +173,7 @@ def test_gui_main_uses_child_connection_for_all_urls(monkeypatch, tmp_path, alre
         calls.append(("ready", url, context))
         return True
 
-    monkeypatch.setattr(gui_main.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(gui_main, "_gateway_urlopen", urlopen)
     monkeypatch.setattr(gui_main, "_wait_for", ready)
     monkeypatch.setattr(gui_main, "_webview2_available", lambda: True)
     monkeypatch.setattr(gui_main.threading, "Thread", lambda **kwargs: SimpleNamespace(start=lambda: None))
