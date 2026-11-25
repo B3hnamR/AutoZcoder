@@ -50,6 +50,49 @@ def manager(tmp_path, monkeypatch):
     return gen.GeneratorManager(tmp_path / "generator", data_dir=tmp_path / "data")
 
 
+@pytest.mark.asyncio
+async def test_worker_details_use_complete_log_and_keep_password_out_of_status(manager, monkeypatch):
+    from fastapi import HTTPException
+    from zcode_gateway import api_dash
+
+    path = manager._worker_log_path("g1")
+    text = "".join(f"Line {i}\n" for i in range(120))
+    path.write_text(text, encoding="utf-8")
+    worker = gen.GenWorker("g1", [], {"ZAI_LOG_FILE": str(path)}, manager.gen_dir)
+    worker.state = "exited"
+    worker.signup_password = "fixture-password"
+    worker.done.set()
+    manager.workers[worker.name] = worker
+    monkeypatch.setattr(api_dash, "_generator", lambda _: manager)
+    monkeypatch.setattr(api_dash, "peer_is_local", lambda _: True)
+    body = {"name": worker.name, "created": worker.created}
+    details = api_dash.generator_worker_details
+
+    status = worker.to_public()
+    assert status["has_log"] and status["has_password"]
+    assert worker.signup_password not in json.dumps(status)
+    log = await details(None, "log", body)
+    assert json.loads(log.body) == {"log": text}
+    password = await details(None, "password", body)
+    assert json.loads(password.body) == {"password": worker.signup_password}
+    assert password.headers["cache-control"] == "no-store"
+
+    if sys.platform == "win32":
+        opened = []
+        monkeypatch.setattr(os, "startfile", opened.append)
+        await details(None, "open-log", body)
+        assert opened == [str(path.resolve())]
+
+    monkeypatch.setattr(api_dash, "peer_is_local", lambda _: False)
+    for action in ("password", "open-log"):
+        with pytest.raises(HTTPException) as denied:
+            await details(None, action, body)
+        assert denied.value.status_code == 403
+    with pytest.raises(HTTPException) as stale:
+        await details(None, "log", {**body, "created": 0})
+    assert stale.value.status_code == 404
+
+
 def load_script(name, path):
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
@@ -83,6 +126,7 @@ def test_old_options_do_not_enable_new_claim_by_default(manager):
 
 def test_display_missing_fails_before_worker_or_proxy(manager, monkeypatch):
     manager.captcha = "classic"
+    monkeypatch.setattr(manager, "_mail_ready", lambda _: True)
     monkeypatch.setattr(gen.sys, "platform", "linux")
     monkeypatch.delenv("DISPLAY", raising=False)
     monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
@@ -92,6 +136,20 @@ def test_display_missing_fails_before_worker_or_proxy(manager, monkeypatch):
     assert "DISPLAY or Xvfb" in manager.start_workers_checked()["error"]
     assert "visible DISPLAY" in manager.start_claim("test@example.com")["error"]
     assert not manager.workers and not manager.claims
+
+
+def test_manual_start_requires_verified_inbox_and_routing(manager, monkeypatch):
+    monkeypatch.setattr(manager, "_ensure_playwright", lambda *_: pytest.fail("installer started"))
+    monkeypatch.setattr(manager, "_ensure_display", lambda **_: pytest.fail("display setup started"))
+    manager.mail_cfg = {"domains": ["example.test"], "active": "example.test",
+                        "inbox_url": "https://worker.invalid/inbox", "inbox_secret": "dummy"}
+    for flags in ({}, {"inbox_ok": True}, {"routing_done": ["example.test"]}):
+        manager.mail_cfg.update(inbox_ok=False, routing_done=[])
+        manager.mail_cfg.update(flags)
+        assert "Finish Email setup" in manager.start_workers_checked()["error"]
+        assert not manager.mail_config()["ready"]
+    manager.mail_cfg.update(inbox_ok=True, routing_done=["example.test"])
+    assert manager.mail_config()["ready"]
 
 
 def test_managed_xvfb_readiness_environment_and_cleanup(manager, monkeypatch):

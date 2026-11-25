@@ -473,12 +473,20 @@ async def check_balance(request: Request, account_id: str,
     account = await state.pool.find(account_id)
     if account is None:
         raise HTTPException(status_code=404, detail="account not found")
-    # full check, not a bare fetch: settles paid_exhausted + plan now
+    checked_at = account.balance_checked_at
+    credentials = account.credential_key()
     await state.tokens.check_account(account)
+    if account.balance_checked_at == checked_at and account.credential_key() != credentials:
+        await state.tokens.check_account(account)
+    if await state.pool.find(account_id) is not account:
+        raise HTTPException(status_code=409, detail="account changed during quota check; retry")
+    quota_error = account.notes.get("quota_check_error", "")
+    refreshed = account.balance_checked_at > checked_at and not quota_error
     me = await state.tokens.fetch_me(account)
     return {"account_id": account_id, "balance_micro": account.balance_micro,
             "balance_checked_at": account.balance_checked_at,
-            "quota_check_error": account.notes.get("quota_check_error", ""),
+            "quota_refreshed": refreshed,
+            "quota_check_error": quota_error or ("" if refreshed else "No fresh quota result; retry"),
             "paid_exhausted": account.paid_exhausted, "has_plan": account.has_plan,
             "me": me, "quotas": account.notes.get("quotas", {}),
             "plans": account.notes.get("plans", [])}

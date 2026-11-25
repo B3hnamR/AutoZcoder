@@ -3,7 +3,7 @@
 
 import { el, fill, $$ } from "../core/dom.js";
 import { api } from "../core/api.js";
-import { toast, confirmDialog } from "../core/toast.js";
+import { toast } from "../core/toast.js";
 import { card, button } from "../core/ui.js";
 import { can, why, platform } from "../core/caps.js";
 import { checkNow as checkForUpdates } from "../core/updates.js";
@@ -110,6 +110,7 @@ let filter = "";
 
 export async function mount({ root, signal }) {
   let data = null;
+  let saving = false;
 
   const lookup = (path) =>
     data.values?.[path] ?? path.split(".").reduce((o, p) => o?.[p], data.effective);
@@ -131,6 +132,7 @@ export async function mount({ root, signal }) {
     if (kind === "bool") {
       const input = el("input", {
         class: "switch__input", type: "checkbox", checked: !!cur,
+        "aria-label": o.label,
         data: { set: path, init: String(!!cur) },
       });
       const state = el("span", { class: "text-sm muted", text: cur ? "On" : "Off" });
@@ -158,6 +160,7 @@ export async function mount({ root, signal }) {
       "aria-label": o.label,
       min: o.min, max: o.max,
       step: kind === "float" ? "any" : (numeric ? "1" : null),
+      required: numeric,
       data: { set: path, init: String(cur ?? "") },
     });
     return o.unit
@@ -217,12 +220,19 @@ export async function mount({ root, signal }) {
   }
 
   async function save() {
+    if (saving) return;
     const values = {};
-    for (const input of $$("[data-set]", root)) {
+    const inputs = $$("[data-set]", root);
+    for (const input of inputs) {
       const cur = input.type === "checkbox" ? String(input.checked) : input.value;
-      if (cur !== input.dataset.init) values[input.dataset.set] = cur;
+      if (cur === input.dataset.init) continue;
+      if (!input.reportValidity()) return;
+      values[input.dataset.set] = cur;
     }
     if (!Object.keys(values).length) { toast("No changes to save", "warn"); return; }
+    saving = true;
+    for (const input of inputs) input.disabled = true;
+    for (const button of $$('[data-needs-dirty]', root)) button.disabled = true;
     try {
       const r = await api.put("/admin/dash/settings", { values });
       toast(r.changed.length
@@ -230,18 +240,11 @@ export async function mount({ root, signal }) {
         : "No changes", "ok");
       await load();
     } catch (e) { toast("save: " + e.message, "err"); }
-  }
-
-  async function regenerateKeys() {
-    const ok = await confirmDialog({
-      title: "Regenerate keys?",
-      body: "The admin key and the first client key both change.\n"
-          + "Anything using the old keys stops working until you update it. A restart is required.",
-      okLabel: "Regenerate",
-      danger: true,
-    });
-    if (!ok) return;
-    toast("Key rotation stays in the desktop launcher for now — it also restarts the gateway.", "warn", 6000);
+    finally {
+      saving = false;
+      for (const input of inputs) input.disabled = false;
+      dirtyState();
+    }
   }
 
   function render() {
@@ -272,10 +275,9 @@ export async function mount({ root, signal }) {
         el("div", { class: "setting__meta" }, [
           el("label", { class: "setting__label", text: "Regenerate keys" }),
           el("p", { class: "field__help", text:
-            "Replaces the admin key and the first client key. Programs using the old keys stop working until you update them." }),
+             platform() === "windows" ? "Use the desktop launcher to regenerate the admin and first client key."
+               : "Update the keys in config.yaml and restart the gateway." }),
         ]),
-        el("div", { class: "setting__control" },
-          button({ label: "Regenerate keys…", variant: "danger", onClick: regenerateKeys })),
       ]),
     });
     keysCard.classList.add("set-card");

@@ -19,6 +19,7 @@ import re
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -31,6 +32,8 @@ REGION_CODE = re.compile(r"^[A-Z]{2}$")
 
 # A client that keeps failing is left stopped instead of spinning.
 MAX_RESTARTS = 5
+HEALTH_PROBE_INTERVAL = 30
+_SETTINGS_WRITE_LOCK = threading.Lock()
 
 
 def bundle_dirs(kind: str) -> list[Path]:
@@ -160,6 +163,10 @@ class ExitPool:
         return self.normalize({**self.defaults, **raw})
 
     def _store(self) -> None:
+        with _SETTINGS_WRITE_LOCK:
+            self._store_locked()
+
+    def _store_locked(self) -> None:
         data: dict[str, Any] = {}
         try:
             current = json.loads(self._settings_path.read_text(encoding="utf-8"))
@@ -169,13 +176,14 @@ class ExitPool:
             data = {}
         data[self.kind] = self._settings
         self._settings_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self._settings_path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(data, indent=1), encoding="utf-8")
+        fd, name = tempfile.mkstemp(dir=self._settings_path.parent, prefix="vpn-", suffix=".tmp")
+        tmp = Path(name)
         try:
-            os.chmod(tmp, 0o600)
-        except OSError:
-            pass
-        os.replace(tmp, self._settings_path)
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(data, stream, indent=1)
+            os.replace(tmp, self._settings_path)
+        finally:
+            tmp.unlink(missing_ok=True)
 
     def normalize(self, config: dict) -> dict:
         return config
@@ -222,6 +230,9 @@ class ExitPool:
     def _prepare(self, inst: Exit) -> None:
         """Called after a port is chosen, before spawning."""
 
+    def _cleanup(self, inst: Exit) -> None:
+        """Remove temporary files owned by this connection attempt."""
+
     def _mark_ready(self, inst: Exit) -> None:
         if inst.state == "ready":
             return
@@ -234,23 +245,37 @@ class ExitPool:
     def _learn_exit(self, inst: Exit) -> None:
         """Trace the exit address in the background; the SOCKS port can take a
         moment to answer after the client reports it is connected."""
-        if inst.extra.get("tracing"):
-            return
-        inst.extra["tracing"] = True
+        with self._lock:
+            if inst.extra.get("tracing") or inst.stop_requested or inst.proc is None:
+                return
+            inst.extra["tracing"] = True
+            inst.extra["last_probe"] = time.monotonic()
 
         def work() -> None:
             try:
-                for _ in range(4):
-                    if inst.proc is None:
+                for attempt in range(4):
+                    if inst.stop_requested or inst.proc.poll() is not None:
                         return
                     info = trace_exit(inst.port)
-                    if info:
-                        inst.exit_ip = info["ip"]
-                        inst.location = info.get("loc", "")
-                        return
-                    time.sleep(3)
+                    with self._lock:
+                        if inst.stop_requested or self._instances.get(inst.region) is not inst:
+                            return
+                        if info and (inst.state == "ready" or self.kind == "surfshark"):
+                            if inst.state == "reconnecting":
+                                self._mark_ready(inst)
+                            inst.exit_ip = info["ip"]
+                            inst.location = info.get("loc", "")
+                            return
+                        if not info and attempt == 3 and self.kind == "surfshark" and inst.state == "ready":
+                            inst.state = "reconnecting"
+                            inst.exit_ip = inst.location = ""
+                            inst.error = "The tunnel did not answer its connection check"
+                    if attempt < 3:
+                        time.sleep(3)
             finally:
-                inst.extra["tracing"] = False
+                with self._lock:
+                    inst.extra["last_probe"] = time.monotonic()
+                    inst.extra["tracing"] = False
 
         threading.Thread(target=work, daemon=True, name=f"{self.kind}-trace").start()
 
@@ -260,6 +285,8 @@ class ExitPool:
 
     def _start(self, region: str, fresh: bool = False) -> Exit:
         with self._lock:
+            if self._closed or not self._settings.get("enabled", True):
+                raise RuntimeError(f"{self.label} is stopped")
             old = self._instances.get(region)
             if old is not None:
                 old.stop_requested = True
@@ -277,6 +304,7 @@ class ExitPool:
                     self._fresh(inst)
             except Exception:
                 self._instances.pop(region, None)
+                self._cleanup(inst)
                 raise
             thread = threading.Thread(target=self._run, args=(inst,), daemon=True,
                                       name=f"{self.kind}-{region}")
@@ -290,15 +318,18 @@ class ExitPool:
         return 0
 
     def _run(self, inst: Exit) -> None:
-        try:
-            proc = self._spawn(inst)
-        except Exception as exc:
-            with self._lock:
+        with self._lock:
+            if self._closed or inst.stop_requested or self._instances.get(inst.region) is not inst:
+                self._cleanup(inst)
+                return
+            try:
+                proc = inst.proc = self._spawn(inst)
+            except Exception as exc:
                 inst.state = "failed"
                 inst.error = str(exc)
                 self._spawn_error = str(exc)
-            return
-        inst.proc = proc
+                self._cleanup(inst)
+                return
         try:
             stream = proc.stdout
             if stream is not None:
@@ -313,6 +344,8 @@ class ExitPool:
                 code = proc.wait(timeout=5)
             except Exception:
                 code = -1
+                self._terminate(inst)
+            self._cleanup(inst)
         with self._lock:
             if inst.stop_requested or self._closed:
                 inst.state = "stopped"
@@ -329,42 +362,39 @@ class ExitPool:
         with self._lock:
             if inst.stop_requested or self._instances.get(inst.region) is not inst:
                 return
-        try:
-            self._start(inst.region)
-        except Exception:
-            pass
-
-    def _terminate(self, inst: Exit) -> None:
-        proc = inst.proc
-        if proc is None:
-            return
-        try:
-            proc.terminate()
-        except Exception:
-            pass
-        try:
-            proc.wait(timeout=5)
-        except Exception:
             try:
-                proc.kill()
+                self._start(inst.region)
             except Exception:
                 pass
 
+    def _terminate(self, inst: Exit) -> None:
+        proc = inst.proc
+        try:
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        finally:
+            self._cleanup(inst)
+
     # ---- actions --------------------------------------------------------
     def connect(self) -> dict:
-        cfg = self.config
-        if not cfg.get("enabled", True):
-            raise RuntimeError(f"{self.label} is turned off. Turn it on first.")
-        if not self.find_client():
-            raise RuntimeError(self.missing_message())
-        regions = cfg.get("regions") or []
-        if not regions:
-            raise RuntimeError("Choose at least one region.")
         with self._lock:
+            if not self._settings.get("enabled", True):
+                raise RuntimeError(f"{self.label} is turned off. Turn it on first.")
+            if not self.find_client():
+                raise RuntimeError(self.missing_message())
+            regions = self._settings.get("regions") or []
+            if not regions:
+                raise RuntimeError("Choose at least one region.")
             self._busy = "connecting"
             self.last_error = ""
-        try:
-            with self._lock:
+            try:
                 for region in list(self._instances):
                     if region not in regions:
                         inst = self._instances.pop(region)
@@ -377,14 +407,12 @@ class ExitPool:
                         if inst is not None:
                             inst.restarts = 0
                         pending.append(region)
-            for region in pending:
-                self._start(region)
-        except Exception as exc:
-            with self._lock:
+                for region in pending:
+                    self._start(region)
+            except Exception as exc:
                 self.last_error = str(exc)
-            raise
-        finally:
-            with self._lock:
+                raise
+            finally:
                 self._busy = ""
         return self.status()
 
@@ -402,9 +430,9 @@ class ExitPool:
         with self._lock:
             live = list(self._instances.values())
             self._instances.clear()
-        for inst in live:
-            inst.stop_requested = True
-            self._terminate(inst)
+            for inst in live:
+                inst.stop_requested = True
+                self._terminate(inst)
 
     def renew(self, region: str) -> dict:
         with self._lock:
@@ -412,7 +440,7 @@ class ExitPool:
                 raise RuntimeError(f"{region} is not one of the chosen regions")
             if region not in self._instances:
                 raise RuntimeError(f"{self.label} {region} is not running. Connect it first.")
-        self._start(region, fresh=True)
+            self._start(region, fresh=True)
         return self.status()
 
     def set_settings(self, patch: dict) -> dict:
@@ -422,24 +450,20 @@ class ExitPool:
             self._store()
             enabled = self._settings.get("enabled", True)
             regions = self._settings.get("regions") or []
-        if not enabled:
-            self.stop_all()
-            return self.status()
-        with self._lock:
-            running = bool(self._instances)
-        if running:
-            with self._lock:
+            if not enabled:
+                self.stop_all()
+            elif self._instances:
                 for region in list(self._instances):
                     if region not in regions:
                         inst = self._instances.pop(region)
                         inst.stop_requested = True
                         self._terminate(inst)
-            for region in regions:
-                if region not in self._instances:
-                    try:
-                        self._start(region)
-                    except Exception:
-                        pass
+                for region in regions:
+                    if region not in self._instances:
+                        try:
+                            self._start(region)
+                        except Exception:
+                            pass
         return self.status()
 
     def autostart(self) -> None:
@@ -485,14 +509,14 @@ class ExitPool:
         return chosen
 
     def unavailable(self) -> str:
-        cfg = self.config
-        if not cfg.get("enabled", True):
-            return f"{self.label} is turned off. Turn it on in Generator → IP source."
-        if not self._instances:
-            return f"{self.label} is not connected. Press Connect under Generator → IP source."
-        if not self.ready():
-            states = ", ".join(f"{r}: {i.state}" for r, i in self._instances.items())
-            return f"No {self.label} region is connected yet ({states})."
+        with self._lock:
+            if not self._settings.get("enabled", True):
+                return f"{self.label} is turned off. Turn it on in Generator → IP source."
+            if not self._instances:
+                return f"{self.label} is not connected. Press Connect under Generator → IP source."
+            if not self.ready():
+                states = ", ".join(f"{r}: {i.state}" for r, i in self._instances.items())
+                return f"No {self.label} region is connected yet ({states})."
         return f"{self.label} has no ready exit right now."
 
     # ---- status ---------------------------------------------------------
@@ -502,11 +526,10 @@ class ExitPool:
         with self._lock:
             instances = list(self._instances.values())
             busy = self._busy
-        # A connected region whose address could not be read yet (the client
-        # said "connected" before its SOCKS port answered) is traced again.
         for inst in instances:
-            if inst.state == "ready" and not inst.exit_ip and not inst.extra.get("tracing") \
-                    and time.time() - inst.since > 5:
+            if ((inst.state == "ready" and not inst.exit_ip)
+                    or (self.kind == "surfshark" and inst.state in ("ready", "reconnecting"))) \
+                    and time.monotonic() - inst.extra.get("last_probe", 0) >= HEALTH_PROBE_INTERVAL:
                 self._learn_exit(inst)
         chosen = cfg.get("regions") or []
         by_region = {i.region: i for i in instances}

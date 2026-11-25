@@ -28,8 +28,12 @@ from pathlib import Path
 from .captcha_tickets import CaptchaTicketPool
 
 from .process_env import external_process_env
-from .psiphon import PsiphonPool
+from .psiphon import PsiphonPool, REGION_NAMES
 from .surfshark import SurfsharkPool
+
+
+class VpnUnavailable(RuntimeError):
+    pass
 
 
 def _gen_dir_under(path: Path) -> Path | None:
@@ -861,6 +865,7 @@ class GenWorker:
         self.name = name
         self.argv = argv
         self.env = env
+        self.route_label = env.pop("_GW_WORKER_ROUTE_LABEL", "")
         self.gen_dir = gen_dir
         self.on_exit = on_exit
         self.proc: subprocess.Popen | None = None
@@ -894,6 +899,7 @@ class GenWorker:
         self.account_file = out_dir / "results" / f"accounts{env.get('ZAI_OUT_SUFFIX', '')}.txt"
         self._account_rows_at_start = self._rows_now()
         self.done = threading.Event()
+        self.signup_password = ""
         self.result = {}
         self.script_result = {}
         self._thread = None
@@ -1064,9 +1070,13 @@ class GenWorker:
         return {
             "name": self.name,
             "proxy": self.proxy,
+            "route_label": self.route_label,
             "captcha": self.captcha,
             "state": self.state,
             "exit_code": self.exit_code,
+            "created": self.created,
+            "has_log": self.done.is_set() and self.state == "exited" and bool(self.env.get("ZAI_LOG_FILE")),
+            "has_password": self.done.is_set() and self.state == "exited" and bool(self.signup_password),
             "auto_generate": self.env.get("ZAI_AUTO_GENERATE") == "1",
             "outcome": {k: v for k, v in self.result.items() if k in ("qualified", "category", "error", "account_id")},
             "email": self.email,
@@ -1878,7 +1888,7 @@ class GeneratorManager:
         self.retries = 5
         self.claim = False                  # legacy invite Global Build (100M) claim on/off
         self.claim500 = False               # legacy 500M giveaway claim (withdrawn 2026-10-26)
-        self.claim_start = True             # Start Plan preview -> billing/claim (default)
+        self.claim_start = False
         self.headless = False               # default: visible window (manual captcha needs it)
         self.browser_display = "auto"       # auto | desktop | virtual (Linux Xvfb)
         self._invite_code = "MT9GNDQ8"      # referral code ('' = off; overridden by config)
@@ -1953,9 +1963,20 @@ class GeneratorManager:
         m["routing_done"] = sorted(done)
         m["routing_all_done"] = bool(doms) and all(d in done for d in doms)
         m["routing_pending"] = [d for d in doms if d not in done]
+        m["ready"] = self._mail_ready(m)
         m.pop("inbox_secret", None)
         m["cf_token_set"] = bool(m.pop("cf_api_token", ""))
         return m
+
+    @staticmethod
+    def _mail_ready(mail: dict) -> bool:
+        domains = mail.get("domains") or []
+        return bool(domains and mail.get("active") in domains and mail.get("inbox_url")
+                    and (mail.get("inbox_secret_set") or mail.get("inbox_secret"))
+                    and mail.get("inbox_ok")
+                    and all(d in (mail.get("routing_done") or []) for d in domains))
+
+    _MAIL_SETUP_REQUIRED = "Finish Email setup before starting: configure domain routing and verify the worker inbox."
 
     def mark_inbox_verified(self, ok: bool) -> None:
         """Persist the last inbox smoke-test result (worker reachability)."""
@@ -3280,8 +3301,9 @@ class GeneratorManager:
                 if d and re.fullmatch(r'[a-z0-9.-]+\.[a-z]{2,}', d) and d not in doms:
                     doms.append(d)
             cfg["domains"] = doms
-            if doms and cfg.get("active") not in doms:
-                cfg["active"] = doms[0]
+            cfg["routing_done"] = [d for d in cfg.get("routing_done", []) if d in doms]
+            if cfg.get("active") not in doms:
+                cfg["active"] = doms[0] if doms else ""
         if "active" in kw:
             a = str(kw["active"] or "").strip().lower().lstrip('@')
             if a in cfg["domains"]:
@@ -3725,6 +3747,8 @@ class GeneratorManager:
                 return {"error": "Stop the Auto Generate run before starting manual workers"}
             if self._closed.is_set():
                 return {"error": "generator is shut down"}
+            if not self._mail_ready(self.mail_cfg):
+                return {"error": self._MAIL_SETUP_REQUIRED}
             # AI judge against the GATEWAY's own model needs a live account
             # pool to serve /v1/chat/completions. A fresh install has zero
             # accounts: warn instead of spawning workers whose every AI call
@@ -3744,22 +3768,21 @@ class GeneratorManager:
                             f"to AI. Or configure a custom AI endpoint below."
                         )
                     }
-            exit_pool = self.exit_pool()
-            if exit_pool is not None and not exit_pool.ready():
-                return {"error": exit_pool.unavailable()}
-            started = []
+            launch = []
             for _ in range(max(1, min(count, 8))):
                 self._seq += 1
                 name = f"g{self._seq}"
-                env = self._worker_env(name)
+                try:
+                    env = self._worker_env(name)
+                except VpnUnavailable as exc:
+                    return {"error": str(exc)}
                 w = GenWorker(name, [self.python_exe, "-u", "main.py", "1"], env,
                               self.gen_dir, on_exit=self._worker_done)
-                self.workers[name] = w
-                started.append(name)
-            launch = [self.workers[name] for name in started]
+                launch.append(w)
+            self.workers.update((worker.name, worker) for worker in launch)
         for worker in launch:
             worker.start()
-        return {"started": started}
+        return {"started": [worker.name for worker in launch]}
 
     def _auto_preflight(self, config: dict) -> None:
         if self._closed.is_set():
@@ -3768,12 +3791,12 @@ class GeneratorManager:
             if any(not worker.done.is_set() and worker.env.get("ZAI_AUTO_GENERATE") != "1"
                    for worker in self.workers.values()):
                 raise ValueError("Finish or stop existing signup workers first")
+        mail = dict(self.mail_cfg)
+        if not self._mail_ready(mail):
+            raise ValueError(self._MAIL_SETUP_REQUIRED)
         check = self.env_setup.check()
         if not check.get("all_ok"):
             raise ValueError("Environment is not ready; open Environment setup")
-        mail = dict(self.mail_cfg)
-        if not mail.get("active") or not mail.get("inbox_url") or not mail.get("inbox_secret"):
-            raise ValueError("Configure a mail domain and inbox before starting")
         inbox = self._verify_inbox(mail["inbox_url"], mail["inbox_secret"], deadline_seconds=12)
         if not inbox.get("ok"):
             raise ValueError("Inbox verification failed; repair Email setup before generating")
@@ -3905,6 +3928,8 @@ class GeneratorManager:
     def start_workers_checked(self, count: int = 1, emit=print) -> dict:
         """start_workers, but with a guaranteed Playwright setup first
         (streams one-time install progress to the caller via `emit`)."""
+        if not self._mail_ready(self.mail_cfg):
+            return {"error": self._MAIL_SETUP_REQUIRED}
         display_error = self._ensure_display(interactive=self.captcha == "manual")
         if display_error:
             return {"error": display_error}
@@ -3920,6 +3945,7 @@ class GeneratorManager:
             "ZAI_OUT_SUFFIX": name,
             "ZAI_OUTPUT_DIR": str(self.data_dir),
             "ZAI_PROXY": "0", "ZAI_USE_POOL": "0", "ZAI_SOCKS_ONLY": "0",
+            "ZAI_REQUIRE_PROXY": "0",
             "ZAI_PROXY_COUNTRY": self.country or "ALL",
             "ZAI_MANUAL": "1" if self.captcha == "manual" else "0",
             # Windows background is native headless; Linux background uses
@@ -3965,12 +3991,16 @@ class GeneratorManager:
             if schemes:
                 env["ZAI_PROXY_TYPES"] = ",".join(schemes)
         elif self.ip_source in ("psiphon", "surfshark"):
-            # Each signup gets the next ready region, so accounts do not share
-            # one exit address. No ready region: the worker is refused earlier.
             exit_pool = self.exit_pool()
             picked = exit_pool.pick() if exit_pool else None
-            if picked is not None:
-                env["ZAI_PROXY"] = f"socks5://127.0.0.1:{picked.port}"
+            if picked is None:
+                raise VpnUnavailable(exit_pool.unavailable() if exit_pool else "VPN source unavailable")
+            env["ZAI_PROXY"] = f"socks5://127.0.0.1:{picked.port}"
+            env["ZAI_REQUIRE_PROXY"] = "1"
+            if self.ip_source == "psiphon":
+                region = REGION_NAMES.get(picked.region)
+                place = f"{region} ({picked.region})" if region else picked.region
+                env["_GW_WORKER_ROUTE_LABEL"] = f"Psiphon \u00b7 {place}"
         elif self.ip_source == "pin" and self.pin_proxy:
             env["ZAI_PROXY"] = self.pin_proxy
         elif self.ip_source == "direct":
@@ -4021,6 +4051,7 @@ class GeneratorManager:
             if not new:
                 w.result = {"qualified": False, "category": category, "error": w.script_result.get("message", "No qualifying account produced")}
                 return
+            w.signup_password = new.get("password", "")
             new.update(auto_generate=True, route_policy=w.env.get("ZAI_ROUTE_POLICY"),
                        auto_run_id=w.env.get("ZAI_AUTO_RUN_ID", ""),
                        auto_attempt_id=w.env.get("ZAI_AUTO_ATTEMPT_ID", ""),
@@ -4055,6 +4086,8 @@ class GeneratorManager:
             w.result = {"qualified": False, "category": "failed"}
             return
         new = w.check_new_account()
+        if new:
+            w.signup_password = new.get("password", "")
         if new and self.on_account:
             try:
                 self.on_account(new)

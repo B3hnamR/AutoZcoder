@@ -28,6 +28,7 @@ import yaml
 from .config import Config, apply_config_env
 from .deps import admin_key, get_state, internal_or_admin
 from .logbuffer import LogBuffer
+from .peer import peer_is_local
 
 log = logging.getLogger("zcode_gateway.dash")
 
@@ -359,6 +360,13 @@ async def dash_settings_put(request: Request, body: dict = Body(...),
                 if val.lower() not in ("1", "true", "yes", "on", "0", "false", "no", "off"):
                     raise ValueError()
                 val = val.lower() in ("1", "true", "yes", "on")
+            elif cast is bool:
+                if not isinstance(val, bool):
+                    raise ValueError()
+            elif cast is int and (isinstance(val, bool) or not isinstance(val, (int, str))):
+                raise ValueError()
+            elif val is None or isinstance(val, (list, dict, bool)):
+                raise ValueError()
             else:
                 val = cast(val)
         except (TypeError, ValueError):
@@ -381,11 +389,12 @@ async def dash_settings_put(request: Request, body: dict = Body(...),
                                     detail=f"{dotted} must be one of: "
                                            f"{', '.join(c[0] for c in allowed)}")
             val = probe
-        if dotted in ("models.default", "models.default_anthropic") and not str(val).strip():
+        if dotted in ("models.default", "models.default_anthropic", "server.host",
+                      "accounts.dir", "accounts.pool_file") and not val.strip():
             raise HTTPException(status_code=400, detail=f"{dotted} cannot be empty")
-        if dotted == "pool.max_in_flight_per_account" and val < 1:
+        if dotted in ("pool.max_in_flight_per_account", "upstream.max_attempts") and val < 1:
             raise HTTPException(status_code=400,
-                                detail="pool.max_in_flight_per_account must be >= 1")
+                                detail=f"{dotted} must be >= 1")
         if dotted == "pool.balance_poll_seconds" and val < 10:
             raise HTTPException(status_code=400,
                                 detail="pool.balance_poll_seconds must be >= 10 "
@@ -421,6 +430,9 @@ async def dash_settings_put(request: Request, body: dict = Body(...),
         detail = "; ".join(".".join(map(str, error["loc"])) + ": " + error["msg"] for error in errors)
         raise HTTPException(400, "Configuration validation failed: " + (detail or "invalid setting")) from None
     if changed:
+        pacing = validated.models.pacing
+        if any(k.startswith("models.pacing.") for k in changed) and pacing.min_gap_ms > pacing.max_gap_ms:
+            raise HTTPException(400, "Shortest pause must be at most the longest pause")
         try:
             validated.server.validate_bind_policy()
         except RuntimeError as exc:
@@ -1047,6 +1059,36 @@ def _start_daily_scheduler(state) -> None:
         log.exception("daily scheduler could not start")
 
 
+def _generator_data_dir(gen_dir: Path) -> Path:
+    from .paths import app_dir, base_dir
+    checkout = app_dir()
+    if getattr(sys, "frozen", False):
+        return (base_dir() if sys.platform == "win32" else checkout) / "generator-data"
+    if (checkout / ".git").is_dir() and gen_dir.resolve() == (checkout / "generator").resolve():
+        return base_dir() / "generator-data"
+    return gen_dir / "output"
+
+
+def _start_saved_vpns(state) -> None:
+    try:
+        gen_dir, _ = _find_zcodeauto(state)
+        if gen_dir is None:
+            return
+        path = _generator_data_dir(gen_dir) / "vpn.json"
+        if not path.is_file():
+            return
+        config = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(config, dict):
+            return
+        for kind in ("psiphon", "surfshark"):
+            options = config.get(kind)
+            if isinstance(options, dict) and options.get("enabled", True) and options.get("autoStart"):
+                _generator_for_state(state)
+                break
+    except Exception:
+        log.exception("generator: saved exit networks could not start")
+
+
 def _generator_for_state(state):
     """Initialize the manager on first use or at boot for a daily schedule."""
     if getattr(state, "update_phase", "idle") == "applying":
@@ -1250,14 +1292,7 @@ def _generator_for_state(state):
 
         from .generator import GeneratorManager, claim_result_landed
         gc = state.cfg.generator
-        # Portable Windows installs share the bootstrap's writable data root.
-        # Linux installs keep worker data in the installer-managed directory.
-        from .paths import app_dir, base_dir
-        checkout = app_dir()
-        data_dir = ((base_dir() if sys.platform == "win32" else checkout) / "generator-data"
-                    if getattr(sys, "frozen", False)
-                    else base_dir() / "generator-data" if (checkout / ".git").is_dir() and gen_dir.resolve() == (checkout / "generator").resolve()
-                    else gen_dir / "output")
+        data_dir = _generator_data_dir(gen_dir)
         mgr = GeneratorManager(gen_dir, on_account=register_account,
                                python_exe=getattr(gc, "python_exe", ""),
                                data_dir=data_dir,
@@ -1353,7 +1388,7 @@ def _generator_for_state(state):
             legacy100 = bool(gc.claim) and not legacy500
             mgr.claim = legacy100
             mgr.claim500 = legacy500
-            mgr.claim_start = bool(getattr(gc, "claim_start", True)) and not (legacy100 or legacy500)
+            mgr.claim_start = gc.claim_start and not (legacy100 or legacy500)
         mgr._invite_code = gc.invite_code
         if gc.captcha in ("auto", "manual", "ai", "classic") and not mgr._has_saved_options:
             # First run only (no generator_options.json yet): seed from
@@ -1759,6 +1794,46 @@ async def generator_shutdown(request: Request, key: str = Depends(admin_key)) ->
     if manager is not None:
         await asyncio.to_thread(manager.shutdown)
     return {"ok": True}
+
+
+@router.post("/admin/dash/generator/workers/details/{action}")
+async def generator_worker_details(request: Request, action: str,
+                                   body: dict = Body(...), key: str = Depends(admin_key)):
+    if action not in ("log", "open-log", "password"):
+        raise HTTPException(404, "Unknown worker action")
+    if action != "log" and not peer_is_local(request):
+        raise HTTPException(403, "This action is available on the gateway computer only")
+    manager = _generator(request)
+    name = body.get("name")
+    worker = manager.workers.get(name) if isinstance(name, str) else None
+    if worker is None or worker.created != body.get("created"):
+        raise HTTPException(404, "Worker is no longer available")
+    if worker.state != "exited" or not worker.done.is_set():
+        raise HTTPException(409, "Wait for the worker to finish")
+    headers = {"Cache-Control": "no-store"}
+    if action == "password":
+        if not worker.signup_password:
+            raise HTTPException(404, "No signup password was saved for this worker")
+        return JSONResponse({"password": worker.signup_password}, headers=headers)
+
+    log_file = worker.env.get("ZAI_LOG_FILE")
+    if not log_file:
+        raise HTTPException(404, "Worker log file is unavailable")
+    path = Path(log_file).resolve()
+    log_dir = (manager.data_dir / "logs" / "workers").resolve()
+    if path.parent != log_dir or path.suffix.lower() != ".log" or not path.is_file():
+        raise HTTPException(404, "Worker log file is unavailable")
+    try:
+        if action == "open-log":
+            if sys.platform != "win32":
+                raise HTTPException(400, "Opening the file directly requires Windows. Use Copy log instead.")
+            opener = getattr(os, "startfile")
+            await asyncio.to_thread(opener, str(path))
+            return JSONResponse({"opened": True}, headers=headers)
+        text = await asyncio.to_thread(path.read_text, encoding="utf-8", errors="replace")
+    except OSError:
+        raise HTTPException(409, "Could not access the worker log file") from None
+    return JSONResponse({"log": text}, headers=headers)
 
 
 @router.post("/admin/dash/generator/workers/remove")

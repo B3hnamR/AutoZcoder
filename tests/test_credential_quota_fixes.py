@@ -42,6 +42,51 @@ def manager_for(account, get):
 
 
 @pytest.mark.asyncio
+async def test_manual_balance_checks_new_credentials_on_same_click(monkeypatch):
+    from zcode_gateway import api_admin
+
+    account = Account(id='dummy', access_token='old')
+    get = AsyncMock(side_effect=[response(401), response(data=balance(73))])
+    manager, pool = manager_for(account, get)
+    manager._found_accounts.return_value = [Account(id='dummy', access_token='new')]
+    monkeypatch.setattr(api_admin, 'get_state', lambda _: SimpleNamespace(pool=pool, tokens=manager))
+    try:
+        result = await api_admin.check_balance(None, account.id)
+        assert result['quota_refreshed'] and not result['quota_check_error']
+        assert result['quotas'][MODEL]['remaining'] == 73
+        assert get.await_count == 2
+        manager.check_account = AsyncMock(return_value=None)
+        result = await api_admin.check_balance(None, account.id)
+        assert not result['quota_refreshed'] and result['quota_check_error']
+        assert result['quotas'][MODEL]['remaining'] == 73
+    finally:
+        await pool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_reload_pool_rereads_saved_accounts(monkeypatch, tmp_path):
+    from zcode_gateway import api_admin
+
+    existing = Account(id='existing', access_token='old', expires_at=1000)
+    manager, pool = manager_for(existing, AsyncMock(return_value=response()))
+    manager.cfg.accounts.source = 'accounts_dir'
+    manager.cfg.accounts.dir = str(tmp_path)
+    for ident, token in [('existing', 'updated'), ('added', 'dummy')]:
+        write_snapshot(tmp_path / f'{ident}.txt', {
+            'account_id': ident, 'access_token': token, 'expires_at_ms': '2000',
+        })
+    state = SimpleNamespace(pool=pool, tokens=manager, cfg=manager.cfg)
+    monkeypatch.setattr(api_admin, 'get_state', lambda _: state)
+    try:
+        result = await api_admin.reload_pool(None)
+        assert (result['loaded'], result['added'], result['updated']) == (2, 1, 1)
+        assert existing.access_token == 'updated'
+        assert (await pool.find('added')).notes['quotas'][MODEL]['remaining'] == 10
+    finally:
+        await pool.aclose()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('result', ['401', 'success', 'empty', 'api_error', 'http_error', 'transport_error'])
 async def test_stale_billing_result_cannot_mutate_rotated_credentials(result):
     started, release = asyncio.Event(), asyncio.Event()

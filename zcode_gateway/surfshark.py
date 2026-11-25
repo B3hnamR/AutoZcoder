@@ -8,9 +8,11 @@ network adapter, route or DNS on this computer changes.
 from __future__ import annotations
 
 import base64
+import os
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -121,21 +123,20 @@ class SurfsharkPool(vpn.ExitPool):
         if public_key and public_key != derived:
             raise ValueError("The public key does not belong to this private key. "
                              "Copy both from the same key pair in your Surfshark account.")
-        replaced = bool(self.config.get("privateKey"))
-        self.set_settings({"privateKey": private_key, "publicKey": derived})
-        if replaced and self._instances:
-            with self._lock:
-                regions = [r for r in self._instances if self._instances[r].state == "ready"]
-            for region in regions:
-                try:
+        with self._lock:
+            replaced = bool(self._settings.get("privateKey")) and self._settings["privateKey"] != private_key
+            self.set_settings({"privateKey": private_key, "publicKey": derived})
+            if replaced:
+                for region in tuple(self._instances):
                     self._start(region, fresh=True)
-                except Exception:
-                    pass
         return self.status()
 
     def clear_keys(self) -> dict:
-        self.stop_all()
-        self.set_settings({"privateKey": "", "publicKey": ""})
+        with self._lock:
+            self.stop_all()
+            for path in self.data_dir.glob("*/wireproxy*.conf"):
+                path.unlink(missing_ok=True)
+            self.set_settings({"privateKey": "", "publicKey": ""})
         return self.status()
 
     # ---- Surfshark's server list ---------------------------------------
@@ -204,8 +205,7 @@ class SurfsharkPool(vpn.ExitPool):
                         patch = {"servers": listing, "updatedAt": int(time.time() * 1000)}
                         if gone:
                             patch.update({"regions": regions, "pinned": pinned})
-                        self._settings = self.normalize({**self._settings, **patch})
-                        self._store()
+                        self.set_settings(patch)
                     return self.status()
                 except Exception as exc:
                     last = str(exc)[:120]
@@ -243,13 +243,19 @@ class SurfsharkPool(vpn.ExitPool):
         inst.extra["server"] = server
         target = self.region_dir(inst.region)
         target.mkdir(parents=True, exist_ok=True)
-        conf = target / "wireproxy.conf"
-        conf.write_text(self._config_text(server, inst.port), encoding="utf-8")
+        fd, name = tempfile.mkstemp(dir=target, prefix="wireproxy-", suffix=".conf")
+        inst.extra["config_file"] = name
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(self._config_text(server, inst.port))
+
+    def _cleanup(self, inst: vpn.Exit) -> None:
+        name = inst.extra.get("config_file")
+        if not name:
+            return
         try:
-            conf.chmod(0o600)
+            Path(name).unlink(missing_ok=True)
         except OSError:
             pass
-        inst.extra["config_file"] = str(conf)
 
     def _spawn(self, inst: vpn.Exit) -> subprocess.Popen:
         client = self.find_client()
@@ -265,10 +271,7 @@ class SurfsharkPool(vpn.ExitPool):
             self._mark_ready(inst)
             # The client has read its settings (which hold the private key):
             # keep the file only while it starts.
-            try:
-                Path(inst.extra.get("config_file", "")).unlink(missing_ok=True)
-            except OSError:
-                pass
+            self._cleanup(inst)
         elif re.search(r"error|failed|could not|unable", line, re.I) and "DEBUG" not in line:
             inst.error = re.sub(r"\s+", " ", line).strip()[:300]
 
@@ -296,7 +299,7 @@ class SurfsharkPool(vpn.ExitPool):
                 mapping[region] = nxt["id"]
                 self._settings = {**self._settings, "serverByRegion": mapping}
                 self._store()
-        self._start(region, fresh=True)
+            self._start(region, fresh=True)
         return self.status()
 
     # ---- status ---------------------------------------------------------

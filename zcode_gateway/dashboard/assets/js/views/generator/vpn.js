@@ -58,38 +58,39 @@ function modePicker(name, cfg, save) {
       if (value === "single") patch.pinned = cfg.pinned || (cfg.regions || [])[0] || "";
       save(patch, value === "single" ? "Stays on one region" : "Takes turns over its regions");
     });
-    return el("label", { class: "chip", style: { cursor: "pointer" } }, [
+    return el("label", { class: "vpn-mode" }, [
       input, el("span", {}, [
         el("b", { text: title }),
-        el("span", { class: "faint text-xs", text: " — " + detail }),
+        el("small", { text: detail }),
       ]),
     ]);
   };
-  const row = el("div", { class: "row", style: { flexWrap: "wrap" } }, [
+  const row = el("div", { class: "vpn-modes" }, [
     radio("spread", "Take turns", "each signup uses the next ready region"),
     radio("single", "Stay on one", "every signup uses the same region"),
   ]);
   let pinned = null;
   if (cfg.mode === "single" && (cfg.regions || []).length) {
-    const select = el("select", { class: "input" }, (cfg.regions || []).map((r) =>
+    const select = el("select", { class: "select", id: name + "-region" }, (cfg.regions || []).map((r) =>
       el("option", { value: r, text: r, selected: r === (cfg.pinned || cfg.regions[0]) })));
     select.addEventListener("change", () => save({ pinned: select.value }, "Region pinned: " + select.value));
     pinned = el("div", { class: "field" }, [
-      el("label", { class: "field__label", text: "Region in use" }),
+      el("label", { class: "field__label", htmlFor: select.id, text: "Region in use" }),
       select,
     ]);
   }
-  return el("div", { class: "stack--tight" }, [row, pinned]);
+  return el("fieldset", { class: "vpn-routing" }, [
+    el("legend", { text: "Region preference" }), row, pinned,
+  ]);
 }
 
-export function createVpnCard() {
-  const box = el("div", { class: "stack" });
+export function createVpnCard(provider, signal) {
+  const box = el("div");
   const node = card({
-    title: "IP source: Psiphon & Surfshark",
-    desc: "Bundled exit networks for the signup generator. A different region means a different "
-      + "exit address; each signup gets the next ready region.",
-    body: box,
+    title: provider === "psiphon" ? "Psiphon" : "Surfshark",
+    body: box, flush: true,
   });
+  node.classList.add("vpn-card");
 
   let status = null;
   let busy = "";
@@ -103,23 +104,31 @@ export function createVpnCard() {
       await api.post(path, body || {});
       if (done) toast(done, "ok");
       await reload();
+      return true;
     } catch (e) {
       toast(String(e?.message || e), "err");
+      return false;
     }
   }
 
   async function act(label, path, body, done) {
+    if (busy) return false;
     busy = label;
     render();
-    try { await talking(path, body, done); }
+    try { return await talking(path, body, done); }
     finally { busy = ""; render(); }
   }
 
   async function reload() {
+    const initial = !status;
     try {
-      status = await api.get("/admin/dash/generator/vpn/status");
+      const next = await api.get("/admin/dash/generator/vpn/status", { signal });
+      if (signal?.aborted) return;
+      status = next;
     } catch (e) {
-      toast("IP source status: " + String(e?.message || e), "err");
+      if (signal?.aborted) return;
+      if (initial) fill(box, el("div", { class: "vpn-provider text-err", role: "status", text: e.message }));
+      return;
     }
     render();
   }
@@ -146,11 +155,15 @@ export function createVpnCard() {
     render();
   }
 
-  function saveRegions(kind, what) {
+  async function saveRegions(kind, what) {
     if (!picked[kind].length) { toast("Choose at least one region", "warn"); return; }
-    dirty[kind] = false;
-    act("save", `/admin/dash/generator/vpn/${kind}/settings`,
-      { regions: picked[kind] }, `${what}: ${picked[kind].length} chosen`);
+    const selection = picked[kind];
+    const saved = await act("save", `/admin/dash/generator/vpn/${kind}/settings`,
+      { regions: selection }, `${what}: ${selection.length} chosen`);
+    if (saved && picked[kind] === selection) {
+      dirty[kind] = false;
+      render();
+    }
   }
 
   /* ------------------------------------------------------------ rows --- */
@@ -208,9 +221,9 @@ export function createVpnCard() {
         ]);
       }));
 
-    return el("div", { class: "stack--tight" }, [
+    return el("section", { class: "vpn-provider", "aria-labelledby": "vpn-psiphon" }, [
       el("div", { class: "row" }, [
-        el("b", { text: "Psiphon" }),
+        el("h3", { id: "vpn-psiphon", text: "Psiphon" }),
         summaryBadge(info, "psiphon"),
         el("span", { class: "spacer" }),
         button({ label: "Update servers", icon: "refresh", disabled: working,
@@ -219,9 +232,11 @@ export function createVpnCard() {
                    "Psiphon servers updated") }),
       ]),
       info.problem ? el("div", { class: "notice notice--warn", text: info.problem }) : null,
-      el("div", { class: "field__help", text: `Regions: ${(info.available || []).length} offered. `
-        + "Tick the ones to run; only running regions take signups." }),
-      chips,
+      el("div", { class: "field" }, [
+        el("b", { text: "Regions" }),
+        el("div", { class: "field__help", text: `${(info.available || []).length} available. Only connected regions are used.` }),
+        chips,
+      ]),
       regionsChanged("psiphon", info)
         ? el("div", { class: "row" }, [
             el("span", { class: "text-xs text-warn", text: `${picked.psiphon.length} chosen — not saved` }),
@@ -258,24 +273,30 @@ export function createVpnCard() {
     const saved = !!info.keys?.saved;
     const open = !saved || keys.editing;
     const saveKeys = async () => {
+      if (busy) return;
       if (!keys.privateKey.trim()) { toast("Paste the private key", "warn"); return; }
       busy = "keys";
+      render();
       try {
-        await talking("/admin/dash/generator/vpn/surfshark/keys",
+        const saved = await talking("/admin/dash/generator/vpn/surfshark/keys",
           { privateKey: keys.privateKey.trim(), publicKey: keys.publicKey.trim() },
           "Surfshark key pair saved");
-        keys.editing = false; keys.privateKey = ""; keys.publicKey = "";
+        if (saved) {
+          keys.editing = false; keys.privateKey = ""; keys.publicKey = "";
+        }
       } finally { busy = ""; }
       render();
     };
     const field = (label, node, help) => el("div", { class: "field" }, [
-      el("label", { class: "field__label", text: label }), node,
-      help ? el("div", { class: "field__help", text: help }) : null,
+      el("label", { class: "field__label", htmlFor: node.id, text: label }), node,
+      help ? el("div", { class: "field__help", id: node.id + "-help", text: help }) : null,
     ]);
-    const pub = el("input", { class: "input input--mono", type: "text", spellcheck: "false",
+    const pub = el("input", { class: "input input--mono", type: "text", id: "vpn-public-key", readOnly: busy === "keys",
                               placeholder: "44 characters ending in =", value: keys.publicKey });
     pub.addEventListener("input", () => { keys.publicKey = pub.value; });
-    const priv = el("input", { class: "input", type: "password", autocomplete: "new-password",
+    pub.spellcheck = false;
+    const priv = el("input", { class: "input input--mono", type: "password", autocomplete: "new-password", readOnly: busy === "keys",
+                               id: "vpn-private-key", "aria-describedby": "vpn-private-key-help",
                                placeholder: "44 characters ending in =", value: keys.privateKey });
     priv.addEventListener("input", () => { keys.privateKey = priv.value; });
 
@@ -307,7 +328,7 @@ export function createVpnCard() {
               button({ label: "Save key pair", variant: "primary", disabled: busy !== "",
                        onClick: saveKeys }),
               keys.editing
-                ? button({ label: "Cancel", onClick: () => { keys.editing = false; keys.privateKey = ""; keys.publicKey = ""; render(); } })
+                ? button({ label: "Cancel", disabled: busy !== "", onClick: () => { keys.editing = false; keys.privateKey = ""; keys.publicKey = ""; render(); } })
                 : null,
             ]),
           ])
@@ -327,16 +348,22 @@ export function createVpnCard() {
     const counts = new Map();
     for (const s of servers) counts.set(s.country, (counts.get(s.country) || 0) + 1);
 
-    const searchInput = el("input", { class: "input", type: "search",
+    const searchInput = el("input", { class: "input", type: "search", id: "vpn-location-search", "aria-label": "Search locations",
                                       placeholder: "Search a country or city…", value: search });
-    searchInput.addEventListener("input", () => { search = searchInput.value; render(); });
+    searchInput.addEventListener("input", () => {
+      search = searchInput.value;
+      const results = box.querySelector("#vpn-location-results");
+      if (results) results.scrollTop = 0;
+      render();
+    });
 
-    const chips = el("div", { class: "row", style: { flexWrap: "wrap", gap: "var(--s-2)" } },
+    const chips = el("div", { class: "vpn-scroll vpn-location-results row", id: "vpn-location-results",
+                              role: "region", "aria-label": "Available locations", tabIndex: 0 },
       shown.map((s) => {
         const on = picked.surfshark.includes(s.id);
         const many = (counts.get(s.country) || 0) > 1;
         const where = many ? (s.location || s.id) : (s.location && s.location !== s.country ? s.location : s.countryCode);
-        const input = el("input", { type: "checkbox", checked: on });
+        const input = el("input", { type: "checkbox", checked: on, id: `vpn-location-${s.id}` });
         input.addEventListener("change", () => toggleChip("surfshark", s.id));
         return el("label", { class: "chip", style: { cursor: "pointer", borderColor: on ? "var(--accent)" : "" },
                              title: `${s.country}${s.location ? " · " + s.location : ""} (${s.id})` }, [
@@ -344,9 +371,9 @@ export function createVpnCard() {
         ]);
       }));
 
-    return el("div", { class: "stack--tight" }, [
+    return el("section", { class: "vpn-provider", "aria-labelledby": "vpn-surfshark" }, [
       el("div", { class: "row" }, [
-        el("b", { text: "Surfshark" }),
+        el("h3", { id: "vpn-surfshark", text: "Surfshark" }),
         summaryBadge(info, "surfshark"),
         el("span", { class: "spacer" }),
         button({ label: "Update servers", icon: "refresh", disabled: working,
@@ -355,6 +382,10 @@ export function createVpnCard() {
                    "Surfshark servers updated") }),
       ]),
       info.problem ? el("div", { class: "notice notice--warn", text: info.problem }) : null,
+      el("div", { class: "notice notice--warn" }, [
+        el("strong", { text: "Surfshark subscription required. " }),
+        el("span", { text: "You need an active paid Surfshark subscription to use Surfshark as an IP route." }),
+      ]),
       keyPanel(info),
       info.keys?.saved
         ? el("div", { class: "stack--tight" }, [
@@ -363,7 +394,8 @@ export function createVpnCard() {
                 + (info.updatedAt ? ` · updated ${ago(info.updatedAt)}` : "")
               : "Press Update servers to load Surfshark's locations." }),
             servers.length ? searchInput : null,
-            chips,
+             shown.length ? chips : servers.length
+               ? el("div", { class: "field__help", text: "No locations match your search." }) : null,
             regionsChanged("surfshark", info)
               ? el("div", { class: "row" }, [
                   el("span", { class: "text-xs text-warn", text: `${picked.surfshark.length} chosen — not saved` }),
@@ -382,8 +414,13 @@ export function createVpnCard() {
                          "Surfshark disconnected") }),
               info.lastError ? el("span", { class: "text-xs text-err", text: info.lastError }) : null,
             ]),
-            (info.regions || []).length
-              ? el("div", {}, info.regions.map((row) => regionRow("surfshark", row, info)))
+             (info.regions || []).length
+               ? el("div", { class: "stack--tight" }, [
+                   el("b", { text: `Location status (${info.regions.length})` }),
+                   el("div", { class: "vpn-scroll vpn-location-status", id: "vpn-location-status",
+                               role: "region", "aria-label": "Location status", tabIndex: 0 },
+                      info.regions.map((row) => regionRow("surfshark", row, info))),
+                 ])
               : null,
             modePicker("surfshark-mode", cfg, save),
             switchField("Surfshark enabled", "Off stops every location and takes Surfshark out of the IP source list.",
@@ -398,20 +435,31 @@ export function createVpnCard() {
 
   function render() {
     if (!status) return;
-    fill(box, [
-      renderPsiphon(status.psiphon || {}),
-      el("hr", { class: "rule" }),
-      renderSurfshark(status.surfshark || {}),
-    ]);
+    const active = document.activeElement;
+    const focused = box.contains(active) && active.id;
+    const selection = focused && active instanceof HTMLInputElement && active.selectionStart !== null
+      ? [active.selectionStart, active.selectionEnd, active.selectionDirection] : null;
+    const scrollPositions = Array.from(box.querySelectorAll(".vpn-scroll"), (list) => [list.id, list.scrollTop]);
+    fill(box, provider === "psiphon" ? renderPsiphon(status.psiphon || {}) : renderSurfshark(status.surfshark || {}));
+    for (const [id, scrollTop] of scrollPositions) {
+      const list = box.querySelector(`#${id}`);
+      if (list) list.scrollTop = scrollTop;
+    }
+    if (focused) {
+      const replacement = box.querySelector(`#${CSS.escape(focused)}`);
+      if (replacement) {
+        replacement.focus({ preventScroll: true });
+        if (selection) replacement.setSelectionRange(...selection);
+      }
+    }
   }
 
-  function refresh(vpn) {
-    // The generator status carries both networks; nothing to do until it does
-    // (an older status response must not trigger extra requests).
-    if (!vpn || typeof vpn !== "object") return;
-    status = vpn;
-    render();
-  }
+  return { node, refresh: reload };
+}
 
-  return { node, refresh, reload };
+export async function mountProvider({ root, signal }, provider) {
+  const view = createVpnCard(provider, signal);
+  root.append(view.node);
+  await view.refresh();
+  return view;
 }

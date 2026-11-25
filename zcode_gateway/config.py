@@ -375,7 +375,7 @@ class GeneratorConfig(BaseModel):
     # claimed from the billing preview after signup, and the marketing feed is
     # also walked for Global/Weekend Build cards (their ids rotate per drop).
     # This is the default path now.
-    claim_start: bool = True
+    claim_start: bool = False
     invite_code: str = "MT9GNDQ8"      # referral code to claim ('' = off)
     # Prefetch Aliyun captcha tickets for claims, so the signup POST does not
     # wait 10-30 s for a mint while the browser idles. Tokens die 90 s after

@@ -108,7 +108,7 @@ export const GUIDE = [
   ] },
   { id: "relays", title: "Edge relays and models", desc: "Route model traffic when necessary, without confusing relays with signup proxies.", route: "models", items: [
     { title: "Enable a relay only after configuring it", tags: "Cloudflare Vercel Deno Netlify 405 unusual activity 3012", steps: [
-      "Edge relay is off on fresh installs. In Proxy tools, deploy Cloudflare/Vercel/Deno/Netlify or add an existing relay URL and its secret. Test it, select an active relay, choose routed models, then enable routing.",
+      "Edge relay is off on fresh installs. In IP Routes > Proxy pool, deploy Cloudflare/Vercel/Deno/Netlify or add an existing relay URL and its secret. Test it, select an active relay, choose routed models, then enable routing.",
       "Cloudflare relay deployment requires an API token and account ID, with workers.dev enabled. Deno requires a token and organization domain. For Netlify use the generated function URL ending /.netlify/functions/relay. Deployment protection and provider rate limits can still block access; inspect the deployment log.",
       "Single uses the active relay; round robin or random rotate eligible relays. Failed relays are temporarily deprioritized; if all are cooling the full list can be reused. A relay health test is not a Zcode inference test, and changing exit does not guarantee removal of provider restrictions.",
       "A relay carries model API traffic, not signup browser traffic or mail. A working relay does not fill the signup proxy pool. Removing a relay from this gateway does not delete the provider deployment.",

@@ -29,12 +29,13 @@ export function createMailCard() {
     errors: new Map(),
     deferred: new Set(),
     advancedOpen: false,
+    testing: false,
   };
 
   const body = el("div", { class: "stack" });
   const node = card({
     title: "Email setup",
-    desc: "Enter a domain already on Cloudflare and an API token. Setup creates the worker, storage and secret, configures routing, and verifies the inbox.",
+    desc: "Connect a Cloudflare domain to the verification inbox.",
     body,
   });
 
@@ -149,8 +150,10 @@ export function createMailCard() {
     }
   }
 
-  async function deploy(redeploy = false) {
+  async function deploy() {
+    if (state.deploying || state.testing) return;
     const domains = fields.domains.value.trim();
+    const added = domains.split(/[,\s]+/).filter(Boolean).map(d => d.toLowerCase().replace(/^@/, ""));
     const token = fields.token.value.trim();
     const account = fields.account.value.trim();
 
@@ -162,8 +165,11 @@ export function createMailCard() {
 
     try {
       const current = await api.get("/admin/dash/generator/mail");
-      const added = domains.split(/[,\s]+/).map(d => d.trim()).filter(Boolean);
-      if (added.length) {
+      if (!added.length && !current.domains?.length) throw new Error("Enter at least one Cloudflare domain.");
+      if (added.some(d => !/^[a-z0-9.-]+\.[a-z]{2,}$/.test(d))) {
+        throw new Error("Enter domain names without URLs or email addresses.");
+      }
+      if (added.length || !current.domains?.includes(current.active)) {
         await api.post("/admin/dash/generator/mail", {
           domains: [...new Set([...(current.domains || []), ...added])],
         });
@@ -271,16 +277,21 @@ export function createMailCard() {
   }
 
   async function testInbox() {
+    if (state.testing || state.deploying) return;
+    state.testing = true;
     state.inboxMessage = "Testing…";
-    await refresh();
+    inboxLine.textContent = state.inboxMessage;
+    testBtn.disabled = deployBtn.disabled = true;
     try {
       const r = await api.get("/admin/dash/generator/mail/test");
       state.inboxMessage = r.ok ? "Worker inbox answered." : (r.error || "Inbox did not answer.");
       toast(state.inboxMessage, r.ok ? "ok" : "err");
     } catch (e) {
       state.inboxMessage = e.message;
+    } finally {
+      state.testing = false;
+      await refresh();
     }
-    await refresh();
   }
 
   async function saveManual() {
@@ -339,7 +350,8 @@ export function createMailCard() {
   const tokenNote = el("div", { class: "field__help" });
   const clearBtnSlot = el("span");
 
-  const deployBtn = button({ label: "Set up email", variant: "primary", onClick: () => deploy(false) });
+  const deployBtn = button({ label: "Set up email", variant: "primary", onClick: deploy });
+  const testBtn = button({ label: "Test worker inbox", onClick: testInbox });
 
   function paint(m) {
     const doms = m.domains || [];
@@ -347,7 +359,7 @@ export function createMailCard() {
     const inboxVerified = credentialsSaved && m.inbox_ok === true;
     const routingDone = doms.length > 0 && doms.every((d) => (m.routing_done || []).includes(d));
     const needsConfirmation = doms.some((d) => state.review.has(d));
-    const ready = inboxVerified && routingDone && !needsConfirmation;
+    const ready = inboxVerified && routingDone && !needsConfirmation && m.ready !== false;
 
     const status = state.deploying ? "Setting up email…"
       : needsConfirmation ? "Routing change needs approval"
@@ -356,6 +368,7 @@ export function createMailCard() {
       : !credentialsSaved ? "Worker setup pending"
       : !inboxVerified && !routingDone ? "Inbox verification and domain routing pending"
       : !inboxVerified ? "Credentials saved; inbox verification pending"
+      : routingDone ? "Run setup to select an active domain"
       : "Inbox verified; domain routing pending";
 
     fill(statusLine, el("b", { text: status }));
@@ -394,13 +407,20 @@ export function createMailCard() {
     logBox.hidden = !state.log;
     inboxLine.textContent = state.inboxMessage;
 
-    deployBtn.disabled = state.deploying;
-    deployBtn.querySelector("span").textContent = state.deploying ? "Setting up email…" : "Set up email";
+    testBtn.hidden = !credentialsSaved;
+    testBtn.disabled = deployBtn.disabled = state.deploying || state.testing;
+    deployBtn.querySelector("span").textContent = state.deploying ? "Setting up email…" : ready ? "Run setup again" : "Set up email";
     for (const f of Object.values(fields)) f.disabled = state.deploying;
   }
 
   function build() {
     fill(body, [
+      el("div", { class: "mail-overview stack--tight" }, [
+        el("div", { class: "row" }, [statusLine, testBtn]), routingBox, inboxLine,
+        el("p", { class: "field__help", text:
+          "An inbox test only proves the worker answers. Send a real email to verify delivery." }),
+      ]),
+      statusError,
       el("div", { class: "field" }, [
         el("label", { class: "field__label", for: "mail-new-domain", text: "Domain(s)" }),
         fields.domains,
@@ -416,13 +436,7 @@ export function createMailCard() {
         deployBtn,
         el("span", { class: "field__help", text: "First setup takes 1–2 minutes. Retries reuse the saved worker." }),
       ]),
-      statusLine,
-      statusError,
       messageLine,
-      routingBox,
-      inboxLine,
-      el("p", { class: "field__help", text:
-        "An inbox test only proves the worker answers. Send a real message to confirm end-to-end delivery." }),
       logBox,
       el("details", { class: "help-details", open: state.advancedOpen,
         on: { toggle: (e) => { state.advancedOpen = e.target.open; } } }, [
@@ -447,8 +461,6 @@ export function createMailCard() {
           ]),
           el("div", { class: "row" }, [
             button({ label: "Save inbox settings", onClick: saveManual }),
-            button({ label: "Test worker inbox", onClick: testInbox }),
-            button({ label: "Redeploy worker", onClick: () => deploy(true) }),
           ]),
           el("p", { class: "field__help", text:
             "Manual fallback: in Cloudflare > your domain > Email > Email Routing, enable routing and point the catch-all at the deployed worker." }),
@@ -463,14 +475,23 @@ export function createMailCard() {
       const m = await api.get("/admin/dash/generator/mail");
       statusError.hidden = true;
       paint(m);
+      return state.deploying || state.testing ? { ...m, ready: false } : m;
     } catch (e) {
       statusError.textContent = "Email status unavailable: " + e.message + ". Use Refresh to retry; your entries are kept.";
       statusError.hidden = false;
-      deployBtn.disabled = state.deploying;
+       testBtn.disabled = deployBtn.disabled = state.deploying || state.testing;
+       inboxLine.textContent = state.inboxMessage;
       for (const f of Object.values(fields)) f.disabled = state.deploying;
     }
   }
 
   build();
   return { node, refresh };
+}
+
+export async function mount({ root }) {
+  const view = createMailCard();
+  root.append(view.node);
+  await view.refresh();
+  return view;
 }

@@ -17,7 +17,7 @@ ADMIN = {"Authorization": "Bearer adm-test"}
 
 def test_generator_config_explicit_claim_beats_claim500_default():
     fresh = GeneratorConfig()
-    assert fresh.claim_start is True and fresh.claim is False
+    assert fresh.claim_start is False and fresh.claim is False
     assert fresh.claim500 is False       # legacy giveaway is off by default
 
     # a config.yaml written before claim500 existed keeps its meaning
@@ -74,8 +74,7 @@ def test_first_run_seeds_claim_type_from_config(tmp_path):
     with TestClient(app) as c:
         c.get("/admin/dash/generator/mail", headers=ADMIN)
         mgr = app.state.app_state.generator
-        # shipped default: Start Plan claim on, both legacy campaigns off
-        assert (mgr.claim, mgr.claim500, mgr.claim_start) == (False, False, True)
+        assert (mgr.claim, mgr.claim500, mgr.claim_start) == (False, False, False)
 
     app, _ = _generator_app(tmp_path / "legacy", claim=True)    # old config.yaml
     with TestClient(app) as c:

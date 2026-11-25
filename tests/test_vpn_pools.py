@@ -3,10 +3,12 @@
 import base64
 import json
 import os
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
 
+from zcode_gateway import psiphon, surfshark, vpn
 from zcode_gateway.app import create_app
 from zcode_gateway.config import Config
 from zcode_gateway.psiphon import PsiphonPool
@@ -106,7 +108,12 @@ def test_worker_env_uses_the_next_ready_region(tmp_path, monkeypatch):
         env = manager._worker_env("g1")
         assert env["ZAI_PROXY"] == "socks5://127.0.0.1:47100"
         assert env["ZAI_USE_POOL"] == "0"
-        assert manager._worker_env("g2")["ZAI_PROXY"] == "socks5://127.0.0.1:47101"
+        assert env["ZAI_REQUIRE_PROXY"] == "1"
+        from zcode_gateway.generator import GenWorker
+        worker = GenWorker("g2", [], manager._worker_env("g2"), manager.gen_dir)
+        assert worker.env["ZAI_PROXY"] == "socks5://127.0.0.1:47101"
+        assert worker.to_public()["route_label"] == "Psiphon \u00b7 Germany (DE)"
+        assert "_GW_WORKER_ROUTE_LABEL" not in worker.env
     finally:
         manager.shutdown()
 
@@ -115,10 +122,25 @@ def test_start_is_refused_when_the_exit_network_is_not_connected(tmp_path, monke
     manager = _manager(tmp_path, monkeypatch)
     try:
         manager.set_options(ip_source="surfshark")
+        monkeypatch.setattr(manager, "_mail_ready", lambda _: True)
         monkeypatch.setattr(manager, "_ensure_display", lambda interactive=False: "")
         result = manager.start_workers(1)
         assert "Surfshark" in result["error"]
         assert "not connected" in result["error"]
+    finally:
+        manager.shutdown()
+
+
+def test_batch_is_not_launched_when_vpn_disappears_during_selection(tmp_path, monkeypatch):
+    manager = _manager(tmp_path, monkeypatch)
+    try:
+        manager.set_options(ip_source="psiphon")
+        monkeypatch.setattr(manager, "_ensure_display", lambda interactive=False: "")
+        monkeypatch.setattr(manager, "_mail_ready", lambda _: True)
+        picks = iter([Exit(region="NL", port=47100, state="ready"), None])
+        monkeypatch.setattr(manager.psiphon, "pick", lambda: next(picks))
+        assert "Psiphon" in manager.start_workers(2)["error"]
+        assert not manager.workers
     finally:
         manager.shutdown()
 
@@ -153,3 +175,111 @@ def test_vpn_endpoints_report_and_save(tmp_path):
         assert bad_key.status_code == 400
 
         assert client.get("/admin/dash/generator/vpn/status").status_code == 403
+
+
+def test_disconnected_instance_cannot_spawn_after_stop(tmp_path, monkeypatch):
+    pool = PsiphonPool(tmp_path)
+    inst = Exit(region="NL", port=47100)
+    pool._instances[inst.region] = inst
+    spawned = []
+    monkeypatch.setattr(pool, "_spawn", spawned.append)
+    pool.disconnect()
+    pool._run(inst)
+    assert not spawned
+
+
+def test_surfshark_spawn_failure_removes_temporary_config(tmp_path, monkeypatch):
+    pool = SurfsharkPool(tmp_path)
+    inst = Exit(region="nl-ams", port=47400)
+    config = tmp_path / "wireproxy-test.conf"
+    config.touch()
+    inst.extra["config_file"] = str(config)
+    pool._instances[inst.region] = inst
+
+    def fail(_):
+        raise OSError("client did not start")
+
+    monkeypatch.setattr(pool, "_spawn", fail)
+    pool._run(inst)
+    assert inst.state == "failed"
+    assert not config.exists()
+
+
+def test_saved_vpn_autostarts_without_opening_dashboard(tmp_path, monkeypatch):
+    gen = tmp_path / "generator"
+    gen.mkdir()
+    (gen / "main.py").touch()
+    (gen / "config.py").touch()
+    PsiphonPool(gen / "output").set_settings({"autoStart": True, "regions": ["NL"]})
+    started = []
+    monkeypatch.setattr(PsiphonPool, "connect", lambda pool: started.append(pool.config["regions"]))
+    app = _app(tmp_path)
+    app.state.cfg.generator.zcodeauto_dir = str(gen)
+    assert not app.state.cfg.claims.daily_enabled
+    with TestClient(app):
+        assert started == [["NL"]]
+
+
+def test_surfshark_health_probe_marks_unreachable_exit_and_recovers(tmp_path, monkeypatch):
+    pool = SurfsharkPool(tmp_path)
+    inst = Exit("nl-ams", 47400, state="ready", exit_ip="192.0.2.1",
+                proc=SimpleNamespace(poll=lambda: None))
+    pool._instances[inst.region] = inst
+    monkeypatch.setattr(vpn.threading, "Thread", lambda *, target, **_: SimpleNamespace(start=target))
+    monkeypatch.setattr(vpn.time, "sleep", lambda _: None)
+    monkeypatch.setattr(vpn, "trace_exit", lambda _: None)
+    assert pool.status()["live"] == 0
+    assert inst.state == "reconnecting" and inst.exit_ip == ""
+    monkeypatch.setattr(vpn, "trace_exit", lambda _: {"ip": "192.0.2.2", "loc": "NL"})
+    inst.extra["last_probe"] -= vpn.HEALTH_PROBE_INTERVAL
+    assert pool.status()["live"] == 1
+    assert inst.exit_ip == "192.0.2.2"
+
+
+def test_surfshark_refresh_stops_retired_locations(tmp_path, monkeypatch):
+    import requests
+
+    pool = SurfsharkPool(tmp_path)
+    pool.set_settings({"regions": ["nl-ams", "de-ber"]})
+    retired = Exit("de-ber", 47401, state="ready")
+    pool._instances.update({"de-ber": retired, "nl-ams": Exit("nl-ams", 47400, state="ready")})
+    monkeypatch.setattr(surfshark.SurfsharkPool, "_parse_servers", staticmethod(lambda _: [{"id": "nl-ams"}]))
+    monkeypatch.setattr(requests, "get", lambda *a, **kw: SimpleNamespace(status_code=200, json=lambda: []))
+    status = pool.update()
+    assert retired.stop_requested
+    assert status["config"]["regions"] == ["nl-ams"]
+    assert status["live"] == 1
+
+
+def test_surfshark_key_change_restarts_starting_connections(tmp_path, monkeypatch):
+    pool = SurfsharkPool(tmp_path)
+    monkeypatch.setattr(surfshark, "public_key_of", lambda key: f"public-{key}")
+    pool.set_keys("test-old")
+    pool.set_settings({"regions": ["nl-ams"]})
+    pool._instances["nl-ams"] = Exit("nl-ams", 47400)
+    restarted = []
+    monkeypatch.setattr(pool, "_start", lambda region, **kw: restarted.append(region))
+    pool.set_keys("test-new")
+    assert restarted == ["nl-ams"]
+
+
+@pytest.mark.parametrize("reports_regions", [True, False])
+def test_psiphon_refresh_requires_a_region_list(tmp_path, monkeypatch, reports_regions):
+    pool = PsiphonPool(tmp_path)
+    (tmp_path / "psiphon.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(pool, "find_client", lambda: tmp_path / "client")
+    monkeypatch.setattr(vpn, "free_port", lambda *args: 47190)
+
+    def notices():
+        yield b'{"noticeType":"Tunnels","data":{"count":1}}'
+        if reports_regions:
+            yield b'{"noticeType":"AvailableEgressRegions","data":{"regions":["NL"]}}'
+            yield b'{"noticeType":"AvailableEgressRegions","data":{"regions":["DE"]}}'
+
+    monkeypatch.setattr(psiphon.subprocess, "Popen", lambda *a, **kw: SimpleNamespace(
+        stdout=notices(), terminate=lambda: None, wait=lambda **_: 0))
+    if reports_regions:
+        assert pool.update()["available"] == ["NL"]
+    else:
+        with pytest.raises(RuntimeError, match="did not report any regions"):
+            pool.update()

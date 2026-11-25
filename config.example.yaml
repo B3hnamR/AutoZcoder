@@ -58,7 +58,8 @@ generator:
   captcha: "manual"     # manual = you solve it in a visible browser | auto = solver
   headless: false       # only used with captcha: auto (manual always needs a window)
   claim: false          # claim the 100M invite Global Build after signup
-  claim500: true        # claim the 500M giveaway after signup (wins over claim)
+  claim500: false       # legacy 500M giveaway (wins over claim)
+  claim_start: false   # claim offered plans after signup
   invite_code: "MT9GNDQ8"      # referral code claimed after signup ('' = off)
   socks_only: true              # legacy bool (proxy_types below overrides it)
   proxy_types: "socks"          # all | socks | socks5 | socks4 | http — pool scheme filter

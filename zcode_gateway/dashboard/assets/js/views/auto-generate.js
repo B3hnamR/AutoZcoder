@@ -78,7 +78,7 @@ export function createAutoGenerate({ signal } = {}) {
   ]), "Windows background uses native headless Chromium, which the provider may reject. Linux background uses Xvfb. Desktop requires a real display. Applies only to this Auto Generate profile.");
   const captchaField = field("captcha", "Captcha solver", el("input", {
     class: "input", value: "AI judge only", type: "text", readOnly: true,
-  }), "Fixed to AI for Auto Generate. Configure a working vision judge in AI setup first.");
+  }), "Uses the AI judge endpoint on this page.");
   const timeoutField = number("timeout_seconds", 1, "Maximum seconds for a single attempt before it is stopped.", "Attempt timeout (seconds)");
   const failureField = number("failure_limit", 1, "Stop after this many consecutive failures. Review the reason before starting again.", "Consecutive failure limit");
   for (const [key, min, max] of [["target", 1, 1000], ["attempt_limit", 1, 10000],
@@ -92,25 +92,33 @@ export function createAutoGenerate({ signal } = {}) {
   const resumeButton = button({ label: "Resume", onClick: () => mutate("resume") });
   const stopButton = button({ label: "Stop session", variant: "danger", onClick: () => mutate("stop") });
   const retryButton = button({ label: "Refresh status", onClick: refresh });
+  const tuning = el("details", { class: "help-details auto-tuning" }, [
+    el("summary", { text: "Browser and retry settings" }),
+    el("div", { class: "auto-fields" }, [concurrencyField, cooldownField, displayField,
+      captchaField, timeoutField, failureField]),
+  ]);
   const form = el("form", { class: "auto-form", on: {
     submit: (event) => { event.preventDefault(); saveConfig(); },
     input: edited, change: edited,
   } }, [
-    el("div", { class: "auto-fields" }, [modeField, targetField, attemptField, concurrencyField,
-      cooldownField, ipField, displayField, captchaField, timeoutField, failureField]),
+    el("div", { class: "auto-fields" }, [modeField, targetField, attemptField, ipField]),
+    tuning,
     el("div", { class: "auto-actions" }, [saveButton, startButton, note]),
   ]);
-  const node = card({ title: "Auto Generate", desc: "Save a bounded profile, then start an unattended session.", body: [
+  form.addEventListener("invalid", (event) => {
+    if (tuning.contains(event.target)) tuning.open = true;
+  }, true);
+  const logControls = el("div", { class: "auto-actions auto-log-controls", hidden: true }, [
+    el("label", { class: "checkline" }, [follow, el("span", { text: "Follow latest" })]), copyLog,
+  ]);
+  const logEmpty = el("p", { class: "auto-note", text: "No session events yet." });
+  const node = card({ title: "Auto Generate", body: [
     form, error, connection,
     el("section", { class: "auto-session", "aria-label": "Auto Generate session" }, [
-      el("div", { class: "auto-session-head" }, [state, progress]), profile, counts, reason, slots,
-      el("div", { class: "auto-actions" }, [pauseButton, resumeButton, stopButton, retryButton]),
-      el("div", { class: "auto-actions" }, [
-        el("strong", { text: "Live session log" }),
-        el("label", { class: "checkline" }, [follow, el("span", { text: "Follow latest" })]), copyLog,
-      ]), logPane,
-      el("p", { class: "auto-note", text: "Last 200 session events. Attempt names match detailed worker cards below. Logs reset on a new session; a gateway restart retains progress, not this in-memory log." }),
-      el("p", { class: "auto-note", text: "Pause prevents new attempts; active attempts can finish. Stop cancels this session and its active attempts. An interrupted session never resumes automatically: choose Resume explicitly." }),
+      el("div", { class: "auto-session-head" }, [state, progress,
+        el("div", { class: "auto-actions" }, [pauseButton, resumeButton, stopButton, retryButton])]),
+      profile, counts, reason, slots,
+      logEmpty, logControls, logPane,
     ]),
   ] });
   node.classList.add("auto-generate");
@@ -193,6 +201,7 @@ export function createAutoGenerate({ signal } = {}) {
         + " | " + count(runConfig.concurrency) + " browser slots | " + count(runConfig.cooldown_seconds)
         + "s cooldown | " + runConfig.ip_source + " | "
         + (runConfig.browser_display === "desktop" ? "Desktop window" : "Background (invisible)") + " | AI only";
+    counts.hidden = status.state === "idle";
     fill(counts, [["launched", "Attempts reserved"], ["completed", "Finished attempts"], ["qualified", "Qualified"],
       ["failed", "Unsuccessful"], ["no_plan", "No plan"], ["duplicates", "Duplicates"], ["active", "Active"], ["cooling", "Cooling"]]
       .map(([key, label]) => el("div", { class: "auto-count" }, [el("dt", { text: label }), el("dd", { text: String(count(status[key])) })])));
@@ -212,13 +221,15 @@ export function createAutoGenerate({ signal } = {}) {
       const stamp = new Date(event.ts * 1000).toLocaleTimeString();
       return "[" + stamp + "] " + (event.worker ? event.worker + " | " : "") + event.message;
     });
+    logEmpty.hidden = !!lines.length;
+    logControls.hidden = logPane.hidden = !lines.length;
     const text = lines.join("\n");
     if (text !== lastLog || !logPane.children.length) {
       const scroll = logPane.scrollTop;
-      fill(logPane, lines.length ? lines.map((line, index) => el("div", {
+      fill(logPane, lines.map((line, index) => el("div", {
         class: "logpane__line" + ((status.events[index].level === "error") ? " logpane__line--err"
           : status.events[index].level === "warn" ? " logpane__line--warn" : ""), text: line,
-      })) : el("div", { class: "faint", text: "No session events yet. Start a saved profile to see attempt and cooldown progress." }));
+      })));
       logPane.scrollTop = follow.checked ? logPane.scrollHeight : scroll;
       lastLog = text;
     }
@@ -299,4 +310,75 @@ export function createAutoGenerate({ signal } = {}) {
   if (signal?.aborted) destroy();
   else refresh();
   return { node, refresh, destroy };
+}
+
+export async function mount({ root, signal }) {
+  const view = createAutoGenerate({ signal });
+  let judgeLoaded = false;
+  const error = el("p", { class: "text-err text-sm", role: "status" });
+  const fields = {};
+  const field = (key, label, attrs = {}) => {
+    const input = el("input", { class: "input", ...attrs });
+    fields[key] = input;
+    return el("label", { class: "field" }, [el("span", { class: "field__label", text: label }), input]);
+  };
+  const keyPlaceholder = (saved) => saved ? "Saved. Leave blank to keep it." : "Enter API key";
+  const save = button({ label: "Save AI judge", disabled: true });
+  const form = el("form", { class: "stack" }, [
+    el("div", { class: "auto-fields auto-judge-fields" }, [
+      field("custom_ai_url", "Endpoint URL", { type: "url", placeholder: "https://api.openai.com/v1" }),
+      field("custom_ai_model", "Model ID", { placeholder: "e.g. gpt-4o-mini" }),
+      field("custom_ai_key", "API key", { type: "password", autocomplete: "new-password" }),
+    ]), save, error,
+  ]);
+  save.type = "submit";
+  const key = fields.custom_ai_key;
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (save.disabled) return;
+    save.disabled = true;
+    for (const input of Object.values(fields)) input.readOnly = true;
+    error.textContent = "";
+    try {
+      const body = Object.fromEntries(Object.entries(fields).map(([name, input]) => [name, input.value.trim()]));
+      if (!body.custom_ai_key) delete body.custom_ai_key;
+      const result = await api.post("/admin/dash/generator/options", body);
+      if (result?.ok === false || result?.error) throw new Error(result.error || "Save rejected");
+      if (signal.aborted) return;
+      if (body.custom_ai_key) key.placeholder = keyPlaceholder(true);
+      key.value = "";
+      toast("AI judge settings saved", "ok");
+    } catch (e) {
+      if (!signal.aborted) error.textContent = e.message;
+    } finally {
+      save.disabled = false;
+      for (const input of Object.values(fields)) input.readOnly = false;
+    }
+  });
+  for (const input of Object.values(fields)) input.readOnly = true;
+  root.append(el("div", { class: "stack" }, [view.node, card({
+    title: "AI judge endpoint",
+    desc: "Use an OpenAI-compatible vision model. Leave the endpoint blank to use this gateway.",
+    body: form,
+  })]));
+  async function loadJudge() {
+    if (judgeLoaded) return;
+    try {
+      const { options = {} } = await api.get("/admin/dash/generator/status", { signal });
+      if (signal.aborted || judgeLoaded) return;
+      judgeLoaded = true;
+      fields.custom_ai_url.value = options.custom_ai_url || "";
+      fields.custom_ai_model.value = options.custom_ai_model || "";
+      key.placeholder = keyPlaceholder(options.custom_ai_key_set);
+      save.disabled = false;
+      error.textContent = "";
+      for (const input of Object.values(fields)) input.readOnly = false;
+    } catch (e) {
+      if (!signal.aborted) error.textContent = "Could not load AI judge settings. Use Refresh to retry.";
+    }
+  }
+  await loadJudge();
+  const refresh = view.refresh;
+  view.refresh = async () => { await Promise.all([refresh(), loadJudge()]); };
+  return view;
 }

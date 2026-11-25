@@ -209,7 +209,7 @@ def test_bootstrap_selects_start_plan_not_withdrawn_legacy_campaign():
     from zcode_gateway.paths import default_config_yaml
     import yaml
     defaults = yaml.safe_load(default_config_yaml())["generator"]
-    assert defaults["claim"] is False and defaults["claim_start"] is True
+    assert defaults["claim"] is False and defaults["claim_start"] is False
     assert defaults["captcha"] == "manual"
 
 

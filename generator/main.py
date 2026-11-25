@@ -1847,8 +1847,8 @@ def _main(auto_result=None):
                         try:
                             plan = check_account_plan(token, log=logger.info)
                         except Exception as e:
-                            if auto:
-                                raise   # strict auto routes never retry directly
+                            if auto or env_on('ZAI_REQUIRE_PROXY'):
+                                raise   # strict routes never retry directly
                             # The plan is tied to the ACCOUNT, not the IP, so if the
                             # proxy died mid-check just retry directly.
                             logger.warning(f"plan check via proxy failed ({type(e).__name__}) "

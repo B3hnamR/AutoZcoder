@@ -223,11 +223,10 @@ class PsiphonPool(vpn.ExitPool):
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                 creationflags=self._creationflags())
             regions: list[str] = []
-            connected = False
             deadline = time.time() + timeout
 
             def read():
-                nonlocal regions, connected
+                nonlocal regions
                 assert proc.stdout is not None
                 for raw in proc.stdout:
                     if time.time() > deadline:
@@ -236,13 +235,15 @@ class PsiphonPool(vpn.ExitPool):
                         notice = json.loads(raw.decode("utf-8", "replace").strip())
                     except ValueError:
                         continue
+                    if not isinstance(notice, dict):
+                        continue
                     kind = notice.get("noticeType")
                     data = notice.get("data") or {}
-                    if kind == "AvailableEgressRegions":
+                    if kind == "AvailableEgressRegions" and isinstance(data, dict) and isinstance(data.get("regions"), list):
                         regions = [str(r).upper() for r in data.get("regions") or []
-                                   if vpn.REGION_CODE.match(str(r).upper())]
-                    elif kind == "Tunnels" and (data.get("count") or 0) > 0:
-                        connected = True
+                                    if vpn.REGION_CODE.match(str(r).upper())]
+                        if regions:
+                            return
 
             reader = threading.Thread(target=read, daemon=True)
             reader.start()
@@ -255,8 +256,8 @@ class PsiphonPool(vpn.ExitPool):
                     proc.kill()
                 except Exception:
                     pass
-            if not connected and not regions:
-                raise RuntimeError("Psiphon could not connect to update its servers. "
+            if not regions:
+                raise RuntimeError("Psiphon did not report any regions. "
                                    "Check this computer's connection and try again.")
             self._save_regions(regions, replace=True)
         finally:

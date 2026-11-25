@@ -70,6 +70,15 @@ window.view = createAutoGenerate({signal:controller.signal}); document.querySele
         page.get_by_role("button", name="Refresh status", exact=True).click()
         page.wait_for_function("document.querySelector('.auto-note').textContent.includes('Review the saved profile')")
         assert start.is_disabled()
+        mode = page.get_by_label("Run mode", exact=True)
+        if page.evaluate("CSS.supports('appearance: base-select') && CSS.supports('selector(::picker(select))')"):
+            assert mode.evaluate("node => getComputedStyle(node).appearance") == "base-select"
+            mode.click()
+            page.wait_for_function("document.querySelector('.auto-generate select').matches(':open')")
+            assert mode.evaluate("node => getComputedStyle(node, '::picker(select)').backgroundColor") != "rgba(0, 0, 0, 0)"
+            page.keyboard.press("Escape")
+            assert mode.input_value() == "goal"
+        page.get_by_text("Browser and retry settings", exact=True).click()
         assert page.get_by_label("Captcha solver", exact=True).get_attribute("readonly") is not None
         display = page.get_by_label("Browser display", exact=True)
         assert display.input_value() == "background"  # Older saved profiles have no display field.
@@ -227,17 +236,15 @@ window.view = await mount({root:document.querySelector('#root'),signal:controlle
         page.on("pageerror", lambda error: errors.append(str(error)))
         page.route("**/*", handle)
         page.goto("http://auto.test/")
-        display = page.get_by_text("Browser display", exact=True).last.locator("..").locator("select")
+        display = page.locator("#generator-display")
         display.wait_for()
         assert display.is_enabled()
         assert display.input_value() == saved_display
         assert display.locator("option").all_text_contents() == ["Desktop window", "Native headless (background)"]
-        auto_display = page.get_by_label("Browser display", exact=True)
-        assert auto_display.input_value() == "background"
+        assert page.locator(".auto-generate").count() == 0
         display.select_option("headless")
         page.wait_for_function("document.querySelector('.text-ok.text-xs').hidden === false")
         assert calls[-1]["browser_display"] == "headless"
-        assert auto_display.input_value() == "background"
         captcha = page.get_by_text("Captcha", exact=True).locator("..").locator("select")
         with page.expect_response(lambda response: urlsplit(response.url).path == "/admin/dash/generator/options"):
             captcha.select_option("manual")
@@ -245,7 +252,6 @@ window.view = await mount({root:document.querySelector('#root'),signal:controlle
         assert display.input_value() == "auto"
         assert calls[-1]["browser_display"] == "auto"
         assert calls[-1]["captcha"] == "manual"
-        assert auto_display.is_enabled() and auto_display.input_value() == "background"
         captcha.select_option("ai")
         assert display.is_enabled()
         assert not errors

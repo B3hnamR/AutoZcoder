@@ -112,7 +112,8 @@ def test_controller_through_actual_manager_launcher_completes_one_fake_child(tmp
 def test_auto_preflight_checks_real_prerequisites_without_altering_manual_options(tmp_path, monkeypatch):
     mgr=GeneratorManager(tmp_path)
     mgr.env_setup.check=lambda:{'all_ok':True}
-    mgr.mail_cfg={'active':'example.test','inbox_url':'https://worker.invalid/inbox','inbox_secret':'dummy'}
+    mgr.mail_cfg={'domains':['example.test'],'active':'example.test','inbox_url':'https://worker.invalid/inbox',
+                  'inbox_secret':'dummy','inbox_ok':True,'routing_done':['example.test']}
     mgr._verify_inbox=lambda *a,**kw:{'ok':True}
     mgr.auto_ai_ready=lambda:True
     mgr.captcha='manual';mgr.captcha_strategy='auto';mgr.ip_source='pin'
@@ -134,7 +135,8 @@ def test_windows_auto_saved_display_controls_actual_launch_environment(tmp_path,
     mgr=GeneratorManager(tmp_path)
     monkeypatch.setattr('zcode_gateway.generator.sys.platform','win32')
     mgr.env_setup.check=lambda:{'all_ok':True}
-    mgr.mail_cfg={'active':'example.test','inbox_url':'https://worker.invalid/inbox','inbox_secret':'dummy'}
+    mgr.mail_cfg={'domains':['example.test'],'active':'example.test','inbox_url':'https://worker.invalid/inbox',
+                  'inbox_secret':'dummy','inbox_ok':True,'routing_done':['example.test']}
     mgr._verify_inbox=lambda *a,**kw:{'ok':True}
     mgr.auto_ai_ready=lambda:True
     config={**mgr.auto_generate.config(),'browser_display':mode}

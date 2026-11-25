@@ -80,7 +80,7 @@ DEFAULT_CONFIG_YAML = 'server:\n  host: 127.0.0.1\n  port: 8788\n  require_clien
 
 
 def default_config_yaml() -> str:
-    return DEFAULT_CONFIG_YAML.replace("  claim: true\n", "  claim: false\n  claim_start: true\n").replace(
+    return DEFAULT_CONFIG_YAML.replace("  claim: true\n", "  claim: false\n  claim_start: false\n").replace(
         "gw-admin-local", f"gw-admin-{secrets.token_hex(8)}").replace(
         "gw-local-1", f"gw-client-{secrets.token_hex(8)}")
 
