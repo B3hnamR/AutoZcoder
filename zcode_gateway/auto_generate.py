@@ -20,12 +20,14 @@ from collections import deque
 
 DEFAULT_CONFIG = {
     "mode": "goal", "target": 20, "attempt_limit": 100, "concurrency": 1,
-    "cooldown_seconds": 60, "ip_source": "direct", "captcha": "ai",
+    "cooldown_seconds": 60, "ip_source": "direct", "ip_sources": [],
+    "ip_mode": "spread", "ip_pick": "", "captcha": "ai",
     "timeout_seconds": 900, "failure_limit": 5,
     "browser_display": "background",
 }
+IP_SOURCES = ("pool", "direct", "pin", "psiphon", "surfshark")
 _BOUNDS = {
-    "target": (1, 1000), "attempt_limit": (1, 10000), "concurrency": (1, 3),
+    "target": (1, 1000), "attempt_limit": (1, 10000), "concurrency": (1, 100),
     "cooldown_seconds": (0, 3600), "timeout_seconds": (60, 3600),
     "failure_limit": (1, 100),
 }
@@ -41,7 +43,7 @@ _CATEGORIES = {
     "mail_error", "pool_empty", "rate_limited", "generated", "registration_error",
     "finish_signup_failed", "browser_failed", "mail_timeout",
 }
-_PAUSE_CATEGORIES = {"pool_empty", "mail_error", "mail_timeout", "rate_limited", "registration_error", "finish_signup_failed"}
+_PAUSE_CATEGORIES = {"pool_empty", "proxy_unavailable", "mail_error", "mail_timeout", "rate_limited", "registration_error", "finish_signup_failed"}
 _REASONS = {
     "", "preflight", "user_paused", "user_stopped", "process_restart",
     "invalid_saved_config", "invalid_saved_progress", "persistence_error",
@@ -65,15 +67,41 @@ def validate_config(config):
         if type(value[name]) is not int or not low <= value[name] <= high:
             raise ValueError(f"{name} must be an integer between {low} and {high}")
     for name, choices in {
-        "mode": ("goal", "attempts"), "ip_source": ("direct", "proxy"),
-        "captcha": ("ai",),
+        "mode": ("goal", "attempts"), "ip_source": (*IP_SOURCES, "proxy"),
+        "ip_mode": ("spread", "single"), "captcha": ("auto", "ai", "classic", "mint"),
         "browser_display": ("background", "desktop"),
     }.items():
         if not isinstance(value[name], str) or value[name] not in choices:
             raise ValueError(f"invalid {name}")
+    selected = value["ip_sources"]
+    if not isinstance(selected, list) or len(selected) > len(IP_SOURCES):
+        raise ValueError("ip_sources must be a list of IP sources")
+    if any(not isinstance(source, str) or source not in IP_SOURCES for source in selected):
+        raise ValueError("invalid ip_sources")
+    if len(set(selected)) != len(selected):
+        raise ValueError("duplicate ip_sources")
+    if not isinstance(value["ip_pick"], str) or len(value["ip_pick"]) > 64:
+        raise ValueError("invalid ip_pick")
     if value["mode"] == "goal" and value["attempt_limit"] < value["target"]:
         raise ValueError("attempt_limit must be at least target in goal mode")
-    return value
+    return {**value, "ip_sources": list(selected)}
+
+
+class RouteUnavailable(RuntimeError):
+    """The selected exit network dropped between attempts; pause, not retry-burn."""
+    category = "proxy_unavailable"
+
+
+def _route_label(config):
+    """Readable route summary; a legacy single ip_source still works."""
+    legacy = "pool" if config["ip_source"] == "proxy" else config["ip_source"]
+    sources = config["ip_sources"] or [legacy]
+    return " + ".join(sources) + (" (stay on one)" if config["ip_mode"] == "single" else " (random)")
+
+
+def copy_config(config):
+    """Shallow copy with an independent source list; callers may mutate either."""
+    return {**config, "ip_sources": list(config["ip_sources"])}
 
 
 def _atomic_json(path, value):
@@ -122,7 +150,7 @@ class AutoGenerateController:
         self._wake = threading.Event()
         self._thread = None
         self._closed = False
-        self._saved_config = dict(DEFAULT_CONFIG)
+        self._saved_config = copy_config(DEFAULT_CONFIG)
         self._run_config = None
         self._status = "idle"
         self._reason = ""
@@ -166,7 +194,7 @@ class AutoGenerateController:
             if status not in _STATUSES:
                 raise ValueError("invalid status")
             active = saved["active"]
-            if type(active) is not int or not 0 <= active <= 3:
+            if type(active) is not int or not 0 <= active <= 100:
                 raise ValueError("invalid active count")
             categories = saved.get("categories", {})
             if (not isinstance(categories, dict) or any(
@@ -185,18 +213,19 @@ class AutoGenerateController:
                     for k, v in outcomes.items())):
                 raise ValueError("invalid attempt outcomes")
             self._outcomes = dict(outcomes)
-            deadlines = saved.get("cooldown_deadlines", [0.0] * 3)
-            if (not isinstance(deadlines, list) or len(deadlines) != 3 or any(
+            deadlines = saved.get("cooldown_deadlines", [0.0])
+            if (not isinstance(deadlines, list) or not 1 <= len(deadlines) <= 100 or any(
                     type(v) not in (int, float) or not math.isfinite(v) or v < 0
                     for v in deadlines)):
                 raise ValueError("invalid cooldown deadlines")
             now, wall = time.monotonic(), time.time()
             self._ready_at = [now + min(config["cooldown_seconds"], max(0.0, v - wall))
                               if v > wall else 0.0 for v in deadlines]
+            self._ensure_ready(max(config["concurrency"], len(deadlines)))
             active_attempts = saved.get("active_attempts", [])
-            if (not isinstance(active_attempts, list) or len(active_attempts) > 3 or any(
+            if (not isinstance(active_attempts, list) or len(active_attempts) > 100 or any(
                     not isinstance(v, dict) or not self._valid_attempt_id(v.get("id"))
-                    or type(v.get("index")) is not int or not 0 <= v["index"] < 3
+                    or type(v.get("index")) is not int or not 0 <= v["index"] < len(self._ready_at)
                     for v in active_attempts)
                     or len({v["id"] for v in active_attempts}) != len(active_attempts)):
                 raise ValueError("invalid active attempts")
@@ -338,28 +367,35 @@ class AutoGenerateController:
 
     def config(self):
         with self._lock:
-            return dict(self._saved_config)
+            return copy_config(self._saved_config)
 
     def save_config(self, config):
         value = validate_config(config)
         with self._lock:
             _atomic_json(self._config_path, value)
             self._saved_config = value
-            return dict(value)
+            return copy_config(value)
 
     def status(self):
         with self._lock:
             now = time.monotonic()
+            concurrency = (self._run_config or self._saved_config)["concurrency"]
+            self._ensure_ready(concurrency)
             return {
                 "status": self._status, "reason": self._reason,
                 "id": self._run_id,
-                "config": dict(self._run_config or self._saved_config),
+                "config": copy_config(self._run_config or self._saved_config),
                 **self._counts, "categories": dict(self._categories),
                 "active": len(self._active),
                 "cooldowns": [max(0.0, deadline - now) for deadline in self._ready_at[
-                    : (self._run_config or self._saved_config)["concurrency"]]],
+                    : concurrency]],
                 "events": [dict(event) for event in self._events],
             }
+
+    def _ensure_ready(self, count):
+        """Cooldown slots live per concurrency index; grow when it is raised."""
+        if len(self._ready_at) < count:
+            self._ready_at.extend([0.0] * (count - len(self._ready_at)))
 
     def _persist_locked(self):
         if self._run_config is None:
@@ -395,7 +431,7 @@ class AutoGenerateController:
             self._counts = dict.fromkeys(_COUNTERS, 0)
             self._categories, self._account_ids = {}, set()
             self._outcomes, self._registrations = {}, {}
-            self._ready_at = [0.0] * 3
+            self._ready_at = [0.0] * value["concurrency"]
             self._run_id = uuid.uuid4().hex
             self._status, self._reason = "preparing", "preflight"
             self._events.clear()
@@ -429,7 +465,7 @@ class AutoGenerateController:
                 return self.status()
             self._status, self._reason = "running", ""
             self._event("Preflight passed. Session running with %d slot(s), %ds completion cooldown, %s route." %
-                        (config["concurrency"], config["cooldown_seconds"], config["ip_source"]))
+                        (config["concurrency"], config["cooldown_seconds"], _route_label(config)))
             if not self._persist_or_fail_locked():
                 raise OSError("could not persist run state")
             if self._thread is None or not self._thread.is_alive():
@@ -478,7 +514,7 @@ class AutoGenerateController:
             if self._status in _ACTIVE_STATUSES or self._active or self._status == "interrupted":
                 self._status, self._reason = "stopping", "user_stopped"
                 self._event("Stop requested. Cancelling pending launches and owned active attempts.", "warn")
-                self._ready_at = [0.0] * 3
+                self._ready_at = [0.0] * max(len(self._ready_at), 1)
                 handles = []
                 for slot in self._active.values():
                     slot["cancelled"] = True
@@ -552,9 +588,12 @@ class AutoGenerateController:
             "mail_timeout": "Verification email did not arrive within the worker wait window.",
             "mail_error": "Mail verification failed. Repair the inbox before resuming.",
             "launch_failed": "Worker could not be started. No browser/signup success should be inferred from an attempt reservation.",
+            "proxy_unavailable": "The selected exit network has no connected exit. Reconnect it before Resume.",
         }
         if category in diagnostics:
-            self._event(diagnostics[category], "warn", worker)
+            detail = result.get("detail")
+            detail = " ".join(detail.split())[:300] if isinstance(detail, str) else ""
+            self._event((" ".join((diagnostics[category], detail))).strip(), "warn", worker)
         if self._ready_at[slot["index"]] > time.monotonic():
             self._event("Slot %d cooling down for %d seconds before another attempt." %
                         (slot["index"] + 1, self._run_config["cooldown_seconds"]), worker=worker)
@@ -624,6 +663,7 @@ class AutoGenerateController:
                           (config["mode"] == "attempts" or
                            self._counts["qualified"] + len(self._active) < config["target"])):
                         occupied = {slot["index"] for slot in self._active.values()}
+                        self._ensure_ready(config["concurrency"])
                         for index in range(config["concurrency"]):
                             if index not in occupied and self._ready_at[index] <= now:
                                 self._counts["attempts"] += 1
@@ -660,11 +700,18 @@ class AutoGenerateController:
                     handle = self._launch(config, attempt_id)
                     if not callable(handle.done.is_set) or not callable(handle.stop):
                         raise TypeError("invalid worker handle")
-                except Exception:
+                except Exception as exc:
                     if handle is not None:
                         self._stop_handles([handle])
                     with self._lock:
-                        self._finish_locked(attempt_id, {"category": "launch_failed"})
+                        category = getattr(exc, "category", "launch_failed")
+                        result = {"category": category}
+                        # RouteUnavailable text is gateway-authored (no URLs or
+                        # credentials), so it is safe to show; arbitrary worker
+                        # exceptions may leak secrets and stay out of the log.
+                        if category == "proxy_unavailable":
+                            result["detail"] = str(exc)
+                        self._finish_locked(attempt_id, result)
                         self._persist_or_fail_locked()
                 else:
                     with self._lock:

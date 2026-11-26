@@ -56,6 +56,47 @@ def test_start_qualification_only_uses_own_current_balance():
     assert not api_dash._qualifying_start_balance(raw,now)
 
 
+def test_active_start_plan_qualifies_before_its_balance_bucket_lands():
+    now = time.time()
+    raw = {'plans': [{'plan_id': 'zcode-v3-start-plan-0817', 'status': 'active',
+                      'starts_at': now - 1, 'ends_at': now + 60}], 'balances': []}
+    assert not api_dash._qualifying_start_balance(raw, now)
+    assert api_dash._active_start_plan(raw, now)
+    assert api_dash._qualifies_start(raw, now)
+    raw['balances'] = [{'user_plan_id': 'absent-owner', 'remaining_units': 0}]
+    assert api_dash._qualifies_start(raw, now)  # unrelated bucket, grant still pending
+    raw['balances'][0]['user_plan_id'] = None
+    assert api_dash._qualifies_start(raw, now)
+    raw['plans'][0]['user_plan_id'] = 'own'
+    raw['balances'][0].update(user_plan_id='own', remaining_units=0)
+    assert not api_dash._qualifies_start(raw, now)  # exists but drained
+    raw['balances'] = []
+    raw['plans'][0]['status'] = 'pending'
+    assert not api_dash._qualifies_start(raw, now)
+    raw['plans'][0].update(status='active', starts_at=now + 10)
+    assert not api_dash._qualifies_start(raw, now)
+    raw['plans'][0].update(starts_at=now - 1, ends_at=now - 1)
+    assert not api_dash._qualifies_start(raw, now)
+    raw['plans'][0].update(ends_at=now + 60, plan_id='zcode-v3-start-plan-500m')
+    assert not api_dash._qualifies_start(raw, now)
+
+
+def test_auto_plan_gate_keeps_worker_start_plan_evidence(tmp_path, monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1] / "generator"))
+    start = {"code": 0, "plans": ["zcode-v3-start-plan-0817"]}
+    assert api_dash._auto_plan_gate(start, False) == (
+        ["zcode-v3-start-plan-0817"], "zcode-v3-start-plan-0817", None)
+    assert api_dash._auto_plan_gate({"code": 0, "plans": ["paid-plan"]}, False)[2]["category"] == "no_plan"
+    assert api_dash._auto_plan_gate({"code": 7, "plans": ["zcode-v3-start-plan-0817"]}, False)[2]["category"] == "no_plan"
+    assert api_dash._auto_plan_gate({"code": 0, "plans": []}, False) == ([], "", None)
+    assert api_dash._auto_plan_gate({"code": 7, "plans": [], "raw": {}}, True) == (
+        ["zcode-v3-start-plan-0817"], "zcode-v3-start-plan-0817", None)
+    assert api_dash._auto_plan_gate(None, True)[1] == "zcode-v3-start-plan-0817"
+    campaign = {"code": 0, "plans": ["zcode-v3-start-plan-1024"]}
+    assert api_dash._auto_plan_gate(campaign, False)[2]["category"] == "no_plan"
+    assert api_dash._auto_plan_gate(campaign, True)[1] == "zcode-v3-start-plan-1024"
+
+
 @pytest.mark.asyncio
 async def test_login_probe_updates_canonical_and_initializing_flow_reused(tmp_path,monkeypatch):
     from zcode_gateway import device_auth

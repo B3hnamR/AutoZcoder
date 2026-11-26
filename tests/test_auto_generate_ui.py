@@ -7,14 +7,17 @@ import pytest
 
 ASSETS = Path(__file__).resolve().parents[1] / "zcode_gateway/dashboard/assets"
 CONFIG = {"mode": "goal", "target": 20, "attempt_limit": 100, "concurrency": 1,
-          "cooldown_seconds": 60, "ip_source": "direct", "captcha": "ai",
-          "timeout_seconds": 900, "failure_limit": 5}
+          "cooldown_seconds": 60, "ip_source": "direct", "ip_sources": [], "ip_mode": "spread",
+          "ip_pick": "", "captcha": "ai", "timeout_seconds": 900, "failure_limit": 5}
+EXITS = [{"key": "psiphon:DE", "label": "Psiphon Germany (DE)"},
+         {"key": "surfshark:nl-ams", "label": "Surfshark Netherlands (Amsterdam)"}]
 
 
 def test_auto_generate_mocked_browser(tmp_path):
     playwright = pytest.importorskip("playwright.sync_api")
     config = dict(CONFIG)
     status = {"state": "idle", "qualified": 0, "no_plan": 0, "slots": []}
+    workers = []
     calls, errors, unexpected = [], [], []
     fail = {"get": True, "save": False}
 
@@ -36,7 +39,15 @@ def test_auto_generate_mocked_browser(tmp_path):
                 status["state"] = {"start": "running", "pause": "paused", "resume": "running", "stop": "stopped"}[action]
                 if action == "start":
                     status.update(id="fixture-session", config=dict(config))
-            route.fulfill(json={"config": config, "status": status})
+            route.fulfill(json={"config": config, "status": status, "workers": workers,
+                                "ip_exits": EXITS, "pool_available": 0, "pin_set": False})
+        elif path.startswith("/admin/dash/generator/workers/"):
+            calls.append((request.method, path, request.post_data_json if request.method != "GET" else None))
+            route.fulfill(json={"log": "full log", "password": "pw", "removed": "x", "cleared": 1})
+        elif path == "/admin/dash/generator/stop":
+            calls.append((request.method, path, request.post_data_json))
+            workers[0]["state"] = "killed"
+            route.fulfill(json={"stopped": workers[0]["name"]})
         elif path.startswith("/assets/"):
             target = ASSETS / path.removeprefix("/assets/")
             route.fulfill(body=target.read_text(encoding="utf-8"),
@@ -79,7 +90,8 @@ window.view = createAutoGenerate({signal:controller.signal}); document.querySele
             page.keyboard.press("Escape")
             assert mode.input_value() == "goal"
         page.get_by_text("Browser and retry settings", exact=True).click()
-        assert page.get_by_label("Captcha solver", exact=True).get_attribute("readonly") is not None
+        assert page.get_by_label("Captcha solver", exact=True).input_value() == "ai"
+        page.get_by_label("Captcha solver", exact=True).select_option("mint")
         display = page.get_by_label("Browser display", exact=True)
         assert display.input_value() == "background"  # Older saved profiles have no display field.
         assert display.locator("option").all_text_contents() == ["Background (invisible)", "Desktop window"]
@@ -169,19 +181,72 @@ window.view = createAutoGenerate({signal:controller.signal}); document.querySele
         page.get_by_role("button", name="Stop session", exact=True).click()
         page.wait_for_function("!document.querySelector('[name=mode]').disabled")
         page.get_by_label("Run mode", exact=True).select_option("attempts")
-        page.get_by_label("IP source", exact=True).select_option("proxy")
+        source = page.get_by_role("checkbox", name="Proxy pool (0)", exact=True)
+        modeRow = page.locator(".ip-field .ip-line").nth(1)
+        assert modeRow.is_visible() is False
+        source.check()
         display.select_option("desktop")
         assert not goal.is_visible()
+        page.get_by_role("checkbox", name="Psiphon", exact=True).check()
+        page.get_by_role("checkbox", name="Surfshark", exact=True).check()
+        page.get_by_label("Concurrent browsers", exact=True).fill("4")
+        assert modeRow.is_visible()
+        page.get_by_role("radio", name="Stay on one").check()
+        pick = page.get_by_label("Exit in use", exact=True)
+        assert pick.locator("option").all_text_contents() == [
+            "Psiphon Germany (DE)", "Surfshark Netherlands (Amsterdam)"]
+        pick.select_option("surfshark:nl-ams")
+        # Unchecking the only remaining source must keep it selected.
+        for name in ("Proxy pool (0)", "Psiphon", "My network"):
+            page.get_by_role("checkbox", name=name, exact=True).click()
+        last = page.get_by_role("checkbox", name="Surfshark", exact=True)
+        last.click()
+        assert last.is_checked()
+        for name in ("Proxy pool (0)", "Psiphon"):
+            page.get_by_role("checkbox", name=name, exact=True).check()
         save.click()
         page.wait_for_function("!document.querySelector('.auto-actions .btn--primary').disabled")
         assert calls[-1][0] == "PUT"
         assert calls[-1][2]["browser_display"] == "desktop"
+        assert sorted(calls[-1][2]["ip_sources"]) == ["pool", "psiphon", "surfshark"]
+        assert calls[-1][2]["ip_mode"] == "single"
+        assert calls[-1][2]["ip_pick"] == "surfshark:nl-ams"
+        assert calls[-1][2]["captcha"] == "mint"
+        assert calls[-1][2]["concurrency"] == 4
+        assert page.get_by_label("Concurrent browsers", exact=True).input_value() == "4"
         start.click()
         pause.wait_for()
         assert "attempts launched" in page.locator(".auto-progress").inner_text()
-        assert status["config"]["ip_source"] == "proxy"
+        assert sorted(status["config"]["ip_sources"]) == ["pool", "psiphon", "surfshark"]
         assert status["config"]["browser_display"] == "desktop"
         assert "Desktop window" in page.locator(".auto-session > .auto-note").first.inner_text()
+        assert "stay on one" in page.locator(".auto-session > .auto-note").first.inner_text()
+        assert "Mint token" in page.locator(".auto-session > .auto-note").first.inner_text()
+        assert status["config"]["concurrency"] == 4
+
+        workers.append({"name": "auto-abc123", "state": "running", "captcha": "mint",
+                        "route_label": "Psiphon · Germany (DE)", "created": 1, "has_log": False,
+                        "has_password": False, "starter": True, "start_plan": False,
+                        "email": "a@b.test", "lines": ["Captcha solved"]})
+        page.evaluate("view.refresh()")
+        card = page.locator(".auto-workers-list .job")
+        card.wait_for()
+        assert "auto-abc123" in card.inner_text() and "Captcha solved" in card.inner_text()
+        assert "Psiphon · Germany (DE)" in card.inner_text()
+        assert card.get_by_text("Starter", exact=True).is_visible()
+        assert "a@b.test" in card.inner_text()
+        workers[0].update(state="exited", has_log=True, has_password=True, starter=False)
+        page.evaluate("view.refresh()")
+        assert card.get_by_text("No plan", exact=True).is_visible()
+        card.get_by_role("button", name="Copy log", exact=True).click()
+        assert any(path.endswith("/workers/details/log") for _, path, _ in calls)
+        assert card.get_by_role("button", name="Kill", exact=True).count() == 0
+        workers.append({"name": "auto-def456", "state": "exited", "created": 2, "has_log": False,
+                        "has_password": False, "lines": []})
+        page.evaluate("view.refresh()")
+        page.locator(".auto-workers-list .job").nth(1).locator('button[title="Remove from list"]').click()
+        assert any(path.endswith("/workers/remove") for _, path, _ in calls)
+        assert not page.get_by_text("No session events yet.", exact=True).is_visible()
         before = len(calls)
         page.evaluate("controller.abort(); view.refresh(); view.destroy()")
         assert len(calls) == before

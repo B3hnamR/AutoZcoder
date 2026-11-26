@@ -1421,7 +1421,14 @@ def signup(email, password, mail=None):
                                  'credentials saved to recovery_accounts.txt if writable; '
                                  'NOT retrying', finish_status)
                     return 'SIGNUP_FINISH_FAILED'
-                return None
+                try:
+                    _save_recovery_account(email, password, 'finish_failed|no_response')
+                except OSError:
+                    logger.error('Writing the recovery file failed', exc_info=True)
+                logger.error('finish_signup returned no response, no account token; '
+                             'credentials saved to recovery_accounts.txt if writable; '
+                             'NOT retrying')
+                return 'SIGNUP_FINISH_FAILED'
 
             except Exception as e:
                 logger.error(f"Error: {e}")
@@ -1774,6 +1781,10 @@ def _main(auto_result=None):
             logger.info(f"  retry {pr + 1}/{max_proxy_retries} — "
                         f"{route} email={email}")
 
+        # An unexpected empty result must still name a category, or the run is
+        # filed as a mystery "failed" with no reason.
+        if result is None and auto:
+            auto_result.update(_auto_result('failed', email))
         if result == 'CAPTCHA_NOT_LOADED':
             if auto:
                 auto_result.update(_auto_result('captcha_failed', email))
@@ -1890,7 +1901,13 @@ def _main(auto_result=None):
                 giveaway500 = False
                 start_plan = False
                 start_plan_id = ''
-                if claim_start_on and isinstance(result, str):
+                if auto and starter and claim_start_on and isinstance(result, str):
+                    # The plan check already proved a live Start Plan. Auto's goal
+                    # is that plan, so the campaign pass (device login, previews,
+                    # marketing touches) only adds lag and can report a fresh
+                    # "nothing claimable" over a plan that is demonstrably active.
+                    logger.info(f"Start Plan already active for {email}; campaign claim skipped")
+                elif claim_start_on and isinstance(result, str):
                     try:
                         from claim_start import claim_start as run_claim_start
                         rc = run_claim_start(token, log=logger.info,

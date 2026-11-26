@@ -113,10 +113,12 @@ def test_strict_integer_validation(field, value):
 
 
 @pytest.mark.parametrize("config", [
-    {"concurrency": 4}, {"target": 1001}, {"attempt_limit": 10001},
+    {"concurrency": 0}, {"concurrency": 101}, {"target": 1001}, {"attempt_limit": 10001},
     {"cooldown_seconds": 3601}, {"timeout_seconds": 59}, {"timeout_seconds": 3601},
     {"failure_limit": 101}, {"mode": "wrong"}, {"ip_source": "wrong"},
-    {"ip_source": "pin"}, {"ip_source": "pool"}, {"captcha": "manual"},
+    {"captcha": "manual"},
+    {"ip_sources": "psiphon"}, {"ip_sources": ["wrong"]}, {"ip_sources": ["psiphon", "psiphon"]},
+    {"ip_sources": [1]}, {"ip_mode": "wrong"}, {"ip_pick": 5}, {"ip_pick": "x" * 65},
     {"captcha": "wrong"}, {"secret": "never persist"}, {"target": 10, "attempt_limit": 9},
 ])
 def test_invalid_configs(config):
@@ -128,6 +130,40 @@ def test_defaults_and_attempt_mode_budget_validation():
     assert validate_config({}) == DEFAULT_CONFIG
     assert validate_config({"mode": "attempts", "target": 100, "attempt_limit": 1})["target"] == 100
     assert validate_config({"ip_source": "proxy"})["ip_source"] == "proxy"
+    assert validate_config({"ip_source": "pool"})["ip_source"] == "pool"
+    assert validate_config({"concurrency": 4})["concurrency"] == 4
+    for mode in ("auto", "ai", "classic", "mint"):
+        assert validate_config({"captcha": mode})["captcha"] == mode
+    vpn = validate_config({"ip_sources": ["psiphon", "surfshark"], "ip_mode": "single",
+                           "ip_pick": "surfshark:nl-ams"})
+    assert vpn["ip_sources"] == ["psiphon", "surfshark"] and vpn["ip_mode"] == "single"
+    vpn["ip_sources"].append("pool")
+    assert validate_config({"ip_sources": ["psiphon"]})["ip_sources"] == ["psiphon"]
+    assert validate_config({})["ip_sources"] is not validate_config({})["ip_sources"]
+
+
+def test_high_concurrency_uses_a_slot_per_browser(factory):
+    controller, _ = factory()
+    controller.start(settings(mode="attempts", attempt_limit=10, concurrency=10, cooldown_seconds=0))
+    wait_for(lambda: controller.status()["attempts"] == 10)
+    status = controller.status()
+    assert status["active"] == 10
+    assert len(status["cooldowns"]) == 10
+    assert not any(slot["index"] >= 10 for slot in controller._active.values())
+
+
+def test_route_loss_at_launch_pauses_instead_of_burning_failures(factory):
+    def launch(config, attempt_id):
+        raise module.RouteUnavailable("no connected exit")
+    controller, _ = factory(launch=launch)
+    controller.start(settings(target=3))
+    wait_for(lambda: controller.status()["status"] == "paused")
+    status = controller.status()
+    assert status["reason"] == "proxy_unavailable"
+    assert status["categories"] == {"proxy_unavailable": 1}
+    assert status["attempts"] == 1 and status["active"] == 0
+    assert any("no connected exit" in event["message"] for event in status["events"])
+    assert any("Reconnect it before Resume" in event["message"] for event in status["events"])
 
 
 def test_saved_preferences_and_running_snapshot_are_separate(factory, tmp_path):

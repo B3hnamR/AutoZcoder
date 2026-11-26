@@ -1046,6 +1046,67 @@ def _qualifying_start_balance(raw: dict, now: float) -> bool:
     return False
 
 
+def _active_start_plan(raw: dict, now: float):
+    """The active, in-window Start Plan row, if one exists."""
+    for plan in raw.get("plans", []):
+        if not isinstance(plan, dict) or plan.get("status") != "active":
+            continue
+        pid = str(plan.get("plan_id") or "")
+        if not pid.startswith("zcode-v3-start-plan-") or pid in (
+                "zcode-v3-start-plan-1024", "zcode-v3-start-plan-500m"):
+            continue
+        if (plan.get("starts_at") or 0) > now:
+            continue
+        if plan.get("ends_at") and plan["ends_at"] <= now:
+            continue
+        return plan
+    return None
+
+
+def _qualifies_start(raw: dict, now: float) -> bool:
+    """Qualification gate: a spendable bucket, or a live Start Plan whose grant
+    has not been written as a bucket yet. An account that just found the plan
+    already active never gets a new grant and its bucket can lag the plan by a
+    few seconds. Manual registration has always accepted the plan alone; Auto
+    Generate must too, or a healthy account is filed as `no_plan`.
+
+    A bucket that exists but is drained (remaining 0) is NOT qualified — that is
+    an exhausted plan, not a lagging grant.
+    """
+    if _qualifying_start_balance(raw, now):
+        return True
+    plan = _active_start_plan(raw, now)
+    if not plan:
+        return False
+    owner = plan.get("user_plan_id")
+    return not any(isinstance(bucket, dict) and owner
+                   and bucket.get("user_plan_id") == owner for bucket in raw.get("balances", []))
+
+
+def _auto_plan_gate(plan_info, hinted: bool):
+    """Validate a plan read for an auto attempt.
+
+    Returns ``(plans, chosen_plan, error)``. An empty plan list with no error
+    means the caller should leave the account for the catch-up scan. A worker
+    that already verified a Start Plan keeps that evidence when this re-read
+    comes back empty or failed.
+    """
+    plan_info = plan_info if isinstance(plan_info, dict) else {}
+    plans = list(plan_info.get("plans") or [])
+    if not plans:
+        if not hinted:
+            return [], "", None
+        plans = ["zcode-v3-start-plan-0817"]
+    elif not hinted:
+        from plan_check import is_start_plan
+        if plan_info.get("code") != 0 or not any(is_start_plan(p) for p in plans):
+            return plans, "", {"qualified": False, "category": "no_plan",
+                               "error": "No active Starter/Start Plan verified"}
+    chosen = next((p for p in plans if str(p).startswith("zcode-v3-start-plan-")
+                   and p != "zcode-v3-start-plan-1024"), plans[0] if plans else "")
+    return plans, chosen, None
+
+
 def _generator(request: Request):
     return _generator_for_state(get_state(request))
 
@@ -1130,6 +1191,10 @@ def _generator_for_state(state):
             email = info.get("email") or ""
             chat_token = info.get("chat_token") or ""
             auto = bool(info.get("auto_generate"))
+            # The worker's own plan check saw a live Start Plan; its balance read
+            # can still fail transiently right after the grant, so a re-read here
+            # must not override that evidence with empty data.
+            hinted = auto and bool(info.get("starter") or info.get("start_plan"))
             cancelled = info.get("cancelled", lambda: False)
             def cancelled_result():
                 return {"qualified": False, "category": "stopped", "error": "Registration cancelled"}
@@ -1188,14 +1253,18 @@ def _generator_for_state(state):
                         break
                     if attempt < 3:
                         _time.sleep(3)
-                if not plans:
-                    log.info("generator: %s has no plan after retries — leaving "
-                             "it for the catch-up scan", email)
-                    return
                 if auto:
-                    from plan_check import is_start_plan
-                    if not plan_info or plan_info.get("code") != 0 or not any(is_start_plan(p) for p in plans):
-                        return {"qualified": False, "category": "no_plan", "error": "No active Starter/Start Plan verified"}
+                    plans, chosen_plan, plan_error = _auto_plan_gate(plan_info, hinted)
+                    if plan_error:
+                        return plan_error
+                    if not plans:
+                        log.info("generator: %s has no plan after retries — leaving "
+                                 "it for the catch-up scan", email)
+                        return
+                    if not plan_info.get("plans"):
+                        log.info("generator: %s plan read empty; trusting the worker's "
+                                 "verified Start Plan", email)
+                        plan_info = {}
                     # The run must count a NEW provider identity, not a duplicate
                     # token for an account already loaded before registration.
                     from .zcode_detect import jwt_claims
@@ -1206,15 +1275,17 @@ def _generator_for_state(state):
                     prior = asyncio.run_coroutine_threadsafe(state.pool.find(ident), main_loop).result(timeout=20)
                     if prior:
                         return {"qualified": False, "category": "duplicate", "account_id": ident}
-                chosen_plan = next((p for p in plans
-                                    if str(p).startswith("zcode-v3-start-plan-")
-                                    and p != "zcode-v3-start-plan-1024"),
-                                   plans[0] if plans else "")
+                else:
+                    chosen_plan = next((p for p in plans
+                                        if str(p).startswith("zcode-v3-start-plan-")
+                                        and p != "zcode-v3-start-plan-1024"),
+                                       plans[0] if plans else "")
                 if auto and cancelled():
                     return cancelled_result()
                 if auto:
-                    if not _qualifying_start_balance(plan_info.get("raw") or {}, time.time()):
-                        return {"qualified": False, "category": "no_plan", "error": "No currently spendable Start Plan balance"}
+                    if not hinted:
+                        if not _qualifies_start(plan_info.get("raw") or {}, time.time()):
+                            return {"qualified": False, "category": "no_plan", "error": "No active Start Plan or spendable balance"}
                     run_id, attempt_id = info.get("auto_run_id"), info.get("auto_attempt_id")
                     if not run_id or not attempt_id:
                         return {"qualified": False, "category": "registration_error", "error": "Registration receipt identity missing"}
@@ -1228,7 +1299,7 @@ def _generator_for_state(state):
                         state.pool.upsert(account), main_loop)
                     fut.result(timeout=30)
                     if auto:
-                        checked = asyncio.run_coroutine_threadsafe(_verify_auto_account(account.id, plan_info.get("raw")), main_loop).result(timeout=20)
+                        checked = asyncio.run_coroutine_threadsafe(_verify_auto_account(account.id, plan_info.get("raw"), hinted), main_loop).result(timeout=20)
                         if not checked:
                             return {"qualified": False, "category": "registration_error",
                                     "error": "Saved account needs a fresh successful plan/quota check"}
@@ -1277,18 +1348,22 @@ def _generator_for_state(state):
             with request_route(info.get("registration_proxy") or None):
                 return _register_account_impl(info)
 
-        async def _verify_auto_account(account_id: str, raw: dict) -> bool:
+        async def _verify_auto_account(account_id: str, raw: dict, hint: bool = False) -> bool:
             account = await state.pool.find(account_id)
-            if account is None or not isinstance(raw, dict):
+            if account is None:
                 return False
             now = time.time()
+            if not isinstance(raw, dict) or not raw.get("plans"):
+                account.plan_checked_at = now
+                account.has_plan = bool(hint)
+                return bool(hint)
             from .quota import parse_balance
             plans, quotas = parse_balance(raw, now)
             account.notes.update(plans=plans, quotas=quotas)
             account.notes.pop("quota_check_error", None)
             account.balance_checked_at = account.plan_checked_at = now
             account.has_plan = account.plan_active(now)
-            return _qualifying_start_balance(raw, now)
+            return _qualifies_start(raw, now) or hint
 
         from .generator import GeneratorManager, claim_result_landed
         gc = state.cfg.generator
@@ -1691,44 +1766,51 @@ async def generator_start(request: Request, body: dict = Body(default={}),
 
 @router.get("/admin/dash/generator/auto")
 async def auto_generate_status(request: Request, key: str = Depends(admin_key)) -> dict:
-    controller = _generator(request).auto_generate
-    return _auto_public(controller)
+    manager = _generator(request)
+    return _auto_public(manager.auto_generate, manager)
 
 
-def _auto_public(controller) -> dict:
+def _auto_public(controller, manager=None) -> dict:
     status = controller.status()
     cooldowns = [value for value in status.get("cooldowns", []) if value > 0]
-    return {"config": controller.config(), "status": {
+    body = {"config": controller.config(), "status": {
         **status, "state": status.get("status", "idle"),
         "launched": status.get("attempts", 0), "completed": status.get("completed_attempts", 0),
         "cooling": len(cooldowns), "remaining_cooldown_seconds": min(cooldowns) if cooldowns else 0,
     }}
+    if manager is not None:
+        body.update(ip_exits=manager.ip_exit_choices(), pin_set=bool(manager.pin_proxy),
+                    pool_available=int(manager._pool_available()),
+                    workers=manager.auto_worker_public(status.get("id", "")))
+    return body
 
 
 @router.put("/admin/dash/generator/auto")
 async def auto_generate_save(request: Request, body: dict = Body(...), key: str = Depends(admin_key)) -> dict:
-    controller = _generator(request).auto_generate
+    manager = _generator(request)
+    controller = manager.auto_generate
     try:
         await asyncio.to_thread(controller.save_config, body)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from None
     except OSError:
         raise HTTPException(500, "Could not save Auto Generate configuration") from None
-    return _auto_public(controller)
+    return _auto_public(controller, manager)
 
 
 @router.post("/admin/dash/generator/auto/{action}")
 async def auto_generate_action(request: Request, action: str, key: str = Depends(admin_key)) -> dict:
     if action not in ("start", "pause", "resume", "stop"):
         raise HTTPException(404, "Unknown Auto Generate action")
-    controller = _generator(request).auto_generate
+    manager = _generator(request)
+    controller = manager.auto_generate
     try:
         await asyncio.to_thread(getattr(controller, action))
     except (ValueError, RuntimeError) as exc:
         raise HTTPException(409, str(exc)) from None
     except OSError:
         raise HTTPException(500, "Auto Generate state could not be saved") from None
-    return _auto_public(controller)
+    return _auto_public(controller, manager)
 
 
 def _env_setup_shared(request: Request):

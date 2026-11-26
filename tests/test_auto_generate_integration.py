@@ -9,7 +9,9 @@ import pytest
 from fastapi.testclient import TestClient
 from zcode_gateway.app import create_app
 from zcode_gateway.config import Config
+from zcode_gateway.auto_generate import RouteUnavailable
 from zcode_gateway.generator import GeneratorManager, GenWorker
+from zcode_gateway.vpn import Exit
 
 
 def test_registration_ledger_parallel_updates_keep_all_entries(tmp_path):
@@ -118,16 +120,124 @@ def test_auto_preflight_checks_real_prerequisites_without_altering_manual_option
     mgr.auto_ai_ready=lambda:True
     mgr.captcha='manual';mgr.captcha_strategy='auto';mgr.ip_source='pin'
     mgr.pin_proxy='http://saved.invalid:8080'
+    # manual page keeps PSIPHON SURFSHARK selected; auto must ignore them
+    mgr.ip_sources=['psiphon','surfshark']
     monkeypatch.setattr('zcode_gateway.generator.sys.platform','win32')
     cfg=mgr.auto_generate.config()
     mgr._auto_preflight(cfg)
     snapshot=mgr._auto_runtime_snapshot
     assert (snapshot.captcha,snapshot.captcha_strategy,snapshot.ip_source,snapshot.retries)==('ai','ai','direct',0)
+    assert snapshot.ip_sources == ['direct'] and mgr.ip_sources == ['psiphon','surfshark']
     assert snapshot.browser_display == 'headless'
     assert mgr.captcha=='manual' and mgr.ip_source=='pin'
     mgr._pool_has_candidates=lambda:False
     with pytest.raises(ValueError,match='No proxy'):
         mgr._auto_preflight({**cfg,'ip_source':'proxy'})
+
+
+def test_auto_preflight_uses_the_saved_vpn_route_and_aborts_when_it_is_offline(tmp_path, monkeypatch):
+    mgr=GeneratorManager(tmp_path)
+    mgr.env_setup.check=lambda:{'all_ok':True}
+    mgr.mail_cfg={'domains':['example.test'],'active':'example.test','inbox_url':'https://worker.invalid/inbox',
+                  'inbox_secret':'dummy','inbox_ok':True,'routing_done':['example.test']}
+    mgr._verify_inbox=lambda *a,**kw:{'ok':True}
+    mgr.auto_ai_ready=lambda:True
+    mgr.ip_sources=['direct']  # manual page keeps My network; auto must not use it
+    monkeypatch.setattr('zcode_gateway.generator.sys.platform','win32')
+    mgr.psiphon._settings.update({'regions':['DE'],'mode':'spread'})
+    mgr.psiphon._instances['DE']=Exit(region='DE',port=47100,state='ready')
+    cfg={**mgr.auto_generate.config(),'ip_sources':['psiphon'],'ip_mode':'single','ip_pick':'psiphon:DE'}
+    mgr._auto_preflight(cfg)
+    snapshot=mgr._auto_runtime_snapshot
+    assert snapshot.ip_sources==['psiphon'] and snapshot.ip_mode=='single'
+    assert snapshot.ip_source=='psiphon' and snapshot.ip_pick=='psiphon:DE'
+    assert mgr.ip_sources==['direct']
+    mgr.psiphon._instances.clear()
+    with pytest.raises(ValueError,match='No selected IP source'):
+        mgr._auto_preflight(cfg)
+
+
+def test_auto_launch_reports_lost_exits_as_route_unavailable(tmp_path, monkeypatch):
+    mgr=GeneratorManager(tmp_path)
+    mgr.env_setup.check=lambda:{'all_ok':True}
+    mgr.mail_cfg={'domains':['example.test'],'active':'example.test','inbox_url':'https://worker.invalid/inbox',
+                  'inbox_secret':'dummy','inbox_ok':True,'routing_done':['example.test']}
+    mgr._verify_inbox=lambda *a,**kw:{'ok':True}
+    mgr.auto_ai_ready=lambda:True
+    monkeypatch.setattr('zcode_gateway.generator.sys.platform','win32')
+    mgr.psiphon._settings.update({'regions':['DE'],'mode':'spread'})
+    mgr.psiphon._instances['DE']=Exit(region='DE',port=47100,state='ready')
+    config={**mgr.auto_generate.config(),'ip_sources':['psiphon']}
+    mgr._auto_preflight(config)
+    mgr.psiphon._instances.clear()
+    with pytest.raises(RouteUnavailable,match='No selected IP source'):
+        mgr._auto_launch(config,'session-1')
+
+
+@pytest.mark.parametrize('mode,strategy', [('auto','auto'),('classic','classic'),('mint','auto')])
+def test_auto_preflight_maps_non_ai_captcha_modes(tmp_path, monkeypatch, mode, strategy):
+    mgr=GeneratorManager(tmp_path)
+    mgr.env_setup.check=lambda:{'all_ok':True}
+    mgr.mail_cfg={'domains':['example.test'],'active':'example.test','inbox_url':'https://worker.invalid/inbox',
+                  'inbox_secret':'dummy','inbox_ok':True,'routing_done':['example.test']}
+    mgr._verify_inbox=lambda *a,**kw:{'ok':True}
+    mgr.auto_ai_ready=lambda:False
+    monkeypatch.setattr(GeneratorManager,'_mint_available',lambda self:True)
+    cfg={**mgr.auto_generate.config(),'captcha':mode}
+    mgr._auto_preflight(cfg)
+    snapshot=mgr._auto_runtime_snapshot
+    assert (snapshot.captcha,snapshot.captcha_strategy)==(mode,strategy)
+    assert snapshot.retries==0
+
+
+def test_auto_preflight_ai_and_mint_prerequisites(tmp_path, monkeypatch):
+    mgr=GeneratorManager(tmp_path)
+    mgr.env_setup.check=lambda:{'all_ok':True}
+    mgr.mail_cfg={'domains':['example.test'],'active':'example.test','inbox_url':'https://worker.invalid/inbox',
+                  'inbox_secret':'dummy','inbox_ok':True,'routing_done':['example.test']}
+    mgr._verify_inbox=lambda *a,**kw:{'ok':True}
+    mgr.auto_ai_ready=lambda:False
+    with pytest.raises(ValueError,match='AI judge needs'):
+        mgr._auto_preflight({**mgr.auto_generate.config(),'captcha':'ai'})
+    mgr.custom_ai_url='https://judge.invalid/v1'
+    with pytest.raises(ValueError,match='Custom AI needs a model and API key'):
+        mgr._auto_preflight({**mgr.auto_generate.config(),'captcha':'ai'})
+    monkeypatch.setattr(GeneratorManager,'_mint_available',lambda self:False)
+    with pytest.raises(ValueError,match='captcha-mint sidecar is missing'):
+        mgr._auto_preflight({**mgr.auto_generate.config(),'captcha':'mint'})
+
+
+def test_auto_workers_are_separated_from_the_manual_board(tmp_path):
+    mgr=GeneratorManager(tmp_path)
+    manual=GenWorker('g1',['py'],{'ZAI_AUTO_GENERATE':'0','ZAI_AUTO_RUN_ID':''},tmp_path)
+    auto=GenWorker('auto-x',['py'],{'ZAI_AUTO_GENERATE':'1','ZAI_AUTO_RUN_ID':'run1'},tmp_path)
+    stale=GenWorker('auto-y',['py'],{'ZAI_AUTO_GENERATE':'1','ZAI_AUTO_RUN_ID':'run0'},tmp_path)
+    mgr.workers.update({w.name:w for w in (manual,auto,stale)})
+    assert [w['name'] for w in mgr.status()['workers']]==['g1']
+    assert [w['name'] for w in mgr.auto_worker_public('run1')]==['auto-x']
+    assert [w['name'] for w in mgr.auto_worker_public('run0')]==['auto-y']
+    assert mgr.auto_worker_public('')==[]
+
+
+def test_auto_launch_sends_bundled_exits_to_the_proxy_route(tmp_path, monkeypatch):
+    mgr=GeneratorManager(tmp_path)
+    mgr.env_setup.check=lambda:{'all_ok':True}
+    mgr.mail_cfg={'domains':['example.test'],'active':'example.test','inbox_url':'https://worker.invalid/inbox',
+                  'inbox_secret':'dummy','inbox_ok':True,'routing_done':['example.test']}
+    mgr._verify_inbox=lambda *a,**kw:{'ok':True}
+    mgr.auto_ai_ready=lambda:True
+    monkeypatch.setattr('zcode_gateway.generator.sys.platform','win32')
+    mgr.psiphon._settings.update({'regions':['DE'],'mode':'spread'})
+    mgr.psiphon._instances['DE']=Exit(region='DE',port=47100,state='ready')
+    config={**mgr.auto_generate.config(),'ip_sources':['psiphon'],'ip_mode':'single','ip_pick':'psiphon:DE'}
+    mgr._auto_preflight(config)
+    workers=[]
+    monkeypatch.setattr(GenWorker,'start',lambda worker:workers.append(worker))
+    worker=mgr._auto_launch(config,'session-1')
+    assert workers==[worker]
+    assert worker.env['ZAI_ROUTE_POLICY']=='proxy'
+    assert worker.env['ZAI_PROXY']=='socks5://127.0.0.1:47100'
+    assert worker.env['ZAI_REQUIRE_PROXY']=='1'
 
 
 @pytest.mark.parametrize('mode,headless', [('background','1'),('desktop','0')])
@@ -182,8 +292,18 @@ def test_auto_admin_api_save_does_not_start_and_caps_concurrency(tmp_path,monkey
         assert response.status_code==200
         assert response.json()['status']['state']=='idle'
         assert response.json()['config']['cooldown_seconds']==10
+        assert {'ip_exits','pool_available','pin_set','workers'} <= set(response.json())
+        saved=client.put('/admin/dash/generator/auto',headers=headers,
+            json={**mgr.auto_generate.config(),'ip_sources':['psiphon','surfshark'],
+                  'ip_mode':'single','ip_pick':'psiphon:DE'})
+        assert saved.status_code==200
+        assert saved.json()['config']['ip_sources']==['psiphon','surfshark']
         assert client.put('/admin/dash/generator/auto',headers=headers,
-            json={**mgr.auto_generate.config(),'concurrency':4}).status_code==400
+            json={**mgr.auto_generate.config(),'ip_sources':['nope']}).status_code==400
+        assert client.put('/admin/dash/generator/auto',headers=headers,
+            json={**mgr.auto_generate.config(),'concurrency':4}).status_code==200
+        assert client.put('/admin/dash/generator/auto',headers=headers,
+            json={**mgr.auto_generate.config(),'concurrency':101}).status_code==400
         assert client.post('/admin/dash/generator/auto/unknown',headers=headers).status_code==404
         assert client.post('/admin/dash/generator/auto/stop',headers=headers).status_code==200
         assert client.post('/admin/dash/generator/auto/resume',headers=headers).status_code==409
