@@ -2,6 +2,9 @@
 // user data — el() sets text through textContent, so account names, domains and
 // error messages can never become markup.
 
+const hasCustomSelect = typeof HTMLSelectedContentElement !== "undefined"
+  && CSS.supports("appearance", "base-select") && CSS.supports("selector(::picker(select))");
+
 /** Create an element. props: {class, text, html, on:{click}, data:{}, ...attrs} */
 export function el(tag, props = null, children = null) {
   const node = document.createElement(tag);
@@ -18,6 +21,10 @@ export function el(tag, props = null, children = null) {
       else node.setAttribute(k, v === true ? "" : v);
     }
   }
+  if (hasCustomSelect && node.matches("select.select")) {
+    // Let the browser mirror the selection, with a separate box for truncation.
+    node.prepend(el("button", { type: "button" }, el("selectedcontent")));
+  }
   append(node, children);
   return node;
 }
@@ -32,7 +39,10 @@ export function append(parent, children) {
 
 /** Replace all children in one shot. */
 export function fill(parent, children) {
-  parent.replaceChildren();
+  const trigger = parent.matches?.("select.select") && parent.firstElementChild?.matches("button:has(selectedcontent)")
+    ? parent.firstElementChild : null;
+  if (trigger) parent.replaceChildren(trigger);
+  else parent.replaceChildren();
   return append(parent, children);
 }
 

@@ -262,7 +262,7 @@ def test_secret_upload_exact_input_and_exit_contract(tmp_path, monkeypatch, retu
     monkeypatch.setattr(mgr, "set_cf_credentials", lambda *args: "")
 
     def run(args, **kwargs):
-        command = args[2:]
+        command = args[args.index("wrangler") + 1:]
         if command == ["whoami"]:
             output = "You are logged in"
         elif command == ["kv", "namespace", "list"]:
@@ -275,7 +275,8 @@ def test_secret_upload_exact_input_and_exit_contract(tmp_path, monkeypatch, retu
 
     class Upload:
         def __init__(self, args, **kwargs):
-            assert args[2:] == ["secret", "put", "INBOX_SECRET"]
+            assert args.index("wrangler") > 0
+            assert args[args.index("wrangler") + 1:] == ["secret", "put", "INBOX_SECRET"]
             self.returncode = returncode
 
         def communicate(self, *, input, timeout):

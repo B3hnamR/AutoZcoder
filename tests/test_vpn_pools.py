@@ -96,7 +96,7 @@ def test_unavailable_explains_what_to_do(tmp_path):
     assert "not connected" in pool.unavailable()
 
 
-def test_worker_env_uses_the_next_ready_region(tmp_path, monkeypatch):
+def test_worker_env_uses_a_ready_region(tmp_path, monkeypatch):
     manager = _manager(tmp_path, monkeypatch)
     try:
         manager.set_options(ip_source="psiphon")
@@ -105,15 +105,108 @@ def test_worker_env_uses_the_next_ready_region(tmp_path, monkeypatch):
             "NL": Exit(region="NL", port=47100, state="ready"),
             "DE": Exit(region="DE", port=47101, state="ready"),
         })
-        env = manager._worker_env("g1")
-        assert env["ZAI_PROXY"] == "socks5://127.0.0.1:47100"
-        assert env["ZAI_USE_POOL"] == "0"
-        assert env["ZAI_REQUIRE_PROXY"] == "1"
+        first = manager._worker_env("g1")
+        second = manager._worker_env("g2")
+        assert first["ZAI_USE_POOL"] == "0" and first["ZAI_REQUIRE_PROXY"] == "1"
+        # random, but never the same exit twice while another is free
+        assert {first["ZAI_PROXY"], second["ZAI_PROXY"]} == {
+            "socks5://127.0.0.1:47100", "socks5://127.0.0.1:47101"}
         from zcode_gateway.generator import GenWorker
-        worker = GenWorker("g2", [], manager._worker_env("g2"), manager.gen_dir)
-        assert worker.env["ZAI_PROXY"] == "socks5://127.0.0.1:47101"
-        assert worker.to_public()["route_label"] == "Psiphon \u00b7 Germany (DE)"
+        worker = GenWorker("g2", [], second, manager.gen_dir)
+        assert worker.to_public()["route_label"].startswith("Psiphon \u00b7 ")
         assert "_GW_WORKER_ROUTE_LABEL" not in worker.env
+    finally:
+        manager.shutdown()
+
+
+
+def test_spread_skips_the_previous_exit_across_providers(tmp_path, monkeypatch):
+    manager = _manager(tmp_path, monkeypatch)
+    try:
+        manager.set_options(ip_sources=["psiphon", "surfshark"], ip_mode="spread")
+        manager.psiphon._settings.update({"regions": ["DE"], "mode": "spread"})
+        manager.psiphon._instances["DE"] = Exit(region="DE", port=47100, state="ready")
+        manager.surfshark._settings.update({"regions": ["nl-ams"], "mode": "spread"})
+        manager.surfshark._instances["nl-ams"] = Exit(region="nl-ams", port=47400, state="ready")
+        picks = [manager._exit_key(manager._pick_ip_exit()) for _ in range(6)]
+        assert {p.split(":")[0] for p in picks} == {"psiphon", "surfshark"}
+        assert all(a != b for a, b in zip(picks, picks[1:]))
+    finally:
+        manager.shutdown()
+
+
+def test_spread_draws_the_provider_before_the_region(tmp_path, monkeypatch):
+    manager = _manager(tmp_path, monkeypatch)
+    try:
+        manager.set_options(ip_sources=["psiphon", "surfshark"], ip_mode="spread")
+        manager.psiphon._settings.update({"regions": ["DE", "ES", "FR"], "mode": "spread"})
+        for index, region in enumerate(("DE", "ES", "FR")):
+            manager.psiphon._instances[region] = Exit(region=region, port=47100 + index, state="ready")
+        manager.surfshark._settings.update({"regions": ["nl-ams", "us-bna"], "mode": "spread"})
+        for index, region in enumerate(("nl-ams", "us-bna")):
+            manager.surfshark._instances[region] = Exit(region=region, port=47400 + index, state="ready")
+        from zcode_gateway import generator
+        draws = []
+
+        def draw(choices):
+            draws.append(choices)
+            return choices[-1]
+
+        monkeypatch.setattr(generator.random, "choice", draw)
+        assert manager._exit_key(manager._pick_ip_exit()) == "surfshark:us-bna"
+        assert draws[0] == ["psiphon", "surfshark"]
+        assert [e["region"] for e in draws[1]] == ["nl-ams", "us-bna"]
+    finally:
+        manager.shutdown()
+
+
+def test_stay_on_one_keeps_the_chosen_provider_exit(tmp_path, monkeypatch):
+    manager = _manager(tmp_path, monkeypatch)
+    try:
+        manager.set_options(ip_sources=["direct", "psiphon", "surfshark"], ip_mode="single",
+                            ip_pick="surfshark:nl-ams")
+        manager.psiphon._settings.update({"regions": ["DE"], "mode": "spread"})
+        manager.psiphon._instances["DE"] = Exit(region="DE", port=47100, state="ready")
+        manager.surfshark._settings.update({"regions": ["nl-ams"], "mode": "spread"})
+        manager.surfshark._instances["nl-ams"] = Exit(region="nl-ams", port=47400, state="ready")
+        assert [manager._worker_env(f"g{i}")["ZAI_PROXY"] for i in range(3)] == [
+            "socks5://127.0.0.1:47400"] * 3
+        manager.surfshark._instances.clear()
+        assert manager._worker_env("g4")["ZAI_PROXY"] == "socks5://127.0.0.1:47100"
+        assert set(manager.options()["ip_sources"]) == {"direct", "psiphon", "surfshark"}
+        assert [c["key"] for c in manager.options()["ip_exits"]] == ["psiphon:DE"]
+    finally:
+        manager.shutdown()
+
+
+def test_sources_accept_separated_strings_and_status_omits_vpn_inventory(tmp_path, monkeypatch):
+    manager = _manager(tmp_path, monkeypatch)
+    try:
+        manager.set_options(ip_sources="psiphon surfshark")
+        assert manager.ip_sources == ["psiphon", "surfshark"]
+        manager.set_options(ip_sources="pool,psiphon")
+        assert manager.ip_sources == ["pool", "psiphon"]
+        # The 3s status poll must not carry the whole server list; /vpn/status
+        # still does.
+        assert "vpn" not in manager.status()
+        assert set(manager.vpn_status()) == {"psiphon", "surfshark"}
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.parametrize("mode", ["spread", "single"])
+def test_selected_vpn_modes_only_use_vpn_exits(tmp_path, monkeypatch, mode):
+    manager = _manager(tmp_path, monkeypatch)
+    try:
+        manager.psiphon._settings.update({"regions": ["DE"], "mode": "spread"})
+        manager.psiphon._instances["DE"] = Exit(region="DE", port=47100, state="ready")
+        manager.set_options(ip_source="direct")
+        assert manager.options()["ip_exits"] == [
+            {"key": "psiphon:DE", "label": "Psiphon \u00b7 Germany (DE)"}]
+        manager.set_options(ip_sources=["direct", "psiphon"], ip_mode=mode, ip_pick="direct")
+        assert manager._worker_env("g1")["ZAI_PROXY"] == "socks5://127.0.0.1:47100"
+        manager.psiphon._instances.clear()
+        assert manager._pick_ip_exit() is None
     finally:
         manager.shutdown()
 
@@ -137,8 +230,8 @@ def test_batch_is_not_launched_when_vpn_disappears_during_selection(tmp_path, mo
         manager.set_options(ip_source="psiphon")
         monkeypatch.setattr(manager, "_ensure_display", lambda interactive=False: "")
         monkeypatch.setattr(manager, "_mail_ready", lambda _: True)
-        picks = iter([Exit(region="NL", port=47100, state="ready"), None])
-        monkeypatch.setattr(manager.psiphon, "pick", lambda: next(picks))
+        candidates = iter([[Exit(region="NL", port=47100, state="ready")], []])
+        monkeypatch.setattr(manager.psiphon, "ready", lambda: next(candidates, []))
         assert "Psiphon" in manager.start_workers(2)["error"]
         assert not manager.workers
     finally:
@@ -249,6 +342,23 @@ def test_surfshark_refresh_stops_retired_locations(tmp_path, monkeypatch):
     assert retired.stop_requested
     assert status["config"]["regions"] == ["nl-ams"]
     assert status["live"] == 1
+
+
+def test_surfshark_renew_skips_default_servers_in_use(tmp_path, monkeypatch):
+    pool = SurfsharkPool(tmp_path)
+    pool.set_settings({"regions": ["nl-ams", "nl-rtm"], "servers": [
+        {"id": server, "countryCode": "NL"} for server in ("nl-ams", "nl-rtm", "nl-unused")]})
+    pool._instances.update({"nl-ams": Exit("nl-ams", 47400), "nl-rtm": Exit("nl-rtm", 47401)})
+    started = []
+    monkeypatch.setattr(pool, "_start", lambda region, fresh: started.append(pool.server_for(region)["id"]))
+    pool.renew("nl-ams")
+    assert started == ["nl-unused"]
+    assert pool.server_for("nl-rtm")["id"] == "nl-rtm"
+
+    pool.set_settings({"servers": pool.servers()[1:]})
+    with pytest.raises(RuntimeError, match="No unused Surfshark server"):
+        pool.renew("nl-ams")
+    assert started == ["nl-unused"]
 
 
 def test_surfshark_key_change_restarts_starting_connections(tmp_path, monkeypatch):

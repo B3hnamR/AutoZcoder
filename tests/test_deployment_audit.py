@@ -500,6 +500,38 @@ cmd_update
     assert not list(tmp_path.glob("stage.*"))
 
 
+@pytest.mark.parametrize("probe_fails", [False, True])
+def test_update_and_rollback_probe_the_configured_http_port(tmp_path, probe_fails):
+    path = _config(tmp_path)
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    data["server"].update(host="127.0.0.1", port=18788)
+    path.write_text(yaml.safe_dump(data), encoding="utf-8")
+    (tmp_path / "ZcodeGateway").write_text("old binary")
+    (tmp_path / "unit").write_text("original unit")
+    result = _shell(tmp_path, f'''
+ZGW_INSTALL_DIR="$PWD"; ZGW_FROM_SOURCE=""; ZGW_SKIP_SYSTEMD=0
+ZGW_PORT=8443; SSL_SCHEME=http
+MANAGER_BIN="$PWD/manager"; UNIT_FILE="$PWD/unit"; ENV_FILE="$PWD/state"
+need_root() {{ :; }}; is_installed() {{ return 0; }}; ensure_service_user() {{ :; }}
+chown() {{ :; }}; fix_ownership() {{ :; }}
+stage_release() {{ printf new > "$1/ZcodeGateway"; }}
+systemctl() {{ :; }}; sleep() {{ :; }}
+curl() {{
+    printf '%s\n' "${{!#}}" >> probes
+    [[ "${{!#}}" == http://127.0.0.1:18788/health ]] || return 1
+    [[ '{probe_fails}' == False || $(<ZcodeGateway) == 'old binary' ]]
+}}
+cmd_update
+''')
+    assert (result.returncode == 0) is not probe_fails, result.stderr
+    probes = (tmp_path / "probes").read_text().splitlines()
+    assert len(probes) == (31 if probe_fails else 1)
+    assert set(probes) == {"http://127.0.0.1:18788/health"}
+    assert (tmp_path / "ZcodeGateway").read_text() == ("old binary" if probe_fails else "new")
+    assert (tmp_path / "unit").read_text() == "original unit"
+    assert "ROLLBACK FAILED" not in result.stderr
+
+
 def test_state_roundtrip_quotes_values_and_preserves_manual_mode(tmp_path):
     result = _shell(tmp_path, r'''
 ENV_FILE="$PWD/state"

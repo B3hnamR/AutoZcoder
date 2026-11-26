@@ -49,6 +49,7 @@ def dashboard():
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <link rel="stylesheet" href="/assets/css/tokens.css">
 <link rel="stylesheet" href="/assets/css/base.css">
+<link rel="stylesheet" href="/assets/css/layout.css">
 <link rel="stylesheet" href="/assets/css/components.css">
 <main id="root" style="padding:16px"></main>""")
             else:
@@ -158,6 +159,112 @@ def test_accounts_empty_pool_does_not_show_a_filter_message(dashboard):
     assert not page.locator("[data-nomatch]").is_visible()
     page.locator("input[type=search]").fill("zzz-no-hit")
     assert page.locator("[data-nomatch]").is_visible()
+
+
+def test_ip_sources_allow_several_providers_and_a_shared_mode(dashboard):
+    page, overrides, defaults, calls = dashboard
+    defaults["/admin/dash/generator/status"]["options"] = {
+        "ip_source": "pool", "ip_sources": ["pool"], "ip_mode": "spread",
+        "ip_exits": [{"key": "psiphon:DE", "label": "Psiphon \u00b7 Germany (DE)"}],
+        "pool_available": 3, "types_counts": {"all": 3, "socks": 3},
+    }
+    mount(page, "generator")
+    pool = page.get_by_role("checkbox", name="Proxy pool (3)")
+    pool.wait_for()
+    assert pool.is_checked()
+    assert page.get_by_label("Proxy types", exact=True).is_visible()
+    assert not page.locator("#generator-pin").is_visible()
+    # mode only concerns the bundled networks, not the pool
+    mode = page.locator(".ip-line", has_text="Mode")
+    assert mode.is_hidden()
+    with page.expect_response(lambda response: urlsplit(response.url).path == "/admin/dash/generator/options"):
+        page.get_by_role("checkbox", name="Pinned proxy", exact=True).check()
+    page.wait_for_timeout(50)
+    assert page.locator("#generator-pin").is_visible()
+    with page.expect_response(lambda response: urlsplit(response.url).path == "/admin/dash/generator/options"):
+        page.get_by_role("checkbox", name="Pinned proxy", exact=True).uncheck()
+    page.wait_for_timeout(50)
+    assert not page.locator("#generator-pin").is_visible()
+
+    with page.expect_response(lambda response: urlsplit(response.url).path == "/admin/dash/generator/options"):
+        page.get_by_role("checkbox", name="Psiphon", exact=True).check()
+        page.get_by_role("radio", name="Stay on one").check()
+    page.wait_for_timeout(50)
+    assert mode.is_visible()
+    assert page.get_by_role("radio", name="Random").is_visible()
+    pick = page.get_by_label("Exit in use", exact=True)
+    pick.wait_for()
+    assert pick.input_value() == "psiphon:DE"
+    body = [c for c in calls if c[1] == "/admin/dash/generator/options"][-1][2]
+    assert body["ip_sources"] == ["pool", "psiphon"]
+    assert body["ip_mode"] == "single" and body["ip_pick"] == "psiphon:DE"
+    assert body["ip_source"] == "pool"
+
+    with page.expect_response(lambda response: urlsplit(response.url).path == "/admin/dash/generator/options"):
+        page.get_by_role("checkbox", name="Psiphon", exact=True).uncheck()
+    page.wait_for_timeout(50)
+    body = [c for c in calls if c[1] == "/admin/dash/generator/options"][-1][2]
+    assert body["ip_sources"] == ["pool"]
+    assert mode.is_hidden()
+    assert not page.get_by_label("Exit in use", exact=True).is_visible()
+
+    # layout: sources and mode are full-width rows, never a squeezed column
+    field = page.locator(".ip-field")
+    assert field.evaluate("node => node.scrollWidth <= node.clientWidth + 1")
+    rows = page.locator(".ip-line .chip").evaluate_all(
+        "nodes => [...new Set(nodes.map(n => Math.round(n.getBoundingClientRect().top)))].length")
+    assert rows == 2
+    page.set_viewport_size({"width": 1280, "height": 900})
+    page.set_viewport_size({"width": 375, "height": 900})
+    assert field.evaluate("node => node.scrollWidth <= node.clientWidth + 1")
+
+
+def test_long_select_value_stays_within_control_and_menu_shows_full_label(dashboard):
+    page, _, defaults, _ = dashboard
+    defaults["/admin/dash/capabilities"] = {"os": "windows"}
+    defaults["/admin/dash/generator/status"]["options"] = {"captcha": "mint", "browser_display": "headless"}
+    page.evaluate("import('/assets/js/core/caps.js').then(m => m.load())")
+    page.set_viewport_size({"width": 675, "height": 900})
+    mount(page, "generator")
+    for name, value in [("Captcha", "mint"), ("Browser display", "headless")]:
+        select = page.get_by_role("combobox", name=name, exact=True)
+        assert select.input_value() == value
+        assert select.evaluate("n => n.scrollHeight <= n.clientHeight && n.scrollWidth <= n.clientWidth")
+        if select.evaluate("n => getComputedStyle(n).appearance === 'base-select'"):
+            full_label = select.locator("option:checked").inner_text()
+            assert select.locator("selectedcontent").text_content() == full_label
+            select.focus()
+            page.keyboard.press("Space")
+            assert select.locator("option:checked").is_visible()
+            assert select.locator("option:checked").inner_text() == full_label
+            page.keyboard.press("Escape")
+            assert select.input_value() == value
+
+
+def test_ip_picker_refreshes_without_saving_a_fallback_or_clearing_the_last_source(dashboard):
+    page, _, defaults, calls = dashboard
+    options = {"ip_sources": ["psiphon"], "ip_mode": "single", "ip_pick": "psiphon:DE",
+               "ip_exits": [{"key": "direct", "label": "My network"}]}
+    defaults["/admin/dash/generator/status"]["options"] = options
+    mount(page, "generator")
+    pick = page.get_by_label("Exit in use", exact=True)
+    assert pick.is_disabled()
+    source = page.get_by_role("checkbox", name="Psiphon", exact=True)
+    source.click()
+    page.get_by_text("Keep at least one IP source selected", exact=True).wait_for()
+    assert source.is_checked()
+
+    options["ip_exits"].append({"key": "psiphon:NL", "label": "Netherlands"})
+    page.evaluate("view.refresh()")
+    assert pick.locator("option").all_text_contents() == ["First connected VPN exit", "Netherlands"]
+    assert pick.is_enabled()
+    options["ip_exits"].append({"key": "psiphon:DE", "label": "Germany"})
+    page.evaluate("view.refresh()")
+    assert pick.input_value() == "psiphon:DE"
+    if pick.evaluate("n => getComputedStyle(n).appearance === 'base-select'"):
+        assert pick.locator("selectedcontent").text_content() == "Germany"
+    assert all(method != "POST" or not path.endswith("/generator/options") for method, path, _ in calls)
+
 
 
 def test_generator_start_points_to_email_setup_before_launch(dashboard):

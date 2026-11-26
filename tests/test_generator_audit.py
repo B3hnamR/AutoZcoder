@@ -580,3 +580,16 @@ def test_mint_captcha_mode_reaches_the_child(manager):
     assert "ZAI_CAPTCHA_MINT" not in manager._worker_env("g2")
     manager.set_options(captcha="manual")
     assert manager._worker_env("g3")["ZAI_MANUAL"] == "1"
+
+
+@pytest.mark.parametrize("summary, expected", [
+    ("1 fully created (1 with Starter plan), 0 need verification", True),
+    ("1 fully created (0 with Starter plan), 0 need verification", False),
+    # A worker that never got to a plan check must not read as "No plan".
+    ("0 fully created (0 with Starter plan), 0 need verification", None),
+])
+def test_summary_only_marks_no_plan_when_an_account_was_created(tmp_path, summary, expected):
+    worker = gen.GenWorker("g1", [], {"ZAI_LOG_FILE": str(tmp_path / "x.log")}, tmp_path)
+    worker.proc = SimpleNamespace(stdout=iter([summary + "\n"]), wait=lambda **_: 0, returncode=0)
+    worker._pump_body()
+    assert worker.starter is expected

@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
 import re
 import subprocess
 import sys
@@ -155,6 +156,54 @@ def _clean_output(s: str) -> str:
 
 
 _NOISE_LINE = re.compile(r"^\s*(?:⛅️?\s*wrangler\b.*|[─━\-=]{6,}|.*Logs were written to.*)$")
+
+
+# wrangler is executed on a pinned LTS Node instead of whatever is on PATH.
+# Bleeding-edge Node majors (25/26) crash wrangler at module load and the only
+# thing its crash report leaves behind is the `Node.js vNN` trailer, which is
+# all the dashboard was able to show. npx provisions the tested pair; the
+# system Node only has to run npx itself.
+_WRANGLER_PACKAGES = ("node@22", "wrangler@4")
+
+
+def wrangler_argv(npx: str, *args: str) -> list[str]:
+    """argv that runs wrangler with the pinned Node.
+
+    ZAI_WRANGLER overrides the pair: an executable path, or package specs
+    (`wrangler@4.40.2`, `node@22,wrangler@4.40.2`).
+    """
+    override = os.environ.get("ZAI_WRANGLER", "").strip()
+    if override and Path(override).is_file():
+        return [override, *args]
+    specs = [s.strip() for s in override.split(",") if s.strip()] if override else []
+    if not any(s.split("@")[0] == "wrangler" for s in specs):
+        specs = [*specs, "wrangler@4"]
+    if not any(s.split("@")[0] == "node" for s in specs):
+        specs.insert(0, "node@22")
+    argv = [npx, "--yes"]
+    for spec in specs:
+        argv += ["--package", spec]
+    return [*argv, "--", "wrangler", *args]
+
+
+_ERROR_LINE = ("typeerror", "referenceerror", "syntaxerror", "rangeerror", "error",
+               "err_", "ebadengine")
+
+
+def _error_line(text: str, limit: int = 220) -> str:
+    """The line worth showing from a failed tool run.
+
+    A Node crash prints its reason first and ends with `Node.js vNN`, which is
+    why a tail-only report showed nothing but the version. Prefer an actual
+    error line; fall back to the last real line.
+    """
+    cleaned = _clean_output(text)
+    lines = [ln.strip() for ln in cleaned.splitlines()
+             if ln.strip() and not _NOISE_LINE.match(ln)]
+    for line in lines:
+        if line.lower().startswith(_ERROR_LINE) or " error" in line.lower():
+            return line[:limit]
+    return lines[-1][:limit] if lines else "no output"
 
 
 def _tail(s: str, limit: int = 700) -> str:
@@ -1009,10 +1058,13 @@ class GenWorker:
                 m_px = re.search(r"proxy=([^\s]+)", line)
                 if m_px:
                     self.proxy = m_px.group(1)
-            elif "1 with Starter plan" in line:
-                self.starter = True
-            elif "0 with Starter plan" in line and self.starter is None:
-                self.starter = False
+            m_created = re.search(r"(\d+) fully created.*?\((\d+) with Starter plan\)", line)
+            if m_created:
+                created, starters = int(m_created.group(1)), int(m_created.group(2))
+                if starters:
+                    self.starter = True
+                elif created and self.starter is None:
+                    self.starter = False
             if ("100M Global Build active" in line or "issued=1" in line
                     or "progress=3/3" in line or "tasks 3/3 complete" in line):
                 self.global_build = True
@@ -1882,6 +1934,12 @@ class GeneratorManager:
         self.custom_ai_key = ""
         self.custom_ai_model = ""
         self.ip_source = "direct"           # socks | pool | direct | pin — default: my network (no proxy)
+        # Multi-select IP sources. Empty keeps the single ip_source authoritative
+        # (older saved options and API callers still set only that field).
+        self.ip_sources: list[str] = []
+        self.ip_mode = "spread"             # spread = take turns | single = stay on one
+        self.ip_pick = ""                   # single mode: "psiphon:DE" | "surfshark:nl-ams"
+        self._ip_last = ""
         self.proxy_types = "socks"          # all | socks | socks5 | socks4 | http | csv
         self.country = "ALL"                # ALL | US | DE | ...
         self.pin_proxy = ""
@@ -2805,7 +2863,7 @@ class GeneratorManager:
             # Email card must not show a red error before the user did anything.
             fields: dict = {}
             try:
-                r = _run_capture([npx, "wrangler", "whoami"], cwd=str(wdir), timeout=60,
+                r = _run_capture(wrangler_argv(npx, "whoami"), cwd=str(wdir), timeout=60,
                                  env=self._full_env())
             except subprocess.TimeoutExpired:
                 fields = {"wrangler_authed": None, "whoami_timeout": True}
@@ -3010,8 +3068,7 @@ class GeneratorManager:
 
     @staticmethod
     def _last_line(text: str, limit: int = 160) -> str:
-        lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
-        return (lines[-1][:limit]) if lines else "no output"
+        return _error_line(text, limit)
 
     def _wrangler_login(self, run, npx: str, say) -> tuple[bool, str]:
         """Log wrangler in; returns (True, whoami output) or (False, error).
@@ -3023,7 +3080,7 @@ class GeneratorManager:
         for label, args, timeout in self._LOGIN_ATTEMPTS:
             say(f"Cloudflare login — {label}…")
             try:
-                r = run([npx, "wrangler", *args], timeout=timeout)
+                r = run(wrangler_argv(npx, *args), timeout=timeout)
                 text = _clean_output((r.stdout or "") + (r.stderr or ""))
             except subprocess.TimeoutExpired:
                 text = "timed out waiting for the browser"
@@ -3031,17 +3088,23 @@ class GeneratorManager:
                 text = f"{type(exc).__name__}: {exc}"
             who = ""
             try:
-                w = run([npx, "wrangler", "whoami"], timeout=90)
+                w = run(wrangler_argv(npx, "whoami"), timeout=90)
                 who = _clean_output((w.stdout or "") + (w.stderr or ""))
             except (subprocess.TimeoutExpired, OSError):
                 pass
             if "You are logged in" in who:
                 return True, who
-            notes.append(f"{label}: {self._last_line(text)}")
+            detail = _error_line(text)
+            trailer = re.fullmatch(r"Node\.js (v\d+[\w.]*)", detail.strip())
+            if trailer:
+                detail = (f"wrangler crashed on {trailer.group(1)} before printing "
+                          "an error; the pinned Node 22 should avoid this")
+            notes.append(f"{label}: {detail}")
             say(f"login attempt failed — {notes[-1]}")
         return False, ("Cloudflare login did not complete (" + "; ".join(notes)
                        + "). If your browser cannot reach localhost:8976, run "
-                       "`npx wrangler login --device` in a terminal (or set "
+                       "`npx --yes --package node@22 --package wrangler@4 -- "
+                       "wrangler login --device` in a terminal (or set "
                        "CLOUDFLARE_API_TOKEN) and retry.")
 
     def _deploy_worker_locked(self, progress=None) -> dict:
@@ -3088,7 +3151,7 @@ class GeneratorManager:
         def kv_id_for_title(title: str = "MAIL") -> str:
             """Find an existing KV namespace by title. Idempotent deploys: the
             namespace is reused instead of failing with 'already exists'."""
-            r = run([npx, "wrangler", "kv", "namespace", "list"], timeout=120, env_extra=wrangler_env)
+            r = run(wrangler_argv(npx, "kv", "namespace", "list"), timeout=120, env_extra=wrangler_env)
             out = _clean_output((r.stdout or "") + (r.stderr or ""))
             # wrangler prints a JSON array; fall back to the table form
             a, b = out.find("["), out.rfind("]")
@@ -3117,7 +3180,7 @@ class GeneratorManager:
                 self._save_mail_config()
 
         # 1) auth: whoami first — if logged in, skip the browser entirely
-        r = run([npx, "wrangler", "whoami"], timeout=90,
+        r = run(wrangler_argv(npx, "whoami"), timeout=90,
                 env_extra={"CLOUDFLARE_ACCOUNT_ID": account_id} if account_id else None)
         out = _clean_output((r.stdout or "") + (r.stderr or ""))
         if "You are logged in" not in out and _is_headless():
@@ -3141,7 +3204,8 @@ class GeneratorManager:
             account_id = _pin_account_id()
             if account_id:
                 say(f"using Cloudflare account {account_id[:8]}…")
-        wrangler_env = {"CLOUDFLARE_ACCOUNT_ID": account_id} if account_id else {}
+        wrangler_env = {"WRANGLER_SEND_METRICS": "false",
+                        **({"CLOUDFLARE_ACCOUNT_ID": account_id} if account_id else {})}
         if "More than one account" in out and not account_id:
             return {"ok": False,
                     "error": "Your Cloudflare login has multiple accounts and "
@@ -3164,8 +3228,8 @@ class GeneratorManager:
             m = _re.search(r'id\s*=\s*"([0-9a-f]{32})"', toml_src)
             cand = m.group(1) if m else ""
             if cand and set(cand) != {"0"}:
-                chk = run([npx, "wrangler", "kv", "namespace", "info",
-                           "--namespace-id", cand], timeout=120,
+                chk = run(wrangler_argv(npx, "kv", "namespace", "info",
+                           "--namespace-id", cand), timeout=120,
                            env_extra=wrangler_env)
                 if chk.returncode == 0:
                     kv_id = cand
@@ -3173,7 +3237,7 @@ class GeneratorManager:
 
         if not kv_id:
             say("creating KV namespace…")
-            r = run([npx, "wrangler", "kv", "namespace", "create", "MAIL"],
+            r = run(wrangler_argv(npx, "kv", "namespace", "create", "MAIL"),
                     timeout=180, env_extra=wrangler_env)
             out = _clean_output((r.stdout or "") + (r.stderr or ""))
             m = _re.search(r'id\s*=\s*"([0-9a-f]{32})"', out) \
@@ -3193,7 +3257,7 @@ class GeneratorManager:
 
         # 3) deploy
         say("deploying worker…")
-        r = run([npx, "wrangler", "deploy"], timeout=600, env_extra=wrangler_env)
+        r = run(wrangler_argv(npx, "deploy"), timeout=600, env_extra=wrangler_env)
         out = _clean_output((r.stdout or "") + (r.stderr or ""))
         if r.returncode != 0:
             # a FAILED deploy can still print a workers.dev URL (wrangler
@@ -3236,7 +3300,7 @@ class GeneratorManager:
         proc = None
         try:
             proc = subprocess.Popen(
-                [npx, "wrangler", "secret", "put", "INBOX_SECRET"],
+                wrangler_argv(npx, "secret", "put", "INBOX_SECRET"),
                 cwd=str(wdir), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT, text=True, encoding="utf-8",
                 errors="replace", shell=False, env=external_process_env(_secret_env),
@@ -3332,6 +3396,10 @@ class GeneratorManager:
         "http": ("http", "https"),
     }
 
+    # Every selectable IP source, in the order the picker offers them.
+    VPN_SOURCE_IDS = ("psiphon", "surfshark")
+    IP_SOURCE_IDS = ("pool", "direct", "pin", *VPN_SOURCE_IDS)
+
     @classmethod
     def normalize_proxy_types(cls, value: str, *, legacy_socks_only: bool | None = None) -> str:
         """Validate/canonicalize a proxy_types setting. Accepts the keywords
@@ -3359,7 +3427,8 @@ class GeneratorManager:
     def _options_path(self) -> Path:
         return self.data_dir / "generator_options.json"
 
-    _OPTION_FIELDS = ("captcha", "ip_source", "country", "proxy_types",
+    _OPTION_FIELDS = ("captcha", "ip_source", "ip_sources", "ip_mode", "ip_pick",
+                      "country", "proxy_types",
                       "pin_proxy", "retries", "claim", "claim500", "claim_start", "headless",
                       "invite_code", "captcha_strategy", "browser_display",
                       "custom_ai_url", "custom_ai_key", "custom_ai_model")
@@ -3373,6 +3442,9 @@ class GeneratorManager:
             "custom_ai_key": self.custom_ai_key,
             "custom_ai_model": self.custom_ai_model,
             "ip_source": self.ip_source,
+            "ip_sources": self.ip_sources,
+            "ip_mode": self.ip_mode,
+            "ip_pick": self.ip_pick,
             "country": getattr(self, "country", "ALL"),
             "proxy_types": self.normalize_proxy_types(self.proxy_types),
             "pin_proxy": self.pin_proxy,
@@ -3427,6 +3499,26 @@ class GeneratorManager:
             # 'socks' was the old socks-only pool entry — now the pool with the
             # proxy_types filter applied; normalize so the UI shows one option
             self.ip_source = "pool" if kw["ip_source"] == "socks" else kw["ip_source"]
+            if "ip_sources" not in kw:
+                # a caller that names one source means that source alone
+                self.ip_sources = []
+        if "ip_sources" in kw:
+            raw = kw["ip_sources"]
+            if isinstance(raw, str):
+                raw = raw.replace(" ", ",").split(",")
+            if isinstance(raw, (list, tuple)):
+                picked = []
+                for item in raw:
+                    name = "pool" if item == "socks" else str(item).strip()
+                    if name in self.IP_SOURCE_IDS and name not in picked:
+                        picked.append(name)
+                self.ip_sources = picked
+                if picked:
+                    self.ip_source = picked[0]
+        if "ip_mode" in kw and kw["ip_mode"] in ("spread", "single"):
+            self.ip_mode = kw["ip_mode"]
+        if "ip_pick" in kw:
+            self.ip_pick = str(kw["ip_pick"] or "").strip()
         if "country" in kw:
             self.country = str(kw["country"] or "ALL").strip().upper()
         if "proxy_types" in kw:
@@ -3581,6 +3673,8 @@ class GeneratorManager:
     def options(self) -> dict:
         tc = self._types_counts()
         return {"captcha": self.captcha, "ip_source": self.ip_source,
+                "ip_sources": self.ip_source_list(), "ip_mode": self.ip_mode,
+                "ip_pick": self.ip_pick, "ip_exits": self.ip_exit_choices(),
                 "captcha_strategy": self.captcha_strategy,
                 "custom_ai_url": self.custom_ai_url,
                 "custom_ai_model": self.custom_ai_model,
@@ -3784,6 +3878,14 @@ class GeneratorManager:
             worker.start()
         return {"started": [worker.name for worker in launch]}
 
+    def _mint_available(self) -> bool:
+        """Mirror claim_start's sidecar lookup without importing the child tree."""
+        binary = "captcha-mint.exe" if os.name == "nt" else "captcha-mint"
+        roots = [getattr(sys, "_MEIPASS", ""), str(Path(sys.executable).parent),
+                 str(self.gen_dir / "tools" / "captcha-mint")]
+        return any(root and (Path(root, binary).is_file()
+                             or Path(root, "captcha-mint", binary).is_file()) for root in roots)
+
     def _auto_preflight(self, config: dict) -> None:
         if self._closed.is_set():
             raise ValueError("Generator is shut down")
@@ -3801,18 +3903,39 @@ class GeneratorManager:
         if not inbox.get("ok"):
             raise ValueError("Inbox verification failed; repair Email setup before generating")
         ready = getattr(self, "auto_ai_ready", None)
-        if self.custom_ai_url:
-            if not self.custom_ai_model or not self.custom_ai_key:
-                raise ValueError("Custom AI needs a model and API key")
-        elif not (ready() if ready else self._pool_health().get("ready")):
-            raise ValueError("AI judge needs usable GLM-5.3-Flash quota or an external vision endpoint")
-        if config["ip_source"] == "proxy" and not self._pool_has_candidates():
-            raise ValueError("No proxy candidates available; verify the pool or choose direct")
+        captcha = config["captcha"]
+        if captcha == "mint":
+            if not self._mint_available():
+                raise ValueError("The captcha-mint sidecar is missing; pick another solver")
+        elif captcha == "ai":
+            if self.custom_ai_url:
+                if not self.custom_ai_model or not self.custom_ai_key:
+                    raise ValueError("Custom AI needs a model and API key")
+            elif not (ready() if ready else self._pool_health().get("ready")):
+                raise ValueError("AI judge needs usable GLM-5.3-Flash quota or an external vision endpoint")
+        elif self.custom_ai_url and (not self.custom_ai_model or not self.custom_ai_key):
+            raise ValueError("Custom AI needs a model and API key")
         import copy
         snapshot = copy.copy(self)
         snapshot.mail_cfg = mail
-        snapshot.captcha = snapshot.captcha_strategy = "ai"
-        snapshot.ip_source = "pool" if config["ip_source"] == "proxy" else "direct"
+        # Mint bypasses the drag entirely; the other modes map 1:1 to the
+        # child's strategy. Manual mode cannot run unattended.
+        snapshot.captcha = captcha
+        snapshot.captcha_strategy = "auto" if captcha == "mint" else captcha
+        # The auto profile owns its route list; the manual page's selection
+        # must not leak in through the shared list object.
+        legacy = config.get("ip_source", "direct")
+        legacy = "pool" if legacy in ("proxy", "pool", "socks") else legacy
+        sources = list(config.get("ip_sources") or [legacy])
+        if sources == ["pool"] and not self._pool_has_candidates():
+            raise ValueError("No proxy candidates available; verify the pool or choose another IP source")
+        snapshot.ip_sources = sources
+        snapshot.ip_mode = config.get("ip_mode", "spread")
+        snapshot.ip_pick = config.get("ip_pick", "")
+        snapshot.ip_source = next((s for s in sources if s in self.VPN_SOURCE_IDS), sources[0])
+        snapshot._ip_last = ""
+        if snapshot._pick_ip_exit() is None:
+            raise ValueError(snapshot.ip_unavailable())
         snapshot.claim, snapshot.claim500, snapshot.claim_start = False, False, True
         snapshot.retries = 0
         background = config.get("browser_display", "background") == "background"
@@ -3840,8 +3963,15 @@ class GeneratorManager:
         import uuid
         name = "auto-" + uuid.uuid4().hex[:16]
         snapshot = self._auto_runtime_snapshot
-        env = snapshot._worker_env(name)
-        env.update(ZAI_AUTO_GENERATE="1", ZAI_ROUTE_POLICY=config["ip_source"],
+        from .auto_generate import RouteUnavailable
+        try:
+            env = snapshot._worker_env(name)
+        except VpnUnavailable as exc:
+            raise RouteUnavailable(str(exc)) from None
+        # The child validates ZAI_ROUTE_POLICY against direct/proxy only; a
+        # bundled exit or the pool both arrive as a proxy route.
+        policy = "proxy" if env.get("ZAI_USE_POOL") == "1" or env.get("ZAI_PROXY", "0") != "0" else "direct"
+        env.update(ZAI_AUTO_GENERATE="1", ZAI_ROUTE_POLICY=policy,
                    ZAI_WORKER_ID=name, ZAI_PROXY_RETRIES="0", ZAI_AUTO_RUN_ID=attempt_id.rsplit("-", 1)[0],
                    ZAI_AUTO_ATTEMPT_ID=attempt_id)
         private = self.data_dir / "auto-private"
@@ -3985,26 +4115,23 @@ class GeneratorManager:
             env["ZAI_INBOX_URL"] = m["inbox_url"]
         if m.get("inbox_secret"):
             env["ZAI_INBOX_SECRET"] = m["inbox_secret"]
-        if self.ip_source in ("socks", "pool"):
+        exit_pick = self._pick_ip_exit()
+        if exit_pick is None:
+            raise VpnUnavailable(self.ip_unavailable())
+        source = exit_pick["source"]
+        if source == "pool":
             env["ZAI_USE_POOL"] = "1"
             schemes = self._proxy_type_schemes()
             if schemes:
                 env["ZAI_PROXY_TYPES"] = ",".join(schemes)
-        elif self.ip_source in ("psiphon", "surfshark"):
-            exit_pool = self.exit_pool()
-            picked = exit_pool.pick() if exit_pool else None
-            if picked is None:
-                raise VpnUnavailable(exit_pool.unavailable() if exit_pool else "VPN source unavailable")
-            env["ZAI_PROXY"] = f"socks5://127.0.0.1:{picked.port}"
-            env["ZAI_REQUIRE_PROXY"] = "1"
-            if self.ip_source == "psiphon":
-                region = REGION_NAMES.get(picked.region)
-                place = f"{region} ({picked.region})" if region else picked.region
-                env["_GW_WORKER_ROUTE_LABEL"] = f"Psiphon \u00b7 {place}"
-        elif self.ip_source == "pin" and self.pin_proxy:
-            env["ZAI_PROXY"] = self.pin_proxy
-        elif self.ip_source == "direct":
+        elif source == "direct":
             env["ZAI_PROXY"] = "0"
+        elif source == "pin":
+            env["ZAI_PROXY"] = self.pin_proxy
+        else:
+            env["ZAI_PROXY"] = f"socks5://127.0.0.1:{exit_pick['port']}"
+            env["ZAI_REQUIRE_PROXY"] = "1"
+            env["_GW_WORKER_ROUTE_LABEL"] = exit_pick["label"]
         return env
 
     def exit_pool(self):
@@ -4014,6 +4141,92 @@ class GeneratorManager:
         if self.ip_source == "surfshark":
             return getattr(self, "surfshark", None)
         return None
+
+    # ---- selected IP sources ------------------------------------------------
+    def ip_source_list(self) -> list[str]:
+        """Chosen sources; a legacy single ip_source still works."""
+        picked = [s for s in (self.ip_sources or []) if s in self.IP_SOURCE_IDS]
+        if picked:
+            return picked
+        return ["pool" if self.ip_source in ("socks", "pool") else self.ip_source]
+
+    def _pool_available(self) -> bool:
+        return bool(self._types_counts().get(self.normalize_proxy_types(self.proxy_types), 0))
+
+    @staticmethod
+    def _exit_key(exit_: dict) -> str:
+        region = exit_.get("region")
+        return f"{exit_['source']}:{region}" if region else exit_["source"]
+
+    def _source_exits(self, source: str) -> list[dict]:
+        if source == "direct":
+            return [{"source": "direct", "label": "My network"}]
+        if source == "pin":
+            return [{"source": "pin", "label": "Pinned proxy"}] if self.pin_proxy else []
+        if source == "pool":
+            # An empty pool keeps its old always-offered behaviour when it is
+            # the only source; mixed setups simply skip it.
+            if self._pool_available() or self.ip_source_list() == ["pool"]:
+                return [{"source": "pool", "label": "Proxy pool"}]
+            return []
+        pool = getattr(self, source, None)
+        if pool is None:
+            return []
+        rows = []
+        for inst in pool.ready():
+            if source == "psiphon":
+                place = REGION_NAMES.get(inst.region, inst.region)
+                label = f"Psiphon \u00b7 {place} ({inst.region})"
+            else:
+                label = f"Surfshark \u00b7 {pool.pick_label(inst)}"
+            rows.append({"source": source, "region": inst.region,
+                         "port": inst.port, "label": label})
+        return rows
+
+    def ip_exit_choices(self) -> list[dict]:
+        """List ready VPN exits so the picker can also show unsaved selections."""
+        return [{"key": self._exit_key(exit_), "label": exit_["label"]}
+                for source in self.VPN_SOURCE_IDS for exit_ in self._source_exits(source)]
+
+    def _pick_ip_exit(self) -> dict | None:
+        """Random exit for one signup: provider first, then a region inside it.
+
+        Picking the provider first keeps both networks evenly weighted however
+        many regions each happens to have, and one exit is drawn at random from
+        that network. The exit used last is skipped while another exists, so
+        consecutive signups do not share an address.
+        """
+        sources = self.ip_source_list()
+        vpns = [s for s in sources if s in self.VPN_SOURCE_IDS]
+        exits = [exit_ for source in (vpns or sources) for exit_ in self._source_exits(source)]
+        if not exits:
+            return None
+        if vpns and self.ip_mode == "single":
+            chosen = next((e for e in exits if self._exit_key(e) == self.ip_pick), exits[0])
+        else:
+            fresh = [e for e in exits if self._exit_key(e) != self._ip_last]
+            by_source: dict[str, list[dict]] = {}
+            for exit_ in (fresh or exits):
+                by_source.setdefault(exit_["source"], []).append(exit_)
+            source = random.choice(list(by_source))
+            chosen = random.choice(by_source[source])
+        self._ip_last = self._exit_key(chosen)
+        return chosen
+
+    def ip_unavailable(self) -> str:
+        sources = self.ip_source_list()
+        if not sources:
+            return "Choose at least one IP source."
+        reasons = []
+        vpns = [s for s in sources if s in self.VPN_SOURCE_IDS]
+        for source in (vpns or sources):
+            if source in self.VPN_SOURCE_IDS:
+                reasons.append(getattr(self, source).unavailable())
+            elif source == "pool":
+                reasons.append("Proxy pool has no usable proxies.")
+            elif source == "pin":
+                reasons.append("Pinned proxy address is empty.")
+        return "No selected IP source has a usable exit. " + " ".join(reasons)
 
     def vpn_status(self) -> dict:
         state = {}
@@ -4055,6 +4268,7 @@ class GeneratorManager:
             new.update(auto_generate=True, route_policy=w.env.get("ZAI_ROUTE_POLICY"),
                        auto_run_id=w.env.get("ZAI_AUTO_RUN_ID", ""),
                        auto_attempt_id=w.env.get("ZAI_AUTO_ATTEMPT_ID", ""),
+                       start_plan=w.start_plan, starter=bool(w.starter),
                        cancelled=lambda: w.stopped or self._closed.is_set())
             route_file = Path(w.env["ZAI_AUTO_ROUTE_FILE"])
             try:
@@ -4507,9 +4721,18 @@ class GeneratorManager:
             claims = list(self.claims.values())
         return {
             "options": self.options(),
-            "workers": [w.to_public() for w in workers],
+            # Auto Generate owns its attempt cards on its own page.
+            "workers": [w.to_public() for w in workers if w.env.get("ZAI_AUTO_GENERATE") != "1"],
             "claims": [j.to_public() for j in claims],
             "alive": sum(1 for w in workers if w.alive()),
             "auto_generate": self.auto_generate.status(),
-            "vpn": self.vpn_status(),
         }
+
+    def auto_worker_public(self, run_id: str) -> list[dict]:
+        """Workers owned by one Auto Generate run, newest last like the board."""
+        if not run_id:
+            return []
+        with self._lock:
+            rows = [w for w in self.workers.values()
+                    if w.env.get("ZAI_AUTO_RUN_ID") == run_id and w.env.get("ZAI_AUTO_GENERATE") == "1"]
+        return [w.to_public() for w in rows]

@@ -284,21 +284,23 @@ class SurfsharkPool(vpn.ExitPool):
             if region not in self._instances:
                 raise RuntimeError(f"{self.label} {region} is not running. Connect it first.")
             current = self.server_for(region)
-            in_use = {s for r, s in (self._settings.get("serverByRegion") or {}).items()
-                      if r != region}
-            siblings = [s for s in self.servers()
-                        if current and s.get("countryCode") == current.get("countryCode")
-                        and s.get("id") != current.get("id")]
-            # Prefer a server no other chosen location uses, so two regions do
-            # not end up behind one exit address.
-            fresh = [s for s in siblings if s.get("id") not in in_use]
-            pick_from = fresh or siblings
-            if pick_from:
-                nxt = pick_from[0]
-                mapping = dict(self._settings.get("serverByRegion") or {})
-                mapping[region] = nxt["id"]
-                self._settings = {**self._settings, "serverByRegion": mapping}
-                self._store()
+            if current is None:
+                raise RuntimeError(f"{region} is no longer in Surfshark's server list. Update servers first.")
+            in_use = {current["id"]}
+            for other, inst in self._instances.items():
+                if other == region:
+                    continue
+                for server in (inst.extra.get("server"), self.server_for(other)):
+                    if server:
+                        in_use.add(server["id"])
+            replacement = next((s for s in self.servers()
+                                if s.get("countryCode") == current.get("countryCode")
+                                and s["id"] not in in_use), None)
+            if replacement is None:
+                raise RuntimeError(f"No unused Surfshark server is available for {region}.")
+            mapping = {**self._settings["serverByRegion"], region: replacement["id"]}
+            self._settings = {**self._settings, "serverByRegion": mapping}
+            self._store()
             self._start(region, fresh=True)
         return self.status()
 

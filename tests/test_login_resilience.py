@@ -32,7 +32,8 @@ class _Wrangler:
         self.authed = False
 
     def __call__(self, args, timeout=300, env_extra=None):
-        sub = tuple(args[2:])           # [npx, "wrangler", ...]
+        at = args.index("wrangler") if "wrangler" in args else 2
+        sub = tuple(args[at + 1:])
         self.calls.append(sub)
         if sub == ("whoami",):
             return _proc(LOGGED_IN if self.authed else NOT_LOGGED_IN)
@@ -78,6 +79,38 @@ def test_login_failure_reports_wranglers_real_error(tmp_path):
     assert any("login attempt failed" in s for s in steps)
 
 
+def test_wrangler_always_runs_on_the_pinned_node(monkeypatch):
+    monkeypatch.delenv("ZAI_WRANGLER", raising=False)
+    argv = gen_mod.wrangler_argv("npx", "whoami")
+    assert argv[0] == "npx" and argv[-2:] == ["wrangler", "whoami"]
+    assert "node@22" in argv and "wrangler@4" in argv
+    assert argv.count("--package") == 2
+
+
+def test_wrangler_override_accepts_a_path_or_specs(monkeypatch, tmp_path):
+    exe = tmp_path / "wrangler.exe"
+    exe.write_text("")
+    monkeypatch.setenv("ZAI_WRANGLER", str(exe))
+    assert gen_mod.wrangler_argv("npx", "deploy") == [str(exe), "deploy"]
+    monkeypatch.setenv("ZAI_WRANGLER", "wrangler@4.40.2")
+    argv = gen_mod.wrangler_argv("npx", "deploy")
+    assert "wrangler@4.40.2" in argv and "node@22" in argv
+    assert "wrangler@4" not in argv
+
+
+def test_node_crash_keeps_the_reason_instead_of_the_version_trailer(tmp_path):
+    crash = ("file:///wrangler/wrangler-dist/cli.js:1\n"
+             "ReferenceError: localStorage is not defined\n"
+             "    at Module._compile (node:internal/modules/cjs/loader:1356:14)\n"
+             "Node.js v26.13.1\n")
+    assert gen_mod._error_line(crash) == "ReferenceError: localStorage is not defined"
+    w = _Wrangler([crash, crash])
+    ok, err = _mgr(tmp_path)._wrangler_login(w, "npx", lambda m: None)
+    assert not ok
+    assert "ReferenceError: localStorage is not defined" in err
+    assert "Node.js v26.13.1" not in err          # the trailer is not the reason
+
+
 def test_deploy_surfaces_the_login_error(tmp_path, monkeypatch):
     monkeypatch.setattr(gen_mod, "_is_headless", lambda: False)
     mgr = _mgr(tmp_path)
@@ -85,7 +118,8 @@ def test_deploy_surfaces_the_login_error(tmp_path, monkeypatch):
     monkeypatch.setattr(mgr, "export_worker", lambda: {"ok": True, "path": str(tmp_path)})
 
     def fake_run_capture(args, cwd, timeout, env=None):
-        sub = tuple(args[2:])
+        at = args.index("wrangler") if "wrangler" in args else 2
+        sub = tuple(args[at + 1:])
         if sub == ("whoami",):
             return _proc(NOT_LOGGED_IN)
         return _proc("ERROR  Timed out waiting for authorization code", code=1)

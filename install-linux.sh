@@ -393,13 +393,12 @@ host_for_display() { echo "${ZGW_DOMAIN:-${SERVER_IP:-${ZGW_SERVER_IP:-<server-i
 # the port the gateway itself listens on (https: public port; http: loopback only)
 gw_port() { [[ "${SSL_SCHEME:-https}" == "https" ]] && echo "${ZGW_PORT}" || echo 8788; }
 gw_health_url() {
-    if [[ "${SSL_SCHEME:-https}" == "https" ]]; then echo "https://127.0.0.1:$(gw_port)/health"
-    else echo "http://127.0.0.1:8788/health"; fi
+    cfg_yaml health
 }
 
 # All config access uses YAML, including updates: key order, indentation and
 # flow-style mappings must not decide whether an existing install is retained.
-cfg_yaml() { # cfg_yaml validate|admin|client|has|set [section key [yaml-value]]
+cfg_yaml() { # cfg_yaml validate|admin|client|health|has|set [section key [yaml-value]]
     system_python - "${ZGW_INSTALL_DIR}/config.yaml" "$@" <<'PY'
 import os
 from pathlib import Path
@@ -435,6 +434,15 @@ try:
         print(admin)
     elif action == "client":
         print(clients[0]["key"])
+    elif action == "health":
+        port = server.get("port", 8788)
+        if isinstance(port, str) and port.isascii() and port.isdecimal():
+            port = int(port)
+        if type(port) is not int or not 1 <= port <= 65535:
+            raise ValueError("invalid server.port")
+        scheme = "https" if server.get("tls_cert") and server.get("tls_key") else "http"
+        host = "[::1]" if server.get("host") in ("::", "::1") else "127.0.0.1"
+        print(f"{scheme}://{host}:{port}/health")
     elif action == "has":
         section, key = sys.argv[3:5]
         sys.exit(0 if key in data.get(section, {}) else 1)
@@ -1172,7 +1180,8 @@ PY
 _prefetch_wrangler() {
     local d rc=0; d="$(mktemp -d)"
     chown "${SVC_USER}:${SVC_USER}" "$d" || { rm -rf -- "$d"; return 1; }
-    ( cd "$d" && run_tool_user npx --yes wrangler --version ) || rc=$?
+    # pinned LTS Node: bleeding-edge Node majors crash wrangler at startup
+    ( cd "$d" && run_tool_user npx --yes --package node@22 --package wrangler@4 -- wrangler --version ) || rc=$?
     rm -rf "$d"
     return $rc
 }
@@ -1538,7 +1547,7 @@ final_report() { # final_report <admin> <client> <tls-note>
 
 cmd_update() (
     need_root; is_installed || fail "not installed — run: autozcoder install"
-    local stage committed=0 activated=0 stopped=0 managed=1 healthy=0 i path name
+    local stage committed=0 activated=0 stopped=0 managed=1 healthy=0 i path name health_url
     [[ "${ZGW_SKIP_SYSTEMD:-0}" == 1 ]] && managed=0
     # Serialize root-owned transactions, including manager refresh.
     acquire_mutation_lock
@@ -1567,7 +1576,7 @@ cmd_update() (
                 systemctl restart "$SERVICE" || rollback_ok=0
                 local restored_health=0
                 for i in $(seq 1 30); do
-                    if curl -fkSs --max-time 2 "$(gw_health_url)" >/dev/null 2>&1; then restored_health=1; break; fi
+                    if curl -fkSs --max-time 2 "$health_url" >/dev/null 2>&1; then restored_health=1; break; fi
                     sleep 1
                 done
                 [[ "$restored_health" == 1 ]] || rollback_ok=0
@@ -1599,6 +1608,7 @@ cmd_update() (
         || fail "cannot secure installation directory"
     # Stop writers before snapshotting files from older, service-owned installs.
     if [[ "$managed" == 1 ]]; then
+        health_url="$(gw_health_url)" || fail "cannot resolve the installed gateway's health URL"
         systemctl stop "$SERVICE" || fail "could not stop service"
         stopped=1
     fi
@@ -1636,7 +1646,7 @@ cmd_update() (
     # choices must not silently change during a binary-only update.
     systemctl restart "${SERVICE}" || fail "updated binary could not restart"
     for i in $(seq 1 30); do
-        if curl -fkSs --max-time 2 "$(gw_health_url)" >/dev/null 2>&1; then healthy=1; break; fi
+        if curl -fkSs --max-time 2 "$health_url" >/dev/null 2>&1; then healthy=1; break; fi
         sleep 1
     done
     [[ "$healthy" == 1 ]] || fail "updated gateway did not become healthy"

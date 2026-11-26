@@ -11,6 +11,7 @@ from zcode_gateway.pool import Account, PoolManager
 from zcode_gateway.registry import Registry
 from zcode_gateway.service import ChatService, UpstreamFailure
 from zcode_gateway.store import JsonlCapture, Store
+from zcode_gateway.upstream import sse_frame
 from tests_fixtures import FakeClient, FakeResponse, frame, sample_events, sample_sse
 
 REQ = {'model': 'GLM-5.4', 'messages': [{'role': 'user', 'content': 'hi'}]}
@@ -149,13 +150,33 @@ async def test_failed_reopen_reports_the_original_error(service, caplog):
 
 
 @pytest.mark.asyncio
-async def test_upstream_error_event_is_logged_not_retried(service, caplog):
-    err = frame({'type': 'error', 'error': {'type': 'api_error', 'message': 'oops'}})
+@pytest.mark.parametrize('anthropic', [False, True])
+@pytest.mark.parametrize('error', [
+    {'type': 'error', 'error': {'type': 'api_error', 'message': 'temporary failure'}},
+    {'error': {'code': 'overloaded_error', 'message': 'temporary failure'}},
+])
+async def test_transient_upstream_error_before_content_retries(service, caplog, anthropic, error):
+    service.cfg.upstream.overload_base_delay_seconds = 0
+    service.client = FakeClient(responses=[FakeResponse(PRELUDE_ONLY + sse_frame(error)), FakeResponse(sample_sse())])
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        _, out = await run_stream(service, anthropic=anthropic)
+    assert len(service.client.calls) == 2
+    assert b'hello' in out and b'temporary failure' not in out
+    assert out.count(b'event: message_start' if anthropic else b'"role":"assistant"') == 1
+    assert 'content_sent=False' in caplog.text and 'retrying transparently' in caplog.text
+    assert all(r.closed for r in service.client.responses) and await idle(service)
+
+
+@pytest.mark.asyncio
+async def test_permanent_upstream_error_before_content_is_logged_without_retry(service, caplog):
+    err = frame({'type': 'error', 'error': {'type': 'invalid_request_error', 'message': 'invalid input'}})
     service.client = FakeClient(responses=[FakeResponse(PRELUDE_ONLY + err), FakeResponse(sample_sse())])
     with caplog.at_level(logging.WARNING, logger=LOGGER):
         _, out = await run_stream(service, anthropic=True)
-    assert len(service.client.calls) == 1 and b'oops' in out
-    assert 'stream failed mid-flight' in caplog.text and 'api_error: oops' in caplog.text
+    assert len(service.client.calls) == 1 and b'invalid input' in out
+    assert b'event: message_start' not in out
+    assert 'invalid_request_error: invalid input' in caplog.text
+    assert await idle(service)
 
 
 @pytest.mark.asyncio

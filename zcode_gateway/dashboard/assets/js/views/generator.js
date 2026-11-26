@@ -149,7 +149,10 @@ export async function mount({ root, signal }) {
     const body = {
       captcha: controls.captcha.value,
       captcha_strategy: controls.strategy.value,
-      ip_source: controls.ip.value,
+      ip_source: ipSources[0],
+      ip_sources: ipSources,
+      ip_mode: ipMode,
+      ip_pick: ipPick,
       proxy_types: controls.ptypes.value,
       country: controls.country.value,
       pin_proxy: controls.pin.value.trim(),
@@ -198,6 +201,89 @@ export async function mount({ root, signal }) {
   }
   window.addEventListener("beforeunload", warnUnsaved);
 
+  let ipSources = [];
+  let ipMode = "spread";
+  let ipPick = "";
+  let renderIpExits;
+
+  function ipField(o) {
+    const known = Array.isArray(o.ip_sources) && o.ip_sources.length
+      ? o.ip_sources : [["socks", "pool"].includes(o.ip_source) ? "pool" : o.ip_source || "direct"];
+    ipSources = known.filter((s) => ["pool", "direct", "pin", "psiphon", "surfshark"].includes(s));
+    if (!ipSources.length) ipSources = ["direct"];
+    ipMode = o.ip_mode === "single" ? "single" : "spread";
+    ipPick = o.ip_pick || "";
+
+    const changed = () => { renderIpExits(true); syncVisibility(); saveOptions(); };
+    const card = (id, label, detail) => {
+      const input = el("input", { type: "checkbox", checked: ipSources.includes(id) });
+      input.addEventListener("change", () => {
+        if (!input.checked && ipSources.length === 1) {
+          input.checked = true;
+          toast("Keep at least one IP source selected", "warn");
+          return;
+        }
+        ipSources = input.checked ? [...ipSources, id] : ipSources.filter((s) => s !== id);
+        changed();
+      });
+      return el("label", { class: "chip", title: detail }, [input, el("span", { text: label })]);
+    };
+    const modeOption = (value, title, detail) => {
+      const input = el("input", { type: "radio", name: "generator-ip-mode", checked: ipMode === value });
+      input.addEventListener("change", () => { ipMode = value; changed(); });
+      return el("label", { class: "chip", title: detail }, [input, el("span", { text: title })]);
+    };
+
+    const vpnSources = ["psiphon", "surfshark"];
+    const pick = el("select", { class: "select", id: "generator-ippick", "aria-label": "Exit in use" });
+    pick.addEventListener("change", () => { ipPick = pick.value; saveOptions(); });
+    const pickSlot = el("div", { class: "ip-pick", hidden: true }, [pick]);
+    const help = el("div", { class: "field__help" });
+    const modeRow = el("div", { class: "row ip-line" }, [
+      el("span", { class: "field__label ip-label", text: "Mode" }),
+      modeOption("spread", "Random", "Each signup picks a random connected exit"),
+      modeOption("single", "Stay on one", "Use the chosen VPN exit or the first connected VPN exit if it goes offline"),
+      pickSlot,
+    ]);
+    let renderedChoices;
+    renderIpExits = (edited = false) => {
+      const selectedVpns = vpnSources.filter((source) => ipSources.includes(source));
+      modeRow.hidden = !selectedVpns.length;
+      pickSlot.hidden = ipMode !== "single" || modeRow.hidden;
+      help.textContent = modeRow.hidden ? "Pick one or more IP sources."
+        : "Signups use the selected VPNs. Connect at least one exit before starting.";
+      if (pickSlot.hidden) return;
+      const choices = (status?.options?.ip_exits || []).filter((e) =>
+        selectedVpns.includes(e.key.split(":")[0]));
+      if (edited && !selectedVpns.includes(ipPick.split(":")[0])) ipPick = choices[0]?.key || "";
+      const selected = choices.some((e) => e.key === ipPick) ? ipPick : "";
+      const options = selected ? choices : [{ key: "", label: choices.length
+        ? "First connected VPN exit" : "No connected VPN exits" }, ...choices];
+      const signature = JSON.stringify(options);
+      if (signature !== renderedChoices) {
+        fill(pick, options.map((e) => el("option", { value: e.key, text: e.label })));
+        renderedChoices = signature;
+      }
+      pick.value = selected;
+      pick.disabled = !choices.length;
+    };
+
+    const field = el("div", { class: "field ip-field" }, [
+      el("div", { class: "row ip-line" }, [
+        el("span", { class: "field__label ip-label", text: "IP sources" }),
+        card("pool", "Proxy pool (" + (o.pool_available || 0) + ")", "Rotates proxies from the pool"),
+        card("direct", "My network", "No proxy"),
+        card("pin", "Pinned proxy", "One fixed proxy address"),
+        card("psiphon", "Psiphon", "Connected Psiphon regions"),
+        card("surfshark", "Surfshark", "Connected Surfshark locations"),
+      ]),
+      modeRow,
+      help,
+    ]);
+    renderIpExits();
+    return field;
+  }
+
   function buildOptions(o) {
     const select = (opts, value) => el("select", {
       class: "select", on: { change: () => { syncVisibility(); saveOptions(); } },
@@ -232,13 +318,7 @@ export async function mount({ root, signal }) {
       field("strategy", "AI judge model", select([
         ["auto", "auto — CV + AI vote"], ["ai", "ai — AI judge only"], ["classic", "classic — CV solver"],
       ], o.captcha_strategy || "auto"), "How the solver picks the drag distance."),
-      field("ip", "IP source", select([
-        ["pool", "Proxy pool (" + (o.pool_available || 0) + ")"],
-        ["direct", "My network (no proxy)"],
-        ["pin", "Pinned proxy"],
-        ["psiphon", "Psiphon"],
-        ["surfshark", "Surfshark"],
-      ], ["pool", "socks"].includes(o.ip_source) ? "pool" : o.ip_source)),
+      ipField(o),
       field("ptypes", "Proxy types", select([
         ["all", "All types (" + ((o.types_counts || {}).all || 0) + ")"],
         ["socks", "socks4 + socks5 (" + ((o.types_counts || {}).socks || 0) + ")"],
@@ -307,12 +387,11 @@ export async function mount({ root, signal }) {
       controls.display.title = "";
     }
 
-    const source = controls.ip?.value;
     for (const key of ["ptypes", "country"]) {
-      if (controls[key]) controls[key].closest(".field").hidden = source !== "pool";
+      if (controls[key]) controls[key].closest(".field").hidden = !ipSources.includes("pool");
     }
     if (controls.pin) {
-      controls.pin.closest(".field").hidden = source !== "pin";
+      controls.pin.closest(".field").hidden = !ipSources.includes("pin");
     }
   }
 
@@ -495,6 +574,8 @@ export async function mount({ root, signal }) {
       buildShell();
       buildOptions(st.options || {});
       syncVisibility();
+    } else {
+      renderIpExits();
     }
     paintBoard(st);
     batch.refresh();

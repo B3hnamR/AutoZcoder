@@ -89,7 +89,8 @@ _prefetch_wrangler
     commands = (tmp_path / "commands").read_text().splitlines()
     assert any(line.startswith("PKG ") and "libnss3" in line for line in commands)
     assert any("-m playwright install chromium" in line for line in commands)
-    assert any("npx --yes wrangler --version" in line for line in commands)
+    assert any("npx --yes --package node@22 --package wrangler@4 -- wrangler --version" in line
+               for line in commands)
     assert all("--with-deps" not in line and "install-deps" not in line for line in commands)
     assert sum(line.startswith("USER ") for line in commands) >= 7
 
