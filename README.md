@@ -11,7 +11,7 @@ It exposes OpenAI- and Anthropic-compatible endpoints locally, pools multiple
 ZCode accounts behind one key, and can create new accounts for you on demand.
 Runs on **Windows (desktop exe)** and **Linux (headless VPS)**.
 
-**[Download latest](https://github.com/B3hnamR/AutoZcoder/releases/latest)** · [Release notes · 2.0.12](docs/releases/2.0.12.md) · [MIT license](LICENSE)
+**[Download latest](https://github.com/B3hnamR/AutoZcoder/releases/latest)** · [Release notes · 3.0.0](docs/releases/3.0.0.md) · [MIT license](LICENSE)
 
 [Quick start](#quick-start) · [Connect a client](#connect-a-client) · [Accounts](#adding-accounts) · [Features](#features) · [Documentation](#documentation) · [Security](#security-notes)
 
