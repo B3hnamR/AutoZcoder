@@ -582,6 +582,16 @@ def test_mint_captcha_mode_reaches_the_child(manager):
     assert manager._worker_env("g3")["ZAI_MANUAL"] == "1"
 
 
+def test_workers_cap_blas_thread_pools(manager, monkeypatch):
+    env = manager._worker_env("g1")
+    for key in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS",
+                "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+        assert env[key] == "1"
+    # An operator-set value survives: spawn merges os.environ under overrides.
+    monkeypatch.setenv("OPENBLAS_NUM_THREADS", "4")
+    assert "OPENBLAS_NUM_THREADS" not in manager._child_env()
+
+
 @pytest.mark.parametrize("summary, expected", [
     ("1 fully created (1 with Starter plan), 0 need verification", True),
     ("1 fully created (0 with Starter plan), 0 need verification", False),

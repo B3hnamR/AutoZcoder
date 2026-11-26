@@ -3802,6 +3802,16 @@ class GeneratorManager:
 
     def _child_env(self, *, virtual_display: bool = False) -> dict[str, str]:
         env = _bundled_captcha_env()
+        # Every worker imports numpy/onnxruntime for ddddocr. Each BLAS pool
+        # reserves a thread arena per process, and several parallel workers
+        # exhaust the commit charge ("OpenBLAS: Memory allocation still failed
+        # after 10 retries, giving up", child dies before the first log line).
+        # The captcha matrices are tiny; one thread per pool is enough. A value
+        # the operator set is kept.
+        for var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS",
+                    "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+            if not os.environ.get(var):
+                env[var] = "1"
         env["ZAI_GATEWAY_URL"] = self.gateway_origin.rstrip("/")
         env["ZAI_GATEWAY_INTERNAL_TOKEN"] = self.internal_token
         env["ZAI_GATEWAY_CA_FILE"] = self.gateway_ca_file
