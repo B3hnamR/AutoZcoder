@@ -247,8 +247,11 @@ window.view = createAutoGenerate({signal:controller.signal}); document.querySele
         page.locator(".auto-workers-list .job").nth(1).locator('button[title="Remove from list"]').click()
         assert any(path.endswith("/workers/remove") for _, path, _ in calls)
         assert not page.get_by_text("No session events yet.", exact=True).is_visible()
+        page.evaluate("controller.abort(); view.destroy()")
+        page.wait_for_timeout(600)          # let an in-flight poll settle
         before = len(calls)
-        page.evaluate("controller.abort(); view.refresh(); view.destroy()")
+        page.evaluate("view.refresh()")     # disposed: must not request
+        page.wait_for_timeout(1200)
         assert len(calls) == before
         assert not errors
         assert not unexpected
