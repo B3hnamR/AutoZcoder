@@ -14,7 +14,10 @@ import pytest
 
 from zcode_gateway.breaker import EdgeBlockBreaker
 from zcode_gateway.registry import Registry, MODEL_CAPS, model_caps
-from zcode_gateway.upstream import merge_anthropic_beta, UpstreamClient
+from zcode_gateway.upstream import (
+    client_not_supported, merge_anthropic_beta, parse_upstream_error, suspended_account,
+    SUSPENDED_PARK_S, UpstreamClient,
+)
 from zcode_gateway.config import UpstreamConfig, PacingConfig
 from zcode_gateway.zcode_protocol import build_body
 from zcode_gateway.aggregate import aggregate_openai_stream
@@ -35,6 +38,27 @@ def test_breaker_ignores_api_json_403():
     br = EdgeBlockBreaker()
     assert br.note_edge_block(API_403_JSON) is False
     assert br.is_blocked() is False
+
+
+def test_suspension_is_told_apart_from_a_request_block():
+    suspended = ("Your account has been suspended for misusing the Start Plan, "
+                 "such as proxying it to non-ZCode clients. Please contact support.")
+    assert suspended_account(suspended)
+    assert not suspended_account("request has been blocked due to unusual activity.")
+    assert not suspended_account(None)
+    assert SUSPENDED_PARK_S >= 3600
+
+
+def test_html_405_has_a_clear_message_without_inventing_a_rejection_reason():
+    body = b'<!doctypehtml><html lang="zh-cn"><title>405</title><style>body{}</style></html>'
+    error = parse_upstream_error(405, body)
+    assert error == {
+        "code": "http_405",
+        "message": "ZCode upstream returned HTTP 405 with an HTML error page.",
+        "raw": None,
+    }
+    assert not client_not_supported(error["message"])
+    assert not EdgeBlockBreaker().note_edge_block(body)
 
 
 def test_breaker_trips_on_html_edge_block():

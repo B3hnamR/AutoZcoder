@@ -154,6 +154,16 @@ def is_block_code(code: str, status: int = 0) -> bool:
 # every account, so it is a build problem and not an account problem.
 CLIENT_NOT_SUPPORTED_MARKERS = ("official zcode client", "client is not supported")
 CLIENT_NOT_SUPPORTED_PARK_S = 120.0
+# The suspension flavor of 3012 is account-level and only support clears it.
+SUSPENDED_PARK_S = 7200.0
+
+
+def suspended_account(message: str | None) -> bool:
+    """Upstream 3012 with "account has been suspended for misusing the Start
+    Plan, such as proxying it to non-ZCode clients." Not a request shape issue
+    and not a quota: retrying the account in 15 minutes only burns a slot."""
+    text = (message or "").lower()
+    return "suspended" in text and "start plan" in text
 
 
 def client_not_supported(message: str | None) -> bool:
@@ -243,6 +253,10 @@ def parse_upstream_error(status: int, body: str | bytes | None) -> dict[str, Any
             }
     except Exception:
         pass
+    if status == 405 and text.lstrip("\ufeff \t\r\n").lower().startswith(("<!doctype", "<html")):
+        return {"code": "http_405",
+                "message": "ZCode upstream returned HTTP 405 with an HTML error page.",
+                "raw": None}
     return {"code": f"http_{status}", "message": text[:400], "raw": None}
 
 

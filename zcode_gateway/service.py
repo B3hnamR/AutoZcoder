@@ -21,6 +21,7 @@ from .zcode_protocol import MessageAccumulator, OpenAITranslator, usage_openai
 from .upstream import (build_headers, build_upstream_body, iter_sse_events, sse_frame,
                        parse_upstream_error, anthropic_error, openai_error, TransportError,
                        is_block_code, is_entitlement_code, client_not_supported, CLIENT_NOT_SUPPORTED_PARK_S,
+                       suspended_account, SUSPENDED_PARK_S,
                        REQUIRE_INCREMENTAL, StreamingRelayUnsupported)
 from .registry import model_caps
 
@@ -202,7 +203,13 @@ class ChatService:
             # not match. Every account then fails identically, so a 900s park
             # per account only spreads a pool-wide outage over 15 minutes of
             # misleading state. Park briefly and name the real cause instead.
-            if client_not_supported(message):
+            if suspended_account(message):
+                # Every model answers 3012 on a suspended account, so rest the
+                # whole account instead of one model lane.
+                await self.pool.cool(account, int(SUSPENDED_PARK_S),
+                                     reason='ACCOUNT_SUSPENDED',
+                                     expected_credentials=expected_credentials)
+            elif client_not_supported(message):
                 await self.pool.cap_model(account, model,
                                           CLIENT_NOT_SUPPORTED_PARK_S,
                                           reason='CLIENT_NOT_SUPPORTED',
