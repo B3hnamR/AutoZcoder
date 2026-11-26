@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 import pytest
 
 from zcode_gateway.config import PoolConfig
-from zcode_gateway.pool import Account, PoolManager
+from zcode_gateway.pool import Account, AccountState, PoolManager
 
 
 @pytest.mark.asyncio
@@ -39,3 +40,22 @@ async def test_acquire_times_out_when_no_slot_frees():
     # nothing releases -> must give up after the wait, not hang forever
     result = await pool.acquire(wait_seconds=0.2)
     assert result is None
+
+
+@pytest.mark.asyncio
+async def test_snapshot_flips_a_finished_cooldown_back_to_ready():
+    now = time.time()
+    done = Account(id="done", access_token="t")
+    done.state, done.cooldown_until = AccountState.COOLING, now - 1
+    waiting = Account(id="wait", access_token="t")
+    waiting.state, waiting.cooldown_until = AccountState.COOLING, now + 60
+    pool = PoolManager(PoolConfig(), [done, waiting])
+
+    snap = await pool.snapshot()
+
+    assert done.state is AccountState.READY and done.cooldown_until == 0.0
+    assert waiting.state is AccountState.COOLING
+    # Ready and cooling are exclusive, so the cards add up to accounts.
+    assert snap["ready"] == 1
+    assert snap["by_state"] == {"ready": 1, "cooling": 1}
+    assert sum(snap["by_state"].values()) == snap["accounts"]

@@ -1000,6 +1000,16 @@ class PoolManager:
 
     async def snapshot(self) -> dict:
         accounts = await self.all()
+        # A cooldown that has run out is usable again, but nothing flips the
+        # state until the account is next used. Flip it at read time, or the
+        # dashboard shows "cooling" for accounts that route fine and the cards
+        # stop adding up (ready + cooling > accounts).
+        now = time.time()
+        for account in accounts:
+            if (account.state is AccountState.COOLING and account.cooldown_until
+                    and account.cooldown_until <= now):
+                account.state = AccountState.READY
+                account.cooldown_until = 0.0
         counts: dict[str, int] = {}
         for a in accounts:
             counts[a.state.value] = counts.get(a.state.value, 0) + 1
