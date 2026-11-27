@@ -8,6 +8,7 @@ import { locateCard } from "./generator/setup.js";
 import { createRelaysCard } from "./proxy/relays.js";
 import { createSourcesCard } from "./proxy/sources.js";
 import { num, duration } from "../core/format.js";
+import { t } from "../core/i18n.js";
 
 const PRESETS = {
   balanced: { latency: 6, timeout: 10, conc: 400, pconc: 300, ptimeout: 3 },
@@ -15,16 +16,16 @@ const PRESETS = {
   fast: { latency: 4, timeout: 6, conc: 700, pconc: 500, ptimeout: 2 },
 };
 
-// label, key, tone, explanation
+// label key, data key, tone, help key
 const COUNTERS = [
-  ["Raw list", "raw", null, "Scraped candidates waiting to be checked."],
-  ["Usable now", "pool_file", "ok", "Verified proxies ready to hand out right now."],
-  ["Working", "healthy", "ok", "The latest check passed and the proxy is not used up."],
-  ["Failing", "failing", "err", "Checked, and the latest check failed."],
-  ["Never checked", "unverified", "warn", "Imported or scraped, not yet proven."],
-  ["SOCKS", "socks", null, "SOCKS proxies in the usable list — preferred for signups."],
-  ["Used up", "used", "warn", "Already consumed by a signup or claim."],
-  ["Bad / MITM", "bad", "err", "Flagged as intercepting HTTPS, or otherwise unusable."],
+  ["proxy.counters.raw", "raw", null, "proxy.counters.raw.help"],
+  ["proxy.counters.pool", "pool_file", "ok", "proxy.counters.pool.help"],
+  ["proxy.counters.healthy", "healthy", "ok", "proxy.counters.healthy.help"],
+  ["proxy.counters.failing", "failing", "err", "proxy.counters.failing.help"],
+  ["proxy.counters.unverified", "unverified", "warn", "proxy.counters.unverified.help"],
+  ["proxy.counters.socks", "socks", null, "proxy.counters.socks.help"],
+  ["proxy.counters.used", "used", "warn", "proxy.counters.used.help"],
+  ["proxy.counters.bad", "bad", "err", "proxy.counters.bad.help"],
 ];
 
 export async function mount({ root, signal }) {
@@ -35,13 +36,13 @@ export async function mount({ root, signal }) {
 
   const autoToggle = el("input", { class: "switch__input", type: "checkbox" });
   const autoInterval = el("select", { class: "select", style: { maxWidth: "150px" } },
-    [[30, "every 30 min"], [45, "every 45 min"], [90, "every 90 min"], [180, "every 3 h"]]
+    [[30, t("proxy.auto.every_30")], [45, t("proxy.auto.every_45")], [90, "90 min"], [180, "3 h"]]
       .map(([v, label]) => el("option", { value: v, text: label, selected: v === 45 })));
   const autoState = el("span", { class: "muted text-xs" });
 
   function paintAutoState(r) {
     autoState.textContent = r.auto_verify
-      ? (r.next_run_in_s ? "Next run " + duration(r.next_run_in_s) + " from now." : "Scheduled.")
+      ? (r.next_run_in_s ? t("proxy.auto.next_run", { time: duration(r.next_run_in_s) }) : t("proxy.auto.scheduled"))
       : "";
   }
 
@@ -51,7 +52,7 @@ export async function mount({ root, signal }) {
         enabled: autoToggle.checked,
         interval_min: parseInt(autoInterval.value, 10) || 45,
       }));
-    } catch (e) { toast("auto-verify: " + e.message, "err"); }
+    } catch (e) { toast(t("proxy.auto.err", { msg: e.message }), "err"); }
   }
   autoToggle.addEventListener("change", saveAutoVerify);
   autoInterval.addEventListener("change", () => { if (autoToggle.checked) saveAutoVerify(); });
@@ -113,21 +114,21 @@ export async function mount({ root, signal }) {
         prefilter: controls.prefilter.checked,
         retry_failed: controls.retry.checked,
       });
-      toast("Proxy " + action + " started", "ok");
+      toast(t("proxy.run.started", { action }), "ok");
       load();
     } catch (e) { toast(action + ": " + e.message, "err"); }
   }
 
   async function stop() {
-    try { await api.post("/admin/dash/generator/proxies/stop"); toast("Stopping", "ok"); load(); }
+    try { await api.post("/admin/dash/generator/proxies/stop"); toast(t("proxy.stopping"), "ok"); load(); }
     catch (e) { toast(e.message, "err"); }
   }
 
   async function maintain(action) {
-    maintMsg.textContent = "Working…";
+    maintMsg.textContent = t("proxy.working");
     try {
       const r = await api.post("/admin/dash/generator/proxies/maintain", { action });
-      maintMsg.textContent = r.message || "Done";
+      maintMsg.textContent = r.message || t("proxy.done");
       load();
     } catch (e) { maintMsg.textContent = e.message; }
   }
@@ -135,7 +136,7 @@ export async function mount({ root, signal }) {
   async function lookupCountries() {
     try {
       await api.post("/admin/dash/generator/proxies/countries", {});
-      toast("Country lookup started", "ok");
+      toast(t("proxy.countries.started"), "ok");
       load();
     } catch (e) { toast(e.message, "err"); }
   }
@@ -148,33 +149,33 @@ export async function mount({ root, signal }) {
     }, Object.keys(PRESETS).map((p) => el("option", { value: p, text: p, selected: p === "balanced" })));
 
     const scanControls = el("div", { class: "grid", style: { gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))" } }, [
-      field("preset", "Scan preset", presetSelect),
-      field("latency", "Max latency (s)", el("input", { class: "input", type: "number", value: ps.max_latency || 6, step: "0.5", min: 1 })),
-      field("timeout", "Timeout (s)", el("input", { class: "input", type: "number", value: 10, min: 2, max: 60 })),
-      field("conc", "Checks", el("input", { class: "input", type: "number", value: 400, min: 20, max: 5000 })),
-      field("pconc", "TCP probes", el("input", { class: "input", type: "number", value: 300, min: 10, max: 5000 })),
-      field("ptimeout", "Probe timeout (s)", el("input", { class: "input", type: "number", value: 3, min: 1, max: 30, step: "0.5" })),
-      field("dead", "Dead cache (h)", el("input", { class: "input", type: "number", value: 0, min: 0, max: 720 })),
+      field("preset", t("proxy.scan.preset"), presetSelect),
+      field("latency", t("proxy.scan.max_latency"), el("input", { class: "input", type: "number", value: ps.max_latency || 6, step: "0.5", min: 1 })),
+      field("timeout", t("proxy.scan.timeout"), el("input", { class: "input", type: "number", value: 10, min: 2, max: 60 })),
+      field("conc", t("proxy.scan.checks"), el("input", { class: "input", type: "number", value: 400, min: 20, max: 5000 })),
+      field("pconc", t("proxy.scan.tcp_probes"), el("input", { class: "input", type: "number", value: 300, min: 10, max: 5000 })),
+      field("ptimeout", t("proxy.scan.probe_timeout"), el("input", { class: "input", type: "number", value: 3, min: 1, max: 30, step: "0.5" })),
+      field("dead", t("proxy.scan.dead_cache"), el("input", { class: "input", type: "number", value: 0, min: 0, max: 720 })),
     ]);
 
     controls.prefilter = el("input", { type: "checkbox", checked: true });
     controls.retry = el("input", { type: "checkbox", checked: true });
 
-    runButtons.all = button({ label: "Scrape + verify", variant: "primary", onClick: () => run("all") });
-    runButtons.verify = button({ label: "Verify raw", onClick: () => run("verify") });
-    runButtons.recheck = button({ label: "Recheck pool", icon: "refresh", onClick: () => run("recheck") });
-    runButtons.stop = button({ label: "Stop", variant: "danger", onClick: stop });
+    runButtons.all = button({ label: t("proxy.run.scrape_verify"), variant: "primary", onClick: () => run("all") });
+    runButtons.verify = button({ label: t("proxy.run.verify_raw"), onClick: () => run("verify") });
+    runButtons.recheck = button({ label: t("proxy.run.recheck_pool"), icon: "refresh", onClick: () => run("recheck") });
+    runButtons.stop = button({ label: t("proxy.run.stop"), variant: "danger", onClick: stop });
 
     const checker = card({
-      title: "Proxy checker",
-      desc: "A proxy qualifies when the z.ai shell loads, the captcha host is reachable, TLS is valid (anti-MITM) and latency is under the cap.",
+      title: t("proxy.checker.title"),
+      desc: t("proxy.checker.desc"),
       body: el("div", { class: "stack" }, [
         countersBox,
         scanControls,
         el("div", { class: "row" }, [
-          el("label", { class: "checkline" }, [controls.prefilter, el("span", { text: "TCP prefilter" })]),
-          el("label", { class: "checkline", title: "Retry timeouts and resets once — recovers roughly 30% more proxies" },
-            [controls.retry, el("span", { text: "Second chance" })]),
+          el("label", { class: "checkline" }, [controls.prefilter, el("span", { text: t("proxy.scan.tcp_prefilter") })]),
+          el("label", { class: "checkline", title: t("proxy.scan.second_chance.help") },
+            [controls.retry, el("span", { text: t("proxy.scan.second_chance") })]),
           el("span", { class: "spacer" }),
           runButtons.all, runButtons.verify, runButtons.recheck, runButtons.stop,
         ]),
@@ -184,15 +185,15 @@ export async function mount({ root, signal }) {
         el("div", { class: "row", style: { paddingTop: "8px", borderTop: "1px solid var(--border-subtle)" } }, [
           el("label", { class: "switch" }, [
             autoToggle, el("span", { class: "switch__track" }),
-            el("span", { class: "text-sm", text: "Auto re-verify" }),
+            el("span", { class: "text-sm", text: t("proxy.auto.verify") }),
           ]),
           autoInterval,
-          el("span", { class: "faint text-xs", text: "Keeps the pool fresh so claims never hit a stale set." }),
+          el("span", { class: "faint text-xs", text: t("proxy.auto.keep_fresh") }),
           autoState,
         ]),
         el("div", { class: "row row--between" }, [
-          el("span", { class: "field__help", text: "Live check log" }),
-          button({ label: "Clear", variant: "quiet", onClick: () => fill(logPane, []) }),
+          el("span", { class: "field__help", text: t("proxy.live_log") }),
+          button({ label: t("proxy.clear"), variant: "quiet", onClick: () => fill(logPane, []) }),
         ]),
         logPane,
       ]),
@@ -212,7 +213,7 @@ export async function mount({ root, signal }) {
         el("div", { class: "row" }, [
           countryLine,
           button({ label: "Look up countries", onClick: lookupCountries }),
-          el("span", { class: "faint text-xs", text: "Uses free public lookup sites; nothing is downloaded." }),
+          el("span", { class: "faint text-xs", text: t("proxy.lookup.free") }),
         ]),
       ]),
     });
@@ -235,8 +236,8 @@ export async function mount({ root, signal }) {
     const pct = total > 0 ? Math.round((probed / total) * 100) : 0;
 
     fill(countersBox, COUNTERS.map(([label, key, tone, hint]) => {
-      const node = metric({ label, value: num(ps[key] ?? 0), tone: ps[key] ? tone : null });
-      node.title = hint;
+      const node = metric({ label: t(label), value: num(ps[key] ?? 0), tone: ps[key] ? tone : null });
+      node.title = t(hint);
       return node;
     }));
 
@@ -245,9 +246,9 @@ export async function mount({ root, signal }) {
     progressText.textContent = probed + " / " + total;
 
     statusLine.textContent = px.running
-      ? "Checking… " + (px.action || "") + " (" + (px.elapsed || 0) + "s)"
-      : px.state === "exited" ? "Finished"
-      : px.state === "failed" ? "Failed" : "Idle";
+      ? t("proxy.run.checking", { action: px.action || "", secs: (px.elapsed || 0) + "s" })
+      : px.state === "exited" ? t("proxy.run.finished")
+      : px.state === "failed" ? t("proxy.run.failed") : t("proxy.run.idle");
 
     for (const [key, btn] of Object.entries(runButtons)) {
       if (key === "stop") btn.hidden = !px.running;
@@ -258,7 +259,7 @@ export async function mount({ root, signal }) {
     const atBottom = logPane.scrollHeight - logPane.scrollTop - logPane.clientHeight < 48;
     fill(logPane, lines.length
       ? lines.map((l) => el("div", { class: "logpane__line", text: l }))
-      : el("div", { class: "faint", text: "No check output yet." }));
+      : el("div", { class: "faint", text: t("proxy.no_output") }));
     if (atBottom) logPane.scrollTop = logPane.scrollHeight;
 
     countryLine.textContent = (ps.countries_known ?? 0) + " of " + (ps.pool_json || 0)

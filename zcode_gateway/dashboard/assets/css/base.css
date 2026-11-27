@@ -1,5 +1,14 @@
 /* Reset + element defaults. No component lives here. */
 
+/* Vazirmatn (Vazir) — Persian UI face. Variable font, one file, all weights. */
+@font-face {
+  font-family: "Vazirmatn";
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url("/dash/assets/fonts/vazirmatn-vazir-woff2/Vazirmatn-Variable.woff2") format("woff2");
+}
+
 *,
 *::before,
 *::after { box-sizing: border-box; }
@@ -93,3 +102,25 @@ hr { border: 0; border-top: 1px solid var(--border); }
     scroll-behavior: auto !important;
   }
 }
+
+/* RTL: Persian switches the whole app to Vazirmatn and lets the browser's
+   logical direction flip the layout. The UI face is the only font that
+   changes; monospace data (emails, tokens, logs) stays LTR. */
+html[lang="fa"] body {
+  font-family: "Vazirmatn", "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+}
+
+/* Numbers and mono data stay LTR even inside an RTL flow. */
+html[lang="fa"] .mono,
+html[lang="fa"] code,
+html[lang="fa"] kbd,
+html[lang="fa"] input.input--mono {
+  direction: ltr;
+  unicode-bidi: plaintext;
+}
+
+/* Logical alignment for the few places that hardcode physical sides. */
+html[lang="fa"] .login__head,
+html[lang="fa"] .login__title { text-align: right; }
+html[lang="fa"] .field__help[style*="text-align:center"],
+html[lang="fa"] p[style*="text-align:center"] { text-align: center; }

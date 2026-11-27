@@ -7,6 +7,7 @@ import { el, fill, debounce, copyText } from "../core/dom.js";
 import { api } from "../core/api.js";
 import { toast } from "../core/toast.js";
 import { card, toolbar, button } from "../core/ui.js";
+import { t } from "../core/i18n.js";
 
 const LEVELS = ["", "DEBUG", "INFO", "WARNING", "ERROR"];
 
@@ -29,7 +30,7 @@ export async function mount({ root, signal }) {
   function paint() {
     if (!records.length) {
       fill(pane, el("div", { class: "faint", text: clearedBefore !== null
-        ? "View cleared. New records appear as they arrive." : "No log records match." }));
+        ? t("logs.empty.cleared") : t("logs.empty.no_match") }));
       return;
     }
     const atBottom = pane.scrollHeight - pane.scrollTop - pane.clientHeight < 60;
@@ -59,16 +60,16 @@ export async function mount({ root, signal }) {
   const levelSelect = el("select", {
     class: "select", style: { maxWidth: "140px" }, "aria-label": "Filter by level",
     on: { change: (e) => { level = e.target.value; load().catch(() => {}); } },
-  }, LEVELS.map((l) => el("option", { value: l, text: l || "All levels" })));
+  }, LEVELS.map((l) => el("option", { value: l, text: l || t("logs.all_levels") })));
 
   const searchInput = el("input", {
-    class: "input", type: "search", placeholder: "Search logs…",
-    style: { maxWidth: "240px" }, "aria-label": "Search logs",
+    class: "input", type: "search", placeholder: t("logs.search.ph"),
+    style: { maxWidth: "240px" }, "aria-label": t("logs.search.aria"),
     on: { input: debounce((e) => { search = e.target.value; load().catch(() => {}); }, 300) },
   });
 
   const clearBtn = button({
-    label: "Clear", onClick: () => {
+    label: t("logs.clear"), onClick: () => {
       clearedBefore = Math.max(clearedBefore ?? 0, ...records.map(r => Number(r.ts) || 0));
       records = [];
       paint();
@@ -76,10 +77,10 @@ export async function mount({ root, signal }) {
   });
 
   const bar = toolbar([levelSelect, searchInput], el("div", { class: "row row--tight" }, [
-    button({ label: "Copy", icon: "copy", onClick: async () => {
+    button({ label: t("logs.copy"), icon: "copy", onClick: async () => {
       const text = records.map((r) => [r.time, r.level, r.logger + ":", r.message].join(" ")).join("\n");
       const ok = await copyText(text);
-      toast(ok ? "Logs copied" : "Could not copy", ok ? "ok" : "err", 1600);
+      toast(ok ? t("logs.copied") : t("logs.copy_failed"), ok ? "ok" : "err", 1600);
     } }),
     clearBtn,
   ]));
@@ -87,8 +88,8 @@ export async function mount({ root, signal }) {
   fill(root, el("div", { class: "stack" }, [
     bar,
     card({
-      title: "Process log",
-      desc: "In-memory ring buffer. Restarting the gateway clears it.",
+      title: t("logs.card.title"),
+      desc: t("logs.card.desc"),
       body: pane,
     }),
   ]));

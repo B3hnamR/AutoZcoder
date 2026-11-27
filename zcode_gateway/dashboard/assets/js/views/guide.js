@@ -1,19 +1,24 @@
 // Searchable operating manual, with short task chapters and an error index.
 import { el, fill } from "../core/dom.js";
+import { t, lang } from "../core/i18n.js";
 import { card, button, copyable, table } from "../core/ui.js";
 import { navigate } from "../core/router.js";
 import { platform } from "../core/caps.js";
-import { GUIDE, ERRORS } from "./guide-content.js";
+import { GUIDE as GUIDE_EN, ERRORS as ERRORS_EN } from "./guide-content.js";
+import { GUIDE as GUIDE_FA, ERRORS as ERRORS_FA } from "./guide-content-fa.js";
 
 export function mount({ root }) {
   let selected = "start", query = "";
+  const fa = lang() === "fa";
+  const GUIDE = fa ? GUIDE_FA : GUIDE_EN;
+  const ERRORS = fa ? ERRORS_FA : ERRORS_EN;
   const body = el("div", { class: "guide-articles" });
-  const nav = el("nav", { class: "guide-toc", "aria-label": "Guide chapters" });
+  const nav = el("nav", { class: "guide-toc", "aria-label": t("guide.toc.aria") });
   const resultCount = el("span", { class: "field__help", role: "status", "aria-live": "polite" });
   const heading = el("h2", { class: "guide-heading" });
   const description = el("p", { class: "muted text-sm" });
-  const sections = [...GUIDE, { id: "errors", title: "Troubleshooting", desc: "Match the failing stage before changing settings.", items: ERRORS }];
-  const chapterPicker = el("select", { class: "select guide-chapter-picker", "aria-label": "Guide chapter",
+  const sections = [...GUIDE, { id: "errors", title: t("guide.troubleshooting.title"), desc: t("guide.troubleshooting.desc"), items: ERRORS }];
+  const chapterPicker = el("select", { class: "select guide-chapter-picker", "aria-label": t("guide.chapter.aria"),
     on: { change: event => { selected = event.target.value; query = ""; input.value = ""; paint(); } } },
     sections.map(s => el("option", { value: s.id, text: s.title })));
   const matches = (section, item) => !query ||
@@ -25,11 +30,11 @@ export function mount({ root }) {
       el("summary", {}, [el("span", { text: item.title }),
         searching ? el("span", { class: "guide-entry__chapter", text: section.title }) : null]),
       el("div", { class: "guide-entry__body" }, [
-        item.sizing ? table({ columns: [{ label: "Workload" }, { label: "CPU" }, { label: "RAM" }, { label: "Guidance" }],
+        item.sizing ? table({ columns: [{ label: t("guide.col.workload") }, { label: t("guide.col.cpu") }, { label: t("guide.col.ram") }, { label: t("guide.col.guidance") }],
           rows: item.sizing, render: row => row }) : null,
         el("ol", { class: "guide-instructions" }, item.steps.map(text => el("li", { text }))),
         ...(item.commands || []).map(command => el("div", { class: "guide-command" }, copyable(command))),
-        button({ label: "Open " + (item.route || section.route || "accounts"),
+        button({ label: t("guide.open", { route: item.route || section.route || "accounts" }),
           variant: "ghost", onClick: () => navigate(item.route || section.route || "accounts") }),
       ]),
     ]);
@@ -46,23 +51,23 @@ export function mount({ root }) {
       else node.removeAttribute("aria-current");
     }
     const section = sections.find(s => s.id === selected);
-    heading.textContent = searching ? "Search results" : section.title;
+    heading.textContent = searching ? t("guide.heading.results") : section.title;
     description.textContent = searching
-      ? "Matches include instructions, error codes, platform notes and recovery steps."
+      ? t("guide.desc.results")
       : section.desc;
     const entries = (searching ? sections : [section])
       .flatMap(s => s.items.filter(item => matches(s, item)).map(item => entry(s, item, searching)));
-    resultCount.textContent = entries.length + (searching ? " matching topics" : " topics");
+    resultCount.textContent = t(searching ? "guide.count.matching" : "guide.count.topics", { n: entries.length });
     fill(body, entries.length ? entries : el("div", { class: "empty" }, [
-      el("h3", { text: "No matching topic" }),
-      el("p", { class: "field__help", text: "Try a shorter phrase, an HTTP code, or a stage such as inbox, quota, browser or proxy." }),
-      button({ label: "Clear search", onClick: () => { input.value = ""; query = ""; paint(); input.focus(); } }),
+      el("h3", { text: t("guide.no_match.title") }),
+      el("p", { class: "field__help", text: t("guide.no_match.body") }),
+      button({ label: t("guide.no_match.clear"), onClick: () => { input.value = ""; query = ""; paint(); input.focus(); } }),
     ]));
     if (!searching) body.querySelector("details")?.setAttribute("open", "");
   }
 
-  const input = el("input", { class: "input", type: "search", placeholder: "Search steps, errors, codes...",
-    "aria-label": "Search the Guide", on: { input: event => {
+  const input = el("input", { class: "input", type: "search", placeholder: t("guide.search.ph"),
+    "aria-label": t("guide.search.aria"), on: { input: event => {
       query = event.target.value.trim().toLowerCase(); paint();
     } } });
   fill(nav, sections.map(s => el("button", {
@@ -77,10 +82,10 @@ export function mount({ root }) {
   fill(root, el("div", { class: "stack guide-workspace" }, [
     el("header", { class: "guide-intro" }, [
       el("div", {}, [
-        el("h2", { text: "Operate with confidence" }),
-        el("p", { class: "muted text-sm", text: "Setup, day-to-day tasks, and recovery. Start with the failing stage, not another retry." }),
+        el("h2", { text: t("guide.intro.title") }),
+        el("p", { class: "muted text-sm", text: t("guide.intro.desc") }),
       ]),
-      el("span", { class: "badge", text: platform() === "linux" ? "Linux VPS reference" : platform() === "windows" ? "Windows reference" : "Windows + Linux" }),
+      el("span", { class: "badge", text: platform() === "linux" ? t("guide.intro.badge.linux") : platform() === "windows" ? t("guide.intro.badge.windows") : t("guide.intro.badge.both") }),
     ]),
     el("div", { class: "guide-search" }, [input, resultCount]),
     chapterPicker,
@@ -89,16 +94,16 @@ export function mount({ root }) {
         el("div", { class: "stack stack--tight" }, [heading, description]), body,
       ]),
     ]),
-    card({ title: "Connection reference", desc: "Use a client key for model traffic. These examples contain placeholders, never your saved credentials.",
+    card({ title: t("guide.reference.title"), desc: t("guide.reference.desc"),
       body: el("div", { class: "guide-reference" }, [
-        el("div", { class: "stack stack--tight" }, [el("span", { class: "field__label", text: "API base URL (current origin)" }), copyable(base),
-          el("p", { class: "field__help", text: "OpenAI chat: /v1/chat/completions | Anthropic messages: /v1/messages | Models: /v1/models" }),
-          button({ label: "Open Server", onClick: () => navigate("server") })]),
-        el("div", { class: "stack stack--tight" }, [el("span", { class: "field__label", text: "Portable request example" }),
+        el("div", { class: "stack stack--tight" }, [el("span", { class: "field__label", text: t("guide.reference.api_label") }), copyable(base),
+          el("p", { class: "field__help", text: t("guide.reference.api_help") }),
+          button({ label: t("guide.reference.open_server"), onClick: () => navigate("server") })]),
+        el("div", { class: "stack stack--tight" }, [el("span", { class: "field__label", text: t("guide.reference.portable") }),
           el("pre", { class: "code", text: JSON.stringify({ model: "<model ID from Models>", messages: [{ role: "user", content: "Hello" }] }, null, 2) }),
-          el("p", { class: "field__help", text: "POST JSON to /v1/chat/completions with Content-Type: application/json and Authorization: Bearer <client key>." })]),
+          el("p", { class: "field__help", text: t("guide.reference.portable_help") })]),
       ]) }),
-    el("p", { class: "field__help", text: "This guide covers known workflows and failure classes, not every possible provider response. For an unknown error, capture the stage, HTTP/status code and minimal redacted logs. Never include account exports, JWTs, passwords, API tokens or inbox secrets." }),
+    el("p", { class: "field__help", text: t("guide.disclaimer") }),
   ]));
   heading.id = "guide-current-heading";
   paint();

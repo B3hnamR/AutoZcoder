@@ -19,6 +19,17 @@
     document.documentElement.setAttribute("data-theme", t);
   } catch (e) {}
 
+  // Same for language: a Persian user must not see a flash of LTR English.
+  // Mirrors core/i18n.js — sets dir/lang and the RTL class before first paint.
+  try {
+    var l = localStorage.getItem("gw-lang");
+    if (l !== "fa" && l !== "en")
+      l = (navigator.language || "").toLowerCase().indexOf("fa") === 0 ? "fa" : "en";
+    document.documentElement.setAttribute("lang", l);
+    document.documentElement.setAttribute("dir", l === "fa" ? "rtl" : "ltr");
+    document.documentElement.classList.toggle("is-rtl", l === "fa");
+  } catch (e) {}
+
   // Admin key hand-off. On a loopback request api_dash.py rewrites the empty
   // string below to the real key, so a local user is not asked for something
   // the Server section would show them anyway. The expression must stay
@@ -42,6 +53,8 @@
     <div class="sidebar__foot">
       <span id="foot-version">—</span>
       <span class="spacer"></span>
+      <button class="btn btn--quiet btn--sm btn--icon btn--lang" id="lang-toggle"
+              type="button" title="Change language" aria-label="Change language"></button>
       <button class="btn btn--quiet btn--sm btn--icon" id="theme-toggle"
               type="button" title="Toggle theme" aria-label="Toggle theme"></button>
     </div>
@@ -95,7 +108,7 @@
         <button class="btn btn--primary btn--block" id="login-submit" type="submit">Continue</button>
       </div>
     </div>
-    <p class="field__help" style="text-align:center;margin-top:12px">
+      <p class="field__help login__help" style="text-align:center;margin-top:12px">
       The key is printed by the installer and shown in the Server section.
     </p>
   </form>

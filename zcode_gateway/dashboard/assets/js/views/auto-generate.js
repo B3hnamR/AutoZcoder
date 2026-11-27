@@ -2,6 +2,7 @@ import { el, fill, copyText } from "../core/dom.js";
 import { toast } from "../core/toast.js";
 import { api } from "../core/api.js";
 import { card, button, stateBadge } from "../core/ui.js";
+import { t } from "../core/i18n.js";
 
 const PATH = "/admin/dash/generator/auto";
 const DEFAULTS = {
@@ -28,11 +29,11 @@ export function createAutoGenerate({ signal } = {}) {
   let requestVersion = 0;
   let pendingRefresh = null;
 
-  const note = el("p", { class: "auto-note", role: "status", "aria-live": "polite", text: "Loading saved configuration..." });
+  const note = el("p", { class: "auto-note", role: "status", "aria-live": "polite", text: t("auto.note.loading") });
   const error = el("p", { class: "auto-error", role: "alert", hidden: true });
   const connection = el("p", { class: "auto-error", role: "status", hidden: true });
   const state = el("span");
-  const progress = el("p", { class: "auto-progress", text: "Loading session status..." });
+  const progress = el("p", { class: "auto-progress", text: t("auto.progress.loading") });
   const profile = el("p", { class: "auto-note" });
   const reason = el("p", { class: "auto-note", hidden: true });
   const counts = el("dl", { class: "auto-counts", "aria-label": "Session counts" });
@@ -41,9 +42,9 @@ export function createAutoGenerate({ signal } = {}) {
     "aria-label": "Auto Generate live session log" });
   const follow = el("input", { type: "checkbox", checked: true });
   let lastLog = "";
-  const copyLog = button({ label: "Copy log", icon: "copy", onClick: async () => {
+  const copyLog = button({ label: t("auto.copy_log"), icon: "copy", onClick: async () => {
     const ok = await copyText(lastLog);
-    toast(ok ? "Auto Generate log copied" : "Clipboard unavailable", ok ? "ok" : "err");
+    toast(ok ? t("auto.copy_log.ok") : t("auto.copy_log.fail"), ok ? "ok" : "err");
   } });
 
   function field(key, label, input, help) {
@@ -59,39 +60,39 @@ export function createAutoGenerate({ signal } = {}) {
   const number = (key, min, help, label) => field(key, label, el("input", {
     class: "input", type: "number", min, step: 1, required: true, value: DEFAULTS[key],
   }), help);
-  const modeField = field("mode", "Run mode", el("select", { class: "select" }, [
-    el("option", { value: "goal", text: "Goal: new qualified Start Plan successes" }),
-    el("option", { value: "attempts", text: "Attempts: fixed signup budget" }),
-  ]), "Only new, qualified Start Plan successes count toward the goal.");
-  const targetField = number("target", 1, "Stop once this many new accounts qualify. No-plan and duplicate results do not count.", "Qualified success goal");
-  const attemptField = number("attempt_limit", 1, "Mandatory safety budget in goal mode; the run stops at this many launched attempts even if the goal is not reached.", "Maximum attempts");
-  const concurrencyField = number("concurrency", 1, "Keep 1 for the first run. Up to 3 browser slots can run concurrently.", "Concurrent browsers");
+  const modeField = field("mode", t("auto.field.mode"), el("select", { class: "select" }, [
+    el("option", { value: "goal", text: t("auto.field.mode.goal") }),
+    el("option", { value: "attempts", text: t("auto.field.mode.attempts") }),
+  ]), t("auto.field.mode.help"));
+  const targetField = number("target", 1, t("auto.field.target.help"), t("auto.field.target"));
+  const attemptField = number("attempt_limit", 1, t("auto.field.attempts.help"), t("auto.field.attempts"));
+  const concurrencyField = number("concurrency", 1, t("auto.field.concurrency.help"), t("auto.field.concurrency"));
   controls.concurrency.max = 3;
-  const cooldownField = number("cooldown_seconds", 0, "Seconds a slot waits before its next attempt. Active attempts keep their own timeout.", "Cooldown (seconds)");
-  const ipField = field("ip_source", "IP source", el("select", { class: "select" }, [
-    el("option", { value: "direct", text: "Direct (no selected proxy)" }),
-    el("option", { value: "proxy", text: "Proxy pool" }),
-  ]), "Direct skips proxy selection. Your system VPN/TUN and OS routing still apply.");
-  const displayField = field("browser_display", "Browser display", el("select", { class: "select" }, [
-    el("option", { value: "background", text: "Background (invisible)" }),
-    el("option", { value: "desktop", text: "Desktop window" }),
-  ]), "Windows background uses native headless Chromium, which the provider may reject. Linux background uses Xvfb. Desktop requires a real display. Applies only to this Auto Generate profile.");
-  const captchaField = field("captcha", "Captcha solver", el("input", {
+  const cooldownField = number("cooldown_seconds", 0, t("auto.field.cooldown.help"), t("auto.field.cooldown"));
+  const ipField = field("ip_source", t("auto.field.ip_source"), el("select", { class: "select" }, [
+    el("option", { value: "direct", text: t("auto.field.ip_source.direct") }),
+    el("option", { value: "proxy", text: t("auto.field.ip_source.proxy") }),
+  ]), t("auto.field.ip_source.help"));
+  const displayField = field("browser_display", t("auto.field.display"), el("select", { class: "select" }, [
+    el("option", { value: "background", text: t("auto.field.display.background") }),
+    el("option", { value: "desktop", text: t("auto.field.display.desktop") }),
+  ]), t("auto.field.display.help"));
+  const captchaField = field("captcha", t("auto.field.captcha"), el("input", {
     class: "input", value: "AI judge only", type: "text", readOnly: true,
-  }), "Fixed to AI for Auto Generate. Configure a working vision judge in AI setup first.");
-  const timeoutField = number("timeout_seconds", 1, "Maximum seconds for a single attempt before it is stopped.", "Attempt timeout (seconds)");
-  const failureField = number("failure_limit", 1, "Stop after this many consecutive failures. Review the reason before starting again.", "Consecutive failure limit");
+  }), t("auto.field.captcha.help"));
+  const timeoutField = number("timeout_seconds", 1, t("auto.field.timeout.help"), t("auto.field.timeout"));
+  const failureField = number("failure_limit", 1, t("auto.field.failure.help"), t("auto.field.failure"));
   for (const [key, min, max] of [["target", 1, 1000], ["attempt_limit", 1, 10000],
     ["cooldown_seconds", 0, 3600], ["timeout_seconds", 60, 3600], ["failure_limit", 1, 100]]) {
     controls[key].min = min;
     controls[key].max = max;
   }
-  const saveButton = button({ label: "Save config", onClick: saveConfig });
-  const startButton = button({ label: "Auto Generate", variant: "primary", icon: "bolt", onClick: () => mutate("start") });
-  const pauseButton = button({ label: "Pause", onClick: () => mutate("pause") });
-  const resumeButton = button({ label: "Resume", onClick: () => mutate("resume") });
-  const stopButton = button({ label: "Stop session", variant: "danger", onClick: () => mutate("stop") });
-  const retryButton = button({ label: "Refresh status", onClick: refresh });
+  const saveButton = button({ label: t("auto.btn.save"), onClick: saveConfig });
+  const startButton = button({ label: t("auto.btn.start"), variant: "primary", icon: "bolt", onClick: () => mutate("start") });
+  const pauseButton = button({ label: t("auto.btn.pause"), onClick: () => mutate("pause") });
+  const resumeButton = button({ label: t("auto.btn.resume"), onClick: () => mutate("resume") });
+  const stopButton = button({ label: t("auto.btn.stop"), variant: "danger", onClick: () => mutate("stop") });
+  const retryButton = button({ label: t("auto.btn.refresh"), onClick: refresh });
   const form = el("form", { class: "auto-form", on: {
     submit: (event) => { event.preventDefault(); saveConfig(); },
     input: edited, change: edited,
@@ -100,17 +101,17 @@ export function createAutoGenerate({ signal } = {}) {
       cooldownField, ipField, displayField, captchaField, timeoutField, failureField]),
     el("div", { class: "auto-actions" }, [saveButton, startButton, note]),
   ]);
-  const node = card({ title: "Auto Generate", desc: "Save a bounded profile, then start an unattended session.", body: [
+  const node = card({ title: t("auto.title"), desc: t("auto.desc"), body: [
     form, error, connection,
-    el("section", { class: "auto-session", "aria-label": "Auto Generate session" }, [
+    el("section", { class: "auto-session", "aria-label": t("auto.title") }, [
       el("div", { class: "auto-session-head" }, [state, progress]), profile, counts, reason, slots,
       el("div", { class: "auto-actions" }, [pauseButton, resumeButton, stopButton, retryButton]),
       el("div", { class: "auto-actions" }, [
-        el("strong", { text: "Live session log" }),
-        el("label", { class: "checkline" }, [follow, el("span", { text: "Follow latest" })]), copyLog,
+        el("strong", { text: t("auto.live_log") }),
+        el("label", { class: "checkline" }, [follow, el("span", { text: t("auto.follow") })]), copyLog,
       ]), logPane,
-      el("p", { class: "auto-note", text: "Last 200 session events. Attempt names match detailed worker cards below. Logs reset on a new session; a gateway restart retains progress, not this in-memory log." }),
-      el("p", { class: "auto-note", text: "Pause prevents new attempts; active attempts can finish. Stop cancels this session and its active attempts. An interrupted session never resumes automatically: choose Resume explicitly." }),
+      el("p", { class: "auto-note", text: t("auto.note.events") }),
+      el("p", { class: "auto-note", text: t("auto.note.pause") }),
     ]),
   ] });
   node.classList.add("auto-generate");
@@ -153,17 +154,17 @@ export function createAutoGenerate({ signal } = {}) {
     stopButton.disabled = !!busy || !healthy || disposed || status.state === "stopping";
     retryButton.disabled = !!busy || disposed;
     form.setAttribute("aria-busy", String(!!busy || !hydrated));
-    note.textContent = busy ? ({ save: "Saving configuration...", start: "Starting session...",
-      pause: "Pausing session...", resume: "Resuming session...", stop: "Stopping session..." }[busy])
-      : !hydrated ? "Loading saved configuration..."
-      : live() ? "Session profile is locked. Stop or finish this session before editing."
-      : dirty ? "Unsaved changes. Save config before starting."
-      : saved ? "Configuration saved. Ready to Auto Generate."
-      : "Review the saved profile, then Save config to enable Auto Generate.";
+    note.textContent = busy ? ({ save: t("auto.note.saving"), start: t("auto.note.starting"),
+      pause: t("auto.note.pausing"), resume: t("auto.note.resuming"), stop: t("auto.note.stopping") }[busy])
+      : !hydrated ? t("auto.note.loading")
+      : live() ? t("auto.note.locked")
+      : dirty ? t("auto.note.dirty")
+      : saved ? t("auto.note.saved")
+      : t("auto.note.review");
   }
   function paint(data) {
     if (data?.error) throw new Error(String(data.error));
-    if (!data?.config || !data?.status?.state) throw new Error("Invalid Auto Generate response. Refresh status to retry.");
+    if (!data?.config || !data?.status?.state) throw new Error(t("auto.error.invalid"));
     if (!hydrated) {
       writeConfig(data.config);
       hydrated = true;
@@ -185,28 +186,28 @@ export function createAutoGenerate({ signal } = {}) {
     const count = (value) => Math.max(0, Number(value) || 0);
     const mode = status.mode || runConfig.mode;
     const target = count(status.target ?? status.goal ?? runConfig.target);
-    progress.textContent = status.state === "idle" ? "No session started."
-      : mode === "goal" ? count(status.qualified) + " / " + target + " new qualified Start Plan successes"
-      : count(status.launched) + " / " + count(status.attempt_limit ?? runConfig.attempt_limit) + " attempts launched";
-    profile.textContent = status.state === "idle" ? "Saved configuration survives gateway restarts; sessions require an explicit start."
+    progress.textContent = status.state === "idle" ? t("auto.progress.no_session")
+      : mode === "goal" ? t("auto.progress.goal", { n: count(status.qualified), target: target })
+      : t("auto.progress.attempts", { n: count(status.launched), target: count(status.attempt_limit ?? runConfig.attempt_limit) });
+    profile.textContent = status.state === "idle" ? t("auto.profile.saved")
       : (status.id ? "Session " + status.id + " | " : "") + (mode === "goal" ? "Goal mode" : "Attempts mode")
-        + " | " + count(runConfig.concurrency) + " browser slots | " + count(runConfig.cooldown_seconds)
+        + " | " + count(runConfig.concurrency) + " slots | " + count(runConfig.cooldown_seconds)
         + "s cooldown | " + runConfig.ip_source + " | "
-        + (runConfig.browser_display === "desktop" ? "Desktop window" : "Background (invisible)") + " | AI only";
-    fill(counts, [["launched", "Attempts reserved"], ["completed", "Finished attempts"], ["qualified", "Qualified"],
-      ["failed", "Unsuccessful"], ["no_plan", "No plan"], ["duplicates", "Duplicates"], ["active", "Active"], ["cooling", "Cooling"]]
+        + (runConfig.browser_display === "desktop" ? t("auto.field.display.desktop") : t("auto.field.display.background")) + " | AI only";
+    fill(counts, [["launched", t("auto.counts.launched")], ["completed", t("auto.counts.completed")], ["qualified", t("auto.counts.qualified")],
+      ["failed", t("auto.counts.failed")], ["no_plan", t("auto.counts.no_plan")], ["duplicates", t("auto.counts.duplicates")], ["active", t("auto.counts.active")], ["cooling", t("auto.counts.cooling")]]
       .map(([key, label]) => el("div", { class: "auto-count" }, [el("dt", { text: label }), el("dd", { text: String(count(status[key])) })])));
     const details = [];
-    if (status.state === "interrupted") details.push("Session interrupted. Review the status, then choose Resume to continue.");
-    if (status.reason) details.push("Reason: " + status.reason);
-    if (count(status.remaining_cooldown_seconds)) details.push("Next slot available in " + Math.ceil(count(status.remaining_cooldown_seconds)) + "s.");
+    if (status.state === "interrupted") details.push(t("auto.interrupted"));
+    if (status.reason) details.push(t("auto.reason", { reason: status.reason }));
+    if (count(status.remaining_cooldown_seconds)) details.push(t("auto.cooldown.next", { n: Math.ceil(count(status.remaining_cooldown_seconds)) }));
     reason.textContent = details.join(" ");
     reason.hidden = !details.length;
     fill(slots, (status.slots || []).map((slot, index) => el("li", { class: "auto-slot" }, [
-      el("strong", { text: "Slot " + (slot.id ?? index + 1) }),
+      el("strong", { text: t("auto.slot", { n: slot.id ?? index + 1 }) }),
       el("span", { text: slot.state || "idle" }),
       el("span", { class: "auto-note", text: slot.worker_name || slot.name || "" }),
-      slot.remaining_cooldown_seconds ? el("span", { class: "auto-note", text: Math.ceil(count(slot.remaining_cooldown_seconds)) + "s remaining" }) : null,
+      slot.remaining_cooldown_seconds ? el("span", { class: "auto-note", text: t("auto.slot.remaining", { n: Math.ceil(count(slot.remaining_cooldown_seconds)) }) }) : null,
     ])));
     const lines = (status.events || []).map(event => {
       const stamp = new Date(event.ts * 1000).toLocaleTimeString();
@@ -218,7 +219,7 @@ export function createAutoGenerate({ signal } = {}) {
       fill(logPane, lines.length ? lines.map((line, index) => el("div", {
         class: "logpane__line" + ((status.events[index].level === "error") ? " logpane__line--err"
           : status.events[index].level === "warn" ? " logpane__line--warn" : ""), text: line,
-      })) : el("div", { class: "faint", text: "No session events yet. Start a saved profile to see attempt and cooldown progress." }));
+      })) : el("div", { class: "faint", text: t("auto.events.empty") }));
       logPane.scrollTop = follow.checked ? logPane.scrollHeight : scroll;
       lastLog = text;
     }
@@ -277,12 +278,12 @@ export function createAutoGenerate({ signal } = {}) {
       } catch (exception) {
         if (disposed || exception.name === "AbortError" || version !== requestVersion) return;
         healthy = false;
-        connection.textContent = "Auto Generate status unavailable: " + exception.message + ". Use Refresh status to retry; no session action was sent.";
+        connection.textContent = t("auto.connection.unavailable", { msg: exception.message });
         connection.hidden = false;
         renderControls();
         if (!hydrated) {
-          note.textContent = "Configuration not loaded. Refresh status to retry.";
-          progress.textContent = "Session status unavailable.";
+          note.textContent = t("auto.config.not_loaded");
+          progress.textContent = t("auto.session.unavailable");
         }
       } finally { pendingRefresh = null; }
     })();

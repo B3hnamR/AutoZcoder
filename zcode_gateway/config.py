@@ -199,7 +199,7 @@ class ServerConfig(BaseModel):
                    for k in self.client_keys)
 
 
-CURRENT_ZCODE_CLIENT_VERSION = "4.0.0"
+CURRENT_ZCODE_CLIENT_VERSION = "4.1.0"
 CURRENT_ZCODE_USER_AGENT = (
     f"ZCode/{CURRENT_ZCODE_CLIENT_VERSION} "
     "ai-sdk/provider-utils/4.0.27 runtime/node.js/24"

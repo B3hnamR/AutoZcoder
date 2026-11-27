@@ -6,6 +6,7 @@ import { api } from "../../core/api.js";
 import { toast, confirmDialog } from "../../core/toast.js";
 import { card, table, button, badge, stateBadge } from "../../core/ui.js";
 import { relative, parseTime } from "../../core/format.js";
+import { t } from "../../core/i18n.js";
 
 const PROVIDERS = [
   { id: "cloudflare", label: "Cloudflare" },
@@ -23,16 +24,16 @@ export function createRelaysCard() {
   const statusNote = el("span", { class: "muted text-xs" });
 
   const node = card({
-    title: "Edge relays",
-    desc: "Route selected models through a configured relay.",
+    title: t("relay.title"),
+    desc: t("relay.desc"),
     actions: statusNote,
     body: el("div", { class: "stack" }, [
       controlsBox,
       el("div", { class: "row" }, [
         ...PROVIDERS.map((p) => button({
-          label: "Deploy " + p.label, onClick: () => openDeploy(p.id),
+          label: t("relay.deploy", { provider: p.label }), onClick: () => openDeploy(p.id),
         })),
-        button({ label: "Add existing URL", variant: "quiet", onClick: () => openDeploy("custom") }),
+        button({ label: t("relay.add_url"), variant: "quiet", onClick: () => openDeploy("custom") }),
         el("span", { class: "spacer" }),
         button({ icon: "refresh", title: "Refresh", variant: "quiet", onClick: () => refresh() }),
       ]),
@@ -53,9 +54,9 @@ export function createRelaysCard() {
     };
     try {
       await api.post("/admin/dash/relays/settings", body);
-      statusNote.textContent = "Saved";
+      statusNote.textContent = t("relay.saved");
       setTimeout(() => { statusNote.textContent = ""; }, 1500);
-    } catch (e) { toast("relay settings: " + e.message, "err"); }
+    } catch (e) { toast(e.message, "err"); }
   }
 
   const controls = {
@@ -63,9 +64,9 @@ export function createRelaysCard() {
     glm54: el("input", { type: "checkbox", on: { change: saveSettings } }),
     flash: el("input", { type: "checkbox", on: { change: saveSettings } }),
     strategy: el("select", { class: "select", style: { maxWidth: "190px" }, on: { change: saveSettings } }, [
-      el("option", { value: "single", text: "Single (active relay only)" }),
-      el("option", { value: "round_robin", text: "Round robin" }),
-      el("option", { value: "random", text: "Random" }),
+      el("option", { value: "single", text: t("relay.strategy.single") }),
+      el("option", { value: "round_robin", text: t("relay.strategy.round_robin") }),
+      el("option", { value: "random", text: t("relay.strategy.random") }),
     ]),
   };
 
@@ -73,22 +74,22 @@ export function createRelaysCard() {
     el("label", { class: "switch" }, [
       controls.enabled,
       el("span", { class: "switch__track" }),
-      el("span", { class: "text-sm", text: "Enable edge relay" }),
+      el("span", { class: "text-sm", text: t("relay.enable") }),
     ]),
     el("div", { class: "relay-controls__sep" }),
-    el("span", { class: "text-sm muted", text: "Route models:" }),
-    el("label", { class: "checkline" }, [controls.glm54, el("span", { text: "GLM-5.4" }), badge("recommended", "ok")]),
-    el("label", { class: "checkline" }, [controls.flash, el("span", { text: "GLM-5.3-Flash" })]),
+    el("span", { class: "text-sm muted", text: t("relay.route_models") }),
+    el("label", { class: "checkline" }, [controls.glm54, el("span", { text: t("relay.glm54") }), badge(t("relay.glm54.badge"), "ok")]),
+    el("label", { class: "checkline" }, [controls.flash, el("span", { text: t("relay.glm53f") })]),
     el("div", { class: "relay-controls__sep" }),
-    el("span", { class: "text-sm muted", text: "Rotation:" }),
+    el("span", { class: "text-sm muted", text: t("relay.rotation") }),
     controls.strategy,
-    el("span", { class: "faint text-xs", text: "A failed relay is skipped for 60s." }),
+    el("span", { class: "faint text-xs", text: t("relay.strategy.skip") }),
   ]);
 
   /* ---------------------------------------------------------- actions --- */
 
   async function setActive(id) {
-    try { await api.post("/admin/dash/relays/settings", { active_id: id }); toast("Active relay set", "ok"); refresh(); }
+    try { await api.post("/admin/dash/relays/settings", { active_id: id }); toast(t("relay.active_set"), "ok"); refresh(); }
     catch (e) { toast(e.message, "err"); }
   }
 
@@ -96,25 +97,24 @@ export function createRelaysCard() {
     const label = btn.querySelector("span:last-child");
     const original = label.textContent;
     btn.disabled = true;
-    label.textContent = "Testing…";
+    label.textContent = t("relay.testing");
     try {
       const r = await api.post("/admin/dash/relays/test", { id });
-      toast(r.ok ? "Relay answered in " + Math.round(r.elapsed_ms || 0) + " ms"
-                 : (r.error || "Relay did not answer"), r.ok ? "ok" : "err");
+      toast(r.ok ? t("relay.test_ok", { n: Math.round(r.elapsed_ms || 0) })
+                 : (r.error || t("relay.test_fail")), r.ok ? "ok" : "err");
       refresh();
-    } catch (e) { toast("test: " + e.message, "err"); }
+    } catch (e) { toast(e.message, "err"); }
     finally { btn.disabled = false; label.textContent = original; }
   }
 
   async function deleteRelay(relay) {
     const ok = await confirmDialog({
-      title: "Delete this relay?",
-      body: (relay.name || relay.id) + " is removed from the gateway.\n"
-          + "The deployed worker itself is not deleted from the provider.",
-      okLabel: "Delete", danger: true,
+      title: t("relay.delete.title"),
+      body: t("relay.delete.body", { name: relay.name || relay.id }),
+      okLabel: t("relay.delete.ok"), danger: true,
     });
     if (!ok) return;
-    try { await api.del("/admin/dash/relays/" + encodeURIComponent(relay.id)); toast("Relay deleted", "ok"); refresh(); }
+    try { await api.del("/admin/dash/relays/" + encodeURIComponent(relay.id)); toast(t("relay.deleted"), "ok"); refresh(); }
     catch (e) { toast(e.message, "err"); }
   }
 
@@ -131,35 +131,35 @@ export function createRelaysCard() {
     };
     const logBox = el("pre", { class: "code", hidden: true });
     const errorBox = el("p", { class: "field__error", hidden: true });
-    const submit = button({ label: isCustom ? "Add relay" : "Deploy", variant: "primary" });
+    const submit = button({ label: isCustom ? t("relay.add_btn") : t("relay.deploy_btn"), variant: "primary" });
 
     const modal = el("div", { class: "modal", role: "dialog", "aria-modal": "true", style: { maxWidth: "520px" } }, [
       el("div", { class: "modal__head" }, el("div", {
         class: "modal__title",
-        text: isCustom ? "Add an existing relay" : "Deploy a " + provider + " relay",
+        text: isCustom ? t("relay.add_existing") : t("relay.deploy_provider", { provider }),
       })),
       el("div", { class: "modal__body stack" }, [
         el("div", { class: "field" }, [
-          el("label", { class: "field__label", text: "Name" }), fields.name,
+          el("label", { class: "field__label", text: t("relay.name") }), fields.name,
         ]),
         isCustom
           ? el("div", { class: "stack" }, [
-              el("div", { class: "field" }, [el("label", { class: "field__label", text: "Relay URL" }), fields.url]),
-              el("div", { class: "field" }, [el("label", { class: "field__label", text: "Relay secret (optional)" }), fields.secret]),
+              el("div", { class: "field" }, [el("label", { class: "field__label", text: t("relay.url") }), fields.url]),
+              el("div", { class: "field" }, [el("label", { class: "field__label", text: t("relay.secret") }), fields.secret]),
             ])
           : el("div", { class: "stack" }, [
               el("div", { class: "field" }, [
-                el("label", { class: "field__label", text: "API token" }), fields.token,
-                el("p", { class: "field__help", text: "Used once to deploy. Stored only if the provider needs it again." }),
+                el("label", { class: "field__label", text: t("relay.token") }), fields.token,
+                el("p", { class: "field__help", text: t("relay.token.help") }),
               ]),
               el("div", { class: "field" }, [
-                el("label", { class: "field__label", text: provider === "deno" ? "Organization domain" : "Account ID" }), fields.account,
+                el("label", { class: "field__label", text: provider === "deno" ? t("relay.account.denolabel") : t("relay.account") }), fields.account,
               ]),
             ]),
         errorBox, logBox,
       ]),
       el("div", { class: "modal__foot" }, [
-        button({ label: "Cancel", variant: "ghost", onClick: () => overlay.remove() }),
+        button({ label: t("relay.cancel"), variant: "ghost", onClick: () => overlay.remove() }),
         submit,
       ]),
     ]);
@@ -169,7 +169,7 @@ export function createRelaysCard() {
 
     submit.addEventListener("click", async () => {
       submit.disabled = true;
-      submit.querySelector("span").textContent = isCustom ? "Adding…" : "Deploying…";
+      submit.querySelector("span").textContent = isCustom ? t("relay.adding") : t("relay.deploying");
       errorBox.hidden = true;
       try {
         const r = isCustom
@@ -185,8 +185,8 @@ export function createRelaysCard() {
               ...(provider === "deno" ? { org_domain: fields.account.value.trim() } : {}),
             });
         if (r.steps?.length) { logBox.textContent = r.steps.join("\n"); logBox.hidden = false; }
-        if (r.ok === false) throw new Error(r.error || "Deployment failed");
-        toast(isCustom ? "Relay added" : "Relay deployed", "ok");
+        if (r.ok === false) throw new Error(r.error || t("relay.deploy_failed"));
+        toast(isCustom ? t("relay.added") : t("relay.deployed"), "ok");
         overlay.remove();
         refresh();
       } catch (e) {
@@ -194,7 +194,7 @@ export function createRelaysCard() {
         errorBox.hidden = false;
       } finally {
         submit.disabled = false;
-        submit.querySelector("span").textContent = isCustom ? "Add relay" : "Deploy";
+        submit.querySelector("span").textContent = isCustom ? t("relay.add_btn") : t("relay.deploy_btn");
       }
     });
 
@@ -216,17 +216,17 @@ export function createRelaysCard() {
 
     fill(listBox, table({
       columns: [
-        { label: "Relay" }, { label: "Provider" }, { label: "Status" },
-        { label: "Latency", align: "right" }, { label: "Checked", align: "right" }, { label: "", width: "150px" },
+        { label: t("relay.col.relay") }, { label: t("relay.col.provider") }, { label: t("relay.col.status") },
+        { label: t("relay.col.latency"), align: "right" }, { label: t("relay.col.checked"), align: "right" }, { label: "", width: "150px" },
       ],
       rows: relays,
       empty: {
-        title: "No relays yet",
-        text: "Deploy a relay or add an existing URL above.",
+        title: t("relay.empty.title"),
+        text: t("relay.empty.body"),
       },
       render: (r) => {
         const isActive = s.active_id === r.id;
-        const testBtn = button({ label: "Test" });
+        const testBtn = button({ label: t("relay.test") });
         testBtn.addEventListener("click", () => testRelay(r.id, testBtn));
         return [
           el("div", {}, [
@@ -242,9 +242,9 @@ export function createRelaysCard() {
           r.last_latency_ms != null ? Math.round(r.last_latency_ms) + " ms" : "—",
           el("span", { class: "faint", text: r.last_tested_at ? relative(parseTime(r.last_tested_at)) : "—" }),
           el("div", { class: "row row--tight", style: { justifyContent: "flex-end" } }, [
-            isActive ? null : button({ label: "Use", onClick: () => setActive(r.id) }),
+            isActive ? null : button({ label: t("relay.use"), onClick: () => setActive(r.id) }),
             testBtn,
-            button({ icon: "eyeOff", title: "Delete", variant: "danger", onClick: () => deleteRelay(r) }),
+            button({ icon: "eyeOff", title: t("relay.delete.title"), variant: "danger", onClick: () => deleteRelay(r) }),
           ]),
         ];
       },

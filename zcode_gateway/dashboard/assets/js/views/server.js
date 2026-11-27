@@ -5,6 +5,7 @@ import { api } from "../core/api.js";
 import { toast } from "../core/toast.js";
 import { ICONS } from "../core/icons.js";
 import { maskSecret } from "../core/format.js";
+import { t } from "../core/i18n.js";
 
 /** A value that copies itself on click. */
 function copyable(value, { mono = true } = {}) {
@@ -12,18 +13,18 @@ function copyable(value, { mono = true } = {}) {
   const node = el("button", {
     class: "copyable" + (mono ? " mono" : ""),
     type: "button",
-    title: "Click to copy",
+    title: t("server.copy.click"),
   }, [el("span", { class: "copyable__text", text: value }), slot]);
 
   let revert = null;
   node.addEventListener("click", async () => {
     if (!(await copyText(value))) {
-      toast("Could not copy — select the text manually", "err");
+      toast(t("server.copy.failed"), "err");
       return;
     }
     fill(slot, icon(ICONS.check, 13));
     node.classList.add("is-copied");
-    toast("Copied to clipboard", "ok", 1800);
+    toast(t("server.copy.copied"), "ok", 1800);
     clearTimeout(revert);
     revert = setTimeout(() => {
       node.classList.remove("is-copied");
@@ -35,7 +36,7 @@ function copyable(value, { mono = true } = {}) {
 
 /** A secret that is blurred until revealed, and copies without revealing. */
 function secret(value) {
-  if (!value) return el("span", { class: "faint", text: "Not set" });
+  if (!value) return el("span", { class: "faint", text: t("server.secret.not_set") });
 
   // Masked state shows real dots, not blurred text: a blur over an element
   // that failed to render looks identical to a bug.
@@ -45,25 +46,25 @@ function secret(value) {
   const toggle = el("button", {
     class: "btn btn--quiet btn--sm btn--icon",
     type: "button",
-    title: "Reveal",
-    "aria-label": "Reveal value",
+    title: t("server.secret.reveal"),
+    "aria-label": t("server.secret.reveal"),
   }, icon(ICONS.eye, 14));
   const copy = el("button", {
     class: "btn btn--quiet btn--sm btn--icon",
     type: "button",
-    title: "Copy",
-    "aria-label": "Copy value",
+    title: t("server.secret.copy"),
+    "aria-label": t("server.secret.copy"),
   }, icon(ICONS.copy, 14));
 
   toggle.addEventListener("click", () => {
     masked = !masked;
     text.textContent = masked ? maskSecret(value) : value;
     fill(toggle, icon(masked ? ICONS.eye : ICONS.eyeOff, 14));
-    toggle.title = masked ? "Reveal" : "Hide";
+    toggle.title = masked ? t("server.secret.reveal") : t("server.secret.hide");
   });
   copy.addEventListener("click", async () => {
     const ok = await copyText(value);
-    toast(ok ? "Copied to clipboard" : "Could not copy", ok ? "ok" : "err", 1800);
+    toast(ok ? t("server.copy.copied") : t("server.copy.failed"), ok ? "ok" : "err", 1800);
   });
 
   return el("span", { class: "secret row row--tight" }, [text, toggle, copy]);
@@ -104,43 +105,39 @@ function render(root, s) {
   const endpoints = s.endpoints || {};
   const bindsEverywhere = ["0.0.0.0", "::", "[::]"].includes(String(s.host || "").trim());
 
-  const endpointCard = card("Endpoints", "Point any OpenAI- or Anthropic-compatible client here.",
+  const endpointCard = card(t("server.endpoints.title"), t("server.endpoints.desc"),
     el("div", { class: "stack stack--tight" }, [
       el("div", { class: "kv" }, [
-        ...kvRow("OpenAI chat", copyable(base + (endpoints.openai || "/v1/chat/completions"))),
-        ...kvRow("Anthropic messages", copyable(base + (endpoints.anthropic || "/v1/messages"))),
-        ...kvRow("Models list", copyable(base + (endpoints.models || "/v1/models"))),
+        ...kvRow(t("server.endpoints.openai"), copyable(base + (endpoints.openai || "/v1/chat/completions"))),
+        ...kvRow(t("server.endpoints.anthropic"), copyable(base + (endpoints.anthropic || "/v1/messages"))),
+        ...kvRow(t("server.endpoints.models"), copyable(base + (endpoints.models || "/v1/models"))),
       ]),
       bindsEverywhere
-        ? el("p", { class: "field__help" }, [
-            el("span", { text: "Listening on " }),
-            el("span", { class: "mono", text: s.host + ":" + s.port }),
-            el("span", { text: " (every interface). Addresses above use this page's host so they are dialable." }),
-          ])
+        ? el("p", { class: "field__help", text: t("server.endpoints.listening", { host: s.host + ":" + s.port }) })
         : null,
     ]));
 
   const clientKeys = s.client_keys || [];
-  const keysCard = card("Keys", "Required on /v1/* and /admin/*. Reveal to read, or copy without revealing.",
+  const keysCard = card(t("server.keys.title"), t("server.keys.desc"),
     el("div", { class: "kv" }, [
-      ...kvRow("Admin key", secret(s.admin_key || "")),
-      ...clientKeys.flatMap((k) => kvRow("Client key · " + (k.name || "default"), secret(k.key || ""))),
-      ...(clientKeys.length ? [] : kvRow("Client keys", el("span", { class: "faint", text: "None configured" }))),
+      ...kvRow(t("server.keys.admin"), secret(s.admin_key || "")),
+      ...clientKeys.flatMap((k) => kvRow(t("server.keys.client", { name: k.name || "default" }), secret(k.key || ""))),
+      ...(clientKeys.length ? [] : kvRow(t("server.keys.client", { name: "default" }), el("span", { class: "faint", text: t("server.keys.none") }))),
     ]));
 
-  const processCard = card("Process", null,
+  const processCard = card(t("server.process.title"), null,
     el("div", { class: "kv" }, [
-      ...kvRow("Version", el("span", { class: "mono", text: s.version || "—" })),
-      ...kvRow("Config file", copyable(s.config_path || "—")),
-      ...kvRow("Accounts folder", copyable(s.accounts_dir || "—")),
-      ...kvRow("Accounts source", el("span", { class: "badge", text: s.accounts_source || "—" })),
-      ...kvRow("Rotation strategy", el("span", { class: "badge badge--accent", text: s.strategy || "—" })),
-      ...kvRow("Working directory", copyable(s.cwd || "—")),
+      ...kvRow(t("server.process.version"), el("span", { class: "mono", text: s.version || "—" })),
+      ...kvRow(t("server.process.config"), copyable(s.config_path || "—")),
+      ...kvRow(t("server.process.accounts_dir"), copyable(s.accounts_dir || "—")),
+      ...kvRow(t("server.process.accounts_source"), el("span", { class: "badge", text: s.accounts_source || "—" })),
+      ...kvRow(t("server.process.strategy"), el("span", { class: "badge badge--accent", text: s.strategy || "—" })),
+      ...kvRow(t("server.process.cwd"), copyable(s.cwd || "—")),
     ]));
 
   const keyPicker = clientKeys.length > 1 ? el("select", {
-    class: "select", "aria-label": "Client key for example",
-  }, clientKeys.map((key, i) => el("option", { value: String(i), text: key.name || "Client " + (i + 1) }))) : null;
+    class: "select", "aria-label": t("server.client.key_picker"),
+  }, clientKeys.map((key, i) => el("option", { value: String(i), text: key.name || t("server.client.key_default", { n: i + 1 }) }))) : null;
   const clientKey = () => clientKeys[Number(keyPicker?.value || 0)]?.key || "";
   const snippet = el("div", { class: "code" });
   const paintSnippet = () => {
@@ -158,14 +155,14 @@ function render(root, s) {
         type: "button",
         on: { click: async () => {
           const real = "base_url: " + base + "/v1\napi_key: " + (clientKey() || "<client key>");
-          toast(await copyText(real) ? "Client config copied" : "Could not copy",
+          toast(await copyText(real) ? t("server.copy.copied") : t("server.copy.failed"),
                 "ok", 2200);
         } },
-      }, [icon(ICONS.copy, 14), el("span", { text: "Copy client config" })]),
-      el("span", { class: "field__help", text: "Works with the OpenAI SDK, Anthropic SDK, Kilo, or plain curl." }),
+      }, [icon(ICONS.copy, 14), el("span", { text: t("server.client.copy") })]),
+      el("span", { class: "field__help", text: t("server.client.help") }),
     ]),
   ]);
-  const clientCard = card("Point a client at it", null, snippetBody);
+  const clientCard = card(t("server.client.title"), null, snippetBody);
 
   // Explicit columns, not auto-fit: four cards of uneven height left a hole in
   // the last row. Connection details stack on the left, process facts sit on
