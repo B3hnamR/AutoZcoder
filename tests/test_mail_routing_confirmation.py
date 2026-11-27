@@ -267,22 +267,31 @@ def test_email_setup_is_one_action_with_independent_readiness_checks():
     mail = (Path(__file__).resolve().parents[1]
             / "zcode_gateway/dashboard/assets/js/views/generator/mail.js").read_text(encoding="utf-8")
     wizard = mail[mail.index("function paint(m)"):mail.index("function build()")]
+    i18n = (Path(__file__).resolve().parents[1]
+            / "zcode_gateway/dashboard/assets/js/core/i18n.js").read_text(encoding="utf-8")
     assert "const credentialsSaved = !!m.inbox_url && m.inbox_secret_set === true" in wizard
     assert "const inboxVerified = credentialsSaved && m.inbox_ok === true" in wizard
     assert "doms.length > 0 && doms.every((d) => (m.routing_done || []).includes(d))" in wizard
     assert "doms.some((d) => state.review.has(d))" in wizard
     assert "const ready = inboxVerified && routingDone && !needsConfirmation" in wizard
-    assert "Email ready" in wizard
+    assert 't("mail.status.ready")' in wizard
     assert 'id: "mail-new-domain"' in mail and 'id: "mail-cf-token"' in mail
-    assert 'label: "Set up email"' in mail
-    assert "How to create a Cloudflare token" in mail
-    assert "Advanced / manual recovery" in mail
-    assert "An inbox test only proves the worker answers" in mail
+    assert 't("mail.btn.setup")' in mail
+    assert 't("mail.token_help.title")' in mail
+    assert 't("mail.advanced.summary")' in mail
+    assert 't("mail.inbox.note")' in mail
+    for english_label in (
+        "Email ready", "Set up email", "How to create a Cloudflare token",
+        "Advanced / manual recovery",
+        "An inbox test only proves the worker answers",
+        "Keep current routing", "Replace routing",
+    ):
+        assert english_label in i18n
     review = mail[mail.index("function routingRow("):mail.index("function ruleDestination(")]
     assert "ruleDestination(review.existing_rule)" in review
     assert "JSON.stringify(review.expected_rule, null, 2)" in review
-    assert 'label: "Keep current routing"' in review
-    assert 'label: "Replace routing"' in review
+    assert 't("mail.routing.keep")' in review
+    assert 't("mail.routing.replace")' in review
     assert "onClick: () => autoRoute(domain, true)" in review
     setup = mail[mail.index("async function deploy("):mail.index("async function autoRoute(")]
     assert 'api.post("/admin/dash/generator/mail", {' in setup

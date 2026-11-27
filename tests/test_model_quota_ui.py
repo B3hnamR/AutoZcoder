@@ -139,7 +139,8 @@ def test_ui_retains_catalog_sync_and_uses_public_accounts_read():
     assert 'api.post("/admin/models/catalog/refresh"' in source
     assert 'api.get("/admin/accounts", { signal })' in source
     assert "aggregateModelQuotas" in source
-    assert "Unknown buckets are not zero" in source
+    i18n = (ROOT / "zcode_gateway/dashboard/assets/js/core/i18n.js").read_text(encoding="utf-8")
+    assert "Unknown buckets are not zero" in i18n
 
 
 def test_models_browser_mocked_api_desktop_mobile_and_actions(tmp_path):
