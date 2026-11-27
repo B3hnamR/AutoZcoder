@@ -2,12 +2,13 @@
 import { el, fill } from "../core/dom.js";
 import { api } from "../core/api.js";
 import { card, table, toolbar, metric, button, stateBadge } from "../core/ui.js";
+import { t } from "../core/i18n.js";
 import { barChart, compactNumber } from "../core/chart.js";
 import { num, relative, parseTime, dateTime, duration } from "../core/format.js";
 import { comparison, downloadCsv } from "./analytics-export.js";
 
-const RANGES = [["1h", "Last hour"], ["6h", "Last 6 hours"], ["24h", "Last 24 hours"],
-  ["7d", "Last 7 days"], ["30d", "Last 30 days"], ["all", "All time"]];
+const RANGES = [["1h", t("analytics.range.1h")], ["6h", t("analytics.range.6h")], ["24h", t("analytics.range.24h")],
+  ["7d", t("analytics.range.7d")], ["30d", t("analytics.range.30d")], ["all", t("analytics.range.all")]];
 const rate = s => s?.requests ? (s.ok / s.requests) * 100 : null;
 const seconds = ms => ms == null ? "No samples" : (ms / 1000).toFixed(2) + "s";
 
@@ -71,8 +72,8 @@ export async function mount({ root, signal }) {
         r.last_ts ? new Date(parseTime(r.last_ts)).toISOString() : ""]));
   }
 
-  const exportButton = button({ label: "Export breakdown", icon: "download", onClick: exportBreakdown, disabled: true });
-  const trafficExport = button({ label: "Export traffic", icon: "download", onClick: () => {
+  const exportButton = button({ label: t("analytics.export.breakdown"), icon: "download", onClick: exportBreakdown, disabled: true });
+  const trafficExport = button({ label: t("analytics.export.traffic"), icon: "download", onClick: () => {
     downloadCsv("analytics-" + data.range.id + "-traffic.csv",
       ["bucket_start_utc", "requests", "succeeded", "failed", "tokens"],
       (data?.series || []).map(r => [new Date(r.ts * 1000).toISOString(), r.requests, r.ok, r.errors, r.tokens]));
@@ -92,20 +93,20 @@ export async function mount({ root, signal }) {
         label: (i % stride === 0 && i < rows.length - Math.max(1, Math.floor(stride / 2))) || i === rows.length - 1
           ? new Date(r.ts * 1000).toLocaleString(undefined, labelOptions) : "",
         value: r[chartMetric], tone: r.errors ? (r.errors > r.requests / 4 ? "err" : "warn") : null,
-        title: dateTime(r.ts * 1000) + " | " + num(r.requests) + " requests | " + num(r.tokens)
-          + " tokens | " + num(r.errors) + " failed",
+        title: dateTime(r.ts * 1000) + " | " + num(r.requests) + " " + t("analytics.chart.requests") + " | " + num(r.tokens)
+          + " " + t("analytics.chart.tokens") + " | " + num(r.errors) + " " + t("analytics.chart.failed"),
       })),
     });
     const peak = Math.max(0, ...rows.map(r => Number(r[chartMetric]) || 0));
     const peakAt = rows.find(r => r[chartMetric] === peak);
     fill(chartBody, [
       el("div", { class: "row row--between analytics-chart-meta" }, [
-        el("span", { class: "field__help", text: "Buckets: " + duration(bucket) + " | " + zone }),
-        el("span", { class: "field__help", text: peak ? "Peak: " + num(peak) + " " + chartMetric
-          + " at " + dateTime(peakAt.ts * 1000) : "No traffic in this period" }),
+        el("span", { class: "field__help", text: t("analytics.chart.buckets") + " " + duration(bucket) + " | " + zone }),
+        el("span", { class: "field__help", text: peak ? t("analytics.chart.peak", { n: num(peak), metric: chartMetric, at: dateTime(peakAt.ts * 1000) })
+          : t("analytics.chart.no_traffic") }),
       ]),
       plot,
-      el("p", { class: "field__help", text: "Hover a bar for exact values. Amber/red marks buckets with errors. Zero traffic has no bar." }),
+      el("p", { class: "field__help", text: t("analytics.chart.hover_hint") }),
     ]);
   }
 
@@ -115,27 +116,27 @@ export async function mount({ root, signal }) {
     const totalTokens = data.summary.total_tokens || 0;
     fill(breakdownBody, table({
       columns: [
-        { label: dimension === "key" ? "API key" : dimension === "account" ? "Account" : "Model" },
-        ...(dimension === "account" ? [{ label: "State / expiry" }] : []),
-        { label: "Requests", align: "right" }, { label: "Success", align: "right" },
-        { label: "Tokens", align: "right" }, { label: "Share", align: "right" },
-        { label: "Avg latency", align: "right" }, { label: "Last seen", align: "right" },
+        { label: dimension === "key" ? t("analytics.breakdown.col.key") : dimension === "account" ? t("analytics.breakdown.col.account") : t("analytics.breakdown.col.model") },
+        ...(dimension === "account" ? [{ label: t("analytics.breakdown.col.state") }] : []),
+        { label: t("analytics.breakdown.col.requests"), align: "right" }, { label: t("analytics.breakdown.col.success"), align: "right" },
+        { label: t("analytics.breakdown.col.tokens"), align: "right" }, { label: t("analytics.breakdown.col.share"), align: "right" },
+        { label: t("analytics.breakdown.col.latency"), align: "right" }, { label: t("analytics.breakdown.col.last_seen"), align: "right" },
       ],
       rows,
-      empty: { title: query ? "No matches" : "No traffic in this period",
-        text: query ? "Try a different filter." : "Requests through the gateway will appear here." },
+      empty: { title: query ? t("analytics.breakdown.no_match") : t("analytics.breakdown.no_traffic"),
+        text: query ? t("analytics.breakdown.try_filter") : t("analytics.breakdown.requests_appear") },
       render: r => [
         el("div", {}, [el("div", { text: rowName(r) }),
           dimension === "account" && r.email ? el("div", { class: "mono faint text-xs", text: r.account_id }) : null]),
         ...(dimension === "account" ? [el("div", {}, [stateBadge(r.state || "not in pool"),
-          el("div", { class: "field__help", text: r.expires_in_s == null ? "Expiry unknown"
-            : r.expires_in_s > 1e8 ? "No token expiry" : "Token expires in " + duration(r.expires_in_s) })])] : []),
+          el("div", { class: "field__help", text: r.expires_in_s == null ? t("analytics.breakdown.expiry.unknown")
+            : r.expires_in_s > 1e8 ? t("analytics.breakdown.expiry.none") : t("analytics.breakdown.expiry.in", { time: duration(r.expires_in_s) }) })])] : []),
         num(r.requests),
         el("span", { class: r.requests > r.ok ? "text-warn" : "text-ok",
           text: r.requests ? ((r.ok / r.requests) * 100).toFixed(1) + "%" : "N/A",
-          title: num(r.ok) + " succeeded; " + num(r.requests - r.ok) + " failed" }),
+          title: num(r.ok) + " " + t("analytics.breakdown.succeeded") + "; " + num(r.requests - r.ok) + " " + t("analytics.breakdown.failed_count") }),
         el("span", { class: "mono", text: compactNumber(r.tokens), title: num(r.tokens)
-          + " total | " + num(r.prompt_tokens) + " input | " + num(r.completion_tokens) + " output" }),
+          + " " + t("analytics.breakdown.tokens_total") + " | " + num(r.prompt_tokens) + " " + t("analytics.breakdown.tokens_input") + " | " + num(r.completion_tokens) + " " + t("analytics.breakdown.tokens_output") }),
         totalTokens ? ((r.tokens / totalTokens) * 100).toFixed(1) + "%" : "N/A",
         seconds(r.avg_duration_ms),
         el("span", { class: "faint", text: relative(parseTime(r.last_ts)), title: dateTime(parseTime(r.last_ts)) }),
@@ -147,35 +148,35 @@ export async function mount({ root, signal }) {
     const s = data.summary, prev = data.previous, lat = data.latency;
     const success = rate(s), prevRate = rate(prev);
     fill(summaries, [
-      metric({ label: "Requests", value: num(s.requests), hint: comparison(s.requests, prev?.requests) }),
-      metric({ label: "Tokens", value: compactNumber(s.total_tokens), hint: comparison(s.total_tokens, prev?.total_tokens) }),
-      metric({ label: "Success rate", value: success == null ? "No traffic" : success.toFixed(1) + "%",
+      metric({ label: t("analytics.summary.requests"), value: num(s.requests), hint: comparison(s.requests, prev?.requests) }),
+      metric({ label: t("analytics.summary.tokens"), value: compactNumber(s.total_tokens), hint: comparison(s.total_tokens, prev?.total_tokens) }),
+      metric({ label: t("analytics.summary.success"), value: success == null ? t("analytics.summary.no_traffic") : success.toFixed(1) + "%",
         tone: success == null ? null : success >= 95 ? "ok" : "warn",
-        hint: success == null ? "No completed requests" : comparison(success, prevRate, "pp") }),
-      metric({ label: "Average latency", value: s.requests ? seconds(s.avg_duration_ms) : "No samples",
+        hint: success == null ? t("analytics.summary.no_completed") : comparison(success, prevRate, "pp") }),
+      metric({ label: t("analytics.summary.latency"), value: s.requests ? seconds(s.avg_duration_ms) : t("analytics.summary.no_samples"),
         hint: s.requests ? comparison(s.avg_duration_ms, prev?.requests ? prev.avg_duration_ms : null) : "" }),
     ]);
     const details = [
-      ["Input tokens", num(s.prompt_tokens)], ["Output tokens", num(s.completion_tokens)],
-      ["Succeeded", num(s.ok)], ["Failed", num(s.requests - s.ok)],
-      ["Rate limited (429)", num(s.rate_limited)], ["Out of credit (402)", num(s.insufficient_credits)],
-      ["Latency p50", lat.samples ? seconds(lat.p50) : "No samples"],
-      ["Latency p95", lat.samples ? seconds(lat.p95) : "No samples"],
-      ["Latency p99", lat.samples ? seconds(lat.p99) : "No samples"],
+      [t("analytics.detail.input"), num(s.prompt_tokens)], [t("analytics.detail.output"), num(s.completion_tokens)],
+      [t("analytics.detail.succeeded"), num(s.ok)], [t("analytics.detail.failed"), num(s.requests - s.ok)],
+      [t("analytics.detail.rate_limited"), num(s.rate_limited)], [t("analytics.detail.out_of_credit"), num(s.insufficient_credits)],
+      [t("analytics.detail.p50"), lat.samples ? seconds(lat.p50) : t("analytics.summary.no_samples")],
+      [t("analytics.detail.p95"), lat.samples ? seconds(lat.p95) : t("analytics.summary.no_samples")],
+      [t("analytics.detail.p99"), lat.samples ? seconds(lat.p99) : t("analytics.summary.no_samples")],
     ];
     fill(latencyBody, el("dl", { class: "analytics-facts" }, details.map(([label, value]) =>
       el("div", {}, [el("dt", { class: "field__help", text: label }), el("dd", { text: value })]))));
-    periodText.textContent = dateTime(data.range.since * 1000) + " to " + dateTime(data.range.until * 1000)
-      + (data.previous ? " | Compared with preceding equal-length period." : " | All stored history; no preceding-period comparison.");
+    periodText.textContent = dateTime(data.range.since * 1000) + " — " + dateTime(data.range.until * 1000)
+      + (data.previous ? " | " + t("analytics.period.compared") : " | " + t("analytics.period.all_history"));
     fill(errorsBody, (data.errors || []).length ? table({
-      columns: [{ label: "HTTP" }, { label: "Error code" }, { label: "Count", align: "right" }, { label: "Last seen", align: "right" }],
+      columns: [{ label: t("analytics.errors.col.http") }, { label: t("analytics.errors.col.code") }, { label: t("analytics.errors.col.count"), align: "right" }, { label: t("analytics.errors.col.last_seen"), align: "right" }],
       rows: data.errors,
-      render: r => [String(r.status), el("span", { class: "mono", text: r.code || "Unspecified" }),
+      render: r => [String(r.status), el("span", { class: "mono", text: r.code || t("analytics.errors.unspecified") }),
         num(r.count), relative(parseTime(r.last_ts))],
-    }) : el("p", { class: "analytics-no-errors text-ok", text: "No errors in this period." }));
+    }) : el("p", { class: "analytics-no-errors text-ok", text: t("analytics.errors.none") }));
     paintChart();
     paintBreakdown();
-    status.textContent = "Updated " + new Date().toLocaleTimeString();
+    status.textContent = t("analytics.updated", { time: new Date().toLocaleTimeString() });
     exportButton.disabled = false;
     trafficExport.disabled = false;
   }
@@ -184,7 +185,7 @@ export async function mount({ root, signal }) {
     const id = ++generation;
     requestController?.abort();
     requestController = new AbortController();
-    status.textContent = "Updating...";
+    status.textContent = t("analytics.updating");
     exportButton.disabled = true;
     trafficExport.disabled = true;
     error.hidden = true;
@@ -196,34 +197,34 @@ export async function mount({ root, signal }) {
       paint();
     } catch (e) {
       if (e.name === "AbortError" || signal.aborted || id !== generation) return;
-      error.textContent = "Could not update analytics: " + e.message + ". Use Refresh to retry.";
+      error.textContent = t("analytics.error.update", { msg: e.message });
       error.hidden = false;
-      status.textContent = data ? "Showing last successful result" : "No data loaded";
+      status.textContent = data ? t("analytics.error.showing_last") : t("analytics.error.no_data");
     }
   }
 
-  const search = el("input", { class: "input analytics-search", type: "search", placeholder: "Filter breakdown...",
-    "aria-label": "Filter breakdown", on: { input: e => { query = e.target.value; paintBreakdown(); } } });
-  const sort = el("select", { class: "select analytics-sort", "aria-label": "Sort breakdown",
+  const search = el("input", { class: "input analytics-search", type: "search", placeholder: t("analytics.breakdown.search.ph"),
+    "aria-label": t("analytics.breakdown.search.aria"), on: { input: e => { query = e.target.value; paintBreakdown(); } } });
+  const sort = el("select", { class: "select analytics-sort", "aria-label": t("analytics.breakdown.sort.aria"),
     on: { change: e => { sortBy = e.target.value; paintBreakdown(); } } },
-    [["tokens", "Most tokens"], ["requests", "Most requests"], ["avg_duration_ms", "Highest latency"]]
+    [["tokens", t("analytics.breakdown.sort.tokens")], ["requests", t("analytics.breakdown.sort.requests")], ["avg_duration_ms", t("analytics.breakdown.sort.latency")]]
       .map(([value, text]) => el("option", { value, text })));
 
   fill(root, el("div", { class: "stack analytics-workspace" }, [
-    toolbar([picker, el("span", { class: "field__help", text: "All figures use the selected period." })], status),
+    toolbar([picker, el("span", { class: "field__help", text: t("analytics.period.hint") })], status),
     error, periodText, summaries,
-    card({ title: "Traffic", actions: [
-      switches([["tokens", "Tokens"], ["requests", "Requests"], ["errors", "Errors"]], chartMetric,
-        "Traffic metric", value => { chartMetric = value; paintChart(); }), trafficExport,
+    card({ title: t("analytics.traffic.title"), actions: [
+      switches([["tokens", t("analytics.traffic.tokens")], ["requests", t("analytics.traffic.requests")], ["errors", t("analytics.traffic.errors")]], chartMetric,
+        t("analytics.traffic.aria"), value => { chartMetric = value; paintChart(); }), trafficExport,
     ], body: chartBody }),
-    card({ title: "Token and response detail", desc: "Percentiles use successful attempts; averages include failures. Recorded duration is not time to first token or end-to-end client latency.", body: latencyBody }),
-    card({ title: "Breakdown", actions: exportButton, body: el("div", { class: "stack" }, [
-      toolbar([switches([["model", "Models"], ["account", "Accounts"], ["key", "API keys"]], dimension,
-        "Breakdown dimension", value => { dimension = value; paintBreakdown(); }), sort], search),
+    card({ title: t("analytics.detail.title"), desc: t("analytics.detail.desc"), body: latencyBody }),
+    card({ title: t("analytics.breakdown.title"), actions: exportButton, body: el("div", { class: "stack" }, [
+      toolbar([switches([["model", t("analytics.breakdown.models")], ["account", t("analytics.breakdown.accounts")], ["key", t("analytics.breakdown.keys")]], dimension,
+        t("analytics.breakdown.sort.aria"), value => { dimension = value; paintBreakdown(); }), sort], search),
       breakdownBody,
     ]) }),
-    card({ title: "Errors", body: errorsBody, flush: true }),
-    el("p", { class: "field__help", text: "Stored locally in gateway.db. Counts are recorded upstream attempts; retries can create multiple rows for one client request." }),
+    card({ title: t("analytics.errors.title"), body: errorsBody, flush: true }),
+    el("p", { class: "field__help", text: t("analytics.storage.note") }),
   ]));
 
   signal.addEventListener("abort", () => requestController?.abort(), { once: true });

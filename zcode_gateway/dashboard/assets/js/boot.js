@@ -5,49 +5,55 @@ import { api, getKey, setKey, probe, on as onApi } from "./core/api.js";
 import { toast } from "./core/toast.js";
 import * as router from "./core/router.js";
 import * as theme from "./core/theme.js";
+import * as i18n from "./core/i18n.js";
 import * as caps from "./core/caps.js";
 import * as updates from "./core/updates.js";
 import * as notifications from "./core/notifications.js";
 import { ICONS } from "./core/icons.js";
+const t = i18n.t;
 
 // True once a key has been accepted. Guards the auth handler so the probe at
 // startup cannot report a rejection for a key the user never entered.
 let signedIn = false;
 
-// Order here is the order in the sidebar.
+// Order here is the order in the sidebar. group/title are i18n keys: the
+// router titles are looked up per route as "topbar.title.<name>", the group
+// label as "nav.group.<group>".
 const SECTIONS = [
-  { group: "Operate", items: [
-    { name: "accounts", title: "Accounts", icon: "accounts", poll: 6000,
+  { group: "operate", items: [
+    { name: "accounts", icon: "accounts", poll: 6000,
       load: () => import("./views/accounts.js") },
-    { name: "models", title: "Models", icon: "models", poll: 8000,
+    { name: "models", icon: "models", poll: 8000,
       load: () => import("./views/models.js") },
-    { name: "generator", title: "Generator", icon: "bolt", poll: 3000,
+    { name: "generator", icon: "bolt", poll: 3000,
       load: () => import("./views/generator.js") },
-    { name: "proxy", title: "Proxy tools", icon: "swap", poll: 3000,
+    { name: "proxy", icon: "swap", poll: 3000,
       load: () => import("./views/proxy.js") },
-    { name: "server", title: "Server", icon: "server", poll: 0,
+    { name: "server", icon: "server", poll: 0,
       load: () => import("./views/server.js") },
   ]},
-  { group: "Insight", items: [
-    { name: "analytics", title: "Analytics", icon: "chart", poll: 15000,
+  { group: "insight", items: [
+    { name: "analytics", icon: "chart", poll: 15000,
       load: () => import("./views/analytics.js") },
-    { name: "logs", title: "Logs", icon: "logs", poll: 4000,
+    { name: "logs", icon: "logs", poll: 4000,
       load: () => import("./views/logs.js") },
   ]},
-  { group: "Configure", items: [
-    { name: "settings", title: "Settings", icon: "settings", poll: 0,
+  { group: "configure", items: [
+    { name: "settings", icon: "settings", poll: 0,
       load: () => import("./views/settings.js") },
-    { name: "guide", title: "Guide", icon: "help", poll: 0,
+    { name: "guide", icon: "help", poll: 0,
       load: () => import("./views/guide.js") },
   ]},
 ];
+
+const titleKey = (name) => "topbar.title." + name;
 
 /* ---------------------------------------------------------------- nav ---- */
 
 function buildNav() {
   const nav = $("#nav");
   fill(nav, SECTIONS.map((group) => el("div", { class: "nav__group" }, [
-    el("div", { class: "nav__label", text: group.group }),
+    el("div", { class: "nav__label", text: t("nav.group." + group.group) }),
     ...group.items.map((item) => el("button", {
       class: "nav-item",
       type: "button",
@@ -55,7 +61,7 @@ function buildNav() {
       on: { click: () => { router.navigate(item.name); closeNav(); } },
     }, [
       icon(ICONS[item.icon] || ICONS.dot),
-      el("span", { text: item.title }),
+      el("span", { text: t(titleKey(item.name)) }),
     ])),
   ])));
 }
@@ -75,7 +81,7 @@ const closeNav = () => $("#app").classList.remove("is-nav-open");
 
 function paintStatus(up) {
   $("#dot-gateway").className = "dot " + (up ? "dot--ok dot--live" : "dot--err");
-  $("#chip-gateway-text").textContent = up ? "online" : "unreachable";
+  $("#chip-gateway-text").textContent = up ? t("chip.online") : t("chip.offline");
 }
 
 /** Pool readiness and the Zcode app chip, polled independently of the view. */
@@ -84,8 +90,8 @@ async function paintChips() {
     const pool = await api.get("/admin/pool/state");
     const total = Object.values(pool.by_state || {}).reduce((a, b) => a + b, 0);
     const chip = $("#chip-pool");
-    chip.textContent = pool.ready + "/" + total + " ready";
-    chip.title = "Accounts able to serve a request right now";
+    chip.textContent = t("chip.ready", { n: pool.ready, total: total });
+    chip.title = t("chip.pool.title");
     chip.hidden = total === 0;
   } catch (_) { $("#chip-pool").hidden = true; }
 
@@ -128,6 +134,17 @@ function hideLogin() {
   $("#app").hidden = false;
 }
 
+function paintLogin() {
+  const sub = $("#login-overlay .login__sub");
+  if (sub) sub.textContent = t("login.sub");
+  const label = $("#login-overlay .field__label");
+  if (label) label.textContent = t("login.label");
+  const help = $("#login-overlay .login__help");
+  if (help) help.textContent = t("login.help");
+  const btn = $("#login-submit");
+  if (btn && !btn.disabled) btn.textContent = t("login.continue");
+}
+
 function wireLogin(onSuccess) {
   $("#login-form").addEventListener("submit", async (e) => {
     e.preventDefault();
@@ -136,7 +153,7 @@ function wireLogin(onSuccess) {
     const previous = getKey();
     setKey(input.value);
     btn.disabled = true;
-    btn.textContent = "Checking…";
+    btn.textContent = t("login.checking");
     if (await probe()) {
       input.value = "";
       $("#login-error").hidden = true;
@@ -145,12 +162,12 @@ function wireLogin(onSuccess) {
     } else {
       setKey(previous);
       const err = $("#login-error");
-      err.textContent = "That key was not accepted.";
+      err.textContent = t("login.rejected.short");
       err.hidden = false;
       input.select();
     }
     btn.disabled = false;
-    btn.textContent = "Continue";
+    btn.textContent = t("login.continue");
   });
 }
 
@@ -161,6 +178,23 @@ function wireChrome() {
   const paintTheme = () => fill(themeBtn, icon(theme.current() === "dark" ? ICONS.sun : ICONS.moon));
   themeBtn.addEventListener("click", () => { theme.toggle(); paintTheme(); });
   paintTheme();
+
+  // Language toggle: the button shows the language you are switching TO.
+  const langBtn = $("#lang-toggle");
+  const paintLang = () => {
+    const next = i18n.lang() === "fa" ? "EN" : "FA";
+    fill(langBtn, [el("span", { class: "lang-badge", text: next })]);
+    langBtn.title = t("lang.toggle");
+    langBtn.setAttribute("aria-label", t("lang.toggle"));
+  };
+  langBtn.addEventListener("click", () => {
+    i18n.toggle();
+    paintLang();
+    buildNav();
+    paintLogin();
+    if (router.currentRoute()) router.refresh();
+  });
+  paintLang();
 
   fill($("#btn-refresh"), icon(ICONS.refresh));
   $("#btn-refresh").addEventListener("click", () => router.refresh());
@@ -207,8 +241,9 @@ async function startApp() {
     root: $("#view-inner"),
     fallback: SECTIONS[0].items[0].name,
     onNavigate: (route) => {
-      $("#view-title").textContent = route.title;
-      document.title = route.title + " · Zcode Gateway";
+      const title = t(titleKey(route.name));
+      $("#view-title").textContent = title;
+      document.title = title + " · " + t("brand.name");
       markActive(route.name);
     },
   });
@@ -216,12 +251,13 @@ async function startApp() {
 
 async function main() {
   theme.init();
+  i18n.init();
   buildNav();
   wireChrome();
 
   for (const group of SECTIONS) {
     for (const item of group.items) {
-      router.register(item.name, { title: item.title, poll: item.poll, load: item.load });
+      router.register(item.name, { title: t(titleKey(item.name)), poll: item.poll, load: item.load });
     }
   }
 
@@ -235,7 +271,7 @@ async function main() {
   onApi("auth", () => {
     if (!signedIn) return;
     signedIn = false;
-    showLogin("The admin key was rejected. Enter it again.");
+    showLogin(t("login.rejected"));
   });
 
   if (ok) {

@@ -3,10 +3,11 @@ import { el, fill } from "../../core/dom.js";
 import { api } from "../../core/api.js";
 import { card, table, button } from "../../core/ui.js";
 import { num } from "../../core/format.js";
+import { t } from "../../core/i18n.js";
 
 export function createSourcesCard(onChanged) {
   const importBox = el("textarea", { class: "textarea input--mono", rows: 4, spellcheck: false,
-    placeholder: "one per line: ip:port, http://ip:port, socks5://user:pass@ip:port" });
+    placeholder: t("src.add.ph") });
   const protoSelect = el("select", { class: "select", style: { maxWidth: "140px" } },
     ["http", "https", "socks4", "socks5"].map(p =>
       el("option", { value: p, text: p + " (default)", selected: p === "http" })));
@@ -18,46 +19,46 @@ export function createSourcesCard(onChanged) {
       const reader = new FileReader();
       reader.onload = () => {
         importBox.value = String(reader.result || "").slice(0, 200000);
-        importMsg.textContent = "File loaded. Press Add to pool.";
+        importMsg.textContent = t("src.add.file.loaded");
       };
       reader.readAsText(file);
     } } });
   const sourcesBox = el("textarea", { class: "textarea input--mono", rows: 6, spellcheck: false,
-    placeholder: "One scrape URL per line." });
+    placeholder: t("src.sources.ph") });
   const sourcesMsg = el("span", { class: "muted text-xs" });
   const yieldBox = el("div");
 
   async function doImport() {
-    if (!importBox.value.trim()) { importMsg.textContent = "Nothing to import."; return; }
+    if (!importBox.value.trim()) { importMsg.textContent = t("src.add.nothing"); return; }
     try {
       const result = await api.post("/admin/dash/generator/proxies/import", {
         text: importBox.value, default_proto: protoSelect.value,
       });
-      importMsg.textContent = "Imported " + num(result.imported) + ".";
+      importMsg.textContent = t("src.add.imported", { n: num(result.imported) });
       importBox.value = "";
       onChanged?.();
-    } catch (error) { importMsg.textContent = "Import failed: " + error.message; }
+    } catch (error) { importMsg.textContent = t("src.add.failed", { msg: error.message }); }
   }
   async function loadSources() {
     try {
       const result = await api.get("/admin/dash/generator/proxies/sources");
       if (document.activeElement !== sourcesBox) sourcesBox.value = result.text || "";
-    } catch (error) { sourcesMsg.textContent = "Load failed: " + error.message; }
+    } catch (error) { sourcesMsg.textContent = t("src.sources.load_failed", { msg: error.message }); }
   }
   async function saveSources() {
     try {
       const result = await api.post("/admin/dash/generator/proxies/sources", { text: sourcesBox.value });
-      sourcesMsg.textContent = "Saved (" + num(result.sources) + " sources).";
-    } catch (error) { sourcesMsg.textContent = "Save failed: " + error.message; }
+      sourcesMsg.textContent = t("src.sources.saved", { n: num(result.sources) });
+    } catch (error) { sourcesMsg.textContent = t("src.sources.save_failed", { msg: error.message }); }
   }
   async function loadYield() {
     try {
       const result = await api.get("/admin/dash/generator/proxies/yield");
       fill(yieldBox, table({
-        columns: [{ label: "Source" }, { label: "Found", align: "right" },
-          { label: "Avg/run", align: "right" }, { label: "Runs", align: "right" }, { label: "Errors", align: "right" }],
+        columns: [{ label: t("src.yield.col.source") }, { label: t("src.yield.col.found"), align: "right" },
+          { label: t("src.yield.col.avg"), align: "right" }, { label: t("src.yield.col.runs"), align: "right" }, { label: t("src.yield.col.errors"), align: "right" }],
         rows: result.sources || [],
-        empty: { title: "No scans yet", text: "Run a scan to measure which sources produce candidates." },
+        empty: { title: t("src.yield.empty.title"), text: t("src.yield.empty.body") },
         render: source => [
           el("span", { class: "mono text-xs truncate", title: source.url || "",
             style: { maxWidth: "340px", display: "block" },
@@ -65,21 +66,21 @@ export function createSourcesCard(onChanged) {
           num(source.found || 0), num(source.avg || 0), num(source.runs || 0), num(source.errors || 0),
         ],
       }));
-    } catch (error) { fill(yieldBox, el("p", { class: "field__help", text: "Yield unavailable: " + error.message })); }
+    } catch (error) { fill(yieldBox, el("p", { class: "field__help", text: t("src.yield.unavailable", { msg: error.message }) })); }
   }
-  const node = card({ title: "Sources & import", desc: "Add proxies you already have, and control where scans look.",
+  const node = card({ title: t("src.title"), desc: t("src.desc"),
     body: el("div", { class: "stack" }, [
-      el("div", { class: "field" }, [el("label", { class: "field__label", text: "Add proxies to the pool" }),
+      el("div", { class: "field" }, [el("label", { class: "field__label", text: t("src.add.label") }),
         importBox, el("div", { class: "row" }, [protoSelect,
-          button({ label: "Add to pool", variant: "primary", onClick: doImport }),
-          button({ label: "Load from file", onClick: () => fileInput.click() }), fileInput, importMsg]),
-        el("p", { class: "field__help", text: "Imported proxies stay pending until a real check proves them." })]),
+          button({ label: t("src.add.btn"), variant: "primary", onClick: doImport }),
+          button({ label: t("src.add.file"), onClick: () => fileInput.click() }), fileInput, importMsg]),
+        el("p", { class: "field__help", text: t("src.add.help") })]),
       el("details", { class: "help-details", on: { toggle: event => { if (event.target.open) loadSources(); } } }, [
-        el("summary", { text: "Scrape sources" }), el("div", { class: "stack" }, [sourcesBox,
-          el("div", { class: "row" }, [button({ label: "Save sources", onClick: saveSources }),
-            button({ label: "Reload", icon: "refresh", onClick: loadSources }), sourcesMsg])])]),
+        el("summary", { text: t("src.sources") }), el("div", { class: "stack" }, [sourcesBox,
+          el("div", { class: "row" }, [button({ label: t("src.sources.save"), onClick: saveSources }),
+            button({ label: t("src.sources.reload"), icon: "refresh", onClick: loadSources }), sourcesMsg])])]),
       el("details", { class: "help-details", on: { toggle: event => { if (event.target.open) loadYield(); } } }, [
-        el("summary", { text: "Source yield" }), yieldBox]),
+        el("summary", { text: t("src.yield") }), yieldBox]),
     ]),
   });
   return { node };

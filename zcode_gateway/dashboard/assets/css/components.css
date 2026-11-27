@@ -124,6 +124,10 @@
 .btn--icon.btn--sm { width: 25px; }
 .btn--block { width: 100%; }
 
+/* Language toggle: a 2-letter badge, not an icon. */
+.lang-badge { font-size: 10px; font-weight: var(--weight-semibold); letter-spacing: 0.06em; }
+.btn--lang { width: 32px; padding: 0; }
+
 /* ---- nav item --------------------------------------------------------- */
 .nav-item {
   display: flex;

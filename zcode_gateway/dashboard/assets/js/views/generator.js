@@ -9,6 +9,7 @@ import { createMailCard } from "./generator/mail.js";
 import { can, isHeadless, platform } from "../core/caps.js";
 import { createClaimBatch } from "./claim-batch.js";
 import { createAutoGenerate } from "./auto-generate.js";
+import { t } from "../core/i18n.js";
 
 const WORKER_TONE = {
   running: "ok", starting: "warn", exited: "ok", failed: "err", killed: "err",
@@ -23,12 +24,12 @@ function trimProxy(value) {
 
 function planBadges(w) {
   const out = [];
-  if (w.giveaway500) out.push(badge("500M claimed", "warn"));
-  else if (w.giveaway500_unavailable) out.push(badge("500M unavailable", "warn"));
-  if (w.global_build) out.push(badge("100M global build", "warn"));
-   else if (w.start_plan) out.push(badge("Start Plan", "ok"));
-   else if (w.starter === true) out.push(badge("Starter", "ok"));
-   else if (w.starter === false && !w.start_plan && !w.giveaway500 && !w.global_build) out.push(badge("No plan"));
+  if (w.giveaway500) out.push(badge(t("gen.500m.claimed"), "warn"));
+  else if (w.giveaway500_unavailable) out.push(badge(t("gen.500m.unavailable"), "warn"));
+  if (w.global_build) out.push(badge(t("gen.100m"), "warn"));
+   else if (w.start_plan) out.push(badge(t("gen.start.plan"), "ok"));
+   else if (w.starter === true) out.push(badge(t("gen.starter"), "ok"));
+   else if (w.starter === false && !w.start_plan && !w.giveaway500 && !w.global_build) out.push(badge(t("gen.no.plan")));
   return out;
 }
 
@@ -43,12 +44,12 @@ function workerCard(w, onStop, onRemove) {
       badge(w.state, WORKER_TONE[w.state]),
       w.email ? el("span", { class: "mono text-xs muted truncate", text: w.email }) : null,
       w.proxy ? el("span", { class: "mono text-xs faint", title: w.proxy, text: trimProxy(w.proxy) }) : null,
-      el("span", { class: "faint text-xs", text: "captcha " + (w.captcha || "—") }),
+      el("span", { class: "faint text-xs", text: t("gen.captcha") + " " + (w.captcha || "—") }),
       ...planBadges(w),
       el("span", { class: "spacer" }),
       live
-        ? button({ label: "Kill", variant: "danger", onClick: () => onStop(w.name) })
-        : button({ icon: "eyeOff", title: "Remove from list", variant: "quiet", onClick: () => onRemove(w.name) }),
+        ? button({ label: t("gen.kill"), variant: "danger", onClick: () => onStop(w.name) })
+        : button({ icon: "eyeOff", title: t("gen.remove"), variant: "quiet", onClick: () => onRemove(w.name) }),
     ]),
     lines.length
       ? el("div", { class: "job__log mono" }, lines.map((l) => el("div", { class: "logpane__line", text: l })))
@@ -58,7 +59,7 @@ function workerCard(w, onStop, onRemove) {
 
 function claimCard(c, onStop, onRemove) {
   const live = c.state === "running" || c.state === "starting";
-  const kind = c.kind === "500m" ? "500M" : c.kind === "start" ? "Start Plan" : "100M";
+  const kind = c.kind === "500m" ? t("gen.500m") : c.kind === "start" ? t("gen.start.plan") : t("gen.100m");
   const issued = c.result?.summary?.issued;
   const unavailable = c.result?.unavailable;
   const lines = (c.lines || []).slice(-10);
@@ -66,24 +67,24 @@ function claimCard(c, onStop, onRemove) {
   return el("div", { class: "job job--claim" }, [
     el("div", { class: "job__head" }, [
       el("span", { class: "dot dot--" + (WORKER_TONE[c.state] || "") + (c.state === "running" ? " dot--live" : "") }),
-      el("b", { class: "job__name truncate", text: kind + " claim · " + (c.email || c.name) }),
+      el("b", { class: "job__name truncate", text: kind + " " + t("gen.claim") + " · " + (c.email || c.name) }),
       badge(c.state, WORKER_TONE[c.state]),
       el("span", { class: "mono text-xs muted", text: c.mode || "proxy" }),
       c.proxy ? el("span", { class: "mono text-xs faint", title: c.proxy, text: trimProxy(c.proxy) }) : null,
       el("span", { class: "faint text-xs", text: (c.elapsed || 0) + "s" }),
-      issued ? badge("100M issued", "warn") : unavailable ? badge("giveaway unavailable", "warn") : null,
+      issued ? badge(t("gen.100m.issued"), "warn") : unavailable ? badge(t("gen.giveaway.unavail"), "warn") : null,
       el("span", { class: "spacer" }),
       live
-        ? button({ label: "Kill", variant: "danger", onClick: () => onStop(c.name) })
-        : button({ icon: "eyeOff", title: "Remove from list", variant: "quiet", onClick: () => onRemove(c.name) }),
+        ? button({ label: t("gen.kill"), variant: "danger", onClick: () => onStop(c.name) })
+        : button({ icon: "eyeOff", title: t("gen.remove"), variant: "quiet", onClick: () => onRemove(c.name) }),
     ]),
     unavailable
       ? el("p", { class: "text-warn text-sm", text:
-          (c.result.error || "The giveaway is not available right now.")
-          + " Nothing was claimed; retrying through other IPs will not help." })
+          (c.result.error || t("gen.giveaway.now"))
+          + " " + t("gen.giveaway.nohelp") })
       : null,
     !live && !issued && c.result?.error
-      ? el("p", { class: "field__help", text: "Result: " + c.result.error }) : null,
+      ? el("p", { class: "field__help", text: t("gen.result") + ": " + c.result.error }) : null,
     lines.length
       ? el("div", { class: "job__log mono" }, lines.map((l) => el("div", { class: "logpane__line", text: l })))
       : null,
@@ -102,7 +103,7 @@ export async function mount({ root, signal }) {
   const optionsBox = el("div", { class: "grid", style: { gridTemplateColumns: "repeat(auto-fit, minmax(190px, 1fr))" } });
   const boardBox = el("div", { class: "stack--tight" });
   const summaryBox = el("div", { class: "grid grid--metrics" });
-  const savedNote = el("span", { class: "text-ok text-xs", hidden: true, text: "Saved" });
+  const savedNote = el("span", { class: "text-ok text-xs", hidden: true, text: t("gen.saved") });
   savedNote.setAttribute("role", "status");
   const saveFeedback = el("span", { class: "text-warn text-xs", role: "status", hidden: true });
   const statusError = el("div", { class: "notice notice--warn", role: "status", hidden: true });
@@ -134,7 +135,7 @@ export async function mount({ root, signal }) {
     savedNote.hidden = true;
     saveFeedback.hidden = false;
     saveFeedback.className = "text-warn text-xs";
-    saveFeedback.textContent = "Unsaved changes";
+    saveFeedback.textContent = t("gen.unsaved");
     clearTimeout(saveTimer);
     saveTimer = setTimeout(() => persistOptions().catch(() => {}), 600);
   }
@@ -403,8 +404,8 @@ export async function mount({ root, signal }) {
     fill(boardBox, cards.length
       ? cards
       : el("div", { class: "empty" }, [
-          el("div", { class: "empty__title", text: "No workers running" }),
-          el("div", { class: "empty__text", text: "Press Start to launch the signup pipeline." }),
+          el("div", { class: "empty__title", text: t("gen.no_workers") }),
+          el("div", { class: "empty__text", text: t("gen.no_workers_hint") }),
         ]));
   }
 
@@ -441,10 +442,8 @@ export async function mount({ root, signal }) {
       statusError,
       isHeadless()
         ? el("div", { class: "notice notice--info" }, [
-            el("b", { text: "Headless host. " }),
-            el("span", { text:
-              "No desktop display is available. Signups use headed Chromium on an invisible Xvfb screen "
-              + "and automatic captcha solving. Xvfb must be installed; manual solving is unavailable." }),
+            el("b", { text: t("gen.headless") + " " }),
+            el("span", { text: t("gen.headless.detail") }),
           ])
         : null,
       summaryBox,

@@ -7,73 +7,56 @@ import { toast, confirmDialog } from "../core/toast.js";
 import { card, button } from "../core/ui.js";
 import { can, why, platform } from "../core/caps.js";
 import { checkNow as checkForUpdates } from "../core/updates.js";
+import { t } from "../core/i18n.js";
 
-// [path, kind, label, help, opts]  kind: bool | enum | model | int | float | text
+// [path, kind, labelKey, helpKey, opts]  kind: bool | enum | model | int | float | text
+// Labels and help are i18n keys resolved at render time (see settingRow), so a
+// live language switch repaints them without rebuilding the structure.
 const SECTIONS = [
-  { id: "server", title: "Server", desc: "Where the gateway listens, and who can reach it.", rows: [
-    ["server.host", "enum", "Who can connect",
-     "“This computer only” is safest. Choose “Everyone on my network” only if other devices should use the gateway; they still need a client key."],
-    ["server.port", "int", "Port",
-     "The port the gateway and this dashboard listen on.", { min: 1, max: 65535 }],
+  { id: "server", titleKey: "set.server.title", descKey: "set.server.desc", rows: [
+    ["server.host", "enum", "set.server.host.label", "set.server.host.help"],
+    ["server.port", "int", "set.server.port.label", "set.server.port.help", { min: 1, max: 65535 }],
   ]},
-  { id: "accounts", title: "Accounts", desc: "Where the gateway finds the Zcode accounts it uses.", rows: [
-    ["accounts.source", "enum", "Where accounts come from",
-     "Normally the account folder, which the Accounts section and the generator fill in."],
-    ["accounts.dir", "text", "Accounts folder",
-     "Folder holding one snapshot .txt file per account."],
-    ["accounts.pool_file", "text", "Pool file", "Only used when the source is “Pool file”.", { adv: true }],
+  { id: "accounts", titleKey: "set.accounts.title", descKey: "set.accounts.desc", rows: [
+    ["accounts.source", "enum", "set.accounts.source.label", "set.accounts.source.help"],
+    ["accounts.dir", "text", "set.accounts.dir.label", "set.accounts.dir.help"],
+    ["accounts.pool_file", "text", "set.accounts.pool_file.label", "set.accounts.pool_file.help", { adv: true }],
   ]},
-  { id: "pool", title: "Account rotation", desc: "How requests spread across accounts, and how failures are handled.", rows: [
-    ["pool.strategy", "enum", "How to pick an account", "Decides which account serves the next request. Applies immediately."],
-    ["pool.max_in_flight_per_account", "int", "Simultaneous requests per account",
-     "How many requests one account may run at once. Higher is faster but looks busier to the provider.", { min: 1 }],
-    ["pool.acquire_wait_seconds", "float", "Wait for a free account",
-     "When every account is busy, how long a request waits for a slot. 0 fails immediately.", { unit: "s", min: 0 }],
-    ["pool.cooldown_seconds", "int", "Rest after an error",
-     "How long an account rests after a connection or server error.", { unit: "s", min: 0 }],
-    ["pool.blocked_model_cooldown_seconds", "int", "Rest after “unusual activity”",
-     "When the provider blocks one model on an account (405/3012), only that model pauses, for this long.", { unit: "s", min: 0 }],
-    ["pool.refresh_lead_seconds", "int", "Renew logins early",
-     "Refresh an account's token this long before it expires.", { unit: "s", min: 0 }],
-    ["pool.balance_poll_seconds", "int", "Check quotas every",
-     "How often each account's remaining quota is read. Minimum 10 seconds.", { unit: "s", min: 10 }],
-    ["pool.min_balance_micro", "int", "Legacy balance threshold",
-     "Old credit-based setting. Zcode now uses per-model token quotas, so leave it at 0.", { min: 0, adv: true }],
+  { id: "pool", titleKey: "set.pool.title", descKey: "set.pool.desc", rows: [
+    ["pool.strategy", "enum", "set.pool.strategy.label", "set.pool.strategy.help"],
+    ["pool.max_in_flight_per_account", "int", "set.pool.inflight.label", "set.pool.inflight.help", { min: 1 }],
+    ["pool.acquire_wait_seconds", "float", "set.pool.acquire_wait.label", "set.pool.acquire_wait.help", { unit: "s", min: 0 }],
+    ["pool.cooldown_seconds", "int", "set.pool.cooldown.label", "set.pool.cooldown.help", { unit: "s", min: 0 }],
+    ["pool.blocked_model_cooldown_seconds", "int", "set.pool.blocked.label", "set.pool.blocked.help", { unit: "s", min: 0 }],
+    ["pool.refresh_lead_seconds", "int", "set.pool.refresh.label", "set.pool.refresh.help", { unit: "s", min: 0 }],
+    ["pool.balance_poll_seconds", "int", "set.pool.balance_poll.label", "set.pool.balance_poll.help", { unit: "s", min: 10 }],
+    ["pool.min_balance_micro", "int", "set.pool.min_balance.label", "set.pool.min_balance.help", { min: 0, adv: true }],
   ]},
-  { id: "upstream", title: "Connection to Zcode", desc: "Timeouts and retries for requests sent to the provider.", rows: [
-    ["upstream.timeout_connect", "float", "Connection timeout", "How long to wait to reach the provider.", { unit: "s", min: 0 }],
-    ["upstream.timeout_read", "float", "Response timeout",
-     "How long to wait for data while an answer streams. Keep it high for long answers.", { unit: "s", min: 0 }],
-    ["upstream.max_attempts", "int", "Accounts to try per request",
-     "If an account fails, the request moves to another one, up to this many tries.", { min: 1 }],
-    ["upstream.overload_max_attempts", "int", "Tries when a model is overloaded",
-     "Counts the first try. The official app uses 11.", { min: 1 }],
-    ["upstream.overload_base_delay_seconds", "float", "First retry delay",
-     "Retries back off exponentially (with jitter) from this delay.", { unit: "s", min: 0 }],
-    ["upstream.overload_max_delay_seconds", "float", "Longest retry delay", "The official app uses 60.", { unit: "s", min: 0 }],
-    ["upstream.anthropic_cache_control", "bool", "Prompt caching",
-     "Send Anthropic cache hints, as the official app does. Turn off only to test."],
+  { id: "upstream", titleKey: "set.upstream.title", descKey: "set.upstream.desc", rows: [
+    ["upstream.timeout_connect", "float", "set.upstream.connect.label", "set.upstream.connect.help", { unit: "s", min: 0 }],
+    ["upstream.timeout_read", "float", "set.upstream.read.label", "set.upstream.read.help", { unit: "s", min: 0 }],
+    ["upstream.max_attempts", "int", "set.upstream.max_attempts.label", "set.upstream.max_attempts.help", { min: 1 }],
+    ["upstream.overload_max_attempts", "int", "set.upstream.overload_attempts.label", "set.upstream.overload_attempts.help", { min: 1 }],
+    ["upstream.overload_base_delay_seconds", "float", "set.upstream.overload_base.label", "set.upstream.overload_base.help", { unit: "s", min: 0 }],
+    ["upstream.overload_max_delay_seconds", "float", "set.upstream.overload_max.label", "set.upstream.overload_max.help", { unit: "s", min: 0 }],
+    ["upstream.anthropic_cache_control", "bool", "set.upstream.cache.label", "set.upstream.cache.help"],
   ]},
-  { id: "models", title: "Models", desc: "Defaults used when a client does not choose.", rows: [
-    ["models.default", "model", "Default model (OpenAI-style)", "Used when /v1/chat/completions names no model."],
-    ["models.default_anthropic", "model", "Default model (Anthropic-style)", "Used when /v1/messages names no model."],
-    ["models.default_effort", "enum", "Reasoning effort",
-     "Used when the client does not ask for one. High is nearly as good as Max for coding and much faster."],
-    ["models.auto_free_fallback.enabled", "bool", "Fall back to another model",
-     "When a model is blocked or out of quota, serve the request with the next model in the fallback chain."],
-    ["models.pacing.enabled", "bool", "Space out requests",
-     "Adds a small random pause between requests so the provider's CDN does not flag your IP."],
-    ["models.pacing.min_gap_ms", "int", "Shortest pause", "With the longest pause this sets the random window.", { unit: "ms", min: 0 }],
-    ["models.pacing.max_gap_ms", "int", "Longest pause", "", { unit: "ms", min: 0 }],
+  { id: "models", titleKey: "set.models.title", descKey: "set.models.desc", rows: [
+    ["models.default", "model", "set.models.default.label", "set.models.default.help"],
+    ["models.default_anthropic", "model", "set.models.default_anthropic.label", "set.models.default_anthropic.help"],
+    ["models.default_effort", "enum", "set.models.effort.label", "set.models.effort.help"],
+    ["models.auto_free_fallback.enabled", "bool", "set.models.fallback.label", "set.models.fallback.help"],
+    ["models.pacing.enabled", "bool", "set.models.pacing.label", "set.models.pacing.help"],
+    ["models.pacing.min_gap_ms", "int", "set.models.pacing_min.label", "set.models.pacing_min.help", { unit: "ms", min: 0 }],
+    ["models.pacing.max_gap_ms", "int", "set.models.pacing_max.label", "set.models.pacing_max.help", { unit: "ms", min: 0 }],
   ]},
-  { id: "logging", title: "Logging", desc: "What the gateway writes down.", rows: [
-    ["logging.level", "enum", "Detail level", "Shown in the Logs section. Info is right for everyday use."],
-    ["logging.capture", "bool", "Record every exchange",
-     "Writes each upstream request and response to a JSONL file. Handy for debugging, but it stores your prompts on disk."],
+  { id: "logging", titleKey: "set.logging.title", descKey: "set.logging.desc", rows: [
+    ["logging.level", "enum", "set.logging.level.label", "set.logging.level.help"],
+    ["logging.capture", "bool", "set.logging.capture.label", "set.logging.capture.help"],
   ]},
-  { id: "updates", title: "Updates", desc: "Release notifications.", rows: [
-    ["update.enabled", "bool", "Check for updates", "Look for new releases on GitHub and show a badge."],
-    ["update.interval_hours", "float", "Check every", "Hours between checks.", { unit: "h", min: 0 }],
+  { id: "updates", titleKey: "set.updates.title", descKey: "set.updates.desc", rows: [
+    ["update.enabled", "bool", "set.updates.enabled.label", "set.updates.enabled.help"],
+    ["update.interval_hours", "float", "set.updates.interval.label", "set.updates.interval.help", { unit: "h", min: 0 }],
   ]},
 ];
 
@@ -84,10 +67,10 @@ function sectionsForHost() {
       // On a remote box "this computer only" means nobody can reach it.
       return {
         ...section,
+        // hostNote is appended to the translated desc at render time.
+        hostNote: t("set.server.host.help_linux"),
         rows: section.rows.map((r) => r[0] !== "server.host" ? r : [
-          r[0], r[1], r[2],
-          "On a server, “this computer only” makes the gateway unreachable from "
-          + "outside the box — you would need an SSH tunnel to get back in.",
+          r[0], r[1], r[2], "set.server.host.help_linux",
           r[4],
         ]),
       };
@@ -96,12 +79,14 @@ function sectionsForHost() {
     // Applying an update in place is Windows-exe only; say so rather than
     // letting someone enable checks and wonder why nothing installs.
     if (can("self_update")) return section;
-    const note = why("self_update") || "Updates are applied outside the app on this host.";
+    const note = why("self_update") || t("set.updates.note");
     return {
       ...section,
-      desc: section.desc + " " + note,
+      hostNote: note,
       rows: section.rows.map((r) =>
-        r[0] === "update.enabled" ? [r[0], r[1], r[2], r[3] + " " + note, r[4]] : r),
+        r[0] === "update.enabled"
+          ? [r[0], r[1], r[2], r[3], { ...r[4], note }]
+          : r),
     };
   });
 }
@@ -165,7 +150,10 @@ export async function mount({ root, signal }) {
       : input;
   }
 
-  function settingRow([path, kind, label, help, opts]) {
+  function settingRow([path, kind, labelKey, helpKey, opts]) {
+    const label = t(labelKey);
+    let help = helpKey ? t(helpKey) : "";
+    if (opts && opts.note) help = help ? help + " " + opts.note : opts.note;
     const o = Object.assign({ label }, opts || {});
     return el("div", {
       class: "setting",
@@ -174,7 +162,7 @@ export async function mount({ root, signal }) {
       el("div", { class: "setting__meta" }, [
         el("label", { class: "setting__label" }, [
           el("span", { text: label }),
-          o.adv ? el("span", { class: "badge", text: "advanced" }) : null,
+          o.adv ? el("span", { class: "badge", text: t("settings.adv") }) : null,
         ]),
         help ? el("p", { class: "field__help", text: help }) : null,
       ]),
@@ -209,7 +197,7 @@ export async function mount({ root, signal }) {
     }
     const label = root.querySelector("[data-dirty]");
     if (label) {
-      label.textContent = n ? n + " unsaved change" + (n === 1 ? "" : "s") : "No changes";
+      label.textContent = n ? t("settings.unsaved.count", { n }) : t("settings.unsaved.none");
       label.classList.toggle("text-warn", n > 0);
     }
     for (const b of $$("[data-needs-dirty]", root)) b.disabled = n === 0;
@@ -222,97 +210,96 @@ export async function mount({ root, signal }) {
       const cur = input.type === "checkbox" ? String(input.checked) : input.value;
       if (cur !== input.dataset.init) values[input.dataset.set] = cur;
     }
-    if (!Object.keys(values).length) { toast("No changes to save", "warn"); return; }
+    if (!Object.keys(values).length) { toast(t("settings.save.none"), "warn"); return; }
     try {
       const r = await api.put("/admin/dash/settings", { values });
       toast(r.changed.length
-        ? "Saved " + r.changed.length + " setting(s)" + (r.restart_required ? ". Restart to apply remaining changes." : ". Applied immediately.")
-        : "No changes", "ok");
+        ? t("settings.save.done", { n: r.changed.length }) + (r.restart_required ? t("settings.save.restart") : t("settings.save.immediate"))
+        : t("settings.save.none"), "ok");
       await load();
-    } catch (e) { toast("save: " + e.message, "err"); }
+    } catch (e) { toast(t("settings.save.err") + ": " + e.message, "err"); }
   }
 
   async function regenerateKeys() {
     const ok = await confirmDialog({
-      title: "Regenerate keys?",
-      body: "The admin key and the first client key both change.\n"
-          + "Anything using the old keys stops working until you update it. A restart is required.",
-      okLabel: "Regenerate",
+      title: t("settings.keys.confirm.title"),
+      body: t("settings.keys.confirm.body"),
+      okLabel: t("settings.keys.confirm.ok"),
       danger: true,
     });
     if (!ok) return;
-    toast("Key rotation stays in the desktop launcher for now — it also restarts the gateway.", "warn", 6000);
+    toast(t("settings.keys.toast"), "warn", 6000);
   }
 
   function render() {
     const search = el("input", {
-      class: "input", type: "search", placeholder: "Filter settings…", value: filter,
-      style: { maxWidth: "260px" }, "aria-label": "Filter settings",
+      class: "input", type: "search", placeholder: t("settings.filter.placeholder"), value: filter,
+      style: { maxWidth: "260px" }, "aria-label": t("settings.filter.aria"),
       on: { input: (e) => { filter = e.target.value; applyFilter(); } },
     });
 
     const sections = sectionsForHost();
-    const toc = el("nav", { class: "set-toc", "aria-label": "Settings sections" },
-      [...sections, { id: "keys", title: "Keys" }].map((g) => el("button", {
-        class: "set-toc__item", type: "button", text: g.title,
+    const toc = el("nav", { class: "set-toc", "aria-label": t("settings.toc.aria") },
+      [...sections, { id: "keys", titleKey: "settings.keys.title" }].map((g) => el("button", {
+        class: "set-toc__item", type: "button", text: t(g.titleKey),
         on: { click: () => root.querySelector("#set-" + g.id)?.scrollIntoView({ behavior: "smooth", block: "start" }) },
       })));
 
     const cards = sections.map((g) => {
-      const node = card({ title: g.title, desc: g.desc, body: g.rows.map(settingRow) });
+      const desc = g.hostNote ? t(g.descKey) + " " + g.hostNote : t(g.descKey);
+      const node = card({ title: t(g.titleKey), desc, body: g.rows.map(settingRow) });
       node.classList.add("set-card");
       node.id = "set-" + g.id;
       return node;
     });
 
     const keysCard = card({
-      title: "Keys",
-      desc: "The admin key and client keys protect this dashboard and the /v1 endpoints.",
+      title: t("settings.keys.title"),
+      desc: t("settings.keys.desc"),
       body: el("div", { class: "setting" }, [
         el("div", { class: "setting__meta" }, [
-          el("label", { class: "setting__label", text: "Regenerate keys" }),
-          el("p", { class: "field__help", text:
-            "Replaces the admin key and the first client key. Programs using the old keys stop working until you update them." }),
+          el("label", { class: "setting__label", text: t("settings.keys.label") }),
+          el("p", { class: "field__help", text: t("settings.keys.help") }),
         ]),
         el("div", { class: "setting__control" },
-          button({ label: "Regenerate keys…", variant: "danger", onClick: regenerateKeys })),
+          button({ label: t("settings.keys.action"), variant: "danger", onClick: regenerateKeys })),
       ]),
     });
     keysCard.classList.add("set-card");
     keysCard.id = "set-keys";
 
     const bar = el("div", { class: "set-bar" }, [
-      el("span", { class: "text-sm muted", "data-dirty": "", text: "No changes" }),
+      el("span", { class: "text-sm muted", "data-dirty": "", text: t("settings.unsaved.none") }),
       el("span", { class: "spacer" }),
-      button({ label: "Discard", variant: "ghost", onClick: () => load(), disabled: true }),
-      button({ label: "Save changes", variant: "primary", onClick: save, disabled: true }),
+      button({ label: t("settings.save.discard"), variant: "ghost", onClick: () => load(), disabled: true }),
+      button({ label: t("settings.save.action"), variant: "primary", onClick: save, disabled: true }),
     ]);
     bar.querySelectorAll(".btn").forEach((b) => b.setAttribute("data-needs-dirty", ""));
 
     fill(root, el("div", { class: "stack" }, [
       el("div", { class: "row" }, [
         search,
-        button({ label: "Check for updates now", icon: "refresh", onClick: async event => {
+        button({ label: t("settings.check.now"), icon: "refresh", onClick: async event => {
           const control = event.currentTarget;
           control.disabled = true;
           try {
             const result = await checkForUpdates();
-            if (result?.error) toast("Update check failed: " + result.error, "warn");
+            if (result?.error) toast(t("settings.check.failed") + ": " + result.error, "warn");
             else if (!result?.update_available && !result?.release_available) toast(result?.disabled
-              ? "Automatic update checks are disabled. Enable them and restart to check releases."
-              : "No newer complete release found", "ok");
-          } catch (error) { toast("Update check failed: " + error.message, "err"); }
+              ? t("settings.check.disabled")
+              : t("settings.check.none"), "ok");
+          } catch (error) { toast(t("settings.check.failed") + ": " + error.message, "err"); }
           finally { control.disabled = false; }
         } }),
         el("span", { class: "field__help", text:
-          "Saved to " + (data.config_path || "config.yaml") + ". Most changes require a restart." }),
+          t("settings.saved.to").replace("{path}", data.config_path || "config.yaml") }),
       ]),
       el("div", { class: "set-wrap" }, [
         toc,
         el("div", { class: "stack" }, [
           ...cards,
           keysCard,
-          el("div", { class: "empty__text", "data-nomatch": "", hidden: true, text: "No settings match that filter." }),
+          el("div", { class: "empty__text", "data-nomatch": "", hidden: true, text: t("settings.nomatch") }),
         ]),
       ]),
       bar,
