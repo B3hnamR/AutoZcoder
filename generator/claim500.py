@@ -37,7 +37,7 @@ from invite_claim import (        # noqa: E402
     _proxies,
 )
 
-BALANCE = 'https://zcode.z.ai/api/v1/zcode-plan/billing/balance?app_version=3.18.2'
+BALANCE = 'https://zcode.z.ai/api/v1/zcode-plan/billing/balance?app_version=4.0.0'
 CLAIM = 'https://zcode.z.ai/api/v1/zcode-plan/billing/claim'
 TOUCH = 'https://zcode.z.ai/api/v1/marketing/touch/action'
 TOUCH_FEED = 'https://zcode.z.ai/api/v1/marketing/touch?seq=0'
@@ -50,14 +50,14 @@ CAMPAIGN_ID = os.environ.get('ZAI_CAMPAIGN_ID', '')
 CLAIM_HEADERS_BASE = {
     'content-type': 'application/json',
     'http-referer': 'https://zcode.z.ai',
-    'user-agent': 'ZCode/3.18.2',
+    'user-agent': 'ZCode/4.0.0',
     'x-client-language': 'en-US',
     'x-os-category': 'windows',
     'x-os-version': 'Windows 11 Pro',
     'x-platform': 'win32-x64',
     'x-release-channel': 'production',
     'x-title': 'Z Code@electron',
-    'x-zcode-app-version': '3.18.2',
+    'x-zcode-app-version': '4.0.0',
     'accept': '*/*',
 }
 

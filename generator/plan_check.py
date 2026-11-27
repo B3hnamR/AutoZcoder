@@ -48,9 +48,10 @@ POLL = "https://zcode.z.ai/api/v1/oauth/cli/poll/"
 AUTHORIZE = "https://chat.z.ai/api/oauth/authorize"
 
 # The gift/preview list is version-gated: 3.14.3..3.16.0 answer [], 3.16.1+
-# name the plan, and marketing offers need 3.17.1+. Track the current desktop
-# build; a stale pin silently empties the preview and reads as "no plan".
-APP_VERSION = (os.environ.get("ZAI_APP_VERSION") or "3.18.2").strip() or "3.18.2"
+# name the plan, marketing offers need 3.17.1+, and 4.x requires the 4.0.0
+# client (3.18.2 silently empties the preview as of 2026-11). Track the
+# current desktop build; a stale pin reads as "no claimable plan".
+APP_VERSION = (os.environ.get("ZAI_APP_VERSION") or "4.0.0").strip() or "4.0.0"
 BRIDGE_REDIRECT = (
     "https://zcode.z.ai/app/oauth/login?redirect=zcode%3A%2F%2Foauth%2Fcallback"
     f"&app_version={APP_VERSION}"
