@@ -61,6 +61,17 @@ def read_credentials(path):
                   'source': str(path), 'captured_at': datetime.now(timezone.utc).isoformat()}
         if device_mid:
             fields['device_mid'] = device_mid
+        # WorkOS issuance context + grant material: without these the token can
+        # only be replaced by hand, never refreshed.
+        for name in ('client_id', 'issuer'):
+            if isinstance(claims.get(name), str) and claims[name]:
+                fields[name] = claims[name]
+        if ident == current_id:
+            refresh = next((decrypt_credential(value) for key, value in data.items()
+                            if key in ('refreshToken', 'refresh_token', 'oauth:zai:refresh_token')),
+                           None)
+            if isinstance(refresh, str) and refresh.strip():
+                fields['refresh_token'] = refresh.strip()
         if ident not in accounts or int(claims.get('iat') or 0) > int(jwt_claims(accounts[ident]['access_token']).get('iat') or 0):
             accounts[ident] = fields
     return list(accounts.values())

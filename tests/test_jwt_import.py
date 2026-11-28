@@ -208,8 +208,8 @@ def test_account_export_import_roundtrip_between_installations(tmp_path, monkeyp
         bundle = response.json()
         assert bundle == {"format": "autozcoder-account", "version": 1, "account_id": IDENT,
                           "email": "owner@example.test", "name": "Owner Label",
-                          "device_mid": "device-example", "access_token": jwt(), "expires_at_ms": 0}
-        assert "refresh_token" not in bundle
+                          "device_mid": "device-example", "access_token": jwt(), "expires_at_ms": 0,
+                          "refresh_token": "not-for-export"}
         assert source.server.admin_key not in response.text
 
     receiver = config(tmp_path / "receiver")
@@ -229,6 +229,7 @@ def test_account_export_import_roundtrip_between_installations(tmp_path, monkeyp
         assert loaded.notes["name"] == "Owner Label"
         assert loaded.notes["imported_jwt"]
         assert loaded.access_token == jwt()
+        assert loaded.refresh_token == 'not-for-export'
 
 
 def test_bulk_copy_exports_only_working_accounts_and_roundtrips(tmp_path, monkeypatch):
@@ -253,7 +254,7 @@ def test_bulk_copy_exports_only_working_accounts_and_roundtrips(tmp_path, monkey
         response = client.get("/admin/accounts/export", headers=HEADERS)
         assert response.status_code == 200
         assert "no-store" in response.headers["cache-control"]
-        assert "never-for-export" not in response.text
+        assert "never-for-export" in response.text
         bundle = response.json()
         assert [entry["account_id"] for entry in bundle["accounts"]] == working
 

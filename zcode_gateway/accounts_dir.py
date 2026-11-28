@@ -251,6 +251,10 @@ def _to_account(fields: dict[str, str], path: Path) -> Account | None:
         "balance_usd": fields.get("balance_usd", ""),
         "plan": fields.get("plan", ""),
         "workos_user_id": fields.get("workos_user_id", ""),
+        # Kept so the WorkOS refresh grant can mint a replacement token; the
+        # bearer itself stays on the Account for rotation.
+        "client_id": fields.get("client_id", ""),
+        "issuer": fields.get("issuer", ""),
         "file": path.name,
         "device_mid": fields.get("device_mid", ""),
         "auto_run_id": fields.get("auto_run_id", ""),

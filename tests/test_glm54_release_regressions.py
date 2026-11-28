@@ -1,3 +1,4 @@
+import hashlib
 import json
 import time
 from types import SimpleNamespace
@@ -144,6 +145,30 @@ async def test_purge_keeps_pending_account_before_and_after_window_start(tmp_pat
         quota["pending_starts_at"] = now - 10
         assert (await api_admin.purge_drained_accounts(request, key="fixture"))["count"] == 0
         assert snapshot.exists()
+    finally:
+        await pool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_reviewed_purge_rejects_changed_candidates(tmp_path):
+    cfg = Config()
+    cfg.accounts.dir = str(tmp_path)
+    reviewed = Account(id='old', access_token='fixture-one', state=AccountState.DEAD)
+    other = Account(id='other', access_token='fixture-two')
+    pool = PoolManager(cfg.pool, [reviewed, other])
+    state = SimpleNamespace(pool=pool, cfg=cfg)
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(app_state=state)))
+    fingerprint = reviewed.to_public()['token_fingerprint']
+    body = {'review': hashlib.sha256(json.dumps([('old', True, fingerprint)]).encode()).hexdigest()}
+    try:
+        other.state = AccountState.DEAD
+        with pytest.raises(HTTPException) as error:
+            await api_admin.purge_reviewed_accounts(request, body, key='fixture')
+        assert error.value.status_code == 409
+        assert len(await pool.all()) == 2
+        other.state = AccountState.READY
+        assert (await api_admin.purge_reviewed_accounts(request, body, key='fixture'))['count'] == 1
+        assert await pool.all() == [other]
     finally:
         await pool.aclose()
 

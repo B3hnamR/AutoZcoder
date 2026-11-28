@@ -96,12 +96,18 @@ class DeviceLogin:
         self.snapshot_path = await asyncio.to_thread(save_account_snapshot, self.accounts_dir,
             {'account_id': ident, 'email': account.email, 'name': user.get('name', ''),
              'access_token': token, 'expires_at_ms': str(account.expires_at),
-             'device_mid': self.fingerprint.device_mid, 'source': 'ZCode CLI OAuth'},
+             'device_mid': self.fingerprint.device_mid, 'source': 'ZCode CLI OAuth'}
+            | {key: value for key, value in {
+                'refresh_token': data.get('refresh_token') if isinstance(data.get('refresh_token'), str) else '',
+                'client_id': claims.get('client_id') if isinstance(claims.get('client_id'), str) else '',
+                'issuer': claims.get('iss') if isinstance(claims.get('iss'), str) else '',
+            }.items() if value},
             writer=write_saved)
         account.email = fields.get('email', account.email)
         account.refresh_token = fields.get('refresh_token', '')
         account.notes.update({key: fields.get(key, '') for key in (
-            'captured_at', 'name', 'balance_usd', 'plan', 'workos_user_id', 'device_mid')})
+            'captured_at', 'name', 'balance_usd', 'plan', 'workos_user_id', 'device_mid',
+            'client_id', 'issuer')})
         account.notes['imported_jwt'] = fields.get('imported_jwt') == 'true'
         account.notes['file'] = self.snapshot_path.name
         self.account_email = account.email

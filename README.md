@@ -180,12 +180,18 @@ Generator and email setup: **[Account generator setup](docs/guides/SETUP.md)**.
 
 To transfer one account, use **Copy account for sharing**, then **Accounts →
 Import account → Validate and import** on the destination. A raw CLI JWT is
-also accepted. Exports contain the current bearer token and account/device
-metadata: treat them as credentials, not public support attachments. Sharing
-does not duplicate quota or entitlement and includes no renewal grant. Quota
-refresh is read-only; credential refresh can adopt a newer saved token but does
-not renew it. An expired or revoked token needs a fresh login/import if no newer
-credential is available; a JWT without declared expiry is not permanent.
+also accepted. Exports contain the current bearer token, its WorkOS refresh
+grant when one is known, and account/device metadata: treat them as
+credentials, not public support attachments. Sharing does not duplicate quota or
+entitlement.
+
+Credential renewal: when an account carries a WorkOS refresh grant, the gateway
+trades it for a new token in the background (`pool.allow_token_refresh`, on by
+default) near expiry, after a 401, and during the balance poll, then rewrites
+the snapshot. A spent or revoked grant is dropped so the account reports its
+401 honestly instead of retrying forever. Accounts without a grant can only
+adopt a newer saved token, so an expired one needs a fresh login/import; a JWT
+without declared expiry is not permanent.
 
 ## Generating accounts (optional)
 

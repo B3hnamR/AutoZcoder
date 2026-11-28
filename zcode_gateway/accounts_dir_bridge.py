@@ -74,6 +74,9 @@ def mint_and_register(accounts_dir: str | Path, email: str, zcode_jwt: str,
     }
     if claims.get("exp"):
         fields["expires_at"] = str(claims["exp"])
+    for name, value in (("client_id", claims.get("client_id")), ("issuer", claims.get("iss"))):
+        if isinstance(value, str) and value:
+            fields[name] = value
     path = save_account_snapshot(accounts_dir, fields, writer=write_saved)
     name, fields = path.name, saved
 

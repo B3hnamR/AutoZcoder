@@ -1,7 +1,8 @@
-"""ZCode long-lived JWTs: reload credentials on rejection; poll model quotas."""
+"""ZCode JWTs: renew from the saved grant or a reloaded credential; poll quotas."""
 from __future__ import annotations
 import asyncio
 import logging
+import re
 import time
 
 import httpx
@@ -12,8 +13,14 @@ from .token_utils import _parse_expiry, _atomic_write, persist_pool_snapshot
 from .accounts_dir import (parse_snapshot, snapshot_path, snapshot_transaction,
                            token_is_older, write_snapshot)
 from .upstream import build_headers
+from .zcode_detect import jwt_claims
 
 log = logging.getLogger('zcode_gateway.tokens')
+
+# WorkOS access tokens are minted by a refresh grant on the account's own
+# issuer. Only the *access* token carries the `workos:` prefix; the API wants
+# the bare values, and responses come back bare.
+DEFAULT_ISSUER = "https://api.workos.com/user_management"
 
 class TokenManager:
     # One accounts-directory scan serves every expiring account within this
@@ -61,7 +68,7 @@ class TokenManager:
             return self._scan_cache
 
     async def refresh(self, account, force=False, *, expected_credentials=None):
-        # Captured JWT has no exp or refresh token. Never invent a refresh API.
+        # Adopt a newer captured token first; fall back to the WorkOS grant.
         async with self._lock_for(account.id):
             if expected_credentials is not None and account.credential_key() != expected_credentials:
                 return bool(account.access_token)
@@ -71,13 +78,14 @@ class TokenManager:
     def _persist_refreshed(path, fields, previous_token):
         with snapshot_transaction(path.parent):
             current = parse_snapshot(path)
-            if current.get('access_token') not in (None, previous_token, fields['access_token']):
-                return  # a newer external capture won while the scan was running
+            if (current.get('access_token') or current.get('token')) not in (previous_token, fields['access_token']):
+                return  # a purge or newer capture won while the scan was running
             write_snapshot(path, {**current, **fields})
 
     async def _refresh_locked(self, account, force=False):
         """Caller owns the per-ID lock; never recursively acquire it on a 401."""
-        if not force and account.access_token and account.expires_in() > 0:
+        still_valid = bool(account.access_token and account.expires_in() > 0)
+        if not force and still_valid and not account.needs_refresh(self.cfg.pool.refresh_lead_seconds):
             return True
         credentials = account.credential_key()
         found = await self._found_accounts(force_scan=force)
@@ -86,7 +94,7 @@ class TokenManager:
         if account.credential_key() != credentials:
             return bool(account.access_token)
         if found is None:
-            return False
+            return await self._grant_refresh(account)
         for fresh in found:
             if fresh.id != account.id or not fresh.access_token:
                 continue
@@ -101,7 +109,7 @@ class TokenManager:
                     refresh_token=fresh.refresh_token or account.refresh_token,
                     expires_at=fresh.expires_at, email=fresh.email,
                     source=fresh.source, notes=fresh.notes, reset=False)
-                return False
+                return await self._grant_refresh(account)
             previous_token = account.access_token
             self._apply_credentials_locked(account, access_token=fresh.access_token,
                 refresh_token=fresh.refresh_token or account.refresh_token,
@@ -122,7 +130,81 @@ class TokenManager:
             except Exception:
                 log.debug('snapshot persist after refresh failed for %s', account.id, exc_info=True)
             return True
-        return False
+        return await self._grant_refresh(account)
+
+    async def _grant_refresh(self, account) -> bool:
+        """Trade the stored WorkOS refresh grant for a fresh access token.
+
+        Called while the per-ID lock is held, only after file adoption failed.
+        A 400/401 means the grant itself is spent or revoked: drop it so the
+        account stops retrying and reports the dead credential honestly.
+        """
+        if not self.cfg.pool.allow_token_refresh:
+            return False
+        refresh = (account.refresh_token or "").strip().removeprefix("workos:")
+        claims = jwt_claims(account.access_token)
+        client_id = (account.notes.get("client_id") or claims.get("client_id") or "").strip()
+        if not refresh or not client_id:
+            return False
+        issuer = (account.notes.get("issuer") or "").rstrip("/")
+        # WorkOS publishes `/user_management/authenticate` with client_id in the
+        # body, while an `iss` claim normally ends in `/user_management/client_x`.
+        # Try the documented root first, then the claimed form for custom hosts.
+        roots = []
+        if issuer:
+            root = re.sub(r"/client_[^/]+$", "", issuer)
+            roots.append(root)
+            if root != issuer:
+                roots.append(issuer)
+        roots.append(DEFAULT_ISSUER)
+        resp = None
+        for root in roots:
+            try:
+                resp = await self._client.post(root + "/authenticate", json={
+                    "client_id": client_id, "grant_type": "refresh_token",
+                    "refresh_token": refresh})
+            except httpx.HTTPError:
+                return False
+            if resp.status_code != 404:
+                break
+        if resp.status_code in (400, 401, 403):
+            account.refresh_token = ""
+            return False
+        if resp.status_code != 200:
+            return False
+        try:
+            data = resp.json()
+        except ValueError:
+            return False
+        token = data.get("access_token") if isinstance(data, dict) else None
+        if not isinstance(token, str) or token.count(".") != 2:
+            return False
+        fresh_claims = jwt_claims(token)
+        ident = fresh_claims.get("user_id") or fresh_claims.get("sub")
+        if ident and ident != account.id:
+            return False
+        stored = token if token.startswith("workos:") else "workos:" + token
+        rotated = data.get("refresh_token") if isinstance(data.get("refresh_token"), str) else refresh
+        previous = account.access_token
+        self._apply_credentials_locked(
+            account, access_token=stored, refresh_token=rotated,
+            expires_at=int(fresh_claims.get("exp") or 0) * 1000,
+            notes={"client_id": client_id})
+        try:
+            fname = account.notes.get("file")
+            if fname:
+                path = snapshot_path(self.cfg.accounts.dir, fname)
+                await asyncio.to_thread(self._persist_refreshed, path, {
+                    "account_id": account.id, "email": account.email,
+                    "name": account.notes.get("name", ""), "access_token": stored,
+                    "refresh_token": rotated, "expires_at_ms": str(account.expires_at),
+                    "device_mid": account.notes.get("device_mid", ""),
+                    "client_id": client_id, "issuer": account.notes.get("issuer", ""),
+                }, previous)
+        except Exception:
+            log.debug("snapshot persist after grant refresh failed for %s", account.id, exc_info=True)
+        log.info("refreshed account %s from its refresh grant", account.id)
+        return True
 
     def _apply_credentials_locked(self, account, *, access_token, refresh_token=None,
                                   expires_at=0, email=None, name=None, device_mid=None,
@@ -167,15 +249,12 @@ class TokenManager:
                 try:
                     if account.needs_refresh(self.cfg.pool.refresh_lead_seconds):
                         await self.refresh(account)
-                    # expiry horizon: there is no refresh grant anywhere (the
-                    # captured JWT has exp and no refresh token), so an expiring
-                    # account is a KNOWN future death. Surface it loudly instead
-                    # of discovering it via 401 strikes mid-request.
+                    # Warn only when nothing can renew the credential by itself.
+                    can_renew = account.refresh_token and self.cfg.pool.allow_token_refresh
                     hours = account.expires_in() / 3600.0
-                    if 0 < hours < 24 and not account.expires_warned:
+                    if 0 < hours < 24 and not can_renew and not account.expires_warned:
                         account.expires_warned = True
-                        log.warning('account %s token expires in %.1fh — no refresh '
-                                    'grant exists; re-login before it dies',
+                        log.warning('account %s token expires in %.1fh; update its saved credential',
                                     account.id, hours)
                         try:
                             self.pool.notify('token_expiring',

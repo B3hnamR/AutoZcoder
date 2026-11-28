@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import json
 import math
@@ -205,6 +206,16 @@ async def import_jwt_account(request: Request, body: dict[str, Any] = Body(...),
     if any(not isinstance(v, str) or len(v) > 254 or any(ord(c) < 32 or ord(c) == 127 for c in v)
            for v in (name, device)):
         raise HTTPException(400, "Invalid account export metadata")
+    optional = {}
+    for field in ("refresh_token", "client_id", "issuer"):
+        value = body.get(field) or (bundle.get(field) if bundle else "") or ""
+        if not isinstance(value, str) or len(value) > 4096 or any(c.isspace() for c in value):
+            raise HTTPException(400, f"Invalid {field.replace('_', ' ')}")
+        if value:
+            optional[field] = value
+    if optional.get("client_id") and not optional.get("issuer"):
+        optional["issuer"] = ("https://api.workos.com/user_management/"
+                              + optional["client_id"])
     if state.cfg.accounts.source not in ("accounts_dir", "pool_file"):
         raise HTTPException(409, "Account import requires Accounts source: Accounts folder or Pool file")
     # Decoding a JWT is not signature validation. Require the configured Zcode
@@ -237,9 +248,13 @@ async def import_jwt_account(request: Request, body: dict[str, Any] = Body(...),
         existing = await state.pool.find(ident)
         email = email or (existing.email if existing else "")
         account = Account(id=ident, email=email, access_token=token,
-                          refresh_token=existing.refresh_token if existing else "", expires_at=int(expiry * 1000),
+                          refresh_token=optional.get("refresh_token") or (existing.refresh_token if existing else ""),
+                          expires_at=int(expiry * 1000),
                           source="jwt-import", notes={"name": name or (existing.notes.get("name", "") if existing else ""),
                                                        "imported_jwt": True})
+        for field in ("client_id", "issuer"):
+            if optional.get(field) or (existing and existing.notes.get(field)):
+                account.notes[field] = optional.get(field) or existing.notes[field]
         if device:
             account.notes["device_mid"] = device
         account.notes.update(plans=plans, quotas=quotas, quota_check_attempted_at=time.time())
@@ -256,6 +271,7 @@ async def import_jwt_account(request: Request, body: dict[str, Any] = Body(...),
                                 source="Manual JWT import", imported_jwt="true")
                 if device:
                     fields["device_mid"] = device
+                fields.update(optional)
                 path = await asyncio.to_thread(save_account_snapshot, folder, fields, reject_stale=True)
                 account.notes["file"] = path.name
             else:
@@ -316,11 +332,19 @@ _EXPORT_HEADERS = {"Cache-Control": "no-store, private", "Pragma": "no-cache"}
 
 
 def _account_export(account: Account) -> dict:
-    return {"format": "autozcoder-account", "version": 1,
-            "account_id": account.id, "email": account.email,
-            "name": account.notes.get("name", ""),
-            "device_mid": account.notes.get("device_mid", ""),
-            "access_token": account.access_token, "expires_at_ms": account.expires_at}
+    exported = {"format": "autozcoder-account", "version": 1,
+                "account_id": account.id, "email": account.email,
+                "name": account.notes.get("name", ""),
+                "device_mid": account.notes.get("device_mid", ""),
+                "access_token": account.access_token, "expires_at_ms": account.expires_at}
+    # Grant material travels with the credential so the receiving installation
+    # can refresh it instead of importing a token that will only expire.
+    for field, source in (("refresh_token", account.refresh_token),
+                          ("client_id", account.notes.get("client_id", "")),
+                          ("issuer", account.notes.get("issuer", ""))):
+        if source:
+            exported[field] = source
+    return exported
 
 
 @router.get("/accounts/export")
@@ -360,26 +384,47 @@ async def purge_drained_accounts(request: Request,
     them GONE, files included; keeping them as "unknown" (empty quotas)
     left plan-lost zombies un-purgeable.
     Takes them out of rotation, deletes their snapshot file from the
-    accounts/ folder, and drops token locks."""
-    state = get_state(request)
+    accounts/ folder."""
+    return await _purge_drained(get_state(request))
+
+
+@router.post("/accounts/purge-reviewed")
+async def purge_reviewed_accounts(request: Request, body: dict = Body(...),
+                                 key: str = Depends(admin_key)) -> dict:
+    review = body.get('review')
+    if not isinstance(review, str) or len(review) != 64:
+        raise HTTPException(400, 'A current purge review is required')
+    return await _purge_drained(get_state(request), review=review)
+
+
+async def _purge_drained(state, *, review=None) -> dict:
+    if not hasattr(state, 'account_persist_lock'):
+        state.account_persist_lock = asyncio.Lock()
+    async with state.account_persist_lock, state.pool._lock:
+        return _purge_locked(state, review)
+
+
+def _purge_locked(state, review):
     from .pool import AccountState
-    import time as _time
-    purged, kept_unknown = [], 0
-    now = _time.time()
-    for account in list(state.pool._accounts.values()):
+    from .accounts_dir import parse_snapshot, snapshot_account_id, snapshot_path, snapshot_transaction
+
+    candidates, purged, kept_unknown = [], [], 0
+    now = time.time()
+    for account in state.pool._accounts.values():
         quotas = (account.notes or {}).get("quotas") or {}
         is_dead = account.state is AccountState.DEAD
         # proven-drained: quota data exists AND every bucket is empty
         drained = bool(quotas) and all(
-            (q.get("remaining", 0) or 0) <= 0 for q in quotas.values())
+            type(q.get("remaining")) is int and q["remaining"] == 0 for q in quotas.values())
         recovers = any(
             (q.get(field) or 0) > now
             for q in quotas.values()
-            for field in ("resets_at", "starts_at", "pending_starts_at")
+            for field in ("starts_at", "pending_starts_at")
         ) or any(until > now for until in account.model_caps.values())
-        # An opened grant can remain pending in the last billing snapshot.
+        # A past reset or grant opening may not have been reflected in billing yet.
         recovers = recovers or any(
-            (q.get("pending_remaining") or 0) > 0 for q in quotas.values()
+            (q.get("pending_remaining") or 0) > 0 or (q.get("resets_at") or 0) > 0
+            for q in quotas.values()
         )
         if not is_dead and not drained:
             if not quotas:
@@ -387,20 +432,37 @@ async def purge_drained_accounts(request: Request,
             continue
         if not is_dead and recovers:
             continue          # daily quota: it will refill — keep the account
-        # 1) drop from the running pool
-        await state.pool.remove(account.id)
-        state.tokens.drop_lock(account.id)
-        # 2) delete the snapshot file so a restart doesn't resurrect it
+        candidates.append(account)
+    if review is not None:
+        versions = sorted((a.id, a.state is AccountState.DEAD,
+                           hashlib.sha256((a.access_token or '').encode()).hexdigest()[:12]) for a in candidates)
+        if not versions or hashlib.sha256(json.dumps(versions).encode()).hexdigest() != review:
+            raise HTTPException(409, 'The purge candidates changed')
+    if candidates and state.cfg.accounts.source == 'pool_file':
+        removed_ids = {a.id for a in candidates}
+        persist_pool_snapshot(state.cfg, [a for a in state.pool._accounts.values() if a.id not in removed_ids])
+    for account in candidates:
         fname = (account.notes or {}).get("file")
         deleted = False
-        if fname:
-            snap = Path(state.cfg.accounts.dir) / fname
+        if fname and state.cfg.accounts.source == 'accounts_dir':
             try:
-                if snap.is_file():
-                    snap.unlink()
-                    deleted = True
-            except OSError:
+                with snapshot_transaction(state.cfg.accounts.dir) as folder:
+                    snap = snapshot_path(folder, fname)
+                    if snap.exists():
+                        fields = parse_snapshot(snap)
+                        owner = snapshot_account_id(fields)
+                        token = fields.get('access_token') or fields.get('token')
+                        if owner != account.id or token != account.access_token:
+                            continue
+                        snap.unlink()
+                        deleted = True
+            except FileNotFoundError:
                 pass
+            except (OSError, ValueError):
+                continue
+        state.pool._accounts.pop(account.id, None)
+        state.pool._affinity.drop_account(account.id)
+        state.pool._slot_gen += 1
         purged.append({"id": account.id, "email": account.email,
                        "file_deleted": deleted})
     return {"purged": purged, "count": len(purged),
@@ -414,8 +476,7 @@ async def refresh_account(request: Request, account_id: str,
 
     First re-read its on-disk snapshot (a re-export after a plan change writes a
     fresh token — the pool entry must adopt it), then re-settle plan/balance so
-    the dashboard shows the new quota immediately. Falls back to an OAuth token
-    refresh only when the snapshot brought nothing new.
+    the dashboard shows the new quota immediately.
     """
     state = get_state(request)
     account = await state.pool.find(account_id)

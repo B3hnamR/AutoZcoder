@@ -43,10 +43,13 @@ contains the coding-plan JWT and user identity. No WorkOS exchange, short user
 code or secondary business token exchange is needed.
 
 The captured coding-plan JWT has no `exp`, so ZcodeGate stores expiry zero as
-long-lived. The login poll may still return a `refresh_token` for some
-providers; when it does, the snapshot keeps it, but nothing silently refreshes
-a coding-plan JWT. A 401 may recover only by loading a changed credential from
-its source; otherwise the account is marked dead and needs login/import.
+long-lived. The login poll may return a `refresh_token`; the snapshot keeps it
+alongside `client_id`/`issuer`. When one exists the gateway redeems it with a
+WorkOS `POST …/user_management/authenticate` (`client_id`, `grant_type:
+refresh_token`), stores the returned `workos:`-prefixed token and rewrites the
+snapshot; a spent grant answers 400/401 and is dropped, after which a 401 parks
+then kills the account for a fresh login/import. Accounts without a grant still
+recover only by loading a changed credential from their source.
 
 ## Credential encryption: correction to the audit prose
 
