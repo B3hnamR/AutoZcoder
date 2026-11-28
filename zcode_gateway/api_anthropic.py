@@ -56,7 +56,8 @@ async def messages(
 
     upstream_model = state.registry.resolve(body.get("model"), "anthropic")
     variant = state.registry.variant_for(upstream_model)
-    payload = {"model": upstream_model, "_anthropic": dict(body)}
+    payload = {"model": upstream_model, "_anthropic": dict(body),
+               "_affinity_scope": request.headers.get('x-zcode-affinity-scope', '')}
 
     wants_stream = bool(body.get("stream", False))
 

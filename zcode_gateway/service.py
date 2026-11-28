@@ -371,18 +371,25 @@ class ChatService:
                         'reporting the original failure', self._describe_failure(exc2))
             return None
 
-    async def open_stream(self, payload, *, model, variant='anthropic', dialect='openai', client_key='anonymous', is_disconnected=None):
+    async def open_stream(self, payload, *, model, variant='anthropic', dialect='openai',
+                          client_key='anonymous', is_disconnected=None, tried=()):
         snapshot = _snapshot_payload(payload)
         handle = await self._open_stream(payload, model=model, variant=variant, dialect=dialect,
-                                         client_key=client_key, is_disconnected=is_disconnected)
+                                         client_key=client_key, is_disconnected=is_disconnected,
+                                         tried=tried)
 
         async def reopen():
+            # Rotate away from the account that just failed even though the
+            # conversation affinity key would otherwise pull the retry back
+            # onto it (an overloaded account stays overloaded).
             return await self.open_stream(_snapshot_payload(snapshot), model=model, variant=variant,
-                                          dialect=dialect, client_key=client_key)
+                                          dialect=dialect, client_key=client_key, is_disconnected=is_disconnected,
+                                          tried=(*tried, handle.account.id))
         handle.reopen = reopen
         return handle
 
-    async def _open_stream(self, payload, *, model, variant='anthropic', dialect='openai', client_key='anonymous', is_disconnected=None):
+    async def _open_stream(self, payload, *, model, variant='anthropic', dialect='openai',
+                           client_key='anonymous', is_disconnected=None, tried=()):
         fallback = self.cfg.models.auto_free_fallback
         chain = list(dict.fromkeys(self.registry.resolve(m, dialect) for m in fallback.chain))
         candidates = chain[chain.index(model):] if fallback.enabled and model in chain else [model]
@@ -391,7 +398,8 @@ class ChatService:
             attempted.append(candidate)
             try:
                 return await self._open_model_stream({**payload, 'model': candidate}, model=candidate,
-                    variant=variant, dialect=dialect, client_key=client_key, is_disconnected=is_disconnected)
+                    variant=variant, dialect=dialect, client_key=client_key, is_disconnected=is_disconnected,
+                    tried=tried)
             except UpstreamFailure as exc:
                 # Try the next model in the fallback chain for every error the
                 # account-parking path already handled (its own codes) AND the
@@ -409,15 +417,19 @@ class ChatService:
                     exc.details['attempted_models'] = attempted
                     raise
 
-    async def _open_model_stream(self, payload, *, model, variant='anthropic', dialect='openai', client_key='anonymous', is_disconnected=None):
+    async def _open_model_stream(self, payload, *, model, variant='anthropic', dialect='openai',
+                                 client_key='anonymous', is_disconnected=None, tried=()):
         # Only retry before a StreamHandle is returned. Never replay output or tools.
+        # The set is shared by every attempt so an overloaded account rotates out.
+        recent = list(tried)
+        tried = set(recent)
         attempts = self.cfg.upstream.overload_max_attempts
         for attempt in range(attempts):
             if is_disconnected is not None and await is_disconnected():
                 raise asyncio.CancelledError()
             try:
                 return await self._open_model_stream_once(payload, model=model, variant=variant,
-                    dialect=dialect, client_key=client_key)
+                    dialect=dialect, client_key=client_key, tried=tried, recent=recent)
             except UpstreamFailure as exc:
                 if not is_model_overload(exc.status, exc.code):
                     raise
@@ -429,7 +441,8 @@ class ChatService:
                          model, exc.code, attempt + 1, attempts - 1, delay)
                 await wait_for_retry(delay, is_disconnected)
 
-    async def _open_model_stream_once(self, payload, *, model, variant='anthropic', dialect='openai', client_key='anonymous'):
+    async def _open_model_stream_once(self, payload, *, model, variant='anthropic', dialect='openai',
+                                      client_key='anonymous', tried=(), recent=None):
         if not self.registry.knows(model):
             raise UpstreamFailure(400, 'unknown_model', f'unknown ZCode model: {model}')
         # fail fast while the egress IP is edge-blocked: every account would
@@ -454,11 +467,27 @@ class ChatService:
             or payload.get("account")
             or payload.get("account_id")
         )
-        affinity_key = affinity_key_from_payload(payload)
-        tried, last = set(), None
+        affinity_key = affinity_key_from_payload(payload, client_key)
+        tried = tried if isinstance(tried, set) else set(tried)
+        recent = recent if recent is not None else []
+        last = None
         for attempt in range(max(1, self.cfg.upstream.max_attempts)):
             account = await self.pool.acquire(tried, model=model, only_id=target_account,
                                               affinity_key=affinity_key)
+            if account is None and tried:
+                # Retries had excluded the whole eligible pool (small pool or a
+                # single account): start a new cycle, still skipping the account
+                # that just failed so a two-account pool really alternates.
+                previous = recent[-1] if recent else None
+                tried.clear()
+                if previous:
+                    tried.add(previous)
+                account = await self.pool.acquire(tried, model=model, only_id=target_account,
+                                                  affinity_key=affinity_key)
+                if account is None:
+                    tried.clear()
+                    account = await self.pool.acquire(tried, model=model, only_id=target_account,
+                                                      affinity_key=affinity_key)
             if account is None:
                 if last: raise last
                 reason = await self.pool.unavailable_reason(model)
@@ -486,6 +515,7 @@ class ChatService:
                                                        expected_credentials=credentials)
                     last = UpstreamFailure(401, 'authentication_error', 'ZCode token expired; sign in again')
                     tried.add(account.id)
+                    recent.append(account.id)
                     continue
                 # Refresh may have adopted a new token; bind effects to the
                 # credentials actually sent, not the mutable account later.
@@ -538,11 +568,19 @@ class ChatService:
                                                retry_after=retry_after_seconds(resp.headers))
                         self._record(account, headers, body, last.status, resp.headers,
                                      raw.decode('utf-8', 'replace'), 0, client_key, dialect, model, {})
-                        if is_model_overload(status, code): raise last
+                        if is_model_overload(status, code):
+                            # Rotate to another account on the next attempt: the
+                            # conversation affinity would otherwise pin retries to
+                            # the busy account. An overload is model-wide, not a
+                            # reason to park the account.
+                            tried.add(account.id)
+                            recent.append(account.id)
+                            raise last
                         if (status < 500 and status not in (401, 402, 403, 405, 429, 451)
                                 and code != '11113' and not is_block_code(code, status)):
                             raise last
                         tried.add(account.id)
+                        recent.append(account.id)
                         continue
                 handle = StreamHandle(account, headers, body, resp, variant, time.time(),
                                       credentials=credentials)
@@ -570,8 +608,13 @@ class ChatService:
                         await self._apply_error(account, model, status, code, message,
                                                 expected_credentials=credentials)
                         last = UpstreamFailure(status, code, message)
-                        if status == 400 or is_model_overload(status, code): raise last
+                        if status == 400:
+                            raise last
                         tried.add(account.id)
+                        recent.append(account.id)
+                        if is_model_overload(status, code):
+                            # Rotate instead of letting affinity pin the retry.
+                            raise last
                         break
                     if first.get('type') != 'message_start':
                         raise UpstreamFailure(502, 'invalid_stream', 'expected ZCode message_start event')
@@ -613,6 +656,7 @@ class ChatService:
                 await self.pool.cool(account, reason='transport_error', expected_credentials=credentials)
                 last = UpstreamFailure(502, 'transport_error', 'could not reach ZCode')
                 tried.add(account.id)
+                recent.append(account.id)
             finally:
                 with anyio.CancelScope(shield=True):
                     if handle is not None:

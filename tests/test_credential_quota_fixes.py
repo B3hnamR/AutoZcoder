@@ -317,6 +317,24 @@ def test_refresh_persistence_does_not_overwrite_newer_external_capture(tmp_path)
     assert fields['session_id'] == 'keep'
 
 
+def test_refresh_persistence_does_not_recreate_purged_snapshot(tmp_path):
+    path = tmp_path / 'purged.txt'
+    TokenManager._persist_refreshed(path, {'account_id': 'dummy', 'access_token': 'fresh'}, 'old')
+    assert not path.exists()
+
+
+@pytest.mark.asyncio
+async def test_refresh_adopts_replacement_before_expiry():
+    account = Account(id='dummy', access_token=jwt(10), expires_at=int((time.time() + 60) * 1000))
+    manager, pool = manager_for(account, AsyncMock())
+    manager._found_accounts.return_value = [Account(id='dummy', access_token=jwt(20))]
+    try:
+        assert await manager.refresh(account)
+        assert account.access_token == jwt(20)
+    finally:
+        await pool.aclose()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize('old,new,old_exp,new_exp,adopt', [
     (jwt(20), jwt(10), 0, 0, False),
@@ -456,3 +474,141 @@ async def test_quota_aware_waits_only_when_all_eligible_accounts_are_saturated()
     await pool.release(accounts[1])
     assert await asyncio.wait_for(pending, 1) is accounts[1]
     await pool.aclose()
+
+# --------------------------------------------------------------------------- #
+# selection + affinity defaults
+# --------------------------------------------------------------------------- #
+
+def test_round_robin_is_the_default_and_spreads_requests():
+    assert Config().pool.strategy == "round_robin"
+    cfg = Config().pool
+    accounts = [Account(id=name, access_token="token") for name in ("a", "b", "c")]
+    pool = PoolManager(cfg, accounts)
+    picked = []
+    for _ in range(6):
+        account = asyncio.run(pool.acquire())
+        picked.append(account.id)
+        asyncio.run(pool.release(account))
+    assert picked == ["a", "b", "c", "a", "b", "c"]
+
+
+def test_affinity_falls_back_to_the_first_message_scoped_by_client():
+    from zcode_gateway.affinity import affinity_key_from_payload
+
+    body = {"messages": [{"role": "system", "content": "You are helpful"},
+                         {"role": "user", "content": "turn one"}]}
+    first = affinity_key_from_payload(body, "key-a")
+    grown = {"messages": [*body["messages"], {"role": "assistant", "content": "hi"},
+                          {"role": "user", "content": "turn two"}]}
+    assert first and first == affinity_key_from_payload(grown, "key-a")
+    assert first != affinity_key_from_payload(body, "key-b")
+    assert first != affinity_key_from_payload({"messages": [body["messages"][0],
+                                                           {"role": "user", "content": "different"}]}, "key-a")
+    assert affinity_key_from_payload({"messages": []}, "key-a") == ""
+    explicit = {**body, "user": "session-7"}
+    assert affinity_key_from_payload(explicit, "key-a") != affinity_key_from_payload(explicit, "key-b")
+    assert affinity_key_from_payload(dict(explicit, _affinity_scope='a' * 64), 'shared') != \
+        affinity_key_from_payload(dict(explicit, _affinity_scope='b' * 64), 'shared')
+
+
+# --------------------------------------------------------------------------- #
+# WorkOS refresh grant
+# --------------------------------------------------------------------------- #
+
+def access_jwt(sub="dummy", exp=None, **extra):
+    def part(value):
+        return base64.urlsafe_b64encode(json.dumps(value).encode()).decode().rstrip("=")
+    claims = {"sub": sub, "exp": int(exp or time.time() + 3600), **extra}
+    return part({"alg": "HS256"}) + "." + part(claims) + ".signature"
+
+
+def grant_manager(account, post):
+    cfg = Config()
+    pool = PoolManager(cfg.pool, [account])
+    manager = TokenManager.__new__(TokenManager)
+    manager.cfg, manager.pool, manager._locks = cfg, pool, {}
+    manager._client = SimpleNamespace(get=AsyncMock(), post=post)
+    manager._found_accounts = AsyncMock(return_value=[])
+    return manager
+
+
+@pytest.mark.asyncio
+async def test_refresh_grant_rotates_an_expired_token():
+    account = Account(id="dummy", access_token="workos:expired", expires_at=1,
+                      refresh_token="workos:grant",
+                      notes={"client_id": "client_x",
+                             "issuer": "https://api.workos.com/user_management/client_x"})
+    fresh = access_jwt(exp=time.time() + 3600)
+    post = AsyncMock(return_value=httpx.Response(
+        200, json={"access_token": fresh, "refresh_token": "grant-2"},
+        request=httpx.Request("POST", "https://dummy.invalid/authenticate")))
+    manager = grant_manager(account, post)
+
+    assert await manager.refresh(account) is True
+    assert account.access_token == "workos:" + fresh
+    assert account.refresh_token == "grant-2"
+    assert account.expires_at > time.time() * 1000
+    assert account.state is AccountState.READY
+    assert post.await_args.kwargs["json"] == {"client_id": "client_x", "grant_type": "refresh_token",
+                                              "refresh_token": "grant"}
+    # documented root first: client_id travels in the body
+    assert str(post.await_args.args[0]) == (
+        "https://api.workos.com/user_management/authenticate")
+
+
+@pytest.mark.asyncio
+async def test_spent_grant_is_dropped_so_401_reports_the_dead_credential():
+    account = Account(id="dummy", access_token="workos:expired", expires_at=1,
+                      refresh_token="workos:grant", notes={"client_id": "client_x"})
+    post = AsyncMock(return_value=httpx.Response(
+        400, json={"code": "invalid_grant"},
+        request=httpx.Request("POST", "https://dummy.invalid/authenticate")))
+    manager = grant_manager(account, post)
+
+    assert await manager.refresh(account) is False
+    assert account.refresh_token == ""
+
+
+@pytest.mark.asyncio
+async def test_no_grant_or_refresh_disabled_skips_the_call():
+    post = AsyncMock()
+    account = Account(id="dummy", access_token="workos:expired", expires_at=1)
+    manager = grant_manager(account, post)
+    assert await manager.refresh(account) is False
+    post.assert_not_awaited()
+
+    account = Account(id="dummy", access_token="workos:expired", expires_at=1,
+                      refresh_token="grant", notes={"client_id": "client_x"})
+    manager = grant_manager(account, post)
+    manager.cfg.pool.allow_token_refresh = False
+    assert await manager.refresh(account) is False
+    post.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_grant_token_for_another_account_is_rejected():
+    account = Account(id="dummy", access_token="workos:expired", expires_at=1,
+                      refresh_token="grant", notes={"client_id": "client_x"})
+    post = AsyncMock(return_value=httpx.Response(
+        200, json={"access_token": access_jwt(sub="someone-else")},
+        request=httpx.Request("POST", "https://dummy.invalid/authenticate")))
+    manager = grant_manager(account, post)
+    assert await manager.refresh(account) is False
+    assert account.access_token == "workos:expired"
+
+
+@pytest.mark.asyncio
+async def test_round_robin_survives_a_temporarily_unavailable_account():
+    a, b, c = [Account(id=name, access_token='fixture') for name in ('a', 'b', 'c')]
+    pool = PoolManager(Config().pool, [a, b, c])
+    try:
+        for model, excluded, expected in (
+            ('GLM-5.4', set(), a), ('GLM-5.4', {'b'}, c),
+            ('GLM-5.4', set(), a), ('GLM-5.3-Flash', set(), a),
+            ('GLM-5.4', set(), b),
+        ):
+            account = await pool.acquire(excluded, model=model)
+            assert account is expected
+            await pool.release(account)
+    finally:
+        await pool.aclose()

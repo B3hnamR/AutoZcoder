@@ -78,6 +78,7 @@ async def chat_completions(
 
     payload = dict(body)
     payload["model"] = upstream_model
+    payload['_affinity_scope'] = request.headers.get('x-zcode-affinity-scope', '')
 
     wants_stream = bool(body.get("stream", False))
 

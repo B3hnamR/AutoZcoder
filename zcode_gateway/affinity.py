@@ -1,9 +1,8 @@
 """Conversation affinity: keep one chat on one account for a short window.
 
-A multi-turn conversation that hops accounts loses the thread (the new account
-never saw the earlier turns) and the upstream prompt cache with it. The client
-is the only party that knows it is the same chat, so the session id it sends
-becomes the key.
+Related requests can reuse an upstream prompt cache by preferring the same
+account. A client session ID is authoritative; a matching opening user message
+is only a best-effort hint. Clients must still send the conversation history.
 
 Deliberately in-memory and bounded: entries expire, a stale binding is ignored
 when the account is no longer eligible, and a restart simply re-binds. Nothing
@@ -13,21 +12,43 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import threading
 import time
 
 __all__ = ["AffinityMap", "affinity_key_from_payload"]
 
 
-def affinity_key_from_payload(payload: dict) -> str:
-    """Stable key for the conversation, or '' when the client sent nothing.
+def _first_text(payload: dict) -> str:
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return ""
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get('role') != 'user':
+            continue
+        content = msg.get("content")
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and isinstance(block.get("text"), str) and block["text"].strip():
+                    return block["text"].strip()
+    return ""
+
+
+def affinity_key_from_payload(payload: dict, client_key: str = "") -> str:
+    """Stable key for the conversation, or '' when nothing identifies it.
 
     Anthropic clients put a JSON `metadata.user_id` on the request; Claude Code
     includes `session_id` inside it. OpenAI clients may send `user`, and some
-    wrappers send `conversation_id`/`session_id` at the top level.
+    wrappers send `conversation_id`/`session_id` at the top level. When none of
+    that exists, the first user message is a best-effort stand-in.
     """
     if not isinstance(payload, dict):
         return ""
+    scope = payload.get('_affinity_scope', '')
+    if not isinstance(scope, str) or not re.fullmatch(r'[0-9a-f]{64}', scope):
+        scope = ''
     native = payload.get("_anthropic")
     if isinstance(native, dict):
         payload = native
@@ -39,7 +60,7 @@ def affinity_key_from_payload(payload: dict) -> str:
             ident = raw.strip()
             try:
                 parsed = json.loads(ident)
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, RecursionError):
                 parsed = None
             if isinstance(parsed, dict):
                 ident = str(parsed.get("session_id")
@@ -53,9 +74,14 @@ def affinity_key_from_payload(payload: dict) -> str:
                 ident = value.strip()
                 break
     if not ident:
-        return ""
+        text = _first_text(payload)
+        if not text:
+            return ""
+        ident = ('prompt', text)
+    else:
+        ident = ('client', ident)
     # hash: the routing table must not hold user identifiers in memory/dumps
-    return hashlib.sha256(ident.encode("utf-8", "ignore")).hexdigest()[:32]
+    return hashlib.sha256(json.dumps((client_key, scope, ident)).encode()).hexdigest()[:32]
 
 
 class AffinityMap:

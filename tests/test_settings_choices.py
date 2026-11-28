@@ -44,11 +44,12 @@ def test_saving_strategy_updates_live_accounts_pool_without_restart(tmp_path, mo
     cfg, conf, app = _client(tmp_path, monkeypatch)
     h = {"Authorization": f"Bearer {cfg.server.admin_key}"}
     with TestClient(app) as c:
-        assert c.get("/admin/pool/state", headers=h).json()["strategy"] == "drain_first"
-        result = c.put("/admin/dash/settings", headers=h, json={"values": {"pool.strategy": "round_robin"}})
-        assert result.json() == {"changed": ["pool.strategy"], "restart_required": False}
+        # Spreading load is the default; switching it must still apply live.
         assert c.get("/admin/pool/state", headers=h).json()["strategy"] == "round_robin"
-    assert yaml.safe_load(conf.read_text(encoding="utf-8"))["pool"]["strategy"] == "round_robin"
+        result = c.put("/admin/dash/settings", headers=h, json={"values": {"pool.strategy": "drain_first"}})
+        assert result.json() == {"changed": ["pool.strategy"], "restart_required": False}
+        assert c.get("/admin/pool/state", headers=h).json()["strategy"] == "drain_first"
+    assert yaml.safe_load(conf.read_text(encoding="utf-8"))["pool"]["strategy"] == "drain_first"
 
 
 def test_enum_settings_reject_values_that_would_break_the_next_boot(tmp_path, monkeypatch):
@@ -82,6 +83,7 @@ def test_every_editable_setting_round_trips(tmp_path, monkeypatch):
         "server.host": "localhost", "server.port": 18788,
         "pool.strategy": "round_robin", "pool.min_balance_micro": 2,
         "pool.refresh_lead_seconds": 90, "pool.cooldown_seconds": 12,
+        "pool.allow_token_refresh": False,
         "pool.max_in_flight_per_account": 2, "pool.acquire_wait_seconds": 1.5,
         "pool.balance_poll_seconds": 42, "pool.blocked_model_cooldown_seconds": 60,
         "upstream.timeout_connect": 3.5, "upstream.timeout_read": 90.5,
