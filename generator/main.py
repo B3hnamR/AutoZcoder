@@ -1901,13 +1901,7 @@ def _main(auto_result=None):
                 giveaway500 = False
                 start_plan = False
                 start_plan_id = ''
-                if auto and starter and claim_start_on and isinstance(result, str):
-                    # The plan check already proved a live Start Plan. Auto's goal
-                    # is that plan, so the campaign pass (device login, previews,
-                    # marketing touches) only adds lag and can report a fresh
-                    # "nothing claimable" over a plan that is demonstrably active.
-                    logger.info(f"Start Plan already active for {email}; campaign claim skipped")
-                elif claim_start_on and isinstance(result, str):
+                if claim_start_on and isinstance(result, str):
                     try:
                         from claim_start import claim_start as run_claim_start
                         rc = run_claim_start(token, log=logger.info,
