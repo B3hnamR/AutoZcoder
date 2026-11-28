@@ -49,6 +49,7 @@ _EDITABLE = {
     "server.host": str, "server.port": int,
     "pool.strategy": str, "pool.min_balance_micro": int,
     "pool.refresh_lead_seconds": int, "pool.cooldown_seconds": int,
+    "pool.allow_token_refresh": bool,
     "pool.max_in_flight_per_account": int, "pool.acquire_wait_seconds": float,
     "pool.balance_poll_seconds": int, "pool.blocked_model_cooldown_seconds": int,
     "upstream.timeout_connect": float, "upstream.timeout_read": float,
@@ -440,7 +441,13 @@ async def dash_settings_put(request: Request, body: dict = Body(...),
         await asyncio.to_thread(_atomic_write_yaml, cfg_path, raw)
     if "pool.strategy" in values:
         state.cfg.pool.strategy = validated.pool.strategy
-    return {"changed": changed, "restart_required": any(k != "pool.strategy" for k in changed)}
+    if "models.default_effort" in values:
+        # Reasoning effort is read per request from the live config, so no restart.
+        state.cfg.models.default_effort = validated.models.default_effort
+    if "pool.allow_token_refresh" in values:
+        state.cfg.pool.allow_token_refresh = validated.pool.allow_token_refresh
+    return {"changed": changed, "restart_required": any(
+        k not in ("pool.strategy", "models.default_effort", "pool.allow_token_refresh") for k in changed)}
 
 
 @router.post("/admin/dash/import")
@@ -2057,9 +2064,31 @@ async def generator_proxies_countries(request: Request, key: str = Depends(admin
 
 # ---- Edge Relays (Cloudflare, Vercel, Deno, Netlify) ------------------------ #
 
+def vpn_relay_exits(state) -> list[dict]:
+    """Connected bundled exits, usable as relays through their socks port."""
+    mgr = getattr(state, "generator", None)
+    if mgr is None:
+        return []
+    from .generator import REGION_NAMES
+    rows = []
+    for kind, pool in (("psiphon", getattr(mgr, "psiphon", None)),
+                       ("surfshark", getattr(mgr, "surfshark", None))):
+        if pool is None:
+            continue
+        for inst in pool.ready():
+            if kind == "psiphon":
+                label = f"Psiphon \u00b7 {REGION_NAMES.get(inst.region, inst.region)} ({inst.region})"
+            else:
+                label = f"Surfshark \u00b7 {pool.pick_label(inst)}"
+            rows.append({"key": f"{kind}:{inst.region}", "label": label,
+                         "url": f"socks5://127.0.0.1:{inst.port}"})
+    return rows
+
+
 def _relay_mgr(request: Request):
     state = get_state(request)
     mgr = getattr(state, "relay_manager", None)
+    resolver = lambda: vpn_relay_exits(state)
     if mgr is None:
         from .relay_manager import RelayManager
         data_dir = (Path(state.cfg.accounts.dir).resolve().parent / "generator-data") if state.cfg.accounts.dir else Path("./generator-data")
@@ -2067,6 +2096,7 @@ def _relay_mgr(request: Request):
         state.relay_manager = mgr
         if getattr(state, "client", None) and not getattr(state.client, "relay_manager", None):
             state.client.relay_manager = mgr
+    mgr.set_vpn_resolver(resolver)
     return mgr
 
 
@@ -2138,11 +2168,12 @@ async def save_relay_settings(request: Request, body: dict = Body(...),
     enabled = body.get("enabled")
     active_id = body.get("active_id")
     strategy = body.get("strategy")
+    vpn_ids = body.get("vpn_ids")
     try:
         # update_options ends in a relays.json write — off the loop
         st = await asyncio.to_thread(
             mgr.update_options, models=models, enabled=enabled,
-            active_id=active_id, strategy=strategy)
+            active_id=active_id, strategy=strategy, vpn_ids=vpn_ids)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from None
     return {"ok": True, "settings": st}

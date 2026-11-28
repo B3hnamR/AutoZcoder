@@ -661,3 +661,45 @@ def test_generator_ip_source_card_lists_bundled_exits(dashboard):
             assert position > 0
             page.evaluate("view.refresh()")
             assert scroll.evaluate("(node, position) => node.scrollTop === position && node === document.activeElement", position)
+
+
+def test_relay_card_offers_connected_vpn_exits_as_relays(dashboard):
+    page, _, defaults, calls = dashboard
+    state = {
+        "enabled": True, "strategy": "single", "models": ["GLM-5.4"],
+        "vpn_ids": [], "relays": [],
+        "vpn_exits": [{"key": "psiphon:DE", "label": "Psiphon · Germany (DE)",
+                       "url": "socks5://127.0.0.1:47190"}],
+    }
+    defaults["/admin/dash/relays"] = state
+
+    def save(route):
+        body = route.request.post_data_json
+        calls.append(("POST", "/admin/dash/relays/settings", body))
+        state["vpn_ids"] = body.get("vpn_ids") or []
+        route.fulfill(json={"ok": True, "settings": state})
+
+    page.route("**/admin/dash/relays/settings", save)
+    page.evaluate("""async () => {
+      const module = await import('/assets/js/views/proxy/relays.js');
+      const card = module.createRelaysCard();
+      document.querySelector('#root').replaceChildren(card.node);
+      window.card = card;
+      await card.refresh();
+    }""")
+    chip = page.get_by_role("checkbox", name="Psiphon · Germany (DE)", exact=True)
+    chip.check()
+    page.wait_for_function("document.querySelector('.relay-vpns input:checked') !== null")
+    assert chip.is_checked()
+    last = [entry[2] for entry in calls if entry[1].endswith("/relays/settings")][-1]
+    assert last["vpn_ids"] == ["psiphon:DE"]
+    assert last["models"] == ["GLM-5.4"]
+
+    chip.uncheck()
+    page.wait_for_function("document.querySelector('.relay-vpns input:checked') === null")
+    last = [entry[2] for entry in calls if entry[1].endswith("/relays/settings")][-1]
+    assert last["vpn_ids"] == []
+
+    state["vpn_exits"] = []
+    page.evaluate("window.card.refresh()")
+    assert page.get_by_text("No connected VPN exits", exact=False).is_visible()

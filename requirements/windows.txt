@@ -8,6 +8,7 @@ PyYAML>=6.0,<7.0
 # gateway registers a freshly created account into the pool
 requests>=2.31,<3.0
 PySocks>=1.7.1,<2.0
+socksio>=1.0.0,<2.0
 # relay deploys use the Windows system cert store (frozen exe has no certifi
 # bundle; AV/proxy TLS interception broke api.netlify.com etc.)
 truststore>=0.9

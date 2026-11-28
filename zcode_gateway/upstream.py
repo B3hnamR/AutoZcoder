@@ -366,6 +366,9 @@ class UpstreamClient:
             follow_redirects=False,
             http2=False,
         )
+        # VPN exits are socks ports; httpx takes a proxy per client, not per
+        # request, so keep one client per exit. Streams keep it alive.
+        self._relay_clients: dict[str, httpx.AsyncClient] = {}
 
     async def _pace(self) -> None:
         """Hold the shared lock for a randomized gap after the previous send.
@@ -384,7 +387,33 @@ class UpstreamClient:
             UpstreamClient._last_send_at = time.monotonic()
 
     async def aclose(self) -> None:
+        for client in self._relay_clients.values():
+            try:
+                await client.aclose()
+            except Exception:
+                pass
+        self._relay_clients.clear()
         await self._client.aclose()
+
+    async def _relay_client(self, url: str) -> httpx.AsyncClient:
+        client = self._relay_clients.get(url)
+        if client is None:
+            client = httpx.AsyncClient(
+                proxy=url,
+                timeout=httpx.Timeout(self.cfg.timeout_read,
+                                      connect=self.cfg.timeout_connect),
+                limits=httpx.Limits(max_connections=20,
+                                    max_keepalive_connections=5),
+                headers={},
+                follow_redirects=False,
+                http2=False,
+            )
+            self._relay_clients[url] = client
+            if len(self._relay_clients) > 16:
+                stale = next(iter(self._relay_clients))
+                if stale != url:
+                    await self._relay_clients.pop(stale).aclose()
+        return client
 
     async def send(self, headers: dict[str, str], body: dict[str, Any],
                    stream: bool) -> UpstreamResponse:
@@ -414,7 +443,7 @@ class UpstreamClient:
                 relay_entry = self.relay_manager.pick_relay_for_model(req_model)
                 relay_url = ((relay_entry or {}).get("url") or "").strip() or None
                 relay_secret = (relay_entry or {}).get("secret") or ""
-                if relay_url and require_incremental:
+                if relay_url and require_incremental and relay_entry.get("type") != "vpn":
                     from urllib.parse import urlsplit
 
                     relay_path = urlsplit(relay_url).path
@@ -426,7 +455,14 @@ class UpstreamClient:
                     break
 
             try:
-                if relay_url:
+                if relay_url and relay_entry.get("type") == "vpn":
+                    # The exit is a tunnel, not a forwarder: post straight to
+                    # the real upstream through it.
+                    client = await self._relay_client(relay_url)
+                    req = client.build_request(
+                        "POST", self.cfg.chat_url, headers=headers, json=wire_body,
+                    )
+                elif relay_url:
                     import urllib.parse
                     parsed = urllib.parse.urlparse(self.cfg.chat_url)
                     target = f"{parsed.scheme}://{parsed.netloc}"
@@ -448,8 +484,9 @@ class UpstreamClient:
                         "POST", self.cfg.chat_url, headers=headers, json=wire_body,
                     )
                 resp = await self._client.send(req, stream=stream)
-            except httpx.HTTPError as exc:
-                # relay (or direct) transport failure: mark + rotate
+            except (httpx.HTTPError, OSError) as exc:
+                # relay (or direct) transport failure: mark + rotate. OSError
+                # covers a dead socks port from a dropped VPN exit.
                 if relay_url and self.relay_manager:
                     self.relay_manager.mark_relay_failed(relay_url)
                     tried_relay_urls.append(relay_url)

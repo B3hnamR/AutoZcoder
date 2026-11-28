@@ -20,6 +20,7 @@ export function createRelaysCard() {
 
   const listBox = el("div", {});
   const controlsBox = el("div", { class: "relay-controls" });
+  const vpnBox = el("div", { class: "relay-vpns" });
   const statusNote = el("span", { class: "muted text-xs" });
 
   const node = card({
@@ -28,6 +29,7 @@ export function createRelaysCard() {
     actions: statusNote,
     body: el("div", { class: "stack" }, [
       controlsBox,
+      vpnBox,
       el("div", { class: "row" }, [
         ...PROVIDERS.map((p) => button({
           label: "Deploy " + p.label, onClick: () => openDeploy(p.id),
@@ -42,16 +44,22 @@ export function createRelaysCard() {
 
   /* --------------------------------------------------------- settings --- */
 
-  async function saveSettings() {
+  function vpnIds() {
+    return (data.vpn_ids || []).slice();
+  }
+
+  async function saveSettings(extra = {}) {
     const body = {
       enabled: controls.enabled.checked,
       strategy: controls.strategy.value,
+      vpn_ids: vpnIds(),
       models: [
         // the gateway's canonical ids; relay matching is case-insensitive, but
         // saving lowercase rewrote the stored setting on every toggle
         controls.glm54.checked ? "GLM-5.4" : null,
         controls.flash.checked ? "GLM-5.3-Flash" : null,
       ].filter(Boolean),
+      ...extra,
     };
     try {
       await api.post("/admin/dash/relays/settings", body);
@@ -86,6 +94,33 @@ export function createRelaysCard() {
     controls.strategy,
     el("span", { class: "faint text-xs", text: "A failed relay is skipped for 60s." }),
   ]);
+
+  async function toggleVpn(key, on) {
+    const ids = new Set(data.vpn_ids || []);
+    if (on) ids.add(key); else ids.delete(key);
+    data.vpn_ids = [...ids];
+    await saveSettings({ vpn_ids: data.vpn_ids });
+    refresh();
+  }
+
+  function paintVpns() {
+    const exits = data.vpn_exits || [];
+    if (!exits.length) {
+      fill(vpnBox, el("p", { class: "field__help", text:
+        "No connected VPN exits. Connect one under IP Routes to offer it as a relay; no deploy needed." }));
+      return;
+    }
+    fill(vpnBox, [
+      el("span", { class: "field__label", text: "VPN exits" }),
+      ...exits.map((exit) => {
+        const input = el("input", { type: "checkbox", checked: (data.vpn_ids || []).includes(exit.key),
+          on: { change: () => toggleVpn(exit.key, input.checked) } });
+        return el("label", { class: "chip", title: exit.url }, [input, el("span", { text: exit.label })]);
+      }),
+      el("span", { class: "field__help", text:
+        "Connected exits act as relays through their local tunnel. They follow the same rotation and 60s skip." }),
+    ]);
+  }
 
   /* ---------------------------------------------------------- actions --- */
 
@@ -216,6 +251,7 @@ export function createRelaysCard() {
     controls.glm54.checked = models.some((m) => /5\.4$/i.test(m));
     controls.flash.checked = models.some((m) => /flash/i.test(m));
 
+    paintVpns();
     fill(listBox, table({
       columns: [
         { label: "Relay" }, { label: "Provider" }, { label: "Status" },

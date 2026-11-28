@@ -131,7 +131,8 @@ VPN_ARGS+=(
     --hidden-import anyio._backends._asyncio \
     --hidden-import httpcore --hidden-import h11 \
     --hidden-import requests --hidden-import urllib3 \
-    --hidden-import urllib3.contrib.socks --hidden-import socks --hidden-import certifi \
+    --hidden-import urllib3.contrib.socks --hidden-import socks \
+    --hidden-import socksio --hidden-import socksio._async_socks5 --hidden-import certifi \
     --hidden-import yaml \
     --hidden-import zcode_gateway.generator \
     --hidden-import zcode_gateway.accounts_dir_bridge \

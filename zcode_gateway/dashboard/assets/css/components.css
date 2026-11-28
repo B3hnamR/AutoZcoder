@@ -646,6 +646,17 @@
   background: var(--surface-2);
 }
 .relay-controls__sep { width: 1px; height: 18px; background: var(--border-strong); }
+.relay-vpns {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--s-2) var(--s-3);
+  padding: var(--s-3) var(--s-5);
+  border: 1px dashed var(--border);
+  border-radius: var(--r-md);
+}
+.relay-vpns > .field__help { flex: 1 0 100%; margin: 0; }
+.relay-vpns .chip { flex: 0 0 auto; }
 
 /* ---- guide ------------------------------------------------------------ */
 .guide-intro { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--s-6); flex-wrap: wrap; }

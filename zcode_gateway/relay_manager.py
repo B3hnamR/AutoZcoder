@@ -13,8 +13,9 @@ a cool-down.
 """
 from __future__ import annotations
 
-import json
 import copy
+import json
+import socket
 
 from .registry import DEFAULT_ANTHROPIC_MODEL, is_retired_model
 import logging
@@ -60,6 +61,10 @@ class RelayManager:
         # into the rotation cooldown, keep last_* fields fresh for the table
         self._health_thread: threading.Thread | None = None
         self._health_stop = threading.Event()
+        # Optional: connected bundled VPN exits, so those can act as relays
+        # without deploying a worker. Returns
+        # [{"key": "psiphon:DE", "label": "...", "url": "socks5://..."}].
+        self._vpn_resolver = None
 
     def start_health_loop(self, interval_s: int = 300) -> None:
         """Ping all relays every interval (default 5 min). Idempotent."""
@@ -88,7 +93,10 @@ class RelayManager:
             if not url:
                 continue
             try:
-                res = ping_relay(url, secret=r.get("secret") or "")
+                if r.get("type") == "vpn":
+                    res = self._probe_socks(url)
+                else:
+                    res = ping_relay(url, secret=r.get("secret") or "")
                 out[r["id"]] = {"ok": bool(res.get("ok")),
                                 "latency_ms": res.get("elapsed_ms")}
             except Exception as e:
@@ -126,13 +134,14 @@ class RelayManager:
             "active_id": "",
             "models": [DEFAULT_ANTHROPIC_MODEL],
             "strategy": "single",   # single | round_robin | random
+            "vpn_ids": [],          # selected VPN exits (see _vpn_entries)
             "relays": [],
         }
 
     def get_settings(self) -> dict[str, Any]:
         with self._lock:
             if self._cache is not None:
-                return copy.deepcopy(self._cache)
+                return self._merged(self._cache)
             if self.path.exists():
                 try:
                     data = json.loads(self.path.read_text(encoding="utf-8"))
@@ -140,8 +149,9 @@ class RelayManager:
                         settings = self._default_settings()
                         settings.update(data)
                         settings["models"] = self._supported_models(settings.get("models"))
+                        settings["vpn_ids"] = self._vpn_ids(settings.get("vpn_ids"))
                         self._cache = settings
-                        return copy.deepcopy(settings)
+                        return self._merged(settings)
                 except Exception:
                     # Do not cache a transient read failure as authoritative defaults.
                     log.warning("relays.json could not be read; serving temporary defaults",
@@ -149,14 +159,69 @@ class RelayManager:
                     return self._default_settings()
             settings = self._default_settings()
             self._cache = settings
-            return copy.deepcopy(settings)
+            return self._merged(settings)
+
+    def set_vpn_resolver(self, resolver) -> None:
+        self._vpn_resolver = resolver
+
+    @staticmethod
+    def _vpn_ids(ids) -> list[str]:
+        out = []
+        for value in ids or []:
+            if not isinstance(value, str):
+                continue
+            kind, _, region = value.partition(":")
+            if kind in ("psiphon", "surfshark") and region and value not in out:
+                out.append(value)
+        return out
+
+    def _vpn_entries(self, settings: dict[str, Any]) -> list[dict[str, Any]]:
+        """Ephemeral relay rows for the selected, currently connected exits."""
+        if self._vpn_resolver is None:
+            return []
+        wanted = set(settings.get("vpn_ids") or [])
+        if not wanted:
+            return []
+        try:
+            available = self._vpn_resolver() or []
+        except Exception:
+            return []
+        rows = []
+        for item in available:
+            key = item.get("key")
+            if key in wanted and item.get("url"):
+                rows.append({"id": "vpn:" + key, "name": item.get("label") or key,
+                             "type": "vpn", "url": item["url"],
+                             "vpn": key.split(":", 1)[0]})
+        return rows
+
+    def _merged(self, settings: dict[str, Any]) -> dict[str, Any]:
+        out = copy.deepcopy(settings)
+        out["relays"] = [*(out.get("relays") or []), *self._vpn_entries(settings)]
+        out["vpn_exits"] = self._vpn_available()
+        return out
+
+    def _vpn_available(self) -> list[dict[str, Any]]:
+        if self._vpn_resolver is None:
+            return []
+        try:
+            return list(self._vpn_resolver() or [])
+        except Exception:
+            return []
 
     def save_settings(self, settings: dict[str, Any]) -> None:
         with self._lock:
-            self._cache = copy.deepcopy(settings)
+            # VPN rows are generated from the live pools; persisting them would
+            # freeze a port that dies with the tunnel.
+            clean = copy.deepcopy(settings)
+            clean.pop("vpn_exits", None)
+            clean["vpn_ids"] = self._vpn_ids(clean.get("vpn_ids"))
+            clean["relays"] = [r for r in clean.get("relays") or []
+                               if r.get("type") != "vpn"]
+            self._cache = clean
             self.data_dir.mkdir(parents=True, exist_ok=True)
             tmp = self.path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(settings, indent=2, ensure_ascii=False), encoding="utf-8")
+            tmp.write_text(json.dumps(clean, indent=2, ensure_ascii=False), encoding="utf-8")
             tmp.replace(self.path)
 
     @staticmethod
@@ -324,6 +389,16 @@ class RelayManager:
         # Same whole-operation lock as add_relay (see above).
         with self._lock:
             st = self.get_settings()
+            if str(relay_id).startswith("vpn:"):
+                key = relay_id[4:]
+                if key not in st.get("vpn_ids") or []:
+                    return False
+                st["vpn_ids"] = [i for i in st["vpn_ids"] if i != key]
+                if st.get("active_id") == relay_id:
+                    st["active_id"] = ""
+                    st["active_url"] = ""
+                self.save_settings(st)
+                return True
             orig_len = len(st["relays"])
             st["relays"] = [r for r in st["relays"] if r.get("id") != relay_id]
             if len(st["relays"]) == orig_len:
@@ -378,7 +453,8 @@ class RelayManager:
     def update_options(self, models: list[str] | None = None,
                        enabled: bool | None = None,
                        active_id: str | None = None,
-                       strategy: str | None = None) -> dict[str, Any]:
+                       strategy: str | None = None,
+                       vpn_ids: list[str] | None = None) -> dict[str, Any]:
         # Apply ALL provided fields to one snapshot, then save once.
         # The old flow delegated active_id to set_active(), which re-read the
         # cache BEFORE this call's models/enabled were persisted — so saving
@@ -390,6 +466,16 @@ class RelayManager:
                 st["models"] = self._supported_models(models)
             if enabled is not None:
                 st["enabled"] = bool(enabled)
+            if vpn_ids is not None:
+                st["vpn_ids"] = self._vpn_ids(vpn_ids)
+                # a deselected exit can no longer be the pinned active relay
+                if str(st.get("active_id") or "").startswith("vpn:") and \
+                        st["active_id"][4:] not in st["vpn_ids"]:
+                    st["active_id"] = ""
+                    st["active_url"] = ""
+                # rows captured at entry predate this selection
+                st["relays"] = [r for r in st["relays"] if r.get("type") != "vpn"]
+                st["relays"] += self._vpn_entries(st)
             if strategy is not None:
                 s = str(strategy).lower().strip()
                 if s not in STRATEGIES:
@@ -404,12 +490,28 @@ class RelayManager:
             self.save_settings(st)
             return st
 
+    @staticmethod
+    def _probe_socks(url: str) -> dict[str, Any]:
+        """A VPN exit is a local socks port, not an HTTP forwarder."""
+        started = time.time()
+        parsed = urlparse(url)
+        try:
+            with socket.create_connection((parsed.hostname or "127.0.0.1",
+                                           parsed.port or 1080), timeout=5):
+                return {"ok": True, "status": 200,
+                        "elapsed_ms": (time.time() - started) * 1000}
+        except OSError as exc:
+            return {"ok": False, "error": str(exc)[:120]}
+
     def test_relay_by_id(self, relay_id: str) -> dict[str, Any]:
         st = self.get_settings()
         target = next((r for r in st["relays"] if r.get("id") == relay_id), None)
         if not target:
             return {"ok": False, "error": "Relay not found"}
-        res = ping_relay(target["url"], secret=target.get("secret") or "")
+        if target.get("type") == "vpn":
+            res = self._probe_socks(target["url"])
+        else:
+            res = ping_relay(target["url"], secret=target.get("secret") or "")
         self._merge_health([(target, res, time.time())])
         return res
 

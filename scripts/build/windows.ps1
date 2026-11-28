@@ -141,6 +141,8 @@ $buildArgs = @(
     "--hidden-import", "urllib3",
     "--hidden-import", "urllib3.contrib.socks",
     "--hidden-import", "socks",
+    "--hidden-import", "socksio",
+    "--hidden-import", "socksio._async_socks5",
     "--hidden-import", "certifi",
     "--hidden-import", "uvicorn.loops.auto",
     "--hidden-import", "uvicorn.protocols",

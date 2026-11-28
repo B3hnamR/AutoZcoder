@@ -250,3 +250,44 @@ def test_all_relays_failed_still_routes(tmp_path: Path):
     mgr.mark_relay_failed("https://cf2.workers.dev")
     assert mgr.get_relay_for_model("GLM-5.4") in {
         "https://cf1.workers.dev", "https://cf2.workers.dev"}
+
+
+def test_connected_vpn_exits_join_rotation_only_when_selected(tmp_path: Path):
+    mgr = RelayManager(data_dir=tmp_path)
+    exits = [{"key": "psiphon:DE", "label": "Psiphon · Germany (DE)",
+              "url": "socks5://127.0.0.1:47190"}]
+    mgr.set_vpn_resolver(lambda: list(exits))
+    assert mgr.get_settings()["relays"] == []
+
+    mgr.update_options(enabled=True, vpn_ids=["psiphon:DE", "bogus", "psiphon:DE"])
+    st = mgr.get_settings()
+    assert st["vpn_ids"] == ["psiphon:DE"]
+    assert [r["id"] for r in st["relays"]] == ["vpn:psiphon:DE"]
+    assert st["vpn_exits"][0]["key"] == "psiphon:DE"
+    # generated rows describe a live port, so they never reach relays.json
+    assert json.loads(mgr.path.read_text(encoding="utf-8"))["relays"] == []
+    assert mgr.get_relay_count() == 1
+    assert mgr.pick_relay_for_model("GLM-5.4")["url"] == "socks5://127.0.0.1:47190"
+
+    exits.clear()
+    st = mgr.get_settings()
+    assert st["relays"] == [] and st["vpn_ids"] == ["psiphon:DE"]
+
+    exits.append({"key": "surfshark:nl-ams", "label": "Surfshark · Amsterdam",
+                  "url": "socks5://127.0.0.1:47400"})
+    mgr.update_options(vpn_ids=["surfshark:nl-ams"], active_id="vpn:surfshark:nl-ams")
+    assert mgr.get_settings()["active_url"] == "socks5://127.0.0.1:47400"
+    assert mgr.delete_relay("vpn:surfshark:nl-ams") is True
+    assert mgr.get_settings()["vpn_ids"] == []
+    assert mgr.get_settings()["active_id"] == ""
+    assert mgr.delete_relay("vpn:surfshark:nl-ams") is False
+
+
+@pytest.mark.asyncio
+async def test_vpn_relay_gets_its_own_socks_client():
+    client = UpstreamClient(UpstreamConfig(), relay_manager=None)
+    first = await client._relay_client("socks5://127.0.0.1:47190")
+    again = await client._relay_client("socks5://127.0.0.1:47190")
+    assert first is again and first is not client._client
+    await client.aclose()
+    assert client._relay_clients == {}
