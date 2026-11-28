@@ -1482,7 +1482,15 @@ class CatchAllMail:
             _secret_filter.remember(value)
 
     def _pick_domain(self) -> str:
-        """Rotation across the user's configured domains (ZAI_MAIL_DOMAIN wins)."""
+        """Pick a domain for this signup.
+
+        ZAI_MAIL_DOMAINS (set by the dashboard) is the exact routed set and is
+        used as-is; otherwise rotate across CONFIG['mail_domains'] plus the
+        primary domain."""
+        env_domains = [d.strip().lower() for d in
+                       (os.environ.get('ZAI_MAIL_DOMAINS') or '').split(',') if d.strip()]
+        if env_domains:
+            return random.choice(env_domains)
         domains = [d.strip() for d in CONFIG.get('mail_domains') or [] if d.strip()]
         if self.domain not in domains:
             domains.insert(0, self.domain)

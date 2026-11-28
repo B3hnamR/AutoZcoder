@@ -1974,7 +1974,8 @@ class GeneratorManager:
     # ---- email system -------------------------------------------------------
 
     def _default_mail(self) -> dict:
-        return {"domains": [], "active": "", "inbox_url": "", "inbox_secret": ""}
+        return {"domains": [], "active": "", "rotate": False,
+                "inbox_url": "", "inbox_secret": ""}
 
     def _load_mail_config(self):
         try:
@@ -2021,18 +2022,42 @@ class GeneratorManager:
         m["routing_done"] = sorted(done)
         m["routing_all_done"] = bool(doms) and all(d in done for d in doms)
         m["routing_pending"] = [d for d in doms if d not in done]
+        m["rotate"] = m.get("rotate") is True
+        m["domains_in_use"] = self._mail_domains_in_use(m)
+        m["routing_in_use_done"] = (bool(m["domains_in_use"])
+                                    and all(d in done for d in m["domains_in_use"]))
         m["ready"] = self._mail_ready(m)
         m.pop("inbox_secret", None)
         m["cf_token_set"] = bool(m.pop("cf_api_token", ""))
         return m
 
     @staticmethod
-    def _mail_ready(mail: dict) -> bool:
-        domains = mail.get("domains") or []
-        return bool(domains and mail.get("active") in domains and mail.get("inbox_url")
+    def _mail_domains_in_use(mail: dict) -> list[str]:
+        """Domains signups draw addresses from.
+
+        Rotate mode uses every domain whose routing is configured (the active
+        one first); otherwise only the active domain. Domains still waiting on
+        routing never receive signups, so they cannot block or burn accounts."""
+        doms = [str(d).strip().lower() for d in (mail.get("domains") or [])]
+        done = {str(d).strip().lower() for d in (mail.get("routing_done") or [])}
+        active = str(mail.get("active") or "").strip().lower()
+        if mail.get("rotate") is True:
+            routed = [d for d in doms if d in done]
+            return sorted(routed, key=lambda d: d != active)
+        return [active] if active and active in doms else []
+
+    @classmethod
+    def _mail_ready(cls, mail: dict) -> bool:
+        in_use = cls._mail_domains_in_use(mail)
+        done = {str(d).strip().lower() for d in (mail.get("routing_done") or [])}
+        return bool(in_use and mail.get("inbox_url")
                     and (mail.get("inbox_secret_set") or mail.get("inbox_secret"))
                     and mail.get("inbox_ok")
-                    and all(d in (mail.get("routing_done") or []) for d in domains))
+                    and all(d in done for d in in_use))
+
+    # Hostname labels plus a letter TLD or an IDN (punycode) TLD such as xn--p1ai.
+    _MAIL_DOMAIN_RE = re.compile(
+        r'(?=.{4,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:[a-z]{2,63}|xn--[a-z0-9-]{1,59})')
 
     _MAIL_SETUP_REQUIRED = "Finish Email setup before starting: configure domain routing and verify the worker inbox."
 
@@ -2917,7 +2942,7 @@ class GeneratorManager:
                 res["routing"] = self.auto_route_all(progress)
             config = self.mail_config()
             res["inbox_ok"] = config.get("inbox_ok") is True
-            res["routing_ok"] = config.get("routing_all_done") is True
+            res["routing_ok"] = config.get("routing_in_use_done") is True
             res["ready"] = res["inbox_ok"] and res["routing_ok"]
             res["config"] = config
             return self._redact_mail_result(res)
@@ -3362,7 +3387,7 @@ class GeneratorManager:
             doms = []
             for d in (kw["domains"] or []):
                 d = str(d or "").strip().lower().lstrip('@')
-                if d and re.fullmatch(r'[a-z0-9.-]+\.[a-z]{2,}', d) and d not in doms:
+                if d and self._MAIL_DOMAIN_RE.fullmatch(d) and d not in doms:
                     doms.append(d)
             cfg["domains"] = doms
             cfg["routing_done"] = [d for d in cfg.get("routing_done", []) if d in doms]
@@ -3372,6 +3397,8 @@ class GeneratorManager:
             a = str(kw["active"] or "").strip().lower().lstrip('@')
             if a in cfg["domains"]:
                 cfg["active"] = a
+        if "rotate" in kw:
+            cfg["rotate"] = kw["rotate"] is True
         if "inbox_url" in kw:
             u = str(kw["inbox_url"] or "").strip()
             if u and not u.startswith(("http://", "https://")):
@@ -4119,8 +4146,12 @@ class GeneratorManager:
         env["ZAI_CLAIM500"] = "1" if self.claim500 else "0"
         # email: the user's own domains + worker inbox (public-ready setup)
         m = self.mail_cfg
-        if m.get("active"):
-            env["ZAI_MAIL_DOMAIN"] = m["active"]
+        in_use = self._mail_domains_in_use(m)
+        if in_use:
+            # ZAI_MAIL_DOMAIN stays the primary for older generator builds;
+            # ZAI_MAIL_DOMAINS is the full routed set each signup picks from.
+            env["ZAI_MAIL_DOMAIN"] = in_use[0]
+            env["ZAI_MAIL_DOMAINS"] = ",".join(in_use)
         if m.get("inbox_url"):
             env["ZAI_INBOX_URL"] = m["inbox_url"]
         if m.get("inbox_secret"):

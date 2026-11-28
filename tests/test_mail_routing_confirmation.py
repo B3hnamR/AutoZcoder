@@ -269,8 +269,8 @@ def test_email_setup_is_one_action_with_independent_readiness_checks():
     wizard = mail[mail.index("function paint(m)"):mail.index("function build()")]
     assert "const credentialsSaved = !!m.inbox_url && m.inbox_secret_set === true" in wizard
     assert "const inboxVerified = credentialsSaved && m.inbox_ok === true" in wizard
-    assert "doms.length > 0 && doms.every((d) => (m.routing_done || []).includes(d))" in wizard
-    assert "doms.some((d) => state.review.has(d))" in wizard
+    assert "const routingDone = m.routing_in_use_done === true" in wizard
+    assert "inUse.some((d) => state.review.has(d))" in wizard
     assert "const ready = inboxVerified && routingDone && !needsConfirmation" in wizard
     assert "Email ready" in wizard
     assert 'id: "mail-new-domain"' in mail and 'id: "mail-cf-token"' in mail
