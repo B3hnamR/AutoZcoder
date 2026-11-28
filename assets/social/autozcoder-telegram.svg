@@ -1,0 +1,78 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1000" viewBox="0 0 1600 1000" fill="none" role="img" aria-labelledby="title desc">
+  <title id="title">AutoZCoder - Your ZCode accounts. One gateway.</title>
+  <desc id="desc">Self-hosted on Windows and Linux. OpenAI and Anthropic compatible APIs. Explore github.com/B3hnamR/AutoZcoder. An abstract routing illustration connects multiple accounts through the violet Z gateway.</desc>
+  <defs>
+    <radialGradient id="ambient" cx="0" cy="0" r="1" gradientTransform="translate(1330 390) rotate(90) scale(560 620)" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#8b7cf7" stop-opacity=".14"/>
+      <stop offset="1" stop-color="#8b7cf7" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="tile" x1="1160" y1="290" x2="1435" y2="570" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#b3a7fb"/>
+      <stop offset=".55" stop-color="#8b7cf7"/>
+      <stop offset="1" stop-color="#7564e5"/>
+    </linearGradient>
+    <linearGradient id="route" x1="1008" y1="0" x2="1160" y2="0" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#55506c"/>
+      <stop offset="1" stop-color="#b3a7fb"/>
+    </linearGradient>
+    <pattern id="grid" width="64" height="64" patternUnits="userSpaceOnUse">
+      <path d="M64 0H0V64" stroke="#b3a7fb" stroke-opacity=".055"/>
+    </pattern>
+  </defs>
+
+  <!-- Ink canvas and a quiet technical field behind the routing mark. -->
+  <rect width="1600" height="1000" fill="#0f1115"/>
+  <rect x="910" width="690" height="826" fill="url(#grid)"/>
+  <rect width="1600" height="1000" fill="url(#ambient)"/>
+  <path d="M96 0H1504" stroke="#8b7cf7" stroke-width="6"/>
+
+  <g font-family="Segoe UI, Arial, sans-serif">
+    <g id="eyebrow">
+      <rect x="96" y="88" width="40" height="40" rx="11" fill="#8b7cf7"/>
+      <path d="M108 100H125L108 116H125" stroke="#0f1115" stroke-width="4.5"/>
+      <text x="158" y="118" fill="#b3a7fb" font-size="27" font-weight="600" letter-spacing="3.4">SELF-HOSTED AI GATEWAY</text>
+    </g>
+
+    <text id="wordmark" x="89" y="300" fill="#f3f2f9" font-size="150" font-weight="700" letter-spacing="-7">AutoZCoder</text>
+    <g id="tagline" font-size="66" letter-spacing="-1.7">
+      <text x="96" y="429" fill="#e8eaf0">Your ZCode accounts.</text>
+      <text x="96" y="515" fill="#b3a7fb" font-weight="600">One gateway.</text>
+    </g>
+
+    <!-- Abstract account routing, not a product screenshot. -->
+    <g id="gateway-illustration">
+      <rect x="1127" y="257" width="342" height="342" rx="90" stroke="#b3a7fb" stroke-opacity=".13"/>
+      <path d="M1013 312H1050Q1074 312 1074 336V404Q1074 428 1098 428H1160M1013 428H1160M1013 544H1050Q1074 544 1074 520V452Q1074 428 1098 428" stroke="url(#route)" stroke-width="3"/>
+      <g fill="#181922" stroke="#77708e" stroke-width="2">
+        <rect x="975" y="293" width="38" height="38" rx="12"/>
+        <rect x="975" y="409" width="38" height="38" rx="12"/>
+        <rect x="975" y="525" width="38" height="38" rx="12"/>
+      </g>
+      <g fill="#b3a7fb">
+        <circle cx="994" cy="312" r="5"/>
+        <circle cx="994" cy="428" r="5"/>
+        <circle cx="994" cy="544" r="5"/>
+        <circle cx="1104" cy="428" r="5"/>
+      </g>
+      <path d="M1436 428H1511M1501 418L1511 428L1501 438" stroke="#b3a7fb" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+      <rect x="1160" y="290" width="276" height="276" rx="67" fill="url(#tile)"/>
+      <rect x="1161" y="291" width="274" height="274" rx="66" stroke="#e0d9ff" stroke-opacity=".35" stroke-width="2"/>
+      <path d="M1248 368H1352V382L1248 489H1352" stroke="#0f1115" stroke-width="25" stroke-linejoin="miter"/>
+      <path d="M1140 247H1117V270M1456 247H1479V270M1140 609H1117V586M1456 609H1479V586" stroke="#8b7cf7" stroke-opacity=".65" stroke-width="2"/>
+    </g>
+
+    <g id="benefits">
+      <path d="M96 624H176" stroke="#8b7cf7" stroke-width="4"/>
+      <text x="96" y="704" fill="#f3f2f9" font-size="44" font-weight="600" letter-spacing="-.6">OpenAI + Anthropic compatible APIs</text>
+      <text x="96" y="774" fill="#b8bdcc" font-size="36">Windows + Linux</text>
+      <circle cx="414" cy="763" r="4" fill="#8b7cf7"/>
+      <text x="442" y="774" fill="#b8bdcc" font-size="36">Self-hosted</text>
+    </g>
+
+    <g id="footer">
+      <path d="M96 836H1504" stroke="#30313e" stroke-width="2"/>
+      <text x="96" y="917" fill="#b3a7fb" font-size="27" font-weight="600" letter-spacing="2">EXPLORE THE PROJECT</text>
+      <text x="1504" y="920" text-anchor="end" fill="#f3f2f9" font-size="39" font-weight="500" letter-spacing="-.4">github.com/B3hnamR/AutoZcoder</text>
+    </g>
+  </g>
+</svg>
