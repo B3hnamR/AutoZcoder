@@ -216,6 +216,8 @@ def test_start_is_refused_when_the_exit_network_is_not_connected(tmp_path, monke
     try:
         manager.set_options(ip_source="surfshark")
         monkeypatch.setattr(manager, "_mail_ready", lambda _: True)
+        # the AI-captcha account check must not depend on the host's accounts
+        monkeypatch.setattr(manager, "_pool_health", lambda: {"total": 1, "active": 1, "ready": True})
         monkeypatch.setattr(manager, "_ensure_display", lambda interactive=False: "")
         result = manager.start_workers(1)
         assert "Surfshark" in result["error"]
@@ -230,6 +232,7 @@ def test_batch_is_not_launched_when_vpn_disappears_during_selection(tmp_path, mo
         manager.set_options(ip_source="psiphon")
         monkeypatch.setattr(manager, "_ensure_display", lambda interactive=False: "")
         monkeypatch.setattr(manager, "_mail_ready", lambda _: True)
+        monkeypatch.setattr(manager, "_pool_health", lambda: {"total": 1, "active": 1, "ready": True})
         candidates = iter([[Exit(region="NL", port=47100, state="ready")], []])
         monkeypatch.setattr(manager.psiphon, "ready", lambda: next(candidates, []))
         assert "Psiphon" in manager.start_workers(2)["error"]

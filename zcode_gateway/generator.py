@@ -1630,6 +1630,32 @@ def _run_capture(args, cwd, timeout, env=None) -> subprocess.CompletedProcess:
     return subprocess.CompletedProcess(args, proc.returncode, out, err)
 
 
+def _extract_node_archive(archive: Path, dest: Path) -> None:
+    """Unpack the official Node.js tarball after validating every member.
+
+    Python 3.10/3.11's backported "data" filter resolves a relative symlink
+    (bin/npm -> ../lib/...) against the extraction root instead of the link's
+    own directory, so it rejects the official archive (Ubuntu 22.04 ships
+    such a Python). Only regular files, directories and in-tree symlinks pass."""
+    import tarfile
+    root = os.path.realpath(dest)
+    with tarfile.open(archive) as tf:
+        members = tf.getmembers()
+        for m in members:
+            path = os.path.normpath(os.path.join(root, m.name))
+            if not path.startswith(root + os.sep) or not (m.isfile() or m.isdir() or m.issym()):
+                raise RuntimeError(f"unsafe archive member {m.name!r}")
+            if m.issym():
+                link = os.path.normpath(os.path.join(os.path.dirname(path), m.linkname))
+                if os.path.isabs(m.linkname) or not link.startswith(root + os.sep):
+                    raise RuntimeError(f"unsafe archive link {m.name!r} -> {m.linkname!r}")
+            m.mode &= 0o755
+        if hasattr(tarfile, "fully_trusted_filter"):
+            tf.extractall(dest, members=members, filter="fully_trusted")
+        else:
+            tf.extractall(dest, members=members)
+
+
 def _private_node_bin() -> Path:
     """<app dir>/node/bin — where the installer / auto-install puts Node.js on
     Linux (a system Node is used when it is new enough)."""
@@ -2704,7 +2730,6 @@ class GeneratorManager:
         import hashlib
         import platform
         import shutil as _sh
-        import tarfile
         import tempfile
         import httpx as _hx
         from .paths import app_dir
@@ -2745,11 +2770,7 @@ class GeneratorManager:
                 if digest.hexdigest() != expected:
                     raise RuntimeError("SHA-256 mismatch — refusing the download")
                 say("unpacking Node.js…")
-                with tarfile.open(archive) as tf:
-                    try:
-                        tf.extractall(tmp, filter="data")
-                    except TypeError:          # Python < 3.12: no extraction filters
-                        tf.extractall(tmp)
+                _extract_node_archive(archive, tmp)
                 dest = app_dir() / "node"
                 if dest.exists():
                     _sh.rmtree(dest)

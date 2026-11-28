@@ -35,7 +35,7 @@ require root:
 | `sudo autozcoder start` / `stop` / `restart` | control the gateway service |
 | `sudo autozcoder status` | service, certificate expiry, dashboard URL |
 | `sudo autozcoder info` | dashboard URL + admin/client keys |
-| `sudo autozcoder cert` | transactional certificate/mode change (IP / domain / self-signed / none); restores prior TLS/config/renewal state on failure |
+| `sudo autozcoder cert` | transactional certificate/mode change (IP / domain / self-signed / none); asks for the mode on a terminal with the current one as default (`ZGW_SSL_MODE` skips the question); restores prior TLS/config/renewal state on failure |
 | `sudo autozcoder update` | transactional, SHA-256 verified update; startup/health failure rolls back deployment files; config and runtime data kept |
 | `sudo autozcoder uninstall` | fully deletes service, certificates, files (`--yes` to skip the prompt) |
 

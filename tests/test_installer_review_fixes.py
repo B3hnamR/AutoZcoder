@@ -337,3 +337,54 @@ def test_nonroot_commands_fail_before_private_state_but_help_works(tmp_path):
         assert "PRIVATE_STATE_EXECUTED" not in result.stderr
         if not success:
             assert "run this as root" in result.stderr
+
+
+@pytest.mark.parametrize("port,ok,normalized", [
+    ("8443", True, "8443"), ("08443", True, "8443"), ("80", True, "80"),
+    ("abc", False, ""), ("0", False, ""), ("70000", False, ""), ("", True, "8443"),
+])
+def test_port_override_is_validated(tmp_path, port, ok, normalized):
+    result = _shell(tmp_path, f'''
+ENV_FILE="$PWD/none"; ZGW_PORT="{port}"
+resolve_config
+echo "PORT=$ZGW_PORT"
+''')
+    assert (result.returncode == 0) is ok, result.stderr
+    if ok:
+        assert f"PORT={normalized}" in result.stdout
+
+
+def test_cert_command_offers_the_mode_again_with_saved_default(tmp_path):
+    # Install keeps a saved mode silently; `autozcoder cert` must ask again,
+    # default to the saved mode, and let a typed domain replace the old one.
+    result = _shell(tmp_path, r'''
+ENV_FILE="$PWD/state"; printf 'SAVED_SSL_MODE=self\nSAVED_DOMAIN=old.example.com\n' > "$ENV_FILE"
+resolve_config; TTY_OK=1
+ask() { echo "ASKED:$1" >> "$PWD/asked"; echo "$2"; }
+choose_tls_mode
+[[ "$TLS_MODE_CHOICE" == self && ! -e "$PWD/asked" ]]
+ZGW_SSL_MODE=""
+choose_tls_mode
+grep -q 'Choose an option \[3\]' "$PWD/asked" && [[ "$TLS_MODE_CHOICE" == self ]]
+printf '%s\n' 1 new.example.com > "$PWD/answers"
+ask() { local a; a="$(head -1 "$PWD/answers")"; sed -i 1d "$PWD/answers"; echo "${a:-$2}"; }
+ZGW_SSL_MODE=""; choose_tls_mode
+[[ "$TLS_MODE_CHOICE" == domain && "$ZGW_DOMAIN" == new.example.com ]]
+''')
+    assert result.returncode == 0, result.stderr
+    cert = (ROOT / "install-linux.sh").read_text(encoding="utf-8")
+    cert = cert[cert.index("cmd_cert() ("):cert.index("write_install_marker() {")]
+    assert 'if [[ "$TTY_OK" == 1 && -z "${ZGW_SSL_MODE_ENV:-}" ]]; then ZGW_SSL_MODE=""; fi' in cert
+    assert cert.index('ZGW_SSL_MODE=""; fi') < cert.index("choose_tls_mode")
+
+
+def test_prerequisites_keep_curl_minimal_and_suse_uses_its_names():
+    text = (ROOT / "install-linux.sh").read_text(encoding="utf-8")
+    # RHEL 9 curl-minimal conflicts with the curl package: never request it when present
+    assert 'command -v curl >/dev/null 2>&1 || prereqs=(curl "${prereqs[@]}")' in text
+    assert "install_pkgs curl openssl" not in text
+    suse = text[text.index("opensuse-*|sles) browser_libs=("):]
+    suse = suse[:suse.index(") ;;")]
+    for name in ("mozilla-nss", "mozilla-nspr", "libgbm1", "libatk-1_0-0", "libasound2"):
+        assert name in suse
+    assert "mesa-libgbm" not in suse and " nspr " not in suse
