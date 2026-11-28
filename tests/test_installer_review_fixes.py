@@ -388,3 +388,13 @@ def test_prerequisites_keep_curl_minimal_and_suse_uses_its_names():
     for name in ("mozilla-nss", "mozilla-nspr", "libgbm1", "libatk-1_0-0", "libasound2"):
         assert name in suse
     assert "mesa-libgbm" not in suse and " nspr " not in suse
+
+
+def test_renewal_skip_is_not_a_failed_unit():
+    # acme.sh exits 2 for "Skipping. Next renewal time is ..." — seen on a real
+    # VPS: without this every twice-daily timer run left a failed unit.
+    text = (ROOT / "install-linux.sh").read_text(encoding="utf-8")
+    unit = text[text.index('cat > "$RENEW_SERVICE_FILE" <<EOF'):]
+    unit = unit[:unit.index("\nEOF\n")]
+    assert "SuccessExitStatus=2" in unit
+    assert unit.index("SuccessExitStatus=2") < unit.index("ExecStart=")

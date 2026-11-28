@@ -791,6 +791,9 @@ Description=Renew the Zcode Gateway TLS certificate (acme.sh)
 [Service]
 Type=oneshot
 UMask=0077
+# acme.sh exits 2 when the certificate is not due yet ("Skipping"); that is the
+# normal outcome of most timer runs and must not leave a failed unit behind
+SuccessExitStatus=2
 ExecStart=/usr/bin/flock -n ${UPDATE_LOCK} ${ACME_HOME}/acme.sh --renew --home ${ACME_HOME} --server letsencrypt -d ${CURRENT_ACME_HOST}
 EOF
     cat > "$RENEW_TIMER_FILE" <<EOF
