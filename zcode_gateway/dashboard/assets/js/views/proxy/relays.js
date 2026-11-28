@@ -47,8 +47,10 @@ export function createRelaysCard() {
       enabled: controls.enabled.checked,
       strategy: controls.strategy.value,
       models: [
-        controls.glm54.checked ? "glm-5.4" : null,
-        controls.flash.checked ? "glm-5.3-flash" : null,
+        // the gateway's canonical ids; relay matching is case-insensitive, but
+        // saving lowercase rewrote the stored setting on every toggle
+        controls.glm54.checked ? "GLM-5.4" : null,
+        controls.flash.checked ? "GLM-5.3-Flash" : null,
       ].filter(Boolean),
     };
     try {
