@@ -8,7 +8,7 @@ import logging
 import os
 import threading
 import time
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -288,16 +288,51 @@ def load_from_pool_file(path: str) -> list[Account]:
     return out
 
 
+def _per_account_device_mid(token: str) -> str:
+    """Deterministic per-account device id.
+
+    Mirrors the generator's derivation exactly (uuid5 of the access token) so
+    the gateway and the generator agree on a single, stable id per account.
+    """
+    import uuid as _uuid
+    return str(_uuid.uuid5(_uuid.NAMESPACE_URL, "zcode-device:" + (token or "")))
+
+
+def _ensure_unique_device_mids(accounts: list[Account]) -> list[Account]:
+    """Guarantee every account presents a distinct ``x-device-mid``.
+
+    Z.ai risk control correlates accounts that share a device fingerprint: a
+    shared *or* empty ``device_mid`` across the pool is a direct cross-account
+    signal that gets the whole pool flagged ``UNUSUAL_ACTIVITY`` (HTTP 405 from
+    the edge WAF). Older generator batches wrote the same hardcoded mid into
+    every snapshot, so we rewrite any missing or duplicated mid to a stable
+    per-account uuid5 derived from the access token. Unique mids are preserved.
+    """
+    counts = Counter((a.notes.get("device_mid") or "").strip() for a in accounts)
+    seen: set[str] = set()
+    for account in accounts:
+        mid = (account.notes.get("device_mid") or "").strip()
+        if not mid or counts[mid] > 1:
+            seed = account.access_token or account.id
+            mid = _per_account_device_mid(seed)
+            while mid in seen or (mid in counts and counts[mid] > 1):
+                mid = _per_account_device_mid(mid)
+            account.notes["device_mid"] = mid
+        seen.add(mid)
+    return accounts
+
+
 def load_accounts(cfg: AccountsConfig) -> list[Account]:
     if cfg.source == "pool_file":
-        return load_from_pool_file(cfg.pool_file)
-    if cfg.source == "providers_json":
-        return load_from_providers_json(cfg.providers_json)
-    if cfg.source == "accounts_dir":
+        accounts = load_from_pool_file(cfg.pool_file)
+    elif cfg.source == "providers_json":
+        accounts = load_from_providers_json(cfg.providers_json)
+    elif cfg.source == "accounts_dir":
         from .accounts_dir import load_from_accounts_dir
         accounts = load_from_accounts_dir(cfg.dir)
-        return accounts
-    raise ValueError(f"unknown accounts.source: {cfg.source}")
+    else:
+        raise ValueError(f"unknown accounts.source: {cfg.source}")
+    return _ensure_unique_device_mids(accounts)
 
 
 # --------------------------------------------------------------------------- #

@@ -21,7 +21,7 @@ pool:
   cooldown_seconds: 30
   max_in_flight_per_account: 4
   acquire_wait_seconds: 5
-  balance_poll_seconds: 60
+  balance_poll_seconds: 300
   blocked_model_cooldown_seconds: 900
 accounts:
   source: accounts_dir
